@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/ferros", "crates/ferros-core", "crates/ferros-mir", "crates/ferros-ui", "crates/ferros-protocol", "crates/ferros-utils"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+# missing_docs = "warn"
+unused = "warn"
+

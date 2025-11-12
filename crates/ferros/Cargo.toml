@@ -1,0 +1,17 @@
+[package]
+name = "ferros"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-native debugger with hybrid MIR and system-level introspection."
+license = "Apache-2.0"
+repository = "https://github.com/jamallyons/ferros"
+homepage = "https://github.com/jamallyons/ferros"
+documentation = "https://docs.rs/ferros"
+keywords = ["debugger", "rust", "mir", "debugging"]
+categories = ["development-tools", "debuggers"]
+
+[features]
+# Include nothing by default
+default = []
+
+full = [] # todo - add all features

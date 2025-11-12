@@ -1,0 +1,257 @@
+---
+alwaysApply: true
+---
+
+# Ferros Rust Development Rules
+
+## Project Overview
+Ferros is a Rust-native debugger built as a workspace of multiple crates. Each crate has a specific responsibility:
+- `ferros`: Command-line interface
+- `ferros-core`: Low-level debugging primitives and process control
+- `ferros-mir`: MIR integration, introspection, and analysis
+- `ferros-ui`: Optional TUI/GUI for visualization
+- `ferros-protocol`: Communication layer between debugger and frontend
+- `ferros-utils`: Shared utilities, logging, config, and helpers
+
+## Code Style & Formatting
+
+### Formatting Rules
+- Always run `cargo fmt --all` before committing
+- Follow the project's `rustfmt.toml`
+
+### Linting Rules
+- Always run `cargo clippy --all -- -D warnings` before committing
+- Workspace-level lint rules:
+  - `unsafe_code = "forbid"` - NO unsafe code allowed unless absolutely necessary and thoroughly documented
+  - `unused = "warn"` - Clean up unused code
+- Prefer explicit types where clarity helps
+- Use `clippy::pedantic` suggestions when appropriate
+
+## Workspace Configuration
+
+### Crate Structure
+- All crates live under `/crates` directory
+- Each crate should have its own `README.md` describing its purpose and public API
+- All crates inherit workspace lints via `[lints] workspace = true`
+
+### Dependencies
+- **Async Runtime**: Prefer `tokio` for async operations
+- **Error Handling**: Use `thiserror` for library errors, `anyhow` for application errors
+- **Logging**: Use `tracing` and `tracing-subscriber` for structured logging
+- **Serialization**: Use `serde` and `serde_json` for data serialization
+- **CLI**: Use `clap` for command-line argument parsing
+- **Testing**: Use `proptest` for property-based testing, `insta` for snapshot testing
+
+## Error Handling
+
+### Error Types
+- Use `thiserror` for library crates (`ferros-core`, `ferros-mir`, `ferros-protocol`)
+- Use `anyhow` for application crates (`ferros`, `ferros-ui`)
+- Always provide context with `.context()` or `#[source]` attributes
+- Use `Result<T, E>` for fallible operations
+- Prefer `?` operator over explicit `match` when propagating errors
+
+### Error Messages
+- Write clear, actionable error messages
+- Include relevant context (file paths, line numbers, variable values when safe)
+- Use structured error types with `#[error("...")]` attributes
+
+## Async Programming
+
+### Async Patterns
+- Use `tokio` as the async runtime
+- Prefer `async fn` over manual `Future` implementations
+- Use `tokio::spawn` for concurrent tasks
+- Use `tokio::select!` for concurrent operations
+- Prefer `tokio::sync::mpsc` for channels
+- Use `Arc` and `Mutex`/`RwLock` for shared state in async contexts
+
+### Async Safety
+- Ensure all async operations are properly awaited
+- Use `#[tokio::test]` for async tests
+- Be mindful of cancellation and cleanup in async code
+
+## Documentation
+
+### Public API Documentation
+- Document all public functions, types, and modules with Rustdoc comments (`///`)
+- Use `# Examples` sections for complex APIs
+- Include `# Safety` sections for any unsafe code (should be rare)
+- Use `# Errors` sections to document error conditions
+- Use `# Panics` sections if functions can panic
+
+### Code Comments
+- Write comments that explain "why" not "what"
+- Use `//` for inline comments
+- Use `/* */` for multi-line comments when needed
+- Keep comments up-to-date with code changes
+
+## Testing
+
+### Test Organization
+- Each crate contains its own `tests/` directory for unit tests
+- Top-level `tests/` directory for integration tests across crates
+- Use `#[cfg(test)]` modules for unit tests within source files
+
+### Test Practices
+- Write tests for all new functionality
+- Use descriptive test names: `test_function_name_scenario_expected_result`
+- Use `#[should_panic]` sparingly and document why
+- Use `criterion` for performance benchmarking
+- Run `cargo test --workspace --all-features` before committing
+
+### Test Data
+- Use `proptest` for property-based testing
+- Use `insta` for snapshot testing when appropriate
+- Create test fixtures in `tests/fixtures/` when needed
+
+## Crate-Specific Guidelines
+
+### ferros-core
+- Focus on low-level debugging primitives
+- Interface with OS-level APIs (`ptrace`, `procfs`, Windows Debug API)
+- Manage breakpoints, stack unwinding, register inspection, memory mapping
+- Provide async-safe abstractions
+- Handle platform-specific code with `#[cfg(target_os = "...")]`
+
+### ferros-mir
+- Integrate with Rust compiler internals and MIR
+- Perform symbolic execution, type inspection, variable lifetime analysis
+- Expose APIs for interpreting and visualizing MIR blocks
+- May use `rustc_private` or `rustc_driver` for compiler hooks
+- Document MIR-specific concepts clearly
+
+### ferros-protocol
+- Define structured messages for communication
+- Use JSON or binary formats (MessagePack) for efficiency
+- Enable remote debugging capabilities
+- Version protocol messages for backward compatibility
+- Use `serde` for serialization
+
+### ferros-ui
+- Provide terminal or graphical user interface
+- Display source view, stack frames, local variables, heap visualization
+- Use `ratatui` for TUI or `egui` for GUI
+- Communicate asynchronously via `ferros-protocol`
+- Handle user input gracefully
+
+### ferros-utils
+- Provide shared utilities across crates
+- Include common macros, traits, and helper functions
+- Keep utilities generic and reusable
+- Document utility functions thoroughly
+
+## Memory Safety & Performance
+
+### Memory Safety
+- NO unsafe code unless absolutely necessary
+- If unsafe is required, document why it's safe with `# Safety` comments
+- Prefer safe abstractions over raw pointers
+- Use `std::ptr` utilities when needed, but prefer safe alternatives
+
+### Performance
+- Profile before optimizing
+- Use `criterion` for benchmarks
+- Prefer zero-cost abstractions
+- Use `#[inline]` judiciously (let the compiler decide first)
+- Consider `Vec::with_capacity` when size is known
+- Use `Cow` for avoiding unnecessary allocations
+
+## Cross-Platform Considerations
+
+### Platform-Specific Code
+- Use `#[cfg(target_os = "...")]` for platform-specific implementations
+- Support Linux (`ptrace`), macOS (Mach ports), and Windows (WinDbg APIs)
+- Test on all supported platforms
+- Document platform-specific behavior
+
+### Conditional Compilation
+- Use feature flags for optional functionality
+- Document feature flags in `Cargo.toml`
+- Use `#[cfg(feature = "...")]` for feature-gated code
+
+## Git & Commit Messages
+
+### Commit Message Format
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+- `feat(crate): description` - new feature
+- `fix(crate): description` - bug fix
+- `refactor(crate): description` - non-breaking code improvements
+- `docs(crate): description` - documentation updates
+- `test(crate): description` - adding or improving tests
+- `chore(crate): description` - tooling or maintenance
+
+### Examples
+```
+feat(core): add DWARF parser for symbol resolution
+fix(cli): handle SIGTRAP signals gracefully
+docs: update architecture overview
+refactor(mir): simplify MIR block traversal
+```
+
+### PR Guidelines
+- Keep PRs focused and small (ideally < 300 lines of diff)
+- Reference related issues (`Closes #42`)
+- Ensure all tests pass
+- Update documentation as needed
+- Get CI approval before requesting review
+
+## Build & Development Workflow
+
+### Before Committing
+1. Run `cargo fmt --all`
+2. Run `cargo clippy --all -- -D warnings`
+3. Run `cargo test --workspace --all-features`
+4. Run `cargo doc --workspace --no-deps` to check documentation
+5. Ensure all linter errors are resolved
+
+### Development Commands
+- `cargo build` - Build all crates
+- `cargo test` - Run all tests
+- `cargo test -p <crate>` - Run tests for specific crate
+- `cargo clippy` - Run linter
+- `cargo fmt` - Format code
+- `cargo doc --open` - Build and open documentation
+
+## Code Review Checklist
+
+When reviewing code, check for:
+- ✅ Follows formatting rules (`cargo fmt`)
+- ✅ Passes clippy (`cargo clippy`)
+- ✅ All tests pass
+- ✅ Public APIs are documented
+- ✅ Error handling is appropriate
+- ✅ No unsafe code (or properly documented)
+- ✅ Cross-platform compatibility considered
+- ✅ Performance implications considered
+- ✅ Commit messages follow conventions
+
+## Additional Best Practices
+
+### Type Safety
+- Prefer strong types over primitives (e.g., `struct ProcessId(u32)` over `u32`)
+- Use newtype patterns for domain concepts
+- Leverage Rust's type system for compile-time guarantees
+
+### Code Organization
+- Keep modules focused and cohesive
+- Use `mod.rs` for module organization
+- Group related functionality together
+- Avoid deep nesting (prefer flat module structure)
+
+### Naming Conventions
+- Use `snake_case` for functions and variables
+- Use `PascalCase` for types and traits
+- Use `SCREAMING_SNAKE_CASE` for constants
+- Use descriptive names that convey intent
+- Avoid abbreviations unless widely understood
+
+### Resource Management
+- Use RAII patterns for resource cleanup
+- Implement `Drop` for custom resource types
+- Use `std::sync::Arc` for shared ownership
+- Prefer borrowing over cloning when possible
+
+---
+
+Remember: Ferros is built to be a production-grade Rust debugger. Write code that is safe, performant, maintainable, and well-documented. When in doubt, prefer clarity and safety over cleverness.

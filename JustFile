@@ -33,6 +33,8 @@ check-prerequisites:
     @echo "  ✓ rustup found"
     @command -v cargo >/dev/null 2>&1 || { echo "  ⚠ cargo not found - will install with rustup"; exit 0; }
     @echo "  ✓ cargo found"
+    @command -v cargo-ws >/dev/null 2>&1 || { echo "  ⚠ cargo-ws not found (optional, install with: cargo install cargo-workspaces)"; exit 0; }
+    @echo "  ✓ cargo-ws found"
 
 # Install Rust toolchain via rustup
 install-rust:
@@ -81,6 +83,10 @@ verify-setup:
     @echo "Verifying clippy..."
     @cargo clippy --version >/dev/null 2>&1 || { echo "  ⚠ clippy not found (optional)"; exit 0; }
     @echo "  ✓ clippy: $(cargo clippy --version | cut -d' ' -f2)"
+    
+    @echo "Verifying cargo-workspaces..."
+    @cargo ws --version >/dev/null 2>&1 || { echo "  ⚠ cargo-ws not found (optional)"; exit 0; }
+    @echo "  ✓ cargo-ws: $(cargo ws --version | cut -d' ' -f2)"
 
 # Format all code
 fmt:
@@ -143,8 +149,79 @@ info:
     @echo "Toolchain: $(rustup show active-toolchain 2>/dev/null || echo 'unknown')"
     @echo ""
     @echo "Workspace crates:"
-    @if command -v jq >/dev/null 2>&1; then \
+    @if command -v cargo-ws >/dev/null 2>&1; then \
+        cargo ws list 2>/dev/null | sed 's/^/  • /' || { \
+            echo "  ⚠ cargo-ws failed, using fallback..."; \
+            if command -v jq >/dev/null 2>&1; then \
+                cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.workspace_members[]' | sed 's/.*\///' | sed 's/#.*//' | sort -u | sed 's/^/  • /'; \
+            else \
+                cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -A 100 '"workspace_members"' | grep -o '"[^"]*ferros[^"]*"' | grep -v '_' | sed 's/"//g' | sort -u | sed 's/^/  • /'; \
+            fi \
+        }; \
+    elif command -v jq >/dev/null 2>&1; then \
         cargo metadata --format-version 1 --no-deps | jq -r '.workspace_members[]' | sed 's/.*\///' | sed 's/#.*//' | sort -u | sed 's/^/  • /'; \
     else \
         cargo metadata --format-version 1 --no-deps | grep -A 100 '"workspace_members"' | grep -o '"[^"]*ferros[^"]*"' | grep -v '_' | sed 's/"//g' | sort -u | sed 's/^/  • /'; \
     fi
+
+# List workspace crates using cargo-ws
+list:
+    @echo "📦 Workspace crates:"
+    @cargo ws list 2>/dev/null || { \
+        echo "  ⚠ cargo-ws failed. This may be due to workspace configuration issues."; \
+        echo "  Try running 'just clean' to remove build artifacts."; \
+        exit 1; \
+    }
+
+# List crates that have changed since last tagged release
+changed:
+    @echo "📝 Changed crates since last release:"
+    @cargo ws changed
+
+# Execute a command in each crate (usage: just exec "cargo test")
+exec COMMAND:
+    @echo "🔧 Executing '{{COMMAND}}' in each crate..."
+    @cargo ws exec {{COMMAND}}
+
+# Bump version of crates (usage: just version patch|minor|major)
+version LEVEL:
+    @echo "📌 Bumping {{LEVEL}} version across workspace..."
+    @cargo ws version {{LEVEL}}
+
+# Show publishing plan
+plan:
+    @echo "📋 Publishing order:"
+    @cargo ws plan 2>&1 | grep -v "^error: config value" || true
+
+# Publish all crates in the workspace (with version bumping)
+# Usage: just publish [BUMP]
+# Examples:
+#   just publish              # Interactive version bump and publish
+#   just publish patch        # Bump patch version and publish
+#   just publish minor        # Bump minor version and publish
+#   just publish major        # Bump major version and publish
+# Note: For additional options (--dry-run, --yes, etc.), use cargo ws publish directly
+publish BUMP="":
+    @echo "📦 Publishing workspace crates..."
+    @if [ -z "{{BUMP}}" ]; then \
+        cargo ws publish; \
+    else \
+        cargo ws publish {{BUMP}}; \
+    fi
+
+# Publish crates without versioning (from current git state)
+publish-as-is:
+    @echo "📦 Publishing workspace crates as-is (no version bump)..."
+    @cargo ws publish --publish-as-is
+
+# Dry-run publish (test without actually publishing)
+publish-dry-run BUMP="patch":
+    @echo "🧪 Dry-run: Testing publish with {{BUMP}} version bump..."
+    @cargo ws publish {{BUMP}} --dry-run
+
+# Publish with a delay between crates to avoid rate limiting
+# Usage: just publish-with-delay [BUMP] [SECONDS]
+# Example: just publish-with-delay patch 10
+publish-with-delay BUMP="patch" SECONDS="10":
+    @echo "📦 Publishing workspace crates with {{SECONDS}}s delay between publishes..."
+    @cargo ws publish {{BUMP}} --publish-interval {{SECONDS}}

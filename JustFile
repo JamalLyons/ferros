@@ -200,7 +200,7 @@ plan:
 #   just publish patch        # Bump patch version and publish
 #   just publish minor        # Bump minor version and publish
 #   just publish major        # Bump major version and publish
-# Note: For additional options (--dry-run, --yes, etc.), use cargo ws publish directly
+# Note: For additional options (--yes, --allow-dirty, etc.), use cargo ws publish directly
 publish BUMP="":
     @echo "📦 Publishing workspace crates..."
     @if [ -z "{{BUMP}}" ]; then \
@@ -213,11 +213,6 @@ publish BUMP="":
 publish-as-is:
     @echo "📦 Publishing workspace crates as-is (no version bump)..."
     @cargo ws publish --publish-as-is
-
-# Dry-run publish (test without actually publishing)
-publish-dry-run BUMP="patch":
-    @echo "🧪 Dry-run: Testing publish with {{BUMP}} version bump..."
-    @cargo ws publish {{BUMP}} --dry-run
 
 # Publish with a delay between crates to avoid rate limiting
 # Usage: just publish-with-delay [BUMP] [SECONDS]

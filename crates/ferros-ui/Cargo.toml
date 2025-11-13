@@ -8,6 +8,7 @@ repository = "https://github.com/jamallyons/ferros"
 readme = "README.md"
 keywords = ["debugger", "rust", "tui", "gui"]
 categories = ["development-tools"]
+publish = false
 
 [dependencies]
 

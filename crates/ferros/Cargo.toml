@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
 homepage = "https://github.com/jamallyons/ferros"
 documentation = "https://docs.rs/ferros"
+readme = "../../README.md"
 keywords = ["debugger", "rust", "mir", "debugging"]
 categories = ["development-tools", "debuggers"]
 

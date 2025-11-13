@@ -1,0 +1,150 @@
+# Justfile for Ferros development
+# Run `just setup` to get started
+
+# Default recipe - show available commands
+default:
+    @just --list
+
+# Setup development environment for new contributors
+setup: check-prerequisites install-rust install-nightly verify-setup run-setup-tests
+    @echo ""
+    @echo "🎉 Setup complete! You're ready to contribute to Ferros."
+    @echo ""
+    @echo "Next steps:"
+    @echo "  • Run 'just fmt' to format code"
+    @echo "  • Run 'just lint' to check code quality"
+    @echo "  • Run 'just test' to run tests"
+    @echo "  • Read CONTRIBUTING.md for guidelines"
+
+# Run tests as part of setup
+run-setup-tests:
+    @echo ""
+    @echo "🧪 Running tests..."
+    @cargo test --workspace --all-features
+
+# Check if prerequisites are installed
+check-prerequisites:
+    @echo "🦀 Setting up Ferros development environment..."
+    @echo ""
+    @echo "📋 Checking prerequisites..."
+    @command -v git >/dev/null 2>&1 || { echo "❌ git is not installed. Please install git first."; exit 1; }
+    @echo "  ✓ git found"
+    @command -v rustup >/dev/null 2>&1 || { echo "  ⚠ rustup not found - will install"; exit 0; }
+    @echo "  ✓ rustup found"
+    @command -v cargo >/dev/null 2>&1 || { echo "  ⚠ cargo not found - will install with rustup"; exit 0; }
+    @echo "  ✓ cargo found"
+
+# Install Rust toolchain via rustup
+install-rust:
+    @echo ""
+    @echo "🔧 Installing Rust toolchain..."
+    @if ! command -v rustup >/dev/null 2>&1; then \
+        echo "Installing rustup..."; \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
+        export PATH="$HOME/.cargo/bin:$PATH"; \
+        echo "  ✓ rustup installed"; \
+    else \
+        echo "  ✓ rustup already installed"; \
+    fi
+    @if ! command -v cargo >/dev/null 2>&1; then \
+        echo "  ⚠ cargo not in PATH. Please run: source $HOME/.cargo/env"; \
+    fi
+
+# Install nightly toolchain with rustfmt component
+install-nightly:
+    @echo ""
+    @echo "🌙 Installing nightly toolchain with rustfmt..."
+    @rustup toolchain install nightly --component rustfmt 2>&1 | grep -v "info:" || true
+    @echo "  ✓ nightly toolchain installed"
+    @rustup toolchain list | grep -q nightly || { echo "  ⚠ Failed to install nightly"; exit 1; }
+
+# Verify that everything is set up correctly
+verify-setup:
+    @echo ""
+    @echo "✅ Verifying setup..."
+    @echo "Verifying Rust installation..."
+    @rustc --version || { echo "  ❌ rustc not found"; exit 1; }
+    @echo "  ✓ rustc: $(rustc --version | cut -d' ' -f2)"
+    
+    @echo "Verifying cargo..."
+    @cargo --version || { echo "  ❌ cargo not found"; exit 1; }
+    @echo "  ✓ cargo: $(cargo --version | cut -d' ' -f2)"
+    
+    @echo "Verifying nightly toolchain..."
+    @rustup toolchain list | grep -q nightly || { echo "  ❌ nightly toolchain not found"; exit 1; }
+    @echo "  ✓ nightly toolchain installed"
+    
+    @echo "Verifying rustfmt..."
+    @cargo fmt --version >/dev/null 2>&1 || { echo "  ❌ rustfmt not found"; exit 1; }
+    @echo "  ✓ rustfmt: $(cargo fmt --version | cut -d' ' -f2)"
+    
+    @echo "Verifying clippy..."
+    @cargo clippy --version >/dev/null 2>&1 || { echo "  ⚠ clippy not found (optional)"; exit 0; }
+    @echo "  ✓ clippy: $(cargo clippy --version | cut -d' ' -f2)"
+
+# Format all code
+fmt:
+    @echo "🎨 Formatting code..."
+    @cargo fmt --all
+
+# Check formatting without making changes
+fmt-check:
+    @echo "🔍 Checking code formatting..."
+    @cargo fmt --all -- --check
+
+# Run clippy linter
+lint:
+    @echo "🔍 Running clippy..."
+    @cargo clippy --all --all-targets -- -D warnings
+
+# Run clippy with auto-fix
+lint-fix:
+    @echo "🔧 Running clippy with auto-fix..."
+    @cargo clippy --all --all-targets --fix --allow-dirty --allow-staged
+
+# Run all tests
+test:
+    @echo "🧪 Running tests..."
+    @cargo test --workspace --all-features
+
+# Run tests for a specific crate (usage: just test-crate ferros-core)
+test-crate CRATE:
+    @echo "🧪 Running tests for {{CRATE}}..."
+    @cargo test -p {{CRATE}} --all-features
+
+# Build the project
+build:
+    @echo "🔨 Building project..."
+    @cargo build --workspace --all-features
+
+# Build in release mode
+build-release:
+    @echo "🔨 Building release..."
+    @cargo build --release --workspace --all-features
+
+# Run all checks (fmt, clippy, test)
+check:
+    @echo "🔍 Running all checks..."
+    @just fmt-check
+    @just lint
+    @just test
+
+# Clean build artifacts
+clean:
+    @echo "🧹 Cleaning build artifacts..."
+    @cargo clean
+
+# Show project information
+info:
+    @echo "🦀 Ferros Development Information"
+    @echo ""
+    @echo "Rust version: $(rustc --version)"
+    @echo "Cargo version: $(cargo --version)"
+    @echo "Toolchain: $(rustup show active-toolchain 2>/dev/null || echo 'unknown')"
+    @echo ""
+    @echo "Workspace crates:"
+    @if command -v jq >/dev/null 2>&1; then \
+        cargo metadata --format-version 1 --no-deps | jq -r '.workspace_members[]' | sed 's/.*\///' | sed 's/#.*//' | sort -u | sed 's/^/  • /'; \
+    else \
+        cargo metadata --format-version 1 --no-deps | grep -A 100 '"workspace_members"' | grep -o '"[^"]*ferros[^"]*"' | grep -v '_' | sed 's/"//g' | sort -u | sed 's/^/  • /'; \
+    fi

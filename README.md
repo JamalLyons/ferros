@@ -39,13 +39,13 @@ Ferros aims to become the Rust ecosystem's standard debugging platform, compleme
 
 | Feature | Description |
 |---------|-------------|
-| 🦀 **Rust-Native Inspection** | Understands ownership, borrows, lifetimes, and async tasks directly |
-| 🧬 **MIR Integration** | Debug at the mid-level IR to analyze compiler-accurate control flow |
-| ⚡ **Hybrid Execution Engine** | Combine symbolic simulation with native process control for precise debugging |
-| 🎯 **Zero-Cost Breakpoints** | Lightweight traps integrated with Rust's runtime model |
-| 👁️ **Memory Safety Visualization** | Visualize move semantics, borrows, and drops in real time |
-| 🌐 **Cross-Platform Support** | Linux (ptrace), macOS (Mach ports), and Windows (WinDbg APIs) |
-| 📦 **Cargo Integration** | Seamless `cargo ferros` workflow for launching and inspecting projects |
+| **Rust-Native Inspection** | Understands ownership, borrows, lifetimes, and async tasks directly |
+| **MIR Integration** | Debug at the mid-level IR to analyze compiler-accurate control flow |
+| **Hybrid Execution Engine** | Combine symbolic simulation with native process control for precise debugging |
+| **Zero-Cost Breakpoints** | Lightweight traps integrated with Rust's runtime model |
+| **Memory Safety Visualization** | Visualize move semantics, borrows, and drops in real time |
+| **Cross-Platform Support** | Linux (ptrace), macOS (Mach ports), and Windows (WinDbg APIs) |
+| **Cargo Integration** | Seamless `cargo ferros` workflow for launching and inspecting projects |
 
 > **Note:** Ferros is currently in active development. See [ROADMAP.md](./ROADMAP.md) for current status.
 

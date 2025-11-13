@@ -1,0 +1,14 @@
+# Clippy configuration for Ferros
+# See https://rust-lang.github.io/rust-clippy/ for more options
+#
+# Note: Lint groups (like pedantic, nursery, cargo) are configured in Cargo.toml
+# This file is for configuring individual lint behavior and thresholds
+
+# Cognitive complexity threshold (default is 25)
+# Increase to allow more complex functions before warning
+cognitive-complexity-threshold = 30
+
+# Array size threshold for large array warnings
+# Arrays larger than this will trigger a warning
+array-size-threshold = 50
+

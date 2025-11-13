@@ -5,7 +5,7 @@ edition = "2021"
 description = "Optional TUI/GUI for Ferros debugger visualization."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["debugger", "rust", "tui", "gui"]
 categories = ["development-tools"]
 

@@ -201,14 +201,14 @@ pub fn create_debugger() -> Result<Box<dyn Debugger>>
 {
     #[cfg(target_os = "macos")]
     {
-        return Ok(Box::new(crate::platform::macos::MacOSDebugger::new()?));
+        Ok(Box::new(crate::platform::macos::MacOSDebugger::new()?))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        return Err(DebuggerError::AttachFailed(format!(
+        Err(crate::error::DebuggerError::AttachFailed(format!(
             "Debugger not yet implemented for platform: {}",
             std::env::consts::OS
-        )));
+        )))
     }
 }

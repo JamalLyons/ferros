@@ -4,11 +4,13 @@
 
 **A Rust-native debugger built from the same element as Rust itself.**
 
+[![GitHub stars](https://img.shields.io/github/stars/jamallyons/ferros.svg?style=social&label=Star)](https://github.com/jamallyons/ferros)
+[![GitHub forks](https://img.shields.io/github/forks/jamallyons/ferros.svg?style=social&label=Fork)](https://github.com/jamallyons/ferros/fork)
+[![GitHub issues](https://img.shields.io/github/issues/jamallyons/ferros.svg)](https://github.com/jamallyons/ferros/issues)
+[![GitHub pull requests](https://img.shields.io/github/issues-pr/jamallyons/ferros.svg)](https://github.com/jamallyons/ferros/pulls)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Unsafe](https://img.shields.io/badge/unsafe-forbidden-red.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-<img src="./assets/ferros-logo.png" alt="Ferros Logo" width="300" style="border-radius: 50%;">
+<img src="https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/master/assets/ferros-logo.png" alt="Ferros Logo" width="300" style="border-radius: 50%;">
 
 **Ferros** (from *ferrum* — Latin for iron) is a next-generation debugger designed specifically for the Rust programming language.
 

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "cargo": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepTypes": [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies"
+      ],
+      "groupName": "all Rust dependencies",
+      "groupSlug": "all-rust-deps"
+    }
+  ]
+}

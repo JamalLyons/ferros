@@ -100,6 +100,36 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 - Use `criterion` for performance benchmarking
 - Run `cargo test --workspace --all-features` before committing
 
+### Platform-Scoped Tests and Examples
+- **CRITICAL**: All platform-specific tests and examples MUST be scoped with `#[cfg(target_os = "...")]`
+- This ensures CI works on all platforms (Linux, macOS, Windows) without failing
+- **For Examples**:
+  - Wrap platform-specific code in `#[cfg(target_os = "...")]` modules
+  - Provide a stub `main()` for non-target platforms that prints a helpful error message
+  - Example pattern:
+    ```rust
+    #[cfg(not(target_os = "macos"))]
+    fn main() {
+        eprintln!("This example is macOS-only.");
+        std::process::exit(1);
+    }
+    
+    #[cfg(target_os = "macos")]
+    mod macos_impl {
+        // ... platform-specific code ...
+    }
+    
+    #[cfg(target_os = "macos")]
+    fn main() {
+        macos_impl::main();
+    }
+    ```
+- **For Tests**:
+  - Use `#[cfg(target_os = "...")]` on test functions or modules
+  - Ensure tests compile on all platforms (even if they're skipped)
+  - Example: `#[cfg(target_os = "macos")] #[test] fn test_macos_feature() { ... }`
+- **Why this matters**: CI runs on Linux, so macOS/Windows-specific code must compile but can be skipped
+
 ### Test Data
 - Use `proptest` for property-based testing
 - Use `insta` for snapshot testing when appropriate
@@ -169,6 +199,11 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 - Use feature flags for optional functionality
 - Document feature flags in `Cargo.toml`
 - Use `#[cfg(feature = "...")]` for feature-gated code
+- **Platform-specific code**: Always use `#[cfg(target_os = "...")]` for platform-specific implementations
+- **CI Compatibility**: Ensure platform-specific tests/examples compile on all platforms (use conditional compilation)
+  - Tests/examples should not cause compilation errors on non-target platforms
+  - Use `#[cfg(target_os = "...")]` to scope platform-specific code
+  - Provide fallback implementations for non-target platforms when needed
 
 ## Git & Commit Messages
 
@@ -223,6 +258,8 @@ When reviewing code, check for:
 - ✅ Error handling is appropriate
 - ✅ No unsafe code (or properly documented)
 - ✅ Cross-platform compatibility considered
+- ✅ Platform-specific tests/examples are properly scoped with `#[cfg(target_os = "...")]`
+- ✅ Code compiles on all CI platforms (Linux, macOS, Windows)
 - ✅ Performance implications considered
 - ✅ Commit messages follow conventions
 

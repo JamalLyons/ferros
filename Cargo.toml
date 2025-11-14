@@ -17,9 +17,13 @@ unused = { level = "warn", priority = -1 }
 # Clippy lints
 [workspace.lints.clippy]
 # Enforce pedantic clippy lints (set priority to avoid conflicts)
-pedantic = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -2 }
 # Allow nursery lints (experimental)
 nursery = { level = "allow", priority = -1 }
 # Cargo-related lints
-cargo = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -2 }
+
+# Workspace dependencies
+[workspace.dependencies]
+thiserror = "2.0.17"
 

@@ -11,6 +11,12 @@ categories = ["development-tools"]
 publish = false
 
 [dependencies]
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "registry", "chrono"] }
+tracing-appender = "0.2"
 
-[lints]
-workspace = true
+[lints.clippy]
+# Allow multiple crate versions (needed for tracing-appender which uses thiserror 1.0)
+# Use priority 0 to override the default deny from -D warnings
+multiple-crate-versions = { level = "allow", priority = 0 }

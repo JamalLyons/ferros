@@ -10,6 +10,9 @@ keywords = ["debugger", "rust", "debugging", "ptrace"]
 categories = ["development-tools"]
 
 [dependencies]
+libc = "0.2.177"
+thiserror = "2.0.17"
 
-[lints]
-workspace = true
+# macOS-specific Mach API bindings
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.5.0"

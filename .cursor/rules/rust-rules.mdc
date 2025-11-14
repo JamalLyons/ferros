@@ -255,3 +255,9 @@ When reviewing code, check for:
 ---
 
 Remember: Ferros is built to be a production-grade Rust debugger. Write code that is safe, performant, maintainable, and well-documented. When in doubt, prefer clarity and safety over cleverness.
+
+# Package installation rules
+
+always use cargo install <package> over adding your own version number. This way we get the latest version of the package. 
+
+If working in a workspacce, use cargo add <name> --package <workspace-name>

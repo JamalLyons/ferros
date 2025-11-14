@@ -1,0 +1,120 @@
+//! # Error Types
+//!
+//! Error handling for the debugger.
+//!
+//! We use `thiserror` to automatically generate `Error` trait implementations
+//! and nice error messages. This makes error handling ergonomic while still
+//! giving us full control over error types.
+
+use thiserror::Error;
+
+/// Main error type for debugger operations
+///
+/// This enum represents all the ways a debugger operation can fail.
+/// Each variant corresponds to a specific error condition that can occur
+/// when interacting with processes.
+///
+/// ## Why use an enum instead of String?
+///
+/// - **Type safety**: The compiler ensures we handle all error cases
+/// - **Pattern matching**: Can match on specific error types
+/// - **Better error messages**: Each variant can have a custom message
+/// - **Error chaining**: Can convert from platform-specific errors (like MachError)
+///
+/// ## Error Categories
+///
+/// 1. **Process errors**: ProcessNotFound, AttachFailed
+/// 2. **Permission errors**: PermissionDenied
+/// 3. **Platform errors**: MachError (macOS-specific)
+/// 4. **I/O errors**: Io (for file operations, etc.)
+#[derive(Error, Debug)]
+pub enum DebuggerError
+{
+    /// The process with the given PID doesn't exist or has exited
+    ///
+    /// This happens when:
+    /// - You provide an invalid PID
+    /// - The process exited between when you got its PID and when you tried to attach
+    /// - The PID was from a different system (if doing remote debugging)
+    #[error("Process not found: PID {0}")]
+    ProcessNotFound(u32),
+
+    /// Insufficient permissions to debug the target process
+    ///
+    /// On macOS, this typically means:
+    /// - `task_for_pid()` returned `KERN_PROTECTION_FAILURE`
+    /// - You need to run with `sudo` or grant debugging entitlements
+    ///
+    /// On Linux, this means:
+    /// - `ptrace(PTRACE_ATTACH)` failed with EPERM
+    /// - You need to be root or the process owner
+    ///
+    /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger)
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// Invalid argument passed to a debugger function
+    ///
+    /// Examples:
+    /// - Trying to read registers before attaching
+    /// - Invalid memory address
+    /// - Unsupported architecture
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// Failed to attach to a process
+    ///
+    /// This is a general error for attachment failures that don't fit
+    /// into more specific categories. The string contains details about
+    /// what went wrong.
+    #[error("Failed to attach to process: {0}")]
+    AttachFailed(String),
+
+    /// Failed to read registers from the target process
+    ///
+    /// This can happen if:
+    /// - The thread has exited
+    /// - The thread state structure doesn't match what we expect
+    /// - The architecture is different than expected
+    #[error("Failed to read registers: {0}")]
+    ReadRegistersFailed(String),
+
+    /// macOS-specific Mach API error
+    ///
+    /// This wraps errors from the Mach kernel APIs. Common errors:
+    /// - `KERN_PROTECTION_FAILURE`: Permission denied
+    /// - `KERN_INVALID_ARGUMENT`: Invalid PID or argument
+    /// - `KERN_FAILURE`: Process not found
+    ///
+    /// See: [Mach Kernel Return Codes](https://developer.apple.com/documentation/kernel/kern_return_t)
+    #[cfg(target_os = "macos")]
+    #[error("Mach API error: {0}")]
+    MachError(#[from] crate::platform::macos::error::MachError),
+
+    /// I/O error (for file operations, etc.)
+    ///
+    /// Used for errors when reading/writing files, sockets, etc.
+    /// This is a standard Rust `std::io::Error` converted to our error type.
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Convenience type alias for `Result<T, DebuggerError>`
+///
+/// This makes error handling more ergonomic. Instead of writing:
+/// ```rust
+/// use ferros_core::error::DebuggerError;
+/// fn foo() -> std::result::Result<(), DebuggerError>
+/// {
+///     Ok(())
+/// }
+/// ```
+/// We can write:
+/// ```rust
+/// use ferros_core::error::Result;
+/// fn foo() -> Result<()>
+/// {
+///     Ok(())
+/// }
+/// ```
+pub type Result<T> = std::result::Result<T, DebuggerError>;

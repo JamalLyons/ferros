@@ -16,3 +16,6 @@ categories = ["development-tools"]
 default = []
 
 full = [] # todo - add all features
+
+[dependencies]
+ferros-core = { path = "../ferros-core" }

@@ -193,18 +193,18 @@ impl Debugger for MacOSDebugger
                     // Check if process exists using kill(pid, 0)
                     // Signal 0 doesn't send a signal, it just checks if process exists
                     let process_exists = libc::kill(pid.0 as libc::pid_t, 0) == 0;
-                    
+
                     if process_exists {
                         // Process exists but we got KERN_FAILURE -> permission denied
                         return Err(DebuggerError::PermissionDenied(format!(
-                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. \
-                             This usually means insufficient permissions. Try running with sudo.",
+                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This usually means \
+                             insufficient permissions. Try running with sudo.",
                             pid.0
                         )));
                     }
                     // Process doesn't exist -> genuine ProcessNotFound
                 }
-                
+
                 return Err(DebuggerError::MachError(result.into()));
             }
 

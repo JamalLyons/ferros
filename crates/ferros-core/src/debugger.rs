@@ -200,10 +200,15 @@ pub trait Debugger
 pub fn create_debugger() -> Result<Box<dyn Debugger>>
 {
     #[cfg(target_os = "macos")]
-    return Ok(Box::new(crate::platform::macos::MacOSDebugger::new()?));
+    {
+        return Ok(Box::new(crate::platform::macos::MacOSDebugger::new()?));
+    }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    return Err(crate::error::DebuggerError::InvalidArgument(
-        "Unsupported platform".to_string(),
-    ));
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err(DebuggerError::AttachFailed(format!(
+            "Debugger not yet implemented for platform: {}",
+            std::env::consts::OS
+        )));
+    }
 }

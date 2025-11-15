@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Primary Meta Tags -->
+  <title>Ferros — A Rust-Native Debugger</title>
+  <meta name="title" content="Ferros — A Rust-Native Debugger" />
+  <meta name="description"
+    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
+  <meta name="keywords"
+    content="rust, debugger, rust debugger, ferros, rust-native, MIR, debugging, rust development, rust tools" />
+  <meta name="author" content="Ferros Team" />
+  <meta name="robots" content="index, follow" />
+  <meta name="language" content="English" />
+  <meta name="revisit-after" content="7 days" />
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="http://ferros.jamallyons.com/" />
+  <meta property="og:title" content="Ferros — A Rust-Native Debugger" />
+  <meta property="og:description"
+    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
+  <meta property="og:image" content="http://ferros.jamallyons.com/ferros-logo.png" />
+  <meta property="og:site_name" content="Ferros" />
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:url" content="http://ferros.jamallyons.com/" />
+  <meta name="twitter:title" content="Ferros — A Rust-Native Debugger" />
+  <meta name="twitter:description"
+    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
+  <meta name="twitter:image" content="http://ferros.jamallyons.com/ferros-logo.png" />
+  <meta name="twitter:site" content="@ferros_rs" />
+  <meta name="twitter:creator" content="@ferros_rs" />
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="/ferros-logo.png" />
+  <link rel="apple-touch-icon" href="/ferros-logo.png" />
+
+  <!-- Canonical URL -->
+  <link rel="canonical" href="http://ferros.jamallyons.com/" />
+
+  <!-- Preconnect for Performance -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+
+  <!-- GSAP Scripts -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
+</head>
+
+<body class="bg-[#0d0d0d] text-white overflow-x-hidden">
+  <!-- Opening Scene - Immersive Reveal -->
+  <section id="hero" class="relative min-h-screen flex items-center justify-center overflow-hidden">
+    <!-- Animated Background Particles -->
+    <div class="absolute inset-0 opacity-20" id="particles"></div>
+
+    <!-- Rotating Iron Ring -->
+    <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+      <svg class="w-[600px] h-[600px] md:w-[800px] md:h-[800px] opacity-30" id="iron-ring" viewBox="0 0 400 400">
+        <defs>
+          <linearGradient id="ringGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#d3752b;stop-opacity:0.3" />
+            <stop offset="50%" style="stop-color:#e67728;stop-opacity:0.1" />
+            <stop offset="100%" style="stop-color:#d3752b;stop-opacity:0.3" />
+          </linearGradient>
+        </defs>
+        <circle cx="200" cy="200" r="180" fill="none" stroke="url(#ringGradient)" stroke-width="2"
+          stroke-dasharray="4 8" />
+        <circle cx="200" cy="200" r="150" fill="none" stroke="url(#ringGradient)" stroke-width="1.5"
+          stroke-dasharray="2 6" />
+        <path d="M 200 20 L 210 30 M 200 20 L 190 30" stroke="#d3752b" stroke-width="2" fill="none" />
+        <path d="M 200 380 L 210 370 M 200 380 L 190 370" stroke="#d3752b" stroke-width="2" fill="none" />
+        <path d="M 20 200 L 30 210 M 20 200 L 30 190" stroke="#d3752b" stroke-width="2" fill="none" />
+        <path d="M 380 200 L 370 210 M 380 200 L 370 190" stroke="#d3752b" stroke-width="2" fill="none" />
+      </svg>
+    </div>
+
+    <!-- Logo and Tagline -->
+    <div class="relative z-10 text-center px-4">
+      <div class="mb-8" id="logo-container">
+        <img src="/ferros-logo.png" alt="Ferros Logo"
+          class="w-32 h-32 md:w-48 md:h-48 mx-auto opacity-0 rounded-full object-cover border-2 border-[#1a1a1a] shadow-lg shadow-[#d3752b]/20"
+          id="logo">
+      </div>
+      <h1 class="text-4xl md:text-6xl lg:text-7xl font-bold font-['Inter'] tracking-tight mb-6 opacity-0" id="tagline">
+        <span class="block">Ferros</span>
+      </h1>
+      <p class="text-lg md:text-xl lg:text-2xl text-gray-400 font-['JetBrains_Mono'] max-w-3xl mx-auto opacity-0"
+        id="subtitle">
+        A Rust-native debugger built from the same element as Rust itself.
+      </p>
+    </div>
+
+    <!-- Scroll Indicator -->
+    <div class="absolute bottom-8 left-1/2 -translate-x-1/2 animate-bounce opacity-0" id="scroll-indicator">
+      <svg class="w-6 h-6 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+      </svg>
+    </div>
+  </section>
+
+  <!-- What Makes Ferros Different - Cinematic Horizontal Scroll -->
+  <section id="different" class="relative py-32 md:py-40 overflow-hidden">
+    <div class="container mx-auto px-4">
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-16 text-center opacity-0" id="different-title">
+        What Makes Ferros Different
+      </h2>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8" id="different-cards">
+        <!-- Card 1: Rust-Native -->
+        <div
+          class="group relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[-100px]">
+          <div class="mb-6">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+            </svg>
+          </div>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Rust-Native Understanding</h3>
+          <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
+            Built to understand ownership, lifetimes, borrows, and MIR — not retrofitted C semantics.
+          </p>
+        </div>
+
+        <!-- Card 2: MIR-Level -->
+        <div
+          class="group relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[-100px]">
+          <div class="mb-6">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+          </div>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">MIR-Level Debugging</h3>
+          <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
+            Debug at the compiler's intermediate representation for precise control flow analysis.
+          </p>
+        </div>
+
+        <!-- Card 3: Cross-Platform -->
+        <div
+          class="group relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[100px]">
+          <div class="mb-6">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+          </div>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Cross-Platform</h3>
+          <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
+            macOS support now, with Linux and Windows planned — unlike Linux-only alternatives.
+          </p>
+        </div>
+
+        <!-- Card 4: Hybrid Architecture -->
+        <div
+          class="group relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[100px]">
+          <div class="mb-6">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+            </svg>
+          </div>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Hybrid Architecture</h3>
+          <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
+            Combines symbolic debugging and interpreted execution in a single tool.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Comparison Section - Diagonal Sliced Panel -->
+  <section id="comparison" class="relative py-32 md:py-40 overflow-hidden">
+    <div class="container mx-auto px-4">
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-0 relative" id="comparison-container">
+        <!-- Left Panel: Why Not Existing Debuggers -->
+        <div
+          class="relative bg-gradient-to-br from-[#1a1a1a] to-[#111315] p-12 md:p-16 border-r border-[#2a2a2a] opacity-0 transform translate-x-[-50px]"
+          id="comparison-left">
+          <div class="absolute top-0 right-0 w-0 h-full bg-[#d3752b]/10 transition-all duration-1000" id="left-overlay">
+          </div>
+          <h3 class="text-4xl md:text-5xl font-bold mb-8 font-['Inter'] text-gray-300">Why Not Existing Debuggers?</h3>
+          <div class="space-y-6">
+            <div class="border-l-2 border-red-500/50 pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">BugStalker</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Linux-only, no macOS or Windows support</p>
+            </div>
+            <div class="border-l-2 border-red-500/50 pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">GDB/LLDB</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">C/C++ semantics, doesn't understand Rust's
+                ownership model</p>
+            </div>
+            <div class="border-l-2 border-red-500/50 pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">CodeLLDB</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Generic debugger extension, no Rust-specific
+                features</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Panel: What Ferros Brings -->
+        <div
+          class="relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] p-12 md:p-16 border-l border-[#2a2a2a] opacity-0 transform translate-x-[50px]"
+          id="comparison-right">
+          <div class="absolute top-0 left-0 w-0 h-full bg-[#d3752b]/10 transition-all duration-1000" id="right-overlay">
+          </div>
+          <h3 class="text-4xl md:text-5xl font-bold mb-8 font-['Inter'] text-[#d3752b]">What Ferros Brings</h3>
+          <div class="space-y-6">
+            <div class="border-l-2 border-[#d3752b] pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Cross-Platform First</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">macOS support now, with Linux and Windows planned
+              </p>
+            </div>
+            <div class="border-l-2 border-[#d3752b] pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Rust-Native Understanding</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Built for ownership, lifetimes, borrows, and MIR
+              </p>
+            </div>
+            <div class="border-l-2 border-[#d3752b] pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Modern Design</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Designed for Rust's safety guarantees from day
+                one</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features Section - Vertical Banners -->
+  <section id="features" class="relative py-32 md:py-40">
+    <div class="container mx-auto px-4">
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-20 text-center opacity-0" id="features-title">Key
+        Features</h2>
+
+      <div class="space-y-8" id="feature-banners">
+        <!-- Feature Banner 1 -->
+        <div
+          class="relative bg-gradient-to-r from-[#111315] via-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-12 overflow-hidden opacity-0 transform translate-y-[50px]"
+          data-feature="1">
+          <div
+            class="absolute inset-0 bg-gradient-to-r from-[#d3752b]/5 to-transparent opacity-0 transition-opacity duration-500"
+            id="feature-glow-1"></div>
+          <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
+            <div class="flex-shrink-0">
+              <svg class="w-16 h-16 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+              </svg>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Rust-Native Inspection</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Understands ownership, borrows, lifetimes, and
+                async tasks directly</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Feature Banner 2 -->
+        <div
+          class="relative bg-gradient-to-r from-[#111315] via-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-12 overflow-hidden opacity-0 transform translate-y-[50px]"
+          data-feature="2">
+          <div
+            class="absolute inset-0 bg-gradient-to-r from-[#d3752b]/5 to-transparent opacity-0 transition-opacity duration-500"
+            id="feature-glow-2"></div>
+          <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
+            <div class="flex-shrink-0">
+              <svg class="w-16 h-16 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">MIR Integration</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Debug at the mid-level IR to analyze
+                compiler-accurate control flow</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Feature Banner 3 -->
+        <div
+          class="relative bg-gradient-to-r from-[#111315] via-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-12 overflow-hidden opacity-0 transform translate-y-[50px]"
+          data-feature="3">
+          <div
+            class="absolute inset-0 bg-gradient-to-r from-[#d3752b]/5 to-transparent opacity-0 transition-opacity duration-500"
+            id="feature-glow-3"></div>
+          <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
+            <div class="flex-shrink-0">
+              <svg class="w-16 h-16 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M13 10V3L4 14h7v7l9-11h-7z" />
+              </svg>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Zero-Cost Breakpoints</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Lightweight traps integrated with Rust's runtime
+                model</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Feature Banner 4 -->
+        <div
+          class="relative bg-gradient-to-r from-[#111315] via-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-12 overflow-hidden opacity-0 transform translate-y-[50px]"
+          data-feature="4">
+          <div
+            class="absolute inset-0 bg-gradient-to-r from-[#d3752b]/5 to-transparent opacity-0 transition-opacity duration-500"
+            id="feature-glow-4"></div>
+          <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
+            <div class="flex-shrink-0">
+              <svg class="w-16 h-16 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                  d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+              </svg>
+            </div>
+            <div class="flex-1">
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Memory Safety Visualization</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Visualize move semantics, borrows, and drops in
+                real time</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture Section - Horizontal Flowchart -->
+  <section id="architecture" class="relative py-32 md:py-40 overflow-hidden">
+    <div class="container mx-auto px-4">
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-20 text-center opacity-0" id="architecture-title">
+        Architecture</h2>
+
+      <div
+        class="relative bg-gradient-to-br from-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-16 overflow-x-auto"
+        id="architecture-container">
+        <!-- Blueprint Background Pattern -->
+        <div class="absolute inset-0 opacity-5"
+          style="background-image: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(211,117,43,0.1) 2px, rgba(211,117,43,0.1) 4px);">
+        </div>
+
+        <div class="relative z-10 flex flex-col md:flex-row items-center justify-center gap-8 md:gap-12 flex-wrap"
+          id="crate-flow">
+          <!-- ferros -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="ferros">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">CLI</p>
+          </div>
+
+          <!-- Arrow -->
+          <div class="hidden md:block opacity-0" id="arrow-1">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+            </svg>
+          </div>
+
+          <!-- ferros-core -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="core">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-core</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Debugging Primitives</p>
+          </div>
+
+          <!-- Arrow -->
+          <div class="hidden md:block opacity-0" id="arrow-2">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+            </svg>
+          </div>
+
+          <!-- ferros-mir -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="mir">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-mir</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">MIR Integration</p>
+          </div>
+
+          <!-- Arrow -->
+          <div class="hidden md:block opacity-0" id="arrow-3">
+            <svg class="w-12 h-12 text-[#d3752b]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+            </svg>
+          </div>
+
+          <!-- ferros-ui -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="ui">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-ui</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">TUI/GUI</p>
+          </div>
+
+          <!-- Vertical Divider -->
+          <div class="hidden md:block w-px h-24 bg-[#2a2a2a] opacity-0" id="divider-1"></div>
+
+          <!-- ferros-protocol -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="protocol">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-protocol</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Communication</p>
+          </div>
+
+          <!-- Vertical Divider -->
+          <div class="hidden md:block w-px h-24 bg-[#2a2a2a] opacity-0" id="divider-2"></div>
+
+          <!-- ferros-utils -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="utils">
+            <div class="crate-icon">
+              <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+              </svg>
+            </div>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-utils</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Shared Utilities</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Mission Statement -->
+  <section id="mission" class="relative py-32 md:py-40">
+    <div class="container mx-auto px-4">
+      <div class="max-w-4xl mx-auto text-center opacity-0 transform translate-y-[30px]" id="mission-content">
+        <div
+          class="relative bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-12 md:p-16 overflow-hidden">
+          <div class="absolute inset-0 bg-gradient-to-r from-[#d3752b]/10 via-transparent to-[#d3752b]/10 opacity-50">
+          </div>
+          <div class="relative z-10">
+            <svg class="w-16 h-16 text-[#d3752b] mx-auto mb-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+            </svg>
+            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">A debugger that speaks Rust's language.</h2>
+            <p class="text-xl text-gray-400 font-['JetBrains_Mono'] leading-relaxed">
+              To give Rust developers a <span class="text-[#d3752b]">first-class, language-native debugging
+                experience</span> — fast, intuitive, and designed for Rust's safety guarantees.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Call to Action -->
+  <section id="cta" class="relative py-32 md:py-40">
+    <div class="container mx-auto px-4">
+      <div class="max-w-3xl mx-auto text-center opacity-0 transform translate-y-[30px]" id="cta-content">
+        <div
+          class="relative bg-gradient-to-br from-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-12 md:p-16 overflow-hidden">
+          <div class="absolute inset-0 border-2 border-[#d3752b]/30 rounded-lg animate-pulse"></div>
+          <div class="relative z-10">
+            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">Ferros is in active development.</h2>
+            <p class="text-xl text-gray-400 mb-8 font-['JetBrains_Mono']">Join the community and help shape the future
+              of Rust debugging.</p>
+            <a href="https://github.com/jamallyons/ferros" target="_blank" rel="noopener noreferrer"
+              class="inline-flex items-center gap-3 px-8 py-4 bg-[#d3752b] hover:bg-[#e67728] text-white font-semibold rounded-lg transition-all duration-300 transform hover:scale-105 border-2 border-[#d3752b] hover:border-[#e67728] shadow-lg shadow-[#d3752b]/20">
+              <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
+                <path fill-rule="evenodd"
+                  d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.005.07 1.533 1.032 1.533 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+                  clip-rule="evenodd" />
+              </svg>
+              <span class="font-['Inter']">View on GitHub</span>
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="relative py-12 border-t border-[#1a1a1a]">
+    <div class="container mx-auto px-4">
+      <div class="flex flex-col md:flex-row items-center justify-center gap-6 mb-6">
+        <!-- Social Links -->
+        <div class="flex items-center gap-4">
+          <a href="https://github.com/jamallyons/ferros" target="_blank" rel="noopener noreferrer"
+            class="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] hover:border-[#d3752b]/50 rounded-lg transition-all duration-300 group"
+            aria-label="View Ferros on GitHub">
+            <svg class="w-5 h-5 text-gray-400 group-hover:text-white transition-colors" fill="currentColor"
+              viewBox="0 0 24 24">
+              <path fill-rule="evenodd"
+                d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.005.07 1.533 1.032 1.533 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
+                clip-rule="evenodd" />
+            </svg>
+            <span
+              class="text-sm text-gray-400 group-hover:text-white font-['JetBrains_Mono'] transition-colors">GitHub</span>
+          </a>
+
+          <a href="https://x.com/ferros_rs" target="_blank" rel="noopener noreferrer"
+            class="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#2a2a2a] border border-[#2a2a2a] hover:border-[#d3752b]/50 rounded-lg transition-all duration-300 group"
+            aria-label="Follow Ferros on Twitter/X">
+            <svg class="w-5 h-5 text-gray-400 group-hover:text-[#d3752b] transition-colors" fill="currentColor"
+              viewBox="0 0 24 24">
+              <path
+                d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
+            </svg>
+            <span
+              class="text-sm text-gray-400 group-hover:text-[#d3752b] font-['JetBrains_Mono'] transition-colors">Twitter</span>
+          </a>
+        </div>
+      </div>
+
+      <div class="text-center">
+        <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">
+          Ferros — built from the same element as Rust.
+        </p>
+        <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">
+          Licensed under Apache License, Version 2.0
+        </p>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module" src="./src/scripts/main.js"></script>
+  <script src="https://beamanalytics.b-cdn.net/beam.min.js" data-token="bf73f66b-6d2b-446b-88bd-d7feda0d8f94"
+    async></script>
+</body>
+<script src="https://beamanalytics.b-cdn.net/beam.min.js" data-token="bf73f66b-6d2b-446b-88bd-d7feda0d8f94" async>
+</script>
+
+</html>

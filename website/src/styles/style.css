@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+/* Custom Fonts */
+@layer base {
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  
+  code, .mono {
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+  }
+}
+
+/* Custom Styles */
+@layer components {
+  .crate-card {
+    @apply bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-6 min-w-[180px] text-center transition-all duration-300 hover:border-[#d3752b]/50 hover:shadow-lg hover:shadow-[#d3752b]/10;
+  }
+  
+  .crate-icon {
+    @apply w-16 h-16 mx-auto mb-4 flex items-center justify-center rounded-lg bg-[#1a1a1a] text-[#d3752b];
+  }
+}
+
+/* Particle Animation */
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0px) translateX(0px);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translateY(-20px) translateX(10px);
+    opacity: 0.6;
+  }
+}
+
+.particle {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  background: radial-gradient(circle, #d3752b 0%, transparent 70%);
+  border-radius: 50%;
+  animation: float 8s infinite ease-in-out;
+}
+
+/* Scrollbar Styling - Webkit (Chrome, Safari, Edge) */
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d0d0d;
+  border-left: 1px solid #1a1a1a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #2a2a2a 0%, #1a1a1a 100%);
+  border-radius: 5px;
+  border: 1px solid #0d0d0d;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #d3752b 0%, #e67728 100%);
+  border-color: #d3752b;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: linear-gradient(180deg, #e67728 0%, #d3752b 100%);
+}
+
+/* Scrollbar Styling - Firefox */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a2a #0d0d0d;
+}
+
+body:hover {
+  scrollbar-color: #d3752b #0d0d0d;
+}
+
+/* Selection Color */
+::selection {
+  background: #d3752b;
+  color: white;
+}
+
+/* Smooth Transitions */
+* {
+  transition-property: color, background-color, border-color, opacity, transform;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+/* Glass Morphism Effect */
+.glass {
+  background: rgba(13, 13, 13, 0.8);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Hex Pattern Background */
+.hex-pattern {
+  background-image: 
+    linear-gradient(30deg, rgba(211, 117, 43, 0.03) 12%, transparent 12.5%, transparent 87%, rgba(211, 117, 43, 0.03) 87.5%, rgba(211, 117, 43, 0.03)),
+    linear-gradient(150deg, rgba(211, 117, 43, 0.03) 12%, transparent 12.5%, transparent 87%, rgba(211, 117, 43, 0.03) 87.5%, rgba(211, 117, 43, 0.03)),
+    linear-gradient(30deg, rgba(211, 117, 43, 0.03) 12%, transparent 12.5%, transparent 87%, rgba(211, 117, 43, 0.03) 87.5%, rgba(211, 117, 43, 0.03)),
+    linear-gradient(150deg, rgba(211, 117, 43, 0.03) 12%, transparent 12.5%, transparent 87%, rgba(211, 117, 43, 0.03) 87.5%, rgba(211, 117, 43, 0.03));
+  background-size: 80px 140px;
+  background-position: 0 0, 0 0, 40px 70px, 40px 70px;
+}

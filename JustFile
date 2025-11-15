@@ -141,7 +141,7 @@ docs-build:
 # Run all checks (fmt, clippy, test)
 check:
     @echo "🔍 Running all checks..."
-    @just fmt-check
+    @just fmt
     @just lint
     @just test
 

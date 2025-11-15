@@ -14,7 +14,7 @@
 /* Custom Styles */
 @layer components {
   .crate-card {
-    @apply bg-gradient-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-6 min-w-[180px] text-center transition-all duration-300 hover:border-[#d3752b]/50 hover:shadow-lg hover:shadow-[#d3752b]/10;
+    @apply bg-linear-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-6 min-w-[180px] text-center transition-all duration-300 hover:border-[#d3752b]/50 hover:shadow-lg hover:shadow-[#d3752b]/10;
   }
   
   .crate-icon {
@@ -107,4 +107,108 @@ body:hover {
     linear-gradient(150deg, rgba(211, 117, 43, 0.03) 12%, transparent 12.5%, transparent 87%, rgba(211, 117, 43, 0.03) 87.5%, rgba(211, 117, 43, 0.03));
   background-size: 80px 140px;
   background-position: 0 0, 0 0, 40px 70px, 40px 70px;
+}
+
+/* Breakpoint Indicator Animation */
+.breakpoint-indicator {
+  display: inline-block;
+  animation: pulse-breakpoint 2s infinite;
+}
+
+@keyframes pulse-breakpoint {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.2);
+  }
+}
+
+/* Roadmap Timeline */
+.roadmap-timeline {
+  transform-origin: left;
+  will-change: transform;
+}
+
+/* Mobile Responsive Adjustments */
+@media (max-width: 768px) {
+  /* Reduce hero text sizes */
+  #hero h1 {
+    font-size: 2.5rem !important;
+  }
+  
+  #hero p {
+    font-size: 1rem !important;
+  }
+  
+  /* Reduce section padding */
+  section {
+    padding-top: 4rem !important;
+    padding-bottom: 4rem !important;
+  }
+  
+  /* Adjust CTA padding */
+  #cta .p-12 {
+    padding: 2rem !important;
+  }
+  
+  /* Scale down feature icons */
+  [data-feature] svg {
+    width: 3rem !important;
+    height: 3rem !important;
+  }
+  
+  /* Reduce roadmap milestone spacing */
+  .roadmap-milestone {
+    margin-bottom: 2rem;
+  }
+}
+
+/* Floating Navigation Styles */
+#floating-nav {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.nav-dot {
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.nav-dot:hover {
+  transform: scale(1.3);
+}
+
+/* Debugger Terminal Styles */
+.debugger-terminal {
+  background: #0a0a0a;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.code-line {
+  opacity: 0;
+  animation: type-in 0.3s ease forwards;
+}
+
+@keyframes type-in {
+  to {
+    opacity: 1;
+  }
+}
+
+/* GPU Acceleration */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Optimize animations for mobile */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

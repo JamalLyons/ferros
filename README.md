@@ -22,7 +22,23 @@ Unlike traditional debuggers that retrofit C-style semantics onto Rust programs,
 
 ## 🎯 What Makes Ferros Different?
 
-Ferros merges **symbolic debugging** and **interpreted execution** in a single hybrid architecture — capable of inspecting compiled binaries *and* running MIR-level simulations for deep program analysis.
+While existing Rust debugging solutions are either platform-limited or retrofitted from C/C++ debuggers, Ferros is built **from the ground up** for Rust developers.
+
+### Why Not Use Existing Debuggers?
+
+| Solution | Limitations |
+|----------|-------------|
+| **BugStalker** | Linux-only, no macOS or Windows support |
+| **GDB/LLDB** | C/C++ semantics, doesn't understand Rust's ownership model |
+| **CodeLLDB** | Generic debugger extension, no Rust-specific features |
+
+### What Ferros Brings
+
+✅ **Cross-Platform First**: macOS support now, with Linux and Windows planned — unlike Linux-only alternatives  
+✅ **Rust-Native Understanding**: Built to understand ownership, lifetimes, borrows, and MIR — not retrofitted C semantics  
+✅ **MIR-Level Debugging**: Debug at the compiler's intermediate representation for precise control flow analysis  
+✅ **Hybrid Architecture**: Combines symbolic debugging and interpreted execution in a single tool  
+✅ **Modern Design**: Designed for Rust's safety guarantees from day one, not adapted from older debuggers  
 
 > **Built from the same element as Rust.**  
 > A debugger that speaks Rust's language.

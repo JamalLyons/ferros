@@ -159,20 +159,7 @@ info:
     @echo "Toolchain: $(rustup show active-toolchain 2>/dev/null || echo 'unknown')"
     @echo ""
     @echo "Workspace crates:"
-    @if command -v cargo-ws >/dev/null 2>&1; then \
-        cargo ws list 2>/dev/null | sed 's/^/  • /' || { \
-            echo "  ⚠ cargo-ws failed, using fallback..."; \
-            if command -v jq >/dev/null 2>&1; then \
-                cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.workspace_members[]' | sed 's/.*\///' | sed 's/#.*//' | sort -u | sed 's/^/  • /'; \
-            else \
-                cargo metadata --format-version 1 --no-deps 2>/dev/null | grep -A 100 '"workspace_members"' | grep -o '"[^"]*ferros[^"]*"' | grep -v '_' | sed 's/"//g' | sort -u | sed 's/^/  • /'; \
-            fi \
-        }; \
-    elif command -v jq >/dev/null 2>&1; then \
-        cargo metadata --format-version 1 --no-deps | jq -r '.workspace_members[]' | sed 's/.*\///' | sed 's/#.*//' | sort -u | sed 's/^/  • /'; \
-    else \
-        cargo metadata --format-version 1 --no-deps | grep -A 100 '"workspace_members"' | grep -o '"[^"]*ferros[^"]*"' | grep -v '_' | sed 's/"//g' | sort -u | sed 's/^/  • /'; \
-    fi
+    @cargo ws list
 
 # List workspace crates using cargo-ws
 list:

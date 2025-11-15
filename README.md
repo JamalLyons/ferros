@@ -105,6 +105,17 @@ cargo ferros run
 ferros attach <pid>
 ```
 
+## 📋 Requirements
+
+- **Rust**: Edition 2021 (Rust 1.56.0 or newer)
+- **macOS**: 10.9+ (Mavericks) for Intel Macs, 11.0+ (Big Sur) for Apple Silicon
+- **Linux**: Planned (ptrace support)
+- **Windows**: Planned (WinDbg API support)
+
+> **Note**: On macOS, debugging other processes requires either:
+> - Running with `sudo`, or
+> - Granting debugging entitlements (`com.apple.security.cs.debugger`)
+
 ---
 
 ## 📚 Documentation

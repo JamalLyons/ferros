@@ -24,9 +24,16 @@ ferros-core = "0.0.0"
 
 ## Platform Support
 
-- Linux (ptrace)
-- macOS (Mach ports)
-- Windows (WinDbg APIs)
+- **macOS**: 10.9+ (Mavericks) for Intel, 11.0+ (Big Sur) for Apple Silicon
+- **Linux**: Planned (ptrace)
+- **Windows**: Planned (WinDbg APIs)
+
+## Requirements
+
+- **Rust**: Edition 2021 (Rust 1.56.0 or newer)
+- **macOS**: Uses Mach APIs (`task_for_pid`, `mach_vm_region`, etc.)
+  - Requires debugging entitlements or `sudo` for process attachment
+  - See [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
 
 ## License
 

@@ -6,51 +6,6 @@ This document provides comprehensive learning resources organized by topic to su
 
 ---
 
-## 📚 Essential Books
-
-### Systems Programming & Operating Systems
-
-**Computer Systems: A Programmer's Perspective (CS:APP)** by Bryant & O'Hallaron
-- **Chapters to read**: 7 (Memory Hierarchy), 8 (Exceptional Control Flow), 9 (Virtual Memory)
-- **Why**: Best resource for understanding process memory layout, signals, and system calls
-- **Link**: https://csapp.cs.cmu.edu/
-
-**The Linux Programming Interface** by Michael Kerrisk
-- **Chapters to read**: 20 (Signals), 26 (Monitoring Child Processes), 27 (Program Execution)
-- **Why**: Deep dive into Linux system calls including `ptrace`
-- **Link**: https://man7.org/tlpi/
-
-**Operating Systems: Three Easy Pieces** by Remzi & Andrea Arpaci-Dusseau
-- **Chapters to read**: Process API, Virtual Memory sections
-- **Why**: Excellent free OS textbook with clear explanations
-- **Link**: https://pages.cs.wisc.edu/~remzi/OSTEP/
-
-### Debugging Specific
-
-**Building a Debugger** by O'Reilly (2024)
-- **Why**: Modern guide specifically about debugger construction
-- **Link**: https://www.oreilly.com/library/view/building-a-debugger/
-
-**The Art of Debugging with GDB, DDD, and Eclipse**
-- **Why**: Learn from established debugger workflows
-- **Link**: https://nostarch.com/debugging
-
-**Debugging: The 9 Indispensable Rules** by David J. Agans
-- **Why**: General debugging philosophy (helpful for debugging your debugger!)
-- **Link**: https://debuggingrules.com/
-
-### Low-Level & Assembly
-
-**Programming from the Ground Up** by Jonathan Bartlett
-- **Why**: Learn x86-64 assembly and register usage
-- **Link**: https://savannah.nongnu.org/projects/pgubook/
-
-**x86-64 Assembly Language Programming with Ubuntu** by Ed Jorgensen
-- **Why**: Modern x86-64 assembly reference
-- **Link**: http://www.egr.unlv.edu/~ed/x86.html
-
----
-
 ## 🌐 Online Documentation & Guides
 
 ### Phase 0: Prerequisites

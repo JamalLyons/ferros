@@ -12,15 +12,15 @@ This roadmap outlines **detailed, incremental milestones** for developing **Ferr
 > Goal: Understand core concepts before writing debugger code
 
 #### 1️⃣ Computer Science Fundamentals
-- [ ] **Task 1.1**: Study process memory layout (stack, heap, data, text segments)
+- [x] **Task 1.1**: Study process memory layout (stack, heap, data, text segments)
   - Read: "Computer Systems: A Programmer's Perspective" Chapter 7
   - Goal: Understand how programs are organized in memory
   
-- [ ] **Task 1.2**: Learn about CPU registers and instruction pointer
+- [x] **Task 1.2**: Learn about CPU registers and instruction pointer
   - Research: x86-64 registers (RAX, RBX, RIP, RSP, RBP, etc.)
   - Goal: Know what registers debuggers need to read/write
   
-- [ ] **Task 1.3**: Understand system calls and signals
+- [x] **Task 1.3**: Understand system calls and signals
   - Read: Linux man pages for `ptrace(2)`, `waitpid(2)`, `kill(2)`
   - Goal: Learn how processes communicate with the OS
 
@@ -71,19 +71,19 @@ This roadmap outlines **detailed, incremental milestones** for developing **Ferr
 ### Project 1.1: Hello ptrace
 **Objective**: Attach to a process and read its registers
 
-- [ ] **Task 1.1.1**: Create a simple "target" program
+- [x] **Task 1.1.1**: Create a simple "target" program
   - Create `examples/hello_target.rs` that prints and loops
   - This will be your program to debug
   
-- [ ] **Task 1.1.2**: Write a program that uses `ptrace` to attach
+- [x] **Task 1.1.2**: Write a program that uses `ptrace` to attach
   - Use the `nix` crate for `ptrace` bindings
   - Attach to the target process by PID
   
-- [ ] **Task 1.1.3**: Read and print all general-purpose registers
+- [x] **Task 1.1.3**: Read and print all general-purpose registers
   - Use `PTRACE_GETREGS` to read register state
   - Print register values in hex format
   
-- [ ] **Task 1.1.4**: Detach cleanly from the target
+- [x] **Task 1.1.4**: Detach cleanly from the target
   - Use `PTRACE_DETACH` to release the process
   - Verify target continues running
 
@@ -92,20 +92,20 @@ This roadmap outlines **detailed, incremental milestones** for developing **Ferr
 ### Project 1.2: Memory Inspector
 **Objective**: Read and write process memory
 
-- [ ] **Task 1.2.1**: Extend hello_target to have known data
-  - Add a static variable with a known value
+- [x] **Task 1.2.1**: Extend hello_target to have known data
+  - Add a variable with a known value
   - Print its address for testing
   
-- [ ] **Task 1.2.2**: Use `PTRACE_PEEKDATA` to read memory
-  - Read the static variable's value from another process
+- [x] **Task 1.2.2**: Implement memory reading
+  - Read the variable's value from another process using platform-specific APIs
   - Verify it matches the expected value
   
-- [ ] **Task 1.2.3**: Use `PTRACE_POKEDATA` to modify memory
+- [x] **Task 1.2.3**: Implement memory writing
   - Change the variable's value from the debugger
   - Verify the target sees the new value
   
-- [ ] **Task 1.2.4**: Parse `/proc/[pid]/maps`
-  - Read and display the target's memory regions
+- [x] **Task 1.2.4**: Implement memory region enumeration
+  - Read and display the target's memory regions using platform-specific APIs
   - Identify stack, heap, and code segments
 
 **Success Criteria**: You can read and modify another process's memory

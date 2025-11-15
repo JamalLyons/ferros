@@ -57,8 +57,8 @@ mod macos_impl
         };
 
         let var_addr: Option<u64> = args.get(2).and_then(|s| {
-            if s.starts_with("0x") {
-                u64::from_str_radix(&s[2..], 16).ok()
+            if let Some(stripped) = s.strip_prefix("0x") {
+                u64::from_str_radix(stripped, 16).ok()
             } else {
                 s.parse().ok()
             }

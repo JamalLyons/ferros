@@ -253,8 +253,8 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
             // Note: macOS's mach_vm_region doesn't easily provide region names
             // (like "[heap]" or "[stack]"), so we leave it as None
             regions.push(MemoryRegion::new(
-                address as u64,
-                (address + size) as u64,
+                address,
+                address + size,
                 perms,
                 None, // macOS mach_vm_region doesn't provide names easily
             ));

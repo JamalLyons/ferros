@@ -192,12 +192,7 @@ impl Default for Registers
 /// );
 ///
 /// // A readable and writable heap region
-/// let heap = MemoryRegion::new(
-///     0x2000,
-///     0x3000,
-///     "rw".to_string(),
-///     Some("[heap]".to_string()),
-/// );
+/// let heap = MemoryRegion::new(0x2000, 0x3000, "rw".to_string(), Some("[heap]".to_string()));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion

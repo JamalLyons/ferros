@@ -38,4 +38,4 @@ pub use debugger::Debugger;
 pub use error::{DebuggerError, Result};
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacOSDebugger;
-pub use types::{ProcessId, Registers};
+pub use types::{MemoryRegion, ProcessId, Registers};

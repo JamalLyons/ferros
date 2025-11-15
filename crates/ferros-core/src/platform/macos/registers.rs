@@ -18,7 +18,7 @@
 ///
 /// ## References
 ///
-/// - [thread_get_state(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/thread_get_state.3.html)
+/// - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 /// - [ARM64 Register Layout](https://developer.arm.com/documentation/102374/0101/Registers-in-AArch64---general-purpose-registers)
 /// - [ARM_THREAD_STATE64 structure](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/arm/_structs.h)
 use libc::{c_int, mach_msg_type_number_t, natural_t, thread_act_t};
@@ -26,6 +26,7 @@ use libc::{c_int, mach_msg_type_number_t, natural_t, thread_act_t};
 use mach2::kern_return::KERN_SUCCESS;
 
 use crate::error::{DebuggerError, Result};
+use crate::platform::macos::ffi;
 use crate::types::Registers;
 
 /// Read ARM64 registers from a thread
@@ -72,7 +73,7 @@ use crate::types::Registers;
 /// **Flavor**: `ARM_THREAD_STATE64` = 6
 /// **Count**: `ARM_THREAD_STATE64_COUNT` = 68 (number of `u32` values)
 ///
-/// See: [thread_get_state(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/thread_get_state.3.html)
+/// See: [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 ///
 /// ## References
 ///
@@ -106,24 +107,7 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
         // Call thread_get_state to read registers
         // This fills state_words with the current register values
         //
-        // Note: thread_get_state() is NOT in mach2 (likely because it's restricted),
-        // so we declare it ourselves. We use mach2's KERN_SUCCESS for comparison.
-        extern "C" {
-            /// Read thread state (registers) from a thread
-            ///
-            /// This function is NOT provided by mach2 (likely because it requires special permissions).
-            /// We declare it ourselves using extern "C".
-            ///
-            /// See: [thread_get_state(3)](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/thread_get_state.3.html)
-            fn thread_get_state(
-                target_act: thread_act_t,
-                flavor: c_int,
-                old_state: *mut natural_t,
-                old_state_count: *mut mach_msg_type_number_t,
-            ) -> libc::kern_return_t;
-        }
-
-        let result = thread_get_state(thread, ARM_THREAD_STATE64, state_words.as_mut_ptr(), &mut count);
+        let result = ffi::thread_get_state(thread, ARM_THREAD_STATE64, state_words.as_mut_ptr(), &mut count);
 
         // Check if the call succeeded
         // Use mach2's KERN_SUCCESS constant (better maintained than libc's version)

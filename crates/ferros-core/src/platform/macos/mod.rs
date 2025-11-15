@@ -22,7 +22,8 @@
 //! We use a hybrid approach:
 //! - **mach2 crate**: For well-maintained Mach APIs (`mach_task_self`, `task_threads`, `KERN_SUCCESS`)
 //! - **libc crate**: For type definitions (`mach_port_t`, `thread_act_t`, etc.)
-//! - **extern "C"**: For restricted functions not in mach2 (`task_for_pid`, `thread_get_state`)
+//! - **ffi module**: Centralized FFI declarations for restricted functions not in mach2
+//!   (`task_for_pid`, `thread_get_state`, `vm_read`, `vm_write`, `mach_vm_region`)
 //!
 //! This gives us the best of both worlds: well-maintained APIs where available,
 //! and direct control over restricted functions.
@@ -30,10 +31,12 @@
 //! ## References
 //!
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
-//! - [task_for_pid(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_for_pid.3.html)
-//! - [thread_get_state(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/thread_get_state.3.html)
+//! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` implementation)
+//! - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 
 pub mod error;
+pub mod ffi;
+pub mod memory;
 pub mod registers;
 pub mod task;
 

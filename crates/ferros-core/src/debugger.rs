@@ -145,15 +145,110 @@ pub trait Debugger
     /// Not yet implemented - returns `InvalidArgument` error.
     fn write_registers(&mut self, regs: &Registers) -> Result<()>;
 
+    /// Read memory from the target process
+    ///
+    /// Reads `len` bytes starting at the given address from the attached process.
+    /// Returns a vector containing the read bytes.
+    ///
+    /// ## Platform-specific behavior
+    ///
+    /// - **macOS**: Uses `vm_read()` to read memory from the Mach task
+    /// - **Linux**: Uses `ptrace(PTRACE_PEEKDATA)` in a loop to read word-aligned data
+    /// - **Windows**: Uses `ReadProcessMemory()`
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `InvalidArgument`: Invalid memory address or length
+    /// - `Io`: Failed to read memory (e.g., invalid address, permission denied)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let data = debugger.read_memory(0x1000, 16)?;
+    /// println!("Read {} bytes: {:?}", data.len(), data);
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>;
+
+    /// Write memory to the target process
+    ///
+    /// Writes `data` bytes starting at the given address in the attached process.
+    /// Returns the number of bytes written.
+    ///
+    /// ## ⚠️ Warning
+    ///
+    /// Writing to memory can crash the process or cause undefined behavior.
+    /// Only write to writable memory regions (e.g., stack, heap).
+    /// Writing to code segments may corrupt the program.
+    ///
+    /// ## Platform-specific behavior
+    ///
+    /// - **macOS**: Uses `vm_write()` to write memory to the Mach task
+    /// - **Linux**: Uses `ptrace(PTRACE_POKEDATA)` in a loop to write word-aligned data
+    /// - **Windows**: Uses `WriteProcessMemory()`
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `InvalidArgument`: Invalid memory address or data length
+    /// - `Io`: Failed to write memory (e.g., read-only memory, permission denied)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let data = vec![0x41, 0x42, 0x43, 0x44];
+    /// debugger.write_memory(0x1000, &data)?;
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize>;
+
+    /// Get memory regions for the attached process
+    ///
+    /// Returns a list of all memory regions (segments) in the target process.
+    /// This includes code segments, data segments, stack, heap, and mapped files.
+    ///
+    /// Each region contains information about its address range, permissions
+    /// (read/write/execute), and optionally a name or description.
+    ///
+    /// ## Platform-specific behavior
+    ///
+    /// - **macOS**: Uses `mach_vm_region()` to enumerate memory regions
+    /// - **Linux**: Parses `/proc/[pid]/maps` file
+    /// - **Windows**: Uses `VirtualQueryEx()` to enumerate memory regions
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `Io`: Failed to read memory map information
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let regions = debugger.get_memory_regions()?;
+    /// for region in regions {
+    ///     println!(
+    ///         "{:016x}-{:016x} {} {:?}",
+    ///         region.start, region.end, region.permissions, region.name
+    ///     );
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    fn get_memory_regions(&self) -> Result<Vec<crate::types::MemoryRegion>>;
+
     // Future methods (commented out until implemented):
-    //
-    // /// Read memory from the target process
-    // /// Uses platform-specific APIs: vm_read (macOS), process_vm_readv (Linux), ReadProcessMemory (Windows)
-    // fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>;
-    //
-    // /// Write memory to the target process
-    // /// Uses platform-specific APIs: vm_write (macOS), process_vm_writev (Linux), WriteProcessMemory (Windows)
-    // fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<()>;
     //
     // /// Set a breakpoint at the given address
     // /// On x86-64/ARM64, this typically involves replacing the instruction with INT3 (x86) or BRK (ARM)

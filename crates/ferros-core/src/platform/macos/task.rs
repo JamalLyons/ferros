@@ -17,9 +17,8 @@
 //!
 //! ## References
 //!
-//! - [task_for_pid(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_for_pid.3.html)
-//! - [task_threads(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_threads.3.html)
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
+//! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
@@ -31,8 +30,10 @@ use mach2::traps::mach_task_self;
 
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
+use crate::platform::macos::ffi;
+use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memory};
 use crate::platform::macos::registers::read_registers_arm64;
-use crate::types::{ProcessId, Registers};
+use crate::types::{MemoryRegion, ProcessId, Registers};
 
 /// macOS debugger implementation using Mach APIs
 ///
@@ -128,7 +129,7 @@ impl Debugger for MacOSDebugger
     ///
     /// **Security**: Requires special permissions (sudo or debugging entitlements).
     ///
-    /// See: [task_for_pid(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_for_pid.3.html)
+    /// See: [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) for `task_for_pid` implementation
     ///
     /// ## Mach API: task_threads()
     ///
@@ -142,7 +143,7 @@ impl Debugger for MacOSDebugger
     ///
     /// **Returns**: Array of thread ports. We use the first one as the main thread.
     ///
-    /// See: [task_threads(3) man page](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_threads.3.html)
+    /// See: [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) for `task_threads` implementation
     ///
     /// ## Errors
     ///
@@ -158,30 +159,14 @@ impl Debugger for MacOSDebugger
         // - mach_task_self(): Get our own task port (not deprecated like libc's version)
         // - task_threads(): Enumerate threads in a task
         //
-        // Note: task_for_pid() is NOT in mach2 (likely because it's restricted/requires entitlements)
-        // So we still declare it ourselves using extern "C"
-        //
-        // We still use libc for:
-        // - Type definitions (mach_port_t, thread_act_t, etc.)
-        // - General C library functions
-        extern "C" {
-            /// Get a Mach port to a process by PID
-            ///
-            /// This function is NOT provided by mach2 (likely because it requires special permissions).
-            /// We declare it ourselves using extern "C".
-            ///
-            /// See: [task_for_pid(3)](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_for_pid.3.html)
-            fn task_for_pid(target_task: mach_port_t, pid: c_int, task: *mut mach_port_t) -> libc::kern_return_t;
-        }
-
         unsafe {
             // Step 1: Get a Mach port to the target process
             // mach_task_self() returns our own task port (from mach2, not deprecated)
             // task_for_pid() requires special permissions (sudo or debugging entitlements)
             //
-            // See: [task_for_pid(3)](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_for_pid.3.html)
+            // See: XNU kernel source for task_for_pid implementation
             let mut task: mach_port_t = 0;
-            let result = task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
+            let result = ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
 
             // Check if task_for_pid succeeded
             // KERN_SUCCESS = 0, anything else is an error
@@ -212,7 +197,7 @@ impl Debugger for MacOSDebugger
             // We need a thread port to read/write registers
             // task_threads() returns an array of thread ports
             //
-            // See: [task_threads(3)](https://developer.apple.com/library/archive/documentation/Darwin/Reference/ManPages/man3/task_threads.3.html)
+            // See: XNU kernel source for task_threads implementation
             let mut threads: *mut thread_act_t = std::ptr::null_mut();
             let mut thread_count: mach_msg_type_number_t = 0;
 
@@ -299,5 +284,38 @@ impl Debugger for MacOSDebugger
         Err(DebuggerError::InvalidArgument(
             "Register writing not yet implemented".to_string(),
         ))
+    }
+
+    /// Read memory from the target process
+    ///
+    /// Uses `vm_read()` to read memory from the Mach task.
+    fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>
+    {
+        if self.task == 0 {
+            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+        }
+        read_memory(self.task, addr, len)
+    }
+
+    /// Write memory to the target process
+    ///
+    /// Uses `vm_write()` to write memory to the Mach task.
+    fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize>
+    {
+        if self.task == 0 {
+            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+        }
+        write_memory(self.task, addr, data)
+    }
+
+    /// Get memory regions for the attached process
+    ///
+    /// Uses `vm_region()` to enumerate memory regions in the Mach task.
+    fn get_memory_regions(&self) -> Result<Vec<MemoryRegion>>
+    {
+        if self.task == 0 {
+            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+        }
+        get_memory_regions(self.task)
     }
 }

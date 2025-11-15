@@ -38,7 +38,7 @@ pub enum MachError
     /// - Need to run with `sudo` or grant debugging entitlements
     /// - System Integrity Protection (SIP) is blocking the operation
     ///
-    /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger)
+    /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
     #[error("KERN_PROTECTION_FAILURE: Permission denied")]
     ProtectionFailure,
 

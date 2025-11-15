@@ -170,3 +170,161 @@ impl Default for Registers
         Self::new()
     }
 }
+
+/// Memory region in a process
+///
+/// Represents a contiguous region of memory in the target process,
+/// such as the stack, heap, or code segments. Each region has a start
+/// address, end address, and permission flags that determine what
+/// operations are allowed on that memory.
+///
+/// ## Examples
+///
+/// ```
+/// use ferros_core::types::MemoryRegion;
+///
+/// // A readable and executable code segment
+/// let code_segment = MemoryRegion::new(
+///     0x1000,
+///     0x2000,
+///     "rx".to_string(),
+///     Some("/usr/bin/example".to_string()),
+/// );
+///
+/// // A readable and writable heap region
+/// let heap = MemoryRegion::new(
+///     0x2000,
+///     0x3000,
+///     "rw".to_string(),
+///     Some("[heap]".to_string()),
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegion
+{
+    /// Start address of the memory region (inclusive)
+    ///
+    /// This is the virtual address where the region begins in the
+    /// target process's address space.
+    pub start: u64,
+
+    /// End address of the memory region (exclusive)
+    ///
+    /// This is the virtual address where the region ends. The region
+    /// includes addresses from `start` (inclusive) to `end` (exclusive).
+    /// The size of the region is `end - start`.
+    pub end: u64,
+
+    /// Memory permissions as a string
+    ///
+    /// Contains characters indicating allowed operations:
+    /// - `r`: Read permission
+    /// - `w`: Write permission
+    /// - `x`: Execute permission
+    ///
+    /// Examples: `"rwx"` (read, write, execute), `"r-x"` (read, execute),
+    /// `"rw-"` (read, write), `"r--"` (read-only).
+    pub permissions: String,
+
+    /// Optional name/description of the region
+    ///
+    /// On Linux, this might be `"[heap]"`, `"[stack]"`, or a file path
+    /// like `"/usr/bin/example"`. On macOS, this is typically `None`
+    /// as `mach_vm_region()` doesn't easily provide region names.
+    pub name: Option<String>,
+}
+
+impl MemoryRegion
+{
+    /// Create a new memory region
+    ///
+    /// ## Parameters
+    ///
+    /// - `start`: Start address of the region (inclusive)
+    /// - `end`: End address of the region (exclusive)
+    /// - `permissions`: Permission string (e.g., `"rwx"`, `"r-x"`, `"rw-"`)
+    /// - `name`: Optional name/description of the region
+    ///
+    /// ## Panics
+    ///
+    /// This function does not validate that `end > start`. If `end <= start`,
+    /// `size()` will return 0.
+    pub fn new(start: u64, end: u64, permissions: String, name: Option<String>) -> Self
+    {
+        Self {
+            start,
+            end,
+            permissions,
+            name,
+        }
+    }
+
+    /// Get the size of the memory region in bytes
+    ///
+    /// Returns `end - start`, or 0 if `end <= start` (using saturating subtraction
+    /// to prevent underflow).
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use ferros_core::types::MemoryRegion;
+    ///
+    /// let region = MemoryRegion::new(0x1000, 0x2000, "rwx".to_string(), None);
+    /// assert_eq!(region.size(), 0x1000); // 4096 bytes
+    /// ```
+    pub fn size(&self) -> u64
+    {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Check if the region is readable
+    ///
+    /// Returns `true` if the permissions string contains `'r'`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use ferros_core::types::MemoryRegion;
+    ///
+    /// let region = MemoryRegion::new(0x1000, 0x2000, "r-x".to_string(), None);
+    /// assert!(region.is_readable());
+    /// ```
+    pub fn is_readable(&self) -> bool
+    {
+        self.permissions.contains('r')
+    }
+
+    /// Check if the region is writable
+    ///
+    /// Returns `true` if the permissions string contains `'w'`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use ferros_core::types::MemoryRegion;
+    ///
+    /// let region = MemoryRegion::new(0x1000, 0x2000, "rw-".to_string(), None);
+    /// assert!(region.is_writable());
+    /// ```
+    pub fn is_writable(&self) -> bool
+    {
+        self.permissions.contains('w')
+    }
+
+    /// Check if the region is executable
+    ///
+    /// Returns `true` if the permissions string contains `'x'`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use ferros_core::types::MemoryRegion;
+    ///
+    /// let region = MemoryRegion::new(0x1000, 0x2000, "r-x".to_string(), None);
+    /// assert!(region.is_executable());
+    /// ```
+    pub fn is_executable(&self) -> bool
+    {
+        self.permissions.contains('x')
+    }
+}

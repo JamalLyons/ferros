@@ -217,3 +217,47 @@ publish-as-is:
 publish-with-delay BUMP="patch" SECONDS="10":
     @echo "📦 Publishing workspace crates with {{SECONDS}}s delay between publishes..."
     @cargo ws publish {{BUMP}} --publish-interval {{SECONDS}}
+
+# Website development commands
+
+# Run website in development mode
+website-dev:
+    @echo "🌐 Starting website development server..."
+    @cd website && if command -v pnpm >/dev/null 2>&1; then \
+        pnpm dev; \
+    elif command -v npm >/dev/null 2>&1; then \
+        npm run dev; \
+    elif command -v yarn >/dev/null 2>&1; then \
+        yarn dev; \
+    else \
+        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        exit 1; \
+    fi
+
+# Build website for production
+website-build:
+    @echo "🔨 Building website for production..."
+    @cd website && if command -v pnpm >/dev/null 2>&1; then \
+        pnpm build; \
+    elif command -v npm >/dev/null 2>&1; then \
+        npm run build; \
+    elif command -v yarn >/dev/null 2>&1; then \
+        yarn build; \
+    else \
+        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        exit 1; \
+    fi
+
+# Preview production build of website
+website-preview:
+    @echo "👀 Previewing website production build..."
+    @cd website && if command -v pnpm >/dev/null 2>&1; then \
+        pnpm preview; \
+    elif command -v npm >/dev/null 2>&1; then \
+        npm run preview; \
+    elif command -v yarn >/dev/null 2>&1; then \
+        yarn preview; \
+    else \
+        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        exit 1; \
+    fi

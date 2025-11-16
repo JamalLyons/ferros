@@ -15,7 +15,7 @@ categories = ["development-tools"]
 # Include nothing by default
 default = []
 
-full = [] # todo - add all features
+full = [] # todo - add features here
 
 [dependencies]
 ferros-core = { path = "../ferros-core" }

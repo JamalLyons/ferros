@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use ferros_core::debugger::create_debugger;
 use ferros_core::types::ProcessId;
 use ferros_core::{Debugger, Result as DebuggerResult};
-use ferros_utils::init_logging;
+use ferros_utils::{info, init_logging};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]
@@ -81,7 +81,7 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
 {
     match cli.command {
         Commands::Attach { pid } => {
-            tracing::info!("Attaching to process {}", pid);
+            info!("Attaching to process {}", pid);
             let mut debugger = create_debugger()?;
             debugger.attach(ProcessId::from(pid))?;
             println!("Successfully attached to process {}", pid);
@@ -89,7 +89,7 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
             Ok(())
         }
         Commands::Launch { program, args } => {
-            tracing::info!("Launching program: {} with args: {:?}", program, args);
+            info!("Launching program: {} with args: {:?}", program, args);
             let mut debugger = create_debugger()?;
             let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             debugger.launch(&program, &args_refs)?;

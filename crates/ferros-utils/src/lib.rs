@@ -9,3 +9,4 @@ pub mod logging;
 
 // Re-export commonly used logging functions for convenience
 pub use logging::{init_logging, init_logging_with_level, LogFormat, LogLevel};
+pub use tracing::{debug, error, info};

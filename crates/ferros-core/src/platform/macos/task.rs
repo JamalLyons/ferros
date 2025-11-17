@@ -165,6 +165,63 @@ impl MacOSDebugger
         }
     }
 
+    /// Common attachment logic shared by `attach()` and `launch()`
+    ///
+    /// This obtains the Mach task port and thread list for the target PID but
+    /// does not modify the task's execution state. Callers decide whether to
+    /// suspend or resume after attaching.
+    fn attach_task(&mut self, pid: ProcessId) -> Result<()>
+    {
+        use tracing::{debug, info, trace};
+
+        info!("Attaching to process {}", pid.0);
+        debug!("Getting Mach task port for process {}", pid.0);
+
+        unsafe {
+            let mut task: mach_port_t = 0;
+            trace!("Calling task_for_pid for PID {}", pid.0);
+            let result = ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
+
+            if result != KERN_SUCCESS {
+                if result == libc::KERN_FAILURE {
+                    let process_exists = libc::kill(pid.0 as libc::pid_t, 0) == 0;
+
+                    if process_exists {
+                        return Err(DebuggerError::PermissionDenied(format!(
+                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This means insufficient \
+                             permissions.\n\nQuick fix: Run with sudo:\n  sudo ferros attach {}\n\nAlternatively, use \
+                             launch() to spawn processes under debugger control, which doesn't require special permissions.",
+                            pid.0, pid.0
+                        )));
+                    }
+                }
+
+                return Err(DebuggerError::MachError(result.into()));
+            }
+
+            let mut threads: *mut thread_act_t = std::ptr::null_mut();
+            let mut thread_count: mach_msg_type_number_t = 0;
+
+            let result = task_threads(task, &mut threads, &mut thread_count);
+            if result != KERN_SUCCESS || thread_count == 0 {
+                Self::deallocate_threads_array(threads, thread_count);
+                return Err(DebuggerError::AttachFailed(format!("Failed to get threads: {}", result)));
+            }
+
+            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
+            self.task = task;
+            self.pid = pid;
+            self.threads = slice.to_vec();
+            Self::deallocate_threads_array(threads, thread_count);
+            self.current_thread = self.threads.first().copied();
+            self.attached = true;
+            self.stopped = false;
+            self.stop_reason = StopReason::Running;
+        }
+
+        Ok(())
+    }
+
     /// Ensure that the debugger is attached to a process
     ///
     /// This is an internal helper method that checks if the debugger is currently
@@ -478,7 +535,10 @@ impl Debugger for MacOSDebugger
             // Attach to the spawned process
             // Since we launched it, we should have permission to attach
             let process_id = ProcessId::from(pid as u32);
-            self.attach(process_id)?;
+            self.attach_task(process_id)?;
+            // The process is already suspended because we used START_SUSPENDED.
+            self.stopped = true;
+            self.stop_reason = StopReason::Suspended;
             info!("Successfully launched and attached to process {}", pid);
             Ok(process_id)
         }
@@ -529,82 +589,10 @@ impl Debugger for MacOSDebugger
     /// - `AttachFailed`: Failed to get threads
     fn attach(&mut self, pid: ProcessId) -> Result<()>
     {
-        use tracing::{debug, info, trace};
-
-        info!("Attaching to process {}", pid.0);
-        debug!("Getting Mach task port for process {}", pid.0);
-
-        // Use mach2 crate for Mach APIs where available - it's better maintained than libc
-        // mach2 provides:
-        // - mach_task_self(): Get our own task port (not deprecated like libc's version)
-        // - task_threads(): Enumerate threads in a task
-        //
-        unsafe {
-            // Step 1: Get a Mach port to the target process
-            // mach_task_self() returns our own task port (from mach2, not deprecated)
-            // task_for_pid() requires special permissions (sudo or debugging entitlements)
-            //
-            // See: XNU kernel source for task_for_pid implementation
-            let mut task: mach_port_t = 0;
-            trace!("Calling task_for_pid for PID {}", pid.0);
-            let result = ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
-
-            // Check if task_for_pid succeeded
-            // KERN_SUCCESS = 0, anything else is an error
-            if result != KERN_SUCCESS {
-                // macOS quirk: task_for_pid() sometimes returns KERN_FAILURE instead of
-                // KERN_PROTECTION_FAILURE when permissions are denied. If the process exists
-                // but we got KERN_FAILURE, it's likely a permission issue.
-                if result == libc::KERN_FAILURE {
-                    // Check if process exists using kill(pid, 0)
-                    // Signal 0 doesn't send a signal, it just checks if process exists
-                    let process_exists = libc::kill(pid.0 as libc::pid_t, 0) == 0;
-
-                    if process_exists {
-                        // Process exists but we got KERN_FAILURE -> permission denied
-                        return Err(DebuggerError::PermissionDenied(format!(
-                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This means insufficient \
-                             permissions.\n\nQuick fix: Run with sudo:\n  sudo ferros attach {}\n\nAlternatively, use \
-                             launch() to spawn processes under debugger control, which doesn't require special permissions.",
-                            pid.0, pid.0
-                        )));
-                    }
-                    // Process doesn't exist -> genuine ProcessNotFound
-                }
-
-                return Err(DebuggerError::MachError(result.into()));
-            }
-
-            // Step 2: Get all threads in the task
-            // We need a thread port to read/write registers
-            // task_threads() returns an array of thread ports
-            //
-            // See: XNU kernel source for task_threads implementation
-            let mut threads: *mut thread_act_t = std::ptr::null_mut();
-            let mut thread_count: mach_msg_type_number_t = 0;
-
-            let result = task_threads(task, &mut threads, &mut thread_count);
-            if result != KERN_SUCCESS || thread_count == 0 {
-                Self::deallocate_threads_array(threads, thread_count);
-                return Err(DebuggerError::AttachFailed(format!("Failed to get threads: {}", result)));
-            }
-
-            // Step 3: Store the task port, PID, and thread list
-            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
-            self.task = task;
-            self.pid = pid;
-            self.threads = slice.to_vec();
-            Self::deallocate_threads_array(threads, thread_count);
-            self.current_thread = self.threads.first().copied();
-            self.attached = true;
-            self.stopped = false;
-            self.stop_reason = StopReason::Running;
-
-            // Suspend immediately so the debugger has control.
-            self.suspend()?;
-
-            Ok(())
-        }
+        self.attach_task(pid)?;
+        // Suspend immediately so the debugger has control.
+        self.suspend()?;
+        Ok(())
     }
 
     /// Detach from the process

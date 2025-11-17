@@ -177,6 +177,43 @@ mod macos_impl
                         eprintln!("   - Check file permissions");
                         eprintln!("   - Ensure sufficient disk space");
                     }
+
+                    // Not attached error
+                    ferros_core::error::DebuggerError::NotAttached => {
+                        eprintln!("💡 Not Attached:");
+                        eprintln!("   - Call attach() before performing operations");
+                        eprintln!("   - Make sure the debugger is connected to a process");
+                    }
+
+                    // Not stopped error
+                    ferros_core::error::DebuggerError::NotStopped => {
+                        eprintln!("💡 Process Not Stopped:");
+                        eprintln!("   - Call suspend() before performing this operation");
+                        eprintln!("   - Some operations require the process to be stopped");
+                    }
+
+                    // No breakpoint error
+                    ferros_core::error::DebuggerError::NoBreakpoint(addr) => {
+                        eprintln!("💡 No Breakpoint:");
+                        eprintln!("   - No breakpoint found at address 0x{:016x}", addr);
+                        eprintln!("   - Set a breakpoint first before trying to remove/query it");
+                    }
+
+                    // Suspend failed error
+                    ferros_core::error::DebuggerError::SuspendFailed(msg) => {
+                        eprintln!("💡 Suspend Failed:");
+                        eprintln!("   {}", msg);
+                        eprintln!("   - The process may have already exited");
+                        eprintln!("   - Check task port validity");
+                    }
+
+                    // Resume failed error
+                    ferros_core::error::DebuggerError::ResumeFailed(msg) => {
+                        eprintln!("💡 Resume Failed:");
+                        eprintln!("   {}", msg);
+                        eprintln!("   - The process may have already exited");
+                        eprintln!("   - Check task port validity");
+                    }
                 }
                 process::exit(1);
             }

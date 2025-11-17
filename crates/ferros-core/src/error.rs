@@ -23,10 +23,12 @@ use thiserror::Error;
 ///
 /// ## Error Categories
 ///
-/// 1. **Process errors**: ProcessNotFound, AttachFailed
-/// 2. **Permission errors**: PermissionDenied
-/// 3. **Platform errors**: MachError (macOS-specific)
-/// 4. **I/O errors**: Io (for file operations, etc.)
+/// 1. **Process errors**: ProcessNotFound, AttachFailed, NotAttached
+/// 2. **State errors**: NotStopped, SuspendFailed, ResumeFailed
+/// 3. **Breakpoint errors**: NoBreakpoint
+/// 4. **Permission errors**: PermissionDenied
+/// 5. **Platform errors**: MachError (macOS-specific)
+/// 6. **I/O errors**: Io (for file operations, etc.)
 #[derive(Error, Debug)]
 pub enum DebuggerError
 {
@@ -67,8 +69,62 @@ pub enum DebuggerError
     /// This is a general error for attachment failures that don't fit
     /// into more specific categories. The string contains details about
     /// what went wrong.
+    ///
+    /// For more specific errors, see:
+    /// - `NotAttached`: Debugger is not attached to any process
+    /// - `PermissionDenied`: Insufficient permissions to attach
+    /// - `ProcessNotFound`: Process doesn't exist
     #[error("Failed to attach to process: {0}")]
     AttachFailed(String),
+
+    /// Operation requires the debugger to be attached to a process
+    ///
+    /// This error occurs when trying to perform an operation (like reading
+    /// registers or memory) without first attaching to a process.
+    ///
+    /// ## Solution
+    ///
+    /// Call `attach(pid)` before performing operations on the process.
+    #[error("Not attached to a process")]
+    NotAttached,
+
+    /// Operation requires the process to be stopped
+    ///
+    /// This error occurs when trying to perform an operation that requires
+    /// the process to be stopped (like reading registers safely) while the
+    /// process is still running.
+    ///
+    /// ## Solution
+    ///
+    /// Call `suspend()` before performing operations that require the process
+    /// to be stopped.
+    #[error("Process must be stopped for this operation")]
+    NotStopped,
+
+    /// No breakpoint found at the specified address
+    ///
+    /// This error occurs when trying to remove, disable, or query a breakpoint
+    /// that doesn't exist at the given address.
+    #[error("No breakpoint at address 0x{0:016x}")]
+    NoBreakpoint(u64),
+
+    /// Failed to suspend the target process
+    ///
+    /// This error occurs when `suspend()` fails. This can happen if:
+    /// - The process has already exited
+    /// - The task port is invalid
+    /// - Insufficient permissions
+    #[error("Failed to suspend process: {0}")]
+    SuspendFailed(String),
+
+    /// Failed to resume the target process
+    ///
+    /// This error occurs when `resume()` fails. This can happen if:
+    /// - The process has already exited
+    /// - The task port is invalid
+    /// - Insufficient permissions
+    #[error("Failed to resume process: {0}")]
+    ResumeFailed(String),
 
     /// Failed to read registers from the target process
     ///

@@ -63,7 +63,7 @@ pub trait Debugger
     ///
     /// - `ProcessNotFound`: The PID doesn't exist
     /// - `PermissionDenied`: Insufficient permissions (need sudo/entitlements)
-    /// - `AttachFailed`: Other attachment failures
+    /// - `AttachFailed`: Other attachment failures (e.g., failed to enumerate threads)
     ///
     /// ## Example
     ///
@@ -109,7 +109,7 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `ReadRegistersFailed`: Failed to read thread state
     ///
     /// ## Example
@@ -158,7 +158,7 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `InvalidArgument`: Invalid memory address or length
     /// - `Io`: Failed to read memory (e.g., invalid address, permission denied)
     ///
@@ -194,7 +194,7 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `InvalidArgument`: Invalid memory address or data length
     /// - `Io`: Failed to write memory (e.g., read-only memory, permission denied)
     ///
@@ -228,7 +228,7 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `Io`: Failed to read memory map information
     ///
     /// ## Example
@@ -377,8 +377,8 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
-    /// - `Io`: Failed to suspend the process (e.g., process already exited)
+    /// - `NotAttached`: Not attached to a process
+    /// - `SuspendFailed`: Failed to suspend the process (e.g., process already exited)
     ///
     /// ## Example
     ///
@@ -408,8 +408,8 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
-    /// - `Io`: Failed to resume the process (e.g., process already exited)
+    /// - `NotAttached`: Not attached to a process
+    /// - `ResumeFailed`: Failed to resume the process (e.g., process already exited)
     ///
     /// ## Example
     ///
@@ -440,8 +440,8 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
-    /// - `Io`: Failed to enumerate threads
+    /// - `NotAttached`: Not attached to a process
+    /// - `AttachFailed`: Failed to enumerate threads
     ///
     /// ## Example
     ///
@@ -497,7 +497,7 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `InvalidArgument`: The thread ID is not valid (not in the thread list)
     ///
     /// ## Example
@@ -538,8 +538,8 @@ pub trait Debugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
-    /// - `Io`: Failed to enumerate threads
+    /// - `NotAttached`: Not attached to a process
+    /// - `AttachFailed`: Failed to enumerate threads
     ///
     /// ## Example
     ///

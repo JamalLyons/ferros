@@ -125,7 +125,7 @@ impl MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// Returns `AttachFailed` if:
+    /// Returns `NotAttached` if:
     /// - The debugger was never attached (`attached == false`)
     /// - The task port is invalid (`task == 0`)
     ///
@@ -141,7 +141,7 @@ impl MacOSDebugger
     fn ensure_attached(&self) -> Result<()>
     {
         if !self.attached || self.task == 0 {
-            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+            return Err(DebuggerError::NotAttached);
         }
         Ok(())
     }
@@ -250,10 +250,8 @@ impl MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// Returns `AttachFailed` if:
-    /// - Not attached to a process
-    /// - `task_threads()` fails
-    /// - No threads found in the process
+    /// Returns `NotAttached` if not attached to a process.
+    /// Returns `AttachFailed` if `task_threads()` fails or no threads found.
     ///
     /// ## See Also
     ///
@@ -565,7 +563,8 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process, or `task_suspend()` failed
+    /// - `NotAttached`: Not attached to a process
+    /// - `SuspendFailed`: `task_suspend()` failed
     fn suspend(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
@@ -576,7 +575,7 @@ impl Debugger for MacOSDebugger
         unsafe {
             let result = task_suspend(self.task);
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::AttachFailed(format!("task_suspend failed: {}", result)));
+                return Err(DebuggerError::SuspendFailed(format!("task_suspend failed: {}", result)));
             }
         }
 
@@ -611,7 +610,8 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process, or `task_resume()` failed
+    /// - `NotAttached`: Not attached to a process
+    /// - `ResumeFailed`: `task_resume()` failed
     fn resume(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
@@ -622,7 +622,7 @@ impl Debugger for MacOSDebugger
         unsafe {
             let result = task_resume(self.task);
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::AttachFailed(format!("task_resume failed: {}", result)));
+                return Err(DebuggerError::ResumeFailed(format!("task_resume failed: {}", result)));
             }
         }
 
@@ -646,7 +646,7 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     fn threads(&self) -> Result<Vec<ThreadId>>
     {
         self.ensure_attached()?;
@@ -674,7 +674,7 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process
+    /// - `NotAttached`: Not attached to a process
     /// - `InvalidArgument`: The thread ID is not valid (not in the thread list)
     fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>
     {
@@ -688,7 +688,8 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `AttachFailed`: Not attached to a process, or `task_threads()` failed
+    /// - `NotAttached`: Not attached to a process
+    /// - `AttachFailed`: `task_threads()` failed
     fn refresh_threads(&mut self) -> Result<()>
     {
         self.refresh_thread_list()

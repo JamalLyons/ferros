@@ -20,13 +20,33 @@
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 //! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
-use std::mem;
+use std::sync::{mpsc, Arc, Mutex};
+use std::{mem, thread};
 
-use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t, vm_address_t, vm_size_t};
+use libc::{c_int, mach_msg_type_number_t, mach_port_t, natural_t, thread_act_t, vm_address_t, vm_size_t};
+#[cfg(target_os = "macos")]
+use mach2::exc::{__Reply__exception_raise_t, __Request__exception_raise_t};
+#[cfg(target_os = "macos")]
+use mach2::exception_types::{
+    exception_behavior_t, exception_mask_t, exception_type_t, EXCEPTION_DEFAULT, EXC_ARITHMETIC, EXC_BAD_ACCESS,
+    EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
+    EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXC_SOFTWARE, MACH_EXCEPTION_CODES,
+};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
-use mach2::task::{task_resume, task_suspend, task_threads};
+use mach2::mach_port::{mach_port_allocate, mach_port_destroy, mach_port_insert_right};
+#[cfg(target_os = "macos")]
+use mach2::message::{
+    mach_msg, mach_msg_header_t, mach_msg_size_t, MACH_MSGH_BITS, MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE,
+    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_RCV_LARGE, MACH_RCV_MSG, MACH_SEND_MSG,
+};
+#[cfg(target_os = "macos")]
+use mach2::ndr::NDR_record;
+#[cfg(target_os = "macos")]
+use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
+#[cfg(target_os = "macos")]
+use mach2::task::{task_resume, task_set_exception_ports, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
@@ -39,6 +59,34 @@ use crate::platform::macos::registers::read_registers_arm64;
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::read_registers_x86_64;
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
+
+/// Shared exception state manipulated by the Mach exception loop and debugger methods.
+#[derive(Debug)]
+struct ExceptionSharedState
+{
+    stopped: bool,
+    stop_reason: StopReason,
+    pending_thread: Option<thread_act_t>,
+}
+
+impl ExceptionSharedState
+{
+    fn new() -> Self
+    {
+        Self {
+            stopped: false,
+            stop_reason: StopReason::Running,
+            pending_thread: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExceptionLoopCommand
+{
+    Continue,
+    Shutdown,
+}
 
 /// macOS debugger implementation using Mach APIs
 ///
@@ -79,10 +127,14 @@ pub struct MacOSDebugger
     architecture: Architecture,
     /// Whether we're currently attached to a process.
     attached: bool,
-    /// Whether the process is currently suspended.
-    stopped: bool,
-    /// Last known stop reason.
-    stop_reason: StopReason,
+    /// Mach exception port used to receive stop notifications.
+    exception_port: mach_port_t,
+    /// Thread running the Mach exception handling loop.
+    exception_thread: Option<thread::JoinHandle<()>>,
+    /// Channel used to signal the exception loop (resume/shutdown).
+    exception_resume_tx: Option<mpsc::Sender<ExceptionLoopCommand>>,
+    /// Shared exception state observed by both the handler loop and debugger.
+    exception_state: Arc<Mutex<ExceptionSharedState>>,
 }
 
 impl MacOSDebugger
@@ -112,8 +164,10 @@ impl MacOSDebugger
             pid: ProcessId(0),
             architecture: Architecture::current(),
             attached: false,
-            stopped: false,
-            stop_reason: StopReason::Running,
+            exception_port: MACH_PORT_NULL,
+            exception_thread: None,
+            exception_resume_tx: None,
+            exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
         })
     }
 
@@ -215,9 +269,16 @@ impl MacOSDebugger
             Self::deallocate_threads_array(threads, thread_count);
             self.current_thread = self.threads.first().copied();
             self.attached = true;
-            self.stopped = false;
-            self.stop_reason = StopReason::Running;
         }
+
+        {
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.stopped = false;
+            shared.stop_reason = StopReason::Running;
+            shared.pending_thread = None;
+        }
+
+        self.start_exception_handler()?;
 
         Ok(())
     }
@@ -397,6 +458,115 @@ impl MacOSDebugger
 
         Ok(())
     }
+
+    /// Attempt to continue execution if we're currently stopped inside the Mach exception loop.
+    ///
+    /// Returns `Ok(true)` if a pending exception reply was sent, or `Ok(false)` if
+    /// the normal `task_resume` path should be used instead.
+    fn try_resume_pending_exception(&mut self) -> Result<bool>
+    {
+        let has_pending = self.exception_state.lock().unwrap().pending_thread.is_some();
+        if !has_pending {
+            return Ok(false);
+        }
+
+        let sender = self
+            .exception_resume_tx
+            .as_ref()
+            .ok_or_else(|| DebuggerError::ResumeFailed("exception handler not running".to_string()))?;
+
+        sender
+            .send(ExceptionLoopCommand::Continue)
+            .map_err(|_| DebuggerError::ResumeFailed("failed to signal exception handler".to_string()))?;
+
+        Ok(true)
+    }
+
+    fn start_exception_handler(&mut self) -> Result<()>
+    {
+        #[cfg(target_os = "macos")]
+        {
+            use tracing::info;
+
+            self.stop_exception_handler();
+
+            if self.task == MACH_PORT_NULL {
+                return Ok(());
+            }
+
+            unsafe {
+                let self_task = mach_task_self();
+                let mut port: mach_port_t = MACH_PORT_NULL;
+                let mut kr = mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &mut port);
+                if kr != KERN_SUCCESS {
+                    return Err(DebuggerError::MachError(kr.into()));
+                }
+
+                kr = mach_port_insert_right(self_task, port, port, MACH_MSG_TYPE_MAKE_SEND);
+                if kr != KERN_SUCCESS {
+                    let _ = mach_port_destroy(self_task, port);
+                    return Err(DebuggerError::MachError(kr.into()));
+                }
+
+                let mask: exception_mask_t = EXC_MASK_BREAKPOINT
+                    | EXC_MASK_BAD_ACCESS
+                    | EXC_MASK_BAD_INSTRUCTION
+                    | EXC_MASK_ARITHMETIC
+                    | EXC_MASK_SOFTWARE;
+                let behavior: exception_behavior_t = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as exception_behavior_t;
+                let flavor = thread_state_flavor_for_arch(self.architecture);
+                kr = task_set_exception_ports(self.task, mask, port, behavior, flavor);
+                if kr != KERN_SUCCESS {
+                    let _ = mach_port_destroy(self_task, port);
+                    return Err(DebuggerError::MachError(kr.into()));
+                }
+
+                let (tx, rx) = mpsc::channel();
+                let shared_state = Arc::clone(&self.exception_state);
+                let architecture = self.architecture;
+                info!("Spawning Mach exception handler thread");
+                let handle = thread::Builder::new()
+                    .name("ferros-mac-exc".to_string())
+                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture))
+                    .map_err(|e| {
+                        let _ = mach_port_destroy(self_task, port);
+                        DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}"))
+                    })?;
+
+                self.exception_port = port;
+                self.exception_thread = Some(handle);
+                self.exception_resume_tx = Some(tx);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stop_exception_handler(&mut self)
+    {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(tx) = self.exception_resume_tx.take() {
+                let _ = tx.send(ExceptionLoopCommand::Shutdown);
+            }
+
+            if self.exception_port != MACH_PORT_NULL {
+                unsafe {
+                    let _ = mach_port_destroy(mach_task_self(), self.exception_port);
+                }
+                self.exception_port = MACH_PORT_NULL;
+            }
+
+            if let Some(handle) = self.exception_thread.take() {
+                let _ = handle.join();
+            }
+
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.pending_thread = None;
+            shared.stopped = false;
+            shared.stop_reason = StopReason::Running;
+        }
+    }
 }
 
 impl Debugger for MacOSDebugger
@@ -537,8 +707,11 @@ impl Debugger for MacOSDebugger
             let process_id = ProcessId::from(pid as u32);
             self.attach_task(process_id)?;
             // The process is already suspended because we used START_SUSPENDED.
-            self.stopped = true;
-            self.stop_reason = StopReason::Suspended;
+            {
+                let mut shared = self.exception_state.lock().unwrap();
+                shared.stopped = true;
+                shared.stop_reason = StopReason::Suspended;
+            }
             info!("Successfully launched and attached to process {}", pid);
             Ok(process_id)
         }
@@ -633,6 +806,8 @@ impl Debugger for MacOSDebugger
             return Ok(());
         }
 
+        self.stop_exception_handler();
+
         let pid = self.pid.0;
         info!("Detaching from process {}", pid);
         debug!("Deallocating Mach ports for process {}", pid);
@@ -657,8 +832,12 @@ impl Debugger for MacOSDebugger
         self.current_thread = None;
         self.pid = ProcessId(0);
         self.attached = false;
-        self.stopped = false;
-        self.stop_reason = StopReason::Running;
+        {
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.stopped = false;
+            shared.stop_reason = StopReason::Running;
+            shared.pending_thread = None;
+        }
 
         info!("Successfully detached from process {}", pid);
         Ok(())
@@ -769,12 +948,12 @@ impl Debugger for MacOSDebugger
 
     fn is_stopped(&self) -> bool
     {
-        self.stopped
+        self.exception_state.lock().unwrap().stopped
     }
 
     fn stop_reason(&self) -> StopReason
     {
-        self.stop_reason
+        self.exception_state.lock().unwrap().stop_reason
     }
 
     /// Suspend execution of the target process using Mach APIs
@@ -810,7 +989,7 @@ impl Debugger for MacOSDebugger
         use tracing::{debug, info};
 
         self.ensure_attached()?;
-        if self.stopped {
+        if self.is_stopped() {
             debug!("Process {} already suspended", self.pid.0);
             return Ok(());
         }
@@ -825,8 +1004,12 @@ impl Debugger for MacOSDebugger
             }
         }
 
-        self.stopped = true;
-        self.stop_reason = StopReason::Suspended;
+        {
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.stopped = true;
+            shared.stop_reason = StopReason::Suspended;
+            shared.pending_thread = None;
+        }
         info!("Successfully suspended process {}", self.pid.0);
         Ok(())
     }
@@ -864,7 +1047,11 @@ impl Debugger for MacOSDebugger
         use tracing::{debug, info};
 
         self.ensure_attached()?;
-        if !self.stopped {
+        if self.try_resume_pending_exception()? {
+            info!("Continuing from Mach exception for process {}", self.pid.0);
+            return Ok(());
+        }
+        if !self.is_stopped() {
             debug!("Process {} already running", self.pid.0);
             return Ok(());
         }
@@ -879,8 +1066,12 @@ impl Debugger for MacOSDebugger
             }
         }
 
-        self.stopped = false;
-        self.stop_reason = StopReason::Running;
+        {
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.stopped = false;
+            shared.stop_reason = StopReason::Running;
+            shared.pending_thread = None;
+        }
         info!("Successfully resumed process {}", self.pid.0);
         Ok(())
     }
@@ -947,6 +1138,269 @@ impl Debugger for MacOSDebugger
     fn refresh_threads(&mut self) -> Result<()>
     {
         self.refresh_thread_list()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_exception_loop(
+    exception_port: mach_port_t,
+    resume_rx: mpsc::Receiver<ExceptionLoopCommand>,
+    shared_state: Arc<Mutex<ExceptionSharedState>>,
+    architecture: Architecture,
+)
+{
+    use std::mem::MaybeUninit;
+
+    use tracing::{debug, error};
+
+    loop {
+        let mut request = MaybeUninit::<__Request__exception_raise_t>::uninit();
+        let recv_size = std::mem::size_of::<__Request__exception_raise_t>() as mach_msg_size_t;
+
+        let kr = unsafe {
+            mach_msg(
+                request.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_RCV_MSG | MACH_RCV_LARGE,
+                0,
+                recv_size,
+                exception_port,
+                MACH_MSG_TIMEOUT_NONE,
+                MACH_PORT_NULL,
+            )
+        };
+
+        if kr != MACH_MSG_SUCCESS {
+            if kr == mach2::message::MACH_RCV_PORT_DIED || kr == mach2::message::MACH_RCV_INVALID_NAME {
+                debug!("Mach exception port closed, exiting handler loop");
+                break;
+            }
+            continue;
+        }
+
+        let message = unsafe { request.assume_init() };
+        let thread_port = message.thread.name as thread_act_t;
+        let codes = [message.code[0] as i64, message.code[1] as i64];
+
+        let rewound_pc = if message.exception == EXC_BREAKPOINT as exception_type_t {
+            match rewind_breakpoint_pc(thread_port, architecture) {
+                Ok(value) => value,
+                Err(err) => {
+                    error!("Failed to rewind breakpoint PC: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let stop_reason = stop_reason_from_exception(message.exception, rewound_pc, codes);
+        {
+            let mut shared = shared_state.lock().unwrap();
+            shared.stopped = true;
+            shared.stop_reason = stop_reason;
+            shared.pending_thread = Some(thread_port);
+        }
+
+        match resume_rx.recv() {
+            Ok(ExceptionLoopCommand::Continue) => {
+                if let Err(err) = send_exception_reply(&message) {
+                    error!("Failed to send Mach exception reply: {err}");
+                    break;
+                }
+
+                let mut shared = shared_state.lock().unwrap();
+                shared.stopped = false;
+                shared.stop_reason = StopReason::Running;
+                shared.pending_thread = None;
+            }
+            Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
+                let mut shared = shared_state.lock().unwrap();
+                shared.stopped = false;
+                shared.stop_reason = StopReason::Running;
+                shared.pending_thread = None;
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_exception_reply(request: &__Request__exception_raise_t) -> Result<()>
+{
+    let mut reply = __Reply__exception_raise_t {
+        Head: mach_msg_header_t {
+            msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0),
+            msgh_size: std::mem::size_of::<__Reply__exception_raise_t>() as mach_msg_size_t,
+            msgh_remote_port: request.Head.msgh_local_port,
+            msgh_local_port: MACH_PORT_NULL,
+            msgh_voucher_port: MACH_PORT_NULL,
+            msgh_id: request.Head.msgh_id + 100,
+        },
+        NDR: unsafe { NDR_record },
+        RetCode: KERN_SUCCESS,
+    };
+
+    let kr = unsafe {
+        mach_msg(
+            &mut reply.Head,
+            MACH_SEND_MSG,
+            reply.Head.msgh_size,
+            0,
+            MACH_PORT_NULL,
+            MACH_MSG_TIMEOUT_NONE,
+            MACH_PORT_NULL,
+        )
+    };
+
+    if kr != MACH_MSG_SUCCESS {
+        return Err(DebuggerError::ResumeFailed(format!("mach_msg reply failed: {}", kr)));
+    }
+
+    Ok(())
+}
+
+fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
+{
+    match architecture {
+        Architecture::Arm64 => 6,
+        Architecture::X86_64 => 4,
+        Architecture::Unknown(_) => 6,
+    }
+}
+
+fn rewind_breakpoint_pc(thread: thread_act_t, architecture: Architecture) -> Result<Option<u64>>
+{
+    match architecture {
+        Architecture::Arm64 => rewind_breakpoint_pc_arm64(thread),
+        Architecture::X86_64 => rewind_breakpoint_pc_x86(thread),
+        Architecture::Unknown(_) => Ok(None),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn rewind_breakpoint_pc_arm64(thread: thread_act_t) -> Result<Option<u64>>
+{
+    const ARM_THREAD_STATE64: c_int = 6;
+    const ARM_THREAD_STATE64_COUNT: mach_msg_type_number_t = 68;
+    const INSTRUCTION_SIZE: u64 = 4;
+
+    unsafe {
+        let mut state: [natural_t; ARM_THREAD_STATE64_COUNT as usize] = [0; ARM_THREAD_STATE64_COUNT as usize];
+        let mut count = ARM_THREAD_STATE64_COUNT;
+        let mut kr = ffi::thread_get_state(thread, ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count);
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        let read_u64 = |idx: usize, buf: &[natural_t]| -> u64 {
+            let lo = buf[idx * 2] as u64;
+            let hi = buf[idx * 2 + 1] as u64;
+            lo | (hi << 32)
+        };
+
+        let pc = read_u64(32, &state);
+        let new_pc = pc.saturating_sub(INSTRUCTION_SIZE);
+        state[64] = (new_pc & 0xFFFF_FFFF) as natural_t;
+        state[65] = (new_pc >> 32) as natural_t;
+
+        kr = ffi::thread_set_state(thread, ARM_THREAD_STATE64, state.as_ptr(), ARM_THREAD_STATE64_COUNT);
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        Ok(Some(new_pc))
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn rewind_breakpoint_pc_arm64(_thread: thread_act_t) -> Result<Option<u64>>
+{
+    Ok(None)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rewind_breakpoint_pc_x86(thread: thread_act_t) -> Result<Option<u64>>
+{
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct X86ThreadState64
+    {
+        rax: u64,
+        rbx: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rsp: u64,
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rip: u64,
+        rflags: u64,
+        cs: u64,
+        fs: u64,
+        gs: u64,
+    }
+
+    const X86_THREAD_STATE64: c_int = 4;
+    const X86_THREAD_STATE64_COUNT: mach_msg_type_number_t = 42;
+    const INSTRUCTION_SIZE: u64 = 1;
+
+    unsafe {
+        let mut state = X86ThreadState64::default();
+        let mut count = X86_THREAD_STATE64_COUNT;
+        let mut kr = ffi::thread_get_state(thread, X86_THREAD_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        let new_pc = state.rip.saturating_sub(INSTRUCTION_SIZE);
+        state.rip = new_pc;
+
+        kr = ffi::thread_set_state(
+            thread,
+            X86_THREAD_STATE64,
+            &state as *const _ as *const natural_t,
+            X86_THREAD_STATE64_COUNT,
+        );
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        Ok(Some(new_pc))
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn rewind_breakpoint_pc_x86(_thread: thread_act_t) -> Result<Option<u64>>
+{
+    Ok(None)
+}
+
+fn stop_reason_from_exception(exception: exception_type_t, pc: Option<u64>, _codes: [i64; 2]) -> StopReason
+{
+    match exception as u32 {
+        EXC_BREAKPOINT => StopReason::Breakpoint(pc.unwrap_or(0)),
+        EXC_BAD_ACCESS => StopReason::Signal(libc::SIGSEGV),
+        EXC_BAD_INSTRUCTION => StopReason::Signal(libc::SIGILL),
+        EXC_ARITHMETIC => StopReason::Signal(libc::SIGFPE),
+        EXC_SOFTWARE => StopReason::Signal(libc::SIGTRAP),
+        _ => StopReason::Unknown,
+    }
+}
+
+impl Drop for MacOSDebugger
+{
+    fn drop(&mut self)
+    {
+        self.stop_exception_handler();
     }
 }
 

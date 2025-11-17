@@ -18,6 +18,7 @@ default = []
 full = [] # todo - add features here
 
 [dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+
 ferros-core = { path = "../ferros-core" }
 ferros-utils = { path = "../ferros-utils" }
-tracing = "0.1"

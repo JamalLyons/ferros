@@ -118,11 +118,9 @@ fn main()
             eprintln!("Error: {}", e);
             process::exit(1);
         }
-    } else {
-        if let Err(e) = run_command(cli) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
+    } else if let Err(e) = run_command(cli) {
+        eprintln!("Error: {}", e);
+        process::exit(1);
     }
 }
 

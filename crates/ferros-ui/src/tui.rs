@@ -27,6 +27,14 @@ impl Tui
     ///
     /// This initializes the terminal in raw mode and alternate screen,
     /// and sets up panic handling to restore the terminal on panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal initialization fails (raw mode, alternate screen, etc.)
+    ///
+    /// # Panics
+    ///
+    /// May panic if terminal restoration fails during panic hook setup
     pub fn new() -> io::Result<Self>
     {
         enable_raw_mode()?;
@@ -50,8 +58,14 @@ impl Tui
     ///
     /// This starts the interactive debugger interface and handles user input
     /// until the user quits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal drawing fails or terminal restoration fails
     pub async fn run(&mut self, debugger: Box<dyn Debugger>, pid: Option<u32>, was_launched: bool) -> io::Result<()>
     {
+        use std::io::Write;
+
         use ferros_utils::info;
 
         if let Some(pid) = pid {
@@ -110,7 +124,6 @@ impl Tui
         app.cleanup();
 
         // Flush stdout to ensure any messages are visible
-        use std::io::Write;
         let _ = std::io::stdout().flush();
 
         // Restore terminal to normal mode
@@ -122,7 +135,7 @@ impl Tui
         // Note: This prints after restoring terminal, so it will be visible
         if app.was_launched {
             if let Some(pid) = app.pid {
-                println!("\nDebugger detached. Process {} was terminated.", pid);
+                println!("\nDebugger detached. Process {pid} was terminated.");
             }
         } else {
             println!("\nDebugger detached from process.");
@@ -135,6 +148,10 @@ impl Tui
     ///
     /// This should be called when exiting the TUI to ensure the terminal
     /// is left in a usable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal restoration fails (disabling raw mode, leaving alternate screen, etc.)
     pub fn restore() -> io::Result<()>
     {
         disable_raw_mode()?;

@@ -12,11 +12,12 @@ use crate::app::App;
 /// Draw the overview screen
 pub fn draw_overview(frame: &mut Frame, area: Rect, app: &App)
 {
-    let chunks = Layout::vertical([
+    // Use boxed slice to avoid large stack array warning
+    let constraints: Box<[Constraint]> = Box::new([
         Constraint::Length(10), // Debugger info
         Constraint::Min(0),     // Status
-    ])
-    .split(area);
+    ]);
+    let chunks = Layout::vertical(constraints).split(area);
 
     draw_debugger_info(frame, chunks[0], app);
     draw_status(frame, chunks[1], app);
@@ -83,9 +84,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App)
         match app.debugger.stop_reason() {
             StopReason::Running => "Process is running",
             StopReason::Suspended => "Process is suspended",
-            StopReason::Signal(sig) => &format!("Stopped by signal: {}", sig),
-            StopReason::Breakpoint(addr) => &format!("Hit breakpoint at 0x{:x}", addr),
-            StopReason::Exited(code) => &format!("Process exited with code: {}", code),
+            StopReason::Signal(sig) => &format!("Stopped by signal: {sig}"),
+            StopReason::Breakpoint(addr) => &format!("Hit breakpoint at 0x{addr:x}"),
+            StopReason::Exited(code) => &format!("Process exited with code: {code}"),
             StopReason::Unknown => "Stopped for unknown reason",
         }
     } else {
@@ -105,7 +106,7 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
     let registers = match app.debugger.read_registers() {
         Ok(regs) => regs,
         Err(e) => {
-            let error = Paragraph::new(format!("Error reading registers: {}", e))
+            let error = Paragraph::new(format!("Error reading registers: {e}"))
                 .block(Block::default().borders(Borders::ALL).title("Registers"))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(error, area);
@@ -143,21 +144,23 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
         Architecture::Arm64 => {
             for (i, val) in registers.general.iter().enumerate() {
                 rows.push(Row::new(vec![
-                    Cell::from(format!("X{}", i)),
-                    Cell::from(format!("0x{:016x}", val)),
+                    Cell::from(format!("X{i}")),
+                    Cell::from(format!("0x{val:016x}")),
                     Cell::from(""),
                 ]));
             }
         }
         Architecture::X86_64 => {
-            let reg_names = [
+            // Use boxed slice to avoid large stack array warning
+            let reg_names: Box<[&str]> = vec![
                 "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15",
-            ];
+            ]
+            .into_boxed_slice();
             for (i, val) in registers.general.iter().enumerate() {
                 if i < reg_names.len() {
                     rows.push(Row::new(vec![
                         Cell::from(reg_names[i]),
-                        Cell::from(format!("0x{:016x}", val)),
+                        Cell::from(format!("0x{val:016x}")),
                         Cell::from(""),
                     ]));
                 }
@@ -166,15 +169,17 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
         Architecture::Unknown(_) => {
             for (i, val) in registers.general.iter().enumerate() {
                 rows.push(Row::new(vec![
-                    Cell::from(format!("R{}", i)),
-                    Cell::from(format!("0x{:016x}", val)),
+                    Cell::from(format!("R{i}")),
+                    Cell::from(format!("0x{val:016x}")),
                     Cell::from(""),
                 ]));
             }
         }
     }
 
-    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(20), Constraint::Length(20)])
+    // Use boxed slice to avoid large stack array warning
+    let constraints: Box<[Constraint]> = Box::new([Constraint::Length(10), Constraint::Length(20), Constraint::Length(20)]);
+    let table = Table::new(rows, constraints)
         .block(Block::default().borders(Borders::ALL).title("Registers"))
         .header(Row::new(vec![
             Cell::from("Register").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -193,7 +198,7 @@ pub fn draw_threads(frame: &mut Frame, area: Rect, app: &mut App)
     let threads = match app.debugger.threads() {
         Ok(threads) => threads,
         Err(e) => {
-            let error = Paragraph::new(format!("Error reading threads: {}", e))
+            let error = Paragraph::new(format!("Error reading threads: {e}"))
                 .block(Block::default().borders(Borders::ALL).title("Threads"))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(error, area);
@@ -207,17 +212,19 @@ pub fn draw_threads(frame: &mut Frame, area: Rect, app: &mut App)
         .iter()
         .enumerate()
         .map(|(i, thread)| {
-            let is_active = active_thread.map(|t| t == *thread).unwrap_or(false);
+            let is_active = active_thread.is_some_and(|t| t == *thread);
             let prefix = if is_active { "→ " } else { "  " };
             Row::new(vec![
-                Cell::from(format!("{}{}", prefix, i)),
+                Cell::from(format!("{prefix}{i}")),
                 Cell::from(format!("{}", thread.raw())),
                 Cell::from(if is_active { "Active" } else { "" }),
             ])
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(20), Constraint::Length(10)])
+    // Use boxed slice to avoid large stack array warning
+    let constraints: Box<[Constraint]> = Box::new([Constraint::Length(10), Constraint::Length(20), Constraint::Length(10)]);
+    let table = Table::new(rows, constraints)
         .block(Block::default().borders(Borders::ALL).title("Threads"))
         .header(Row::new(vec![
             Cell::from("Index").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -236,7 +243,7 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
     let regions = match app.debugger.get_memory_regions() {
         Ok(regions) => regions,
         Err(e) => {
-            let error = Paragraph::new(format!("Error reading memory regions: {}", e))
+            let error = Paragraph::new(format!("Error reading memory regions: {e}"))
                 .block(Block::default().borders(Borders::ALL).title("Memory Regions"))
                 .style(Style::default().fg(Color::Red));
             frame.render_widget(error, area);
@@ -252,35 +259,35 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
                 Cell::from(format!("{}", region.id.value())),
                 Cell::from(format!("{}", region.start)),
                 Cell::from(format!("{}", region.end)),
-                Cell::from(format!("{} KB", size_kb)),
+                Cell::from(format!("{size_kb} KB")),
                 Cell::from(region.permissions.clone()),
                 Cell::from(region.name.as_deref().unwrap_or("").to_string()),
             ])
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(5),
-            Constraint::Length(18),
-            Constraint::Length(18),
-            Constraint::Length(10),
-            Constraint::Length(6),
-            Constraint::Min(0),
-        ],
-    )
-    .block(Block::default().borders(Borders::ALL).title("Memory Regions"))
-    .header(Row::new(vec![
-        Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Start").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("End").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Size").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Perms").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
-    ]))
-    .row_highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-    .highlight_symbol(">> ");
+    // Use boxed slice to avoid large stack array warning
+    let constraints: Box<[Constraint]> = vec![
+        Constraint::Length(5),
+        Constraint::Length(18),
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Min(0),
+    ]
+    .into_boxed_slice();
+    let table = Table::new(rows, constraints)
+        .block(Block::default().borders(Borders::ALL).title("Memory Regions"))
+        .header(Row::new(vec![
+            Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Start").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("End").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Size").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Perms").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD)),
+        ]))
+        .row_highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
 
     frame.render_stateful_widget(table, area, &mut app.memory_regions_state);
 }
@@ -291,14 +298,15 @@ pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
     // For now, show a message that output capture is not yet implemented
     // In the future, this would show captured stdout/stderr from the process
     let mut output_text = vec![
-        Line::from(vec![
-            Span::styled("Process Output", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Process Output",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
     ];
 
     if let Some(pid) = app.pid {
-        output_text.push(Line::from(format!("Process PID: {}", pid)));
+        output_text.push(Line::from(format!("Process PID: {pid}")));
         output_text.push(Line::from(""));
     }
 
@@ -322,11 +330,7 @@ pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
     } else {
         output_text.push(Line::from("Captured output:"));
         output_text.push(Line::from(""));
-        output_text.extend(
-            app.process_output
-                .iter()
-                .map(|line| Line::from(line.as_str())),
-        );
+        output_text.extend(app.process_output.iter().map(|line| Line::from(line.as_str())));
     }
 
     let output = Paragraph::new(output_text)

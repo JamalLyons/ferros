@@ -15,10 +15,11 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut debugger = create_debugger()?;
-//! debugger.attach(ProcessId::from(12345))?;
+//! let pid = ProcessId::from(12345);
+//! debugger.attach(pid)?;
 //!
-//! let mut tui = Tui::new(debugger)?;
-//! tui.run().await?;
+//! let mut tui = Tui::new()?;
+//! tui.run(debugger, Some(u32::from(pid)), false).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -45,12 +46,17 @@ pub use tui::Tui;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut debugger = create_debugger()?;
-/// debugger.attach(ProcessId::from(12345))?;
+/// let pid = ProcessId::from(12345);
+/// debugger.attach(pid)?;
 ///
-/// run_tui(debugger).await?;
+/// run_tui(debugger, Some(u32::from(pid)), false).await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if the TUI fails to initialize or run (terminal errors, etc.)
 pub async fn run_tui(debugger: Box<dyn ferros_core::Debugger>, pid: Option<u32>, was_launched: bool) -> std::io::Result<()>
 {
     let mut tui = Tui::new()?;

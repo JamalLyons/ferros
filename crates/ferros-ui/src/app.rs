@@ -49,6 +49,7 @@ pub enum ViewMode
 impl App
 {
     /// Create a new application instance
+    #[must_use]
     pub fn new(debugger: Box<dyn Debugger>, pid: Option<u32>, was_launched: bool) -> Self
     {
         let mut registers_state = TableState::default();
@@ -96,7 +97,7 @@ impl App
 
             // Detach from the process
             if let Err(e) = self.debugger.detach() {
-                eprintln!("Warning: Failed to detach from process: {}", e);
+                eprintln!("Warning: Failed to detach from process: {e}");
             }
         }
     }
@@ -111,7 +112,7 @@ impl App
         self.error_message = None;
 
         match key_event.code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => {
                 self.should_quit = true;
                 return true;
             }
@@ -133,7 +134,7 @@ impl App
             KeyCode::Char('s') => {
                 if self.debugger.is_attached() {
                     if let Err(e) = self.debugger.suspend() {
-                        self.error_message = Some(format!("Failed to suspend: {}", e));
+                        self.error_message = Some(format!("Failed to suspend: {e}"));
                     }
                 } else {
                     self.error_message = Some("Not attached to a process".to_string());
@@ -142,7 +143,7 @@ impl App
             KeyCode::Char('r') => {
                 if self.debugger.is_attached() {
                     if let Err(e) = self.debugger.resume() {
-                        self.error_message = Some(format!("Failed to resume: {}", e));
+                        self.error_message = Some(format!("Failed to resume: {e}"));
                     }
                 } else {
                     self.error_message = Some("Not attached to a process".to_string());

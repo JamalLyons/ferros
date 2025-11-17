@@ -22,6 +22,7 @@ pub struct EventHandler
 {
     receiver: mpsc::Receiver<Event>,
     should_stop: Arc<AtomicBool>,
+    #[allow(dead_code)] // Kept for potential future use (e.g., aborting the task)
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -31,6 +32,7 @@ impl EventHandler
     ///
     /// This spawns a background task that reads crossterm events
     /// and sends them to the async receiver.
+    #[must_use]
     pub fn new() -> Self
     {
         let tick_rate = Duration::from_millis(250);
@@ -85,13 +87,27 @@ impl EventHandler
     {
         self.should_stop.store(true, Ordering::Relaxed);
         // Drop the receiver to signal the background task
-        drop(&mut self.receiver);
+        // We can't use std::mem::take because Receiver doesn't implement Default
+        // Instead, we just drop it explicitly by replacing with a dummy receiver
+        // The background task will detect the channel is closed when it tries to send
+        drop(std::mem::replace(&mut self.receiver, {
+            let (_sender, receiver) = mpsc::channel(1);
+            receiver
+        }));
     }
 
     /// Get the next event (async)
     pub async fn next(&mut self) -> Option<Event>
     {
         self.receiver.recv().await
+    }
+}
+
+impl Default for EventHandler
+{
+    fn default() -> Self
+    {
+        Self::new()
     }
 }
 

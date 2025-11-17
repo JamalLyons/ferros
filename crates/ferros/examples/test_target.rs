@@ -44,12 +44,12 @@ fn main()
         counter += 1;
         accumulator = process_value(counter, accumulator);
 
-        if counter % 100 == 0 {
+        if counter.is_multiple_of(100) {
             println!("Counter: {}, Accumulator: {}", counter, accumulator);
         }
 
         // Allocate some memory periodically
-        if counter % 50 == 0 {
+        if counter.is_multiple_of(50) {
             let _vec = vec![0u8; 1024];
             let _string = format!("Allocated memory at iteration {}", counter);
             // Memory is dropped here
@@ -69,7 +69,7 @@ fn main()
 /// Process a value and return updated accumulator
 fn process_value(value: u64, acc: i64) -> i64
 {
-    let result = if value % 2 == 0 {
+    let result = if value.is_multiple_of(2) {
         acc + (value as i64)
     } else {
         acc - (value as i64)

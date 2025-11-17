@@ -11,12 +11,13 @@ use crate::app::{App, ViewMode};
 /// Draw the UI
 pub fn draw(frame: &mut Frame, app: &mut App)
 {
-    let chunks = Layout::vertical([
+    // Use boxed slice to avoid large stack array warning
+    let constraints: Box<[Constraint]> = Box::new([
         Constraint::Length(3), // Header
         Constraint::Min(0),    // Main content
         Constraint::Length(3), // Footer/status
-    ])
-    .split(frame.area());
+    ]);
+    let chunks = Layout::vertical(constraints).split(frame.area());
 
     draw_header(frame, chunks[0], app);
     draw_main_content(frame, chunks[1], app);
@@ -28,7 +29,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App)
 {
     let title = if app.debugger.is_attached() {
         if let Some(pid) = app.pid {
-            format!("Ferros Debugger - Attached (PID: {})", pid)
+            format!("Ferros Debugger - Attached (PID: {pid})")
         } else {
             "Ferros Debugger - Attached".to_string()
         }
@@ -62,9 +63,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App)
         ViewMode::Overview => {
             "1: Overview | 2: Registers | 3: Threads | 4: Memory | 5: Output | s: Suspend | r: Resume | q: Quit"
         }
-        ViewMode::Registers => "↑/↓: Navigate | 1-5: Switch View | s: Suspend | r: Resume | q: Quit",
-        ViewMode::Threads => "↑/↓: Navigate | 1-5: Switch View | s: Suspend | r: Resume | q: Quit",
-        ViewMode::MemoryRegions => "↑/↓: Navigate | 1-5: Switch View | s: Suspend | r: Resume | q: Quit",
+        ViewMode::Registers | ViewMode::Threads | ViewMode::MemoryRegions => {
+            "↑/↓: Navigate | 1-5: Switch View | s: Suspend | r: Resume | q: Quit"
+        }
         ViewMode::Output => "↑/↓: Scroll | 1-5: Switch View | s: Suspend | r: Resume | q: Quit",
     };
 
@@ -72,7 +73,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App)
 
     if let Some(ref error) = app.error_message {
         footer_content.push(Span::raw(" | "));
-        footer_content.push(Span::styled(format!("Error: {}", error), Style::default().fg(Color::Red)));
+        footer_content.push(Span::styled(format!("Error: {error}"), Style::default().fg(Color::Red)));
     }
 
     let footer = Paragraph::new(Line::from(footer_content))

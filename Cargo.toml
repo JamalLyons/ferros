@@ -22,6 +22,8 @@ pedantic = { level = "warn", priority = -2 }
 nursery = { level = "allow", priority = -1 }
 # Cargo-related lints
 cargo = { level = "warn", priority = -2 }
+# Allow multiple crate versions (transitive dependencies)
+multiple_crate_versions = { level = "allow", priority = -1 }
 
 # Workspace dependencies
 [workspace.dependencies]

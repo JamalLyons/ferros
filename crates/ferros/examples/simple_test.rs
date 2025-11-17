@@ -16,7 +16,7 @@ fn main()
         counter += 1;
         sum = add_to_sum(counter, sum);
 
-        if counter % 50 == 0 {
+        if counter.is_multiple_of(50) {
             println!("Iteration: {}, Sum: {}", counter, sum);
         }
 
@@ -24,7 +24,7 @@ fn main()
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Allocate some memory
-        if counter % 25 == 0 {
+        if counter.is_multiple_of(25) {
             let _data = vec![counter; 100];
             let _message = format!("Allocated at iteration {}", counter);
         }
@@ -33,7 +33,7 @@ fn main()
 
 fn add_to_sum(value: u64, current_sum: i64) -> i64
 {
-    let result = if value % 2 == 0 {
+    let result = if value.is_multiple_of(2) {
         current_sum + (value as i64)
     } else {
         current_sum - (value as i64)
@@ -45,11 +45,5 @@ fn add_to_sum(value: u64, current_sum: i64) -> i64
 
 fn clamp_result(value: i64) -> i64
 {
-    if value > 1000 {
-        1000
-    } else if value < -1000 {
-        -1000
-    } else {
-        value
-    }
+    value.clamp(-1000, 1000)
 }

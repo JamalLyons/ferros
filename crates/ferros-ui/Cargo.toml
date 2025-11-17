@@ -11,6 +11,11 @@ categories = ["development-tools"]
 publish = false
 
 [dependencies]
+ratatui = "0.29"
+crossterm = "0.29.0"
+ferros-core = { path = "../ferros-core" }
+ferros-utils = { path = "../ferros-utils" }
+tokio = { version = "1.48.0", features = ["full"] }
 
 [lints]
 workspace = true

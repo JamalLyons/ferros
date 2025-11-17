@@ -85,11 +85,12 @@ pub trait Debugger
     /// use ferros_core::Debugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
-    /// debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
+    /// let pid = debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
     /// // Process is now suspended and ready for debugging
+    /// println!("Launched process with PID: {}", pid.0);
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    fn launch(&mut self, program: &str, args: &[&str]) -> Result<()>;
+    fn launch(&mut self, program: &str, args: &[&str]) -> Result<ProcessId>;
 
     /// Attach to a running process
     ///

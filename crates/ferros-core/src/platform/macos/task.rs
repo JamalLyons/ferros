@@ -393,7 +393,7 @@ impl Debugger for MacOSDebugger
     /// // Process is now suspended and ready for debugging
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    fn launch(&mut self, program: &str, args: &[&str]) -> Result<()>
+    fn launch(&mut self, program: &str, args: &[&str]) -> Result<ProcessId>
     {
         use std::ffi::CString;
         use std::ptr;
@@ -467,7 +467,9 @@ impl Debugger for MacOSDebugger
 
             // Attach to the spawned process
             // Since we launched it, we should have permission to attach
-            self.attach(ProcessId::from(pid as u32))
+            let process_id = ProcessId::from(pid as u32);
+            self.attach(process_id)?;
+            Ok(process_id)
         }
     }
 

@@ -19,6 +19,11 @@ full = [] # todo - add features here
 
 [dependencies]
 clap = { version = "4.5.51", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 ferros-core = { path = "../ferros-core" }
+ferros-ui = { path = "../ferros-ui" }
 ferros-utils = { path = "../ferros-utils" }
+
+[dev-dependencies]
+ctrlc = "3.4"

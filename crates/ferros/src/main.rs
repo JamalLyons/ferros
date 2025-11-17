@@ -25,6 +25,9 @@ enum Commands
     {
         /// Process ID (PID) to attach to
         pid: u32,
+        /// Use headless mode (no TUI, just print info and exit)
+        #[arg(long, default_value_t = false)]
+        headless: bool,
     },
     /// Launch a new process under debugger control
     Launch
@@ -34,6 +37,9 @@ enum Commands
         /// Arguments to pass to the program
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+        /// Use headless mode (no TUI, just print info and exit)
+        #[arg(long, default_value_t = false)]
+        headless: bool,
     },
     /// Display CPU registers from the attached process
     Registers,
@@ -71,31 +77,148 @@ fn main()
 
     let cli = Cli::parse();
 
-    if let Err(e) = run_command(cli) {
-        eprintln!("Error: {}", e);
-        process::exit(1);
+    // Check if we need async runtime for TUI (default mode, unless --headless is used)
+    let needs_async = matches!(
+        cli.command,
+        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. }
+    );
+
+    if needs_async {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        if let Err(e) = rt.block_on(run_command_async(cli)) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    } else {
+        if let Err(e) = run_command(cli) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
+{
+    match cli.command {
+        Commands::Attach { pid, headless } => {
+            info!("Attaching to process {}", pid);
+            let mut debugger = create_debugger()?;
+            debugger.attach(ProcessId::from(pid))?;
+            println!("Successfully attached to process {}", pid);
+
+            if headless {
+                print_debugger_info(&*debugger)?;
+                // In headless mode, detach after showing info
+                debugger.detach()?;
+            } else {
+                ferros_ui::run_tui(debugger, Some(pid), false).await?;
+            }
+            Ok(())
+        }
+        Commands::Launch { program, args, headless } => {
+            info!("Launching program: {} with args: {:?}", program, args);
+            let mut debugger = create_debugger()?;
+
+            // Convert relative path to absolute path for posix_spawn
+            let program_path = std::path::Path::new(&program);
+            let absolute_program = if program_path.is_absolute() {
+                program.clone()
+            } else {
+                std::env::current_dir()?
+                    .join(program_path)
+                    .canonicalize()?
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            // The launch method requires at least one argument (typically the program name)
+            // If no args provided, use the program name itself
+            let args_refs: Vec<&str> = if args.is_empty() {
+                vec![&absolute_program]
+            } else {
+                args.iter().map(|s| s.as_str()).collect()
+            };
+
+            let pid = debugger.launch(&absolute_program, &args_refs)?;
+            println!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
+
+            // Process starts suspended, resume it so it runs normally
+            debugger.resume()?;
+            println!("Process resumed and running");
+
+            if headless {
+                print_debugger_info(&*debugger)?;
+                // In headless mode, detach after showing info
+                debugger.detach()?;
+            } else {
+                ferros_ui::run_tui(debugger, Some(pid.0), true).await?;
+            }
+            Ok(())
+        }
+        _ => {
+            // Non-async commands should not reach here
+            Err("TUI mode only available for attach/launch commands".into())
+        }
     }
 }
 
 fn run_command(cli: Cli) -> DebuggerResult<()>
 {
     match cli.command {
-        Commands::Attach { pid } => {
+        Commands::Attach { pid, headless: true } => {
             info!("Attaching to process {}", pid);
             let mut debugger = create_debugger()?;
             debugger.attach(ProcessId::from(pid))?;
             println!("Successfully attached to process {}", pid);
             print_debugger_info(&*debugger)?;
+            // Detach after showing info in headless mode
+            debugger.detach()?;
             Ok(())
         }
-        Commands::Launch { program, args } => {
+        Commands::Launch {
+            program,
+            args,
+            headless: true,
+        } => {
             info!("Launching program: {} with args: {:?}", program, args);
             let mut debugger = create_debugger()?;
-            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            debugger.launch(&program, &args_refs)?;
-            println!("Successfully launched program: {}", program);
+
+            // Convert relative path to absolute path for posix_spawn
+            let program_path = std::path::Path::new(&program);
+            let absolute_program = if program_path.is_absolute() {
+                program.clone()
+            } else {
+                std::env::current_dir()?
+                    .join(program_path)
+                    .canonicalize()?
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            // If no args provided, use the program name itself
+            let args_refs: Vec<&str> = if args.is_empty() {
+                vec![&absolute_program]
+            } else {
+                args.iter().map(|s| s.as_str()).collect()
+            };
+
+            let pid = debugger.launch(&absolute_program, &args_refs)?;
+            println!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
+
+            // Process starts suspended, resume it so it runs normally
+            debugger.resume()?;
+            println!("Process resumed and running");
+
             print_debugger_info(&*debugger)?;
+            // Detach after showing info in headless mode
+            debugger.detach()?;
             Ok(())
+        }
+        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. } => {
+            // These should be handled by run_command_async
+            Err(ferros_core::error::DebuggerError::InvalidArgument(
+                "TUI mode requires async runtime".to_string(),
+            ))
         }
         Commands::Registers => {
             // TODO: Implement state management to persist debugger instance

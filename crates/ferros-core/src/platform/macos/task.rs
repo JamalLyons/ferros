@@ -398,6 +398,11 @@ impl Debugger for MacOSDebugger
         use std::ffi::CString;
         use std::ptr;
 
+        use tracing::{debug, info, trace};
+
+        info!("Launching process: {} with args: {:?}", program, args);
+        debug!("Validating launch parameters");
+
         // Validate inputs
         if program.is_empty() {
             return Err(DebuggerError::InvalidArgument("Program path cannot be empty".to_string()));
@@ -422,6 +427,7 @@ impl Debugger for MacOSDebugger
         argv.push(ptr::null());
 
         unsafe {
+            debug!("Initializing posix_spawn attributes");
             // Initialize spawn attributes
             let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
             let result = ffi::posix_spawnattr_init(&mut attr);
@@ -432,6 +438,7 @@ impl Debugger for MacOSDebugger
                 )));
             }
 
+            debug!("Setting POSIX_SPAWN_START_SUSPENDED flag");
             // Set POSIX_SPAWN_START_SUSPENDED flag
             // This ensures the process starts suspended, allowing us to set breakpoints
             let flags_result = ffi::posix_spawnattr_setflags(&mut attr, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED);
@@ -443,6 +450,7 @@ impl Debugger for MacOSDebugger
                 )));
             }
 
+            trace!("Calling posix_spawn");
             // Spawn the process
             let mut pid: libc::pid_t = 0;
             let spawn_result = ffi::posix_spawn(
@@ -465,10 +473,13 @@ impl Debugger for MacOSDebugger
                 )));
             }
 
+            info!("Successfully spawned process with PID: {}", pid);
+            debug!("Attaching to spawned process");
             // Attach to the spawned process
             // Since we launched it, we should have permission to attach
             let process_id = ProcessId::from(pid as u32);
             self.attach(process_id)?;
+            info!("Successfully launched and attached to process {}", pid);
             Ok(process_id)
         }
     }
@@ -518,6 +529,11 @@ impl Debugger for MacOSDebugger
     /// - `AttachFailed`: Failed to get threads
     fn attach(&mut self, pid: ProcessId) -> Result<()>
     {
+        use tracing::{debug, info, trace};
+
+        info!("Attaching to process {}", pid.0);
+        debug!("Getting Mach task port for process {}", pid.0);
+
         // Use mach2 crate for Mach APIs where available - it's better maintained than libc
         // mach2 provides:
         // - mach_task_self(): Get our own task port (not deprecated like libc's version)
@@ -530,6 +546,7 @@ impl Debugger for MacOSDebugger
             //
             // See: XNU kernel source for task_for_pid implementation
             let mut task: mach_port_t = 0;
+            trace!("Calling task_for_pid for PID {}", pid.0);
             let result = ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
 
             // Check if task_for_pid succeeded
@@ -621,18 +638,27 @@ impl Debugger for MacOSDebugger
     /// - `NotAttached`: Not attached to a process (no-op)
     fn detach(&mut self) -> Result<()>
     {
+        use tracing::{debug, info};
+
         if !self.attached {
+            debug!("Detach called but not attached, no-op");
             return Ok(());
         }
 
+        let pid = self.pid.0;
+        info!("Detaching from process {}", pid);
+        debug!("Deallocating Mach ports for process {}", pid);
+
         unsafe {
             // Deallocate all thread ports first
+            debug!("Deallocating {} thread ports", self.threads.len());
             for thread in &self.threads {
                 let _ = ffi::mach_port_deallocate(mach_task_self(), *thread);
             }
 
             // Deallocate the task port
             if self.task != 0 {
+                debug!("Deallocating task port");
                 let _ = ffi::mach_port_deallocate(mach_task_self(), self.task);
             }
         }
@@ -646,6 +672,7 @@ impl Debugger for MacOSDebugger
         self.stopped = false;
         self.stop_reason = StopReason::Running;
 
+        info!("Successfully detached from process {}", pid);
         Ok(())
     }
 
@@ -792,10 +819,16 @@ impl Debugger for MacOSDebugger
     /// - `SuspendFailed`: `task_suspend()` failed
     fn suspend(&mut self) -> Result<()>
     {
+        use tracing::{debug, info};
+
         self.ensure_attached()?;
         if self.stopped {
+            debug!("Process {} already suspended", self.pid.0);
             return Ok(());
         }
+
+        info!("Suspending process {}", self.pid.0);
+        debug!("Calling task_suspend for process {}", self.pid.0);
 
         unsafe {
             let result = task_suspend(self.task);
@@ -806,6 +839,7 @@ impl Debugger for MacOSDebugger
 
         self.stopped = true;
         self.stop_reason = StopReason::Suspended;
+        info!("Successfully suspended process {}", self.pid.0);
         Ok(())
     }
 
@@ -839,10 +873,16 @@ impl Debugger for MacOSDebugger
     /// - `ResumeFailed`: `task_resume()` failed
     fn resume(&mut self) -> Result<()>
     {
+        use tracing::{debug, info};
+
         self.ensure_attached()?;
         if !self.stopped {
+            debug!("Process {} already running", self.pid.0);
             return Ok(());
         }
+
+        info!("Resuming process {}", self.pid.0);
+        debug!("Calling task_resume for process {}", self.pid.0);
 
         unsafe {
             let result = task_resume(self.task);
@@ -853,6 +893,7 @@ impl Debugger for MacOSDebugger
 
         self.stopped = false;
         self.stop_reason = StopReason::Running;
+        info!("Successfully resumed process {}", self.pid.0);
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use ferros_core::debugger::create_debugger;
 use ferros_core::types::ProcessId;
 use ferros_core::{Debugger, Result as DebuggerResult};
-use ferros_utils::{info, init_logging};
+use ferros_utils::{debug, info, init_logging, init_logging_with_level, LogFormat, LogLevel};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]
@@ -13,6 +13,16 @@ use ferros_utils::{info, init_logging};
 #[command(about = "A Rust-native debugger with hybrid MIR and system-level introspection", long_about = None)]
 struct Cli
 {
+    /// Set the log level (error, warn, info, debug, trace)
+    /// Overrides RUST_LOG environment variable
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
+
+    /// Set the log format (pretty, json)
+    /// Overrides FERROS_LOG_FORMAT environment variable
+    #[arg(long, value_name = "FORMAT")]
+    log_format: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -68,14 +78,33 @@ enum Commands
 
 fn main()
 {
-    // Initialize logging (reads from RUST_LOG env var)
-    // Defaults to INFO level and Pretty format if not set
-    if let Err(e) = init_logging() {
+    let cli = Cli::parse();
+
+    // Initialize logging with CLI flags or environment variables
+    let log_result = if let Some(level_str) = &cli.log_level {
+        // Parse log level from CLI
+        let level = level_str.parse::<LogLevel>().unwrap_or_else(|_| {
+            eprintln!("Invalid log level: {}. Use: error, warn, info, debug, or trace", level_str);
+            process::exit(1);
+        });
+
+        // Parse log format from CLI or default to pretty
+        let format = cli
+            .log_format
+            .as_ref()
+            .and_then(|f| f.parse::<LogFormat>().ok())
+            .unwrap_or(LogFormat::Pretty);
+
+        init_logging_with_level(level, format)
+    } else {
+        // Use environment variables or defaults
+        init_logging()
+    };
+
+    if let Err(e) = log_result {
         eprintln!("Failed to initialize logging: {}", e);
         process::exit(1);
     }
-
-    let cli = Cli::parse();
 
     // Check if we need async runtime for TUI (default mode, unless --headless is used)
     let needs_async = matches!(
@@ -104,7 +133,7 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
             info!("Attaching to process {}", pid);
             let mut debugger = create_debugger()?;
             debugger.attach(ProcessId::from(pid))?;
-            println!("Successfully attached to process {}", pid);
+            info!("Successfully attached to process {}", pid);
 
             if headless {
                 print_debugger_info(&*debugger)?;
@@ -140,11 +169,9 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
             };
 
             let pid = debugger.launch(&absolute_program, &args_refs)?;
-            println!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
 
             // Process starts suspended, resume it so it runs normally
             debugger.resume()?;
-            println!("Process resumed and running");
 
             if headless {
                 print_debugger_info(&*debugger)?;
@@ -169,7 +196,7 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
             info!("Attaching to process {}", pid);
             let mut debugger = create_debugger()?;
             debugger.attach(ProcessId::from(pid))?;
-            println!("Successfully attached to process {}", pid);
+            info!("Successfully attached to process {}", pid);
             print_debugger_info(&*debugger)?;
             // Detach after showing info in headless mode
             debugger.detach()?;
@@ -203,11 +230,11 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
             };
 
             let pid = debugger.launch(&absolute_program, &args_refs)?;
-            println!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
+            info!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
 
             // Process starts suspended, resume it so it runs normally
             debugger.resume()?;
-            println!("Process resumed and running");
+            info!("Process resumed and running");
 
             print_debugger_info(&*debugger)?;
             // Detach after showing info in headless mode
@@ -289,22 +316,22 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
 
 fn print_debugger_info(debugger: &dyn Debugger) -> DebuggerResult<()>
 {
-    println!("\nDebugger Information:");
-    println!("  Architecture: {}", debugger.architecture());
-    println!("  Attached: {}", debugger.is_attached());
-    println!("  Stopped: {}", debugger.is_stopped());
-    println!("  Stop Reason: {:?}", debugger.stop_reason());
+    info!("Debugger Information:");
+    info!("  Architecture: {}", debugger.architecture());
+    info!("  Attached: {}", debugger.is_attached());
+    info!("  Stopped: {}", debugger.is_stopped());
+    debug!("  Stop Reason: {:?}", debugger.stop_reason());
 
     if debugger.is_attached() {
         if let Ok(threads) = debugger.threads() {
-            println!("  Threads: {}", threads.len());
+            info!("  Threads: {}", threads.len());
             if let Some(active) = debugger.active_thread() {
-                println!("  Active Thread: {}", active.raw());
+                debug!("  Active Thread: {}", active.raw());
             }
         }
 
         if let Ok(regions) = debugger.get_memory_regions() {
-            println!("  Memory Regions: {}", regions.len());
+            info!("  Memory Regions: {}", regions.len());
         }
     }
 

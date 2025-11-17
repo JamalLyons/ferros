@@ -12,6 +12,7 @@ categories = ["development-tools"]
 [dependencies]
 libc = "0.2.177"
 thiserror = { workspace = true }
+tracing = "0.1"
 
 # macOS-specific Mach API bindings
 [target.'cfg(target_os = "macos")'.dependencies]

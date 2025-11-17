@@ -429,6 +429,7 @@ dependencies = [
  "mach2",
  "rustc_version",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]

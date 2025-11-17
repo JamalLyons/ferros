@@ -52,6 +52,14 @@ impl Tui
     /// until the user quits.
     pub async fn run(&mut self, debugger: Box<dyn Debugger>, pid: Option<u32>, was_launched: bool) -> io::Result<()>
     {
+        use ferros_utils::info;
+
+        if let Some(pid) = pid {
+            info!("Ferros TUI started (PID: {}, launched: {})", pid, was_launched);
+        } else {
+            info!("Ferros TUI started");
+        }
+
         let mut app = App::new(debugger, pid, was_launched);
         let mut event_handler = crate::event::EventHandler::new();
 
@@ -93,6 +101,8 @@ impl Tui
             }
         }
 
+        info!("Ferros TUI closing");
+
         // Stop the event handler to allow the program to exit
         event_handler.stop();
 
@@ -105,6 +115,8 @@ impl Tui
 
         // Restore terminal to normal mode
         Self::restore()?;
+
+        info!("Ferros TUI closed");
 
         // Print a message so user knows what happened
         // Note: This prints after restoring terminal, so it will be visible

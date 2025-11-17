@@ -7,20 +7,28 @@ use std::time::Duration;
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
+use crate::app::ProcessOutputSource;
+
 /// Events that can occur in the TUI
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Event
 {
     /// Keyboard input event
     Key(KeyEvent),
     /// Tick event (for periodic updates)
     Tick,
+    /// Captured process output ready to display
+    ProcessOutput
+    {
+        source: ProcessOutputSource, line: String
+    },
 }
 
 /// Event handler that reads from crossterm and produces TUI events
 pub struct EventHandler
 {
     receiver: mpsc::Receiver<Event>,
+    sender: mpsc::Sender<Event>,
     should_stop: Arc<AtomicBool>,
     #[allow(dead_code)] // Kept for potential future use (e.g., aborting the task)
     handle: tokio::task::JoinHandle<()>,
@@ -77,6 +85,7 @@ impl EventHandler
 
         Self {
             receiver,
+            sender,
             should_stop,
             handle,
         }
@@ -100,6 +109,13 @@ impl EventHandler
     pub async fn next(&mut self) -> Option<Event>
     {
         self.receiver.recv().await
+    }
+
+    /// Get a sender that can be used to push events into the queue.
+    #[must_use]
+    pub fn sender(&self) -> mpsc::Sender<Event>
+    {
+        self.sender.clone()
     }
 }
 

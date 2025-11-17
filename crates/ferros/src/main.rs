@@ -183,6 +183,10 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
             info!("Launching program: {} with args: {:?}", program, args);
             let mut debugger = create_debugger()?;
 
+            if !headless {
+                debugger.set_capture_process_output(true);
+            }
+
             // Convert relative path to absolute path for posix_spawn
             let program_path = std::path::Path::new(&program);
             let absolute_program = if program_path.is_absolute() {

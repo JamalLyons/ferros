@@ -1,7 +1,28 @@
 //! Application state and logic
 
+use std::collections::VecDeque;
+
 use ferros_core::Debugger;
 use ratatui::widgets::TableState;
+
+/// Maximum number of process output lines retained in memory.
+const MAX_PROCESS_OUTPUT_LINES: usize = 4096;
+
+/// Indicates which stream produced a captured line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutputSource
+{
+    Stdout,
+    Stderr,
+}
+
+/// Captured line of process output.
+#[derive(Debug, Clone)]
+pub struct ProcessOutputLine
+{
+    pub source: ProcessOutputSource,
+    pub text: String,
+}
 
 /// Application state
 pub struct App
@@ -27,7 +48,9 @@ pub struct App
     /// Error message to display (if any)
     pub error_message: Option<String>,
     /// Process output buffer (for displaying in TUI)
-    pub process_output: Vec<String>,
+    pub process_output: VecDeque<ProcessOutputLine>,
+    /// Number of lines scrolled back from the end of the output buffer
+    pub output_scrollback: usize,
 }
 
 /// Different view modes in the TUI
@@ -72,7 +95,8 @@ impl App
             memory_regions_state,
             selected_thread_index: 0,
             error_message: None,
-            process_output: Vec::new(),
+            process_output: VecDeque::new(),
+            output_scrollback: 0,
         }
     }
 
@@ -202,7 +226,10 @@ impl App
                     self.memory_regions_state.select(Some(next));
                 }
             }
-            ViewMode::Overview | ViewMode::Output => {}
+            ViewMode::Output => {
+                self.scroll_output_up();
+            }
+            ViewMode::Overview => {}
         }
     }
 
@@ -241,7 +268,10 @@ impl App
                     self.memory_regions_state.select(Some(next));
                 }
             }
-            ViewMode::Overview | ViewMode::Output => {}
+            ViewMode::Output => {
+                self.scroll_output_down();
+            }
+            ViewMode::Overview => {}
         }
     }
 
@@ -262,6 +292,39 @@ impl App
         // Refresh thread list periodically
         if self.debugger.is_attached() {
             let _ = self.debugger.refresh_threads();
+        }
+    }
+
+    /// Append a captured process output line to the buffer.
+    pub fn push_process_output(&mut self, source: ProcessOutputSource, line: &str)
+    {
+        let cleaned = line.trim_end_matches('\r').to_string();
+        self.process_output.push_back(ProcessOutputLine { source, text: cleaned });
+        if self.process_output.len() > MAX_PROCESS_OUTPUT_LINES {
+            self.process_output.pop_front();
+        }
+
+        let max_scroll = self.process_output.len().saturating_sub(1);
+        if self.output_scrollback > max_scroll {
+            self.output_scrollback = max_scroll;
+        }
+    }
+
+    fn scroll_output_up(&mut self)
+    {
+        if self.process_output.is_empty() {
+            return;
+        }
+        let max_scroll = self.process_output.len().saturating_sub(1);
+        if self.output_scrollback < max_scroll {
+            self.output_scrollback += 1;
+        }
+    }
+
+    fn scroll_output_down(&mut self)
+    {
+        if self.output_scrollback > 0 {
+            self.output_scrollback -= 1;
         }
     }
 }

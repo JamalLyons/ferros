@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, ProcessOutputLine, ProcessOutputSource};
 
 /// Format a memory size in bytes to a human-readable string (KB, MB, or GB)
 #[allow(clippy::large_stack_arrays)]
@@ -327,27 +327,30 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
 /// Draw the process output view
 pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
 {
-    // For now, show a message that output capture is not yet implemented
-    // In the future, this would show captured stdout/stderr from the process
-    let mut output_text = vec![];
+    let viewport_height = area.height.saturating_sub(2) as usize; // account for borders
+    let mut output_text = Vec::new();
 
     if app.process_output.is_empty() {
         output_text.extend(vec![
-            Line::from("Process output capture is not yet implemented."),
+            Line::from("No process output captured yet."),
             Line::from(""),
-            Line::from("To see process output:"),
-            Line::from("  • Use 'ferros launch --headless' to see output directly"),
-            Line::from("  • Or check the terminal after quitting the TUI"),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Note: ", Style::default().fg(Color::Yellow)),
-                Span::raw("Full output capture in TUI is planned for a future release."),
-            ]),
+            Line::from("Output is captured automatically when launching a new target from Ferros."),
+            Line::from("Attach mode reuses the target's existing stdout/stderr."),
         ]);
     } else {
-        output_text.push(Line::from("Captured output:"));
-        output_text.push(Line::from(""));
-        output_text.extend(app.process_output.iter().map(|line| Line::from(line.as_str())));
+        let visible_lines = viewport_height.max(1);
+        let total_lines = app.process_output.len();
+        let scrollback = app.output_scrollback.min(total_lines.saturating_sub(1));
+        let start_index = total_lines.saturating_sub(visible_lines).saturating_sub(scrollback);
+        let lines_to_show = visible_lines.min(total_lines.saturating_sub(start_index));
+
+        output_text.extend(
+            app.process_output
+                .iter()
+                .skip(start_index)
+                .take(lines_to_show)
+                .map(format_process_output_line),
+        );
     }
 
     let output = Paragraph::new(output_text)
@@ -356,4 +359,18 @@ pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
         .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(output, area);
+}
+
+fn format_process_output_line(entry: &ProcessOutputLine) -> Line<'_>
+{
+    let (label, color) = match entry.source {
+        ProcessOutputSource::Stdout => ("stdout", Color::Green),
+        ProcessOutputSource::Stderr => ("stderr", Color::Red),
+    };
+
+    Line::from(vec![
+        Span::styled(format!("[{label}]"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::raw(entry.text.clone()),
+    ])
 }

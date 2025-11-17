@@ -24,6 +24,8 @@
 //! - **Safe**: Wrap unsafe system calls in safe abstractions
 //! - **Explicit**: Clear about what they do and when they can fail
 
+use std::fs::File;
+
 use crate::error::Result;
 use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
 
@@ -47,6 +49,29 @@ use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, Thre
 /// in a `Mutex` or use channels to communicate with a debugger thread.
 pub trait Debugger
 {
+    /// Configure whether stdout/stderr from launched processes should be captured.
+    ///
+    /// The default implementation does nothing. Platform-specific implementations
+    /// can override this to enable or disable stdio redirection before calling
+    /// [`Debugger::launch`].
+    fn set_capture_process_output(&mut self, _capture: bool) {}
+
+    /// Take ownership of the captured stdout stream for the most recently launched process.
+    ///
+    /// Returns `None` if output capture is disabled or unsupported.
+    fn take_process_stdout(&mut self) -> Option<File>
+    {
+        None
+    }
+
+    /// Take ownership of the captured stderr stream for the most recently launched process.
+    ///
+    /// Returns `None` if output capture is disabled or unsupported.
+    fn take_process_stderr(&mut self) -> Option<File>
+    {
+        None
+    }
+
     /// Launch a new process under debugger control
     ///
     /// Spawns a new process from the given executable path and arguments, and

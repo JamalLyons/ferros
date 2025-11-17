@@ -1,16 +1,21 @@
 //! Terminal User Interface initialization and management
 
-use std::io::{self, Stdout};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Stdout};
 use std::panic;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ferros_core::Debugger;
+use ferros_utils::{info, warn};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use crate::app::App;
+use crate::app::{App, ProcessOutputSource};
+use crate::event::Event;
 
 /// Terminal User Interface for Ferros debugger
 ///
@@ -66,8 +71,6 @@ impl Tui
     {
         use std::io::Write;
 
-        use ferros_utils::info;
-
         if let Some(pid) = pid {
             info!("Ferros TUI started (PID: {}, launched: {})", pid, was_launched);
         } else {
@@ -76,6 +79,7 @@ impl Tui
 
         let mut app = App::new(debugger, pid, was_launched);
         let mut event_handler = crate::event::EventHandler::new();
+        let mut output_tasks = spawn_process_output_tasks(&mut app, event_handler.sender());
 
         loop {
             // Check if we should quit before drawing
@@ -93,13 +97,16 @@ impl Tui
             // Use a timeout to allow periodic checks
             match tokio::time::timeout(std::time::Duration::from_millis(100), event_handler.next()).await {
                 Ok(Some(event)) => match event {
-                    crate::event::Event::Key(key_event) => {
+                    Event::Key(key_event) => {
                         if app.handle_key_event(key_event) {
                             break;
                         }
                     }
-                    crate::event::Event::Tick => {
+                    Event::Tick => {
                         app.tick();
+                    }
+                    Event::ProcessOutput { source, line } => {
+                        app.push_process_output(source, &line.clone());
                     }
                 },
                 Ok(None) => {
@@ -119,6 +126,11 @@ impl Tui
 
         // Stop the event handler to allow the program to exit
         event_handler.stop();
+        for handle in output_tasks.drain(..) {
+            if let Err(e) = handle.await {
+                warn!("Process output task exited with error: {e}");
+            }
+        }
 
         // Cleanup before restoring terminal
         app.cleanup();
@@ -159,6 +171,41 @@ impl Tui
         execute!(stdout, LeaveAlternateScreen, DisableMouseCapture)?;
         Ok(())
     }
+}
+
+fn spawn_process_output_tasks(app: &mut App, sender: mpsc::Sender<Event>) -> Vec<JoinHandle<()>>
+{
+    let mut handles = Vec::new();
+
+    if let Some(stdout) = app.debugger.take_process_stdout() {
+        handles.push(spawn_output_reader(stdout, ProcessOutputSource::Stdout, sender.clone()));
+    }
+
+    if let Some(stderr) = app.debugger.take_process_stderr() {
+        handles.push(spawn_output_reader(stderr, ProcessOutputSource::Stderr, sender));
+    }
+
+    handles
+}
+
+fn spawn_output_reader(file: File, source: ProcessOutputSource, sender: mpsc::Sender<Event>) -> JoinHandle<()>
+{
+    tokio::task::spawn_blocking(move || {
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if sender.blocking_send(Event::ProcessOutput { source, line }).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!("Failed to read process output: {err}");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 impl Drop for Tui

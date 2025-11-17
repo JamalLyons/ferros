@@ -261,3 +261,32 @@ website-preview:
         echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
         exit 1; \
     fi
+
+# macOS-specific commands
+
+# Sign debugger binary with entitlements (macOS only)
+# Usage: just sign-debugger [BINARY_PATH]
+# Example: just sign-debugger target/debug/ferros
+sign-debugger BINARY_PATH="target/debug/ferros":
+    @echo "🔐 Signing debugger binary with entitlements..."
+    @if [ ! -f "{{BINARY_PATH}}" ]; then \
+        echo "❌ Binary not found: {{BINARY_PATH}}"; \
+        echo "   Build it first with: cargo build"; \
+        exit 1; \
+    fi
+    @if [ ! -f "crates/ferros-core/ferros.entitlements" ]; then \
+        echo "❌ Entitlements file not found: crates/ferros-core/ferros.entitlements"; \
+        exit 1; \
+    fi
+    @codesign --entitlements crates/ferros-core/ferros.entitlements --force --sign - "{{BINARY_PATH}}" || { \
+        echo "❌ Failed to sign binary. Make sure you have a code signing certificate."; \
+        echo "   Create one with: Keychain Access > Certificate Assistant > Create a Certificate"; \
+        exit 1; \
+    }
+    @echo "✅ Binary signed successfully: {{BINARY_PATH}}"
+
+# Build and sign debugger binary (macOS only)
+build-sign:
+    @echo "🔨 Building and signing debugger..."
+    @just build
+    @just sign-debugger target/debug/ferros

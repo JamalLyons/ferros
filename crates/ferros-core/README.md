@@ -21,11 +21,13 @@ To debug processes on macOS, you have two options:
 1. **Launch processes** (recommended): Use `launch()` to spawn processes under debugger control.
    This doesn't require special permissions.
 
-2. **Attach to running processes**: Requires either:
-   - Running with `sudo`
-   - Code signing with the `com.apple.security.cs.debugger` entitlement
+2. **Attach to running processes**: Requires debugging permissions. The simplest way is to run with `sudo`:
+   ```bash
+   sudo ferros attach <pid>
+   ```
    
-   See `ferros.entitlements` for the entitlement file template.
+   Alternatively, you can code sign with entitlements (see `ferros.entitlements`), but this is optional.
+   Most users will find `sudo` to be the simplest approach.
 
 ### Linux
 

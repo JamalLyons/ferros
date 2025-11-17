@@ -144,8 +144,9 @@ impl MacOSDebugger
     /// if debugger.has_debugging_permissions()? {
     ///     println!("✅ Debugging permissions available");
     /// } else {
-    ///     println!("❌ Need sudo or entitlements to debug processes");
-    ///     println!("   Use launch() instead, or run with sudo");
+    ///     println!("❌ Need debugging permissions");
+    ///     println!("   Quick fix: Run with sudo");
+    ///     println!("   Or use launch() to spawn processes (doesn't need permissions)");
     /// }
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
@@ -528,9 +529,12 @@ impl Debugger for MacOSDebugger
                     if process_exists {
                         // Process exists but we got KERN_FAILURE -> permission denied
                         return Err(DebuggerError::PermissionDenied(format!(
-                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This usually means \
-                             insufficient permissions. Try running with sudo.",
-                            pid.0
+                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. \
+                             This means insufficient permissions.\n\n\
+                             Quick fix: Run with sudo:\n  sudo ferros attach {}\n\n\
+                             Alternatively, use launch() to spawn processes under debugger control, \
+                             which doesn't require special permissions.",
+                            pid.0, pid.0
                         )));
                     }
                     // Process doesn't exist -> genuine ProcessNotFound

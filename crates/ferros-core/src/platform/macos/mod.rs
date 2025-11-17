@@ -36,24 +36,31 @@
 //!
 //! Use `launch()` instead of `attach()` to spawn processes under debugger control.
 //! This avoids permission issues because:
-//! - Launching processes doesn't require entitlements
+//! - Launching processes doesn't require special permissions
 //! - The debugger automatically gets control of processes it launches
 //! - Process starts suspended, allowing breakpoints to be set before execution
 //!
 //! ### Option 2: Attach to Running Processes
 //!
-//! To attach to already-running processes, you need one of:
+//! To attach to already-running processes, you need debugging permissions:
 //!
-//! 1. **Run with sudo**: `sudo ferros attach <pid>`
-//!    - Quick but less secure
-//!    - Requires password each time
+//! 1. **Run with sudo** (Simplest):
+//!    ```bash
+//!    sudo ferros attach <pid>
+//!    ```
+//!    - Quick and easy - no setup required
+//!    - Works immediately without code signing
+//!    - Requires password each time (or use `sudo` with NOPASSWD)
 //!
-//! 2. **Code signing with entitlements** (Recommended for development):
+//! 2. **Code signing with entitlements** (Advanced - optional):
 //!    - Create `ferros.entitlements` file (see `crates/ferros-core/ferros.entitlements`)
 //!    - Sign the binary: `codesign --entitlements ferros.entitlements --force --sign - target/debug/ferros`
 //    - The `com.apple.security.cs.debugger` entitlement grants debugging permissions
+//!    - Useful if you want to avoid typing `sudo` repeatedly
 //!
-//! See the `ferros.entitlements` file in this crate for the required entitlement.
+//! **Recommendation**: For most users, running with `sudo` is the simplest approach.
+//! Entitlements are optional and mainly useful for development workflows where you
+//! frequently attach to processes.
 //!
 //! ## Key Mach APIs Used
 //!

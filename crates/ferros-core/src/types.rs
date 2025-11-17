@@ -198,7 +198,7 @@ impl Default for Registers
     }
 }
 
-/// Reason the debuggee is currently stopped (if at all).
+/// Reason the debugger is currently stopped (if at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason
 {

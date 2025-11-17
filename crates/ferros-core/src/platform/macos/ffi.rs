@@ -119,6 +119,35 @@ extern "C" {
     /// special entitlements. For implementation details, see:
     /// - XNU kernel source: [osfmk/kern/task.c](https://github.com/apple-oss-distributions/xnu)
     pub fn task_for_pid(target_task: mach_port_t, pid: c_int, task: *mut mach_port_t) -> kern_return_t;
+
+    /// Deallocate a Mach port
+    ///
+    /// This function releases a Mach port that was previously obtained (e.g., from
+    /// `task_for_pid()`). After deallocation, the port is no longer valid and cannot
+    /// be used for further operations.
+    ///
+    /// ## Parameters
+    ///
+    /// - `target_task`: Task port that owns the port to deallocate (use `mach_task_self()`)
+    /// - `name`: The Mach port to deallocate
+    ///
+    /// ## Returns
+    ///
+    /// - `KERN_SUCCESS` (0) on success
+    /// - `KERN_INVALID_RIGHT` if the port is invalid or already deallocated
+    /// - `KERN_INVALID_TASK` if the target task is invalid
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It can deallocate kernel resources
+    /// - Deallocating an invalid port can cause errors
+    /// - Double-deallocation can cause undefined behavior
+    ///
+    /// ## Documentation
+    ///
+    /// See: [mach_port_deallocate(3) man page](https://developer.apple.com/documentation/kernel/1578777-mach_port_deallocate/)
+    pub fn mach_port_deallocate(target_task: mach_port_t, name: mach_port_t) -> kern_return_t;
 }
 
 // Thread State Functions
@@ -196,13 +225,79 @@ extern "C" {
     /// - Must match the architecture flavor exactly
     ///
     /// See: [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
-    #[allow(dead_code)] // Not yet implemented, but declared for future use
     pub fn thread_set_state(
         target_act: thread_act_t,
         flavor: c_int,
         new_state: *const natural_t,
         new_state_count: mach_msg_type_number_t,
     ) -> kern_return_t;
+
+    /// Suspend a specific thread
+    ///
+    /// This function suspends execution of a single thread within a task. Unlike
+    /// `task_suspend()`, which suspends all threads, this allows fine-grained control
+    /// over individual threads.
+    ///
+    /// ## Parameters
+    ///
+    /// - `target_act`: Thread port (from `task_threads()`) to suspend
+    ///
+    /// ## Returns
+    ///
+    /// - `KERN_SUCCESS` (0) on success
+    /// - `KERN_INVALID_ARGUMENT` if the thread port is invalid
+    /// - `KERN_FAILURE` if the thread cannot be suspended
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It can suspend thread execution
+    /// - Invalid thread ports can cause errors
+    /// - Suspending threads can cause deadlocks if not done carefully
+    ///
+    /// ## Architecture Notes
+    ///
+    /// On ARM64, `thread_suspend()` is the preferred method for per-thread control.
+    /// On Intel, you may need to use `thread_set_state()` with `X86_THREAD_STATE64` flavor
+    /// to coordinate per-thread operations.
+    ///
+    /// ## Documentation
+    ///
+    /// See: [thread_suspend(3) man page](https://developer.apple.com/documentation/kernel/1402804-thread_suspend/)
+    pub fn thread_suspend(target_act: thread_act_t) -> kern_return_t;
+
+    /// Resume a specific thread
+    ///
+    /// This function resumes execution of a single thread within a task. The thread
+    /// will continue from where it was suspended.
+    ///
+    /// ## Parameters
+    ///
+    /// - `target_act`: Thread port (from `task_threads()`) to resume
+    ///
+    /// ## Returns
+    ///
+    /// - `KERN_SUCCESS` (0) on success
+    /// - `KERN_INVALID_ARGUMENT` if the thread port is invalid
+    /// - `KERN_FAILURE` if the thread cannot be resumed
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It can resume thread execution
+    /// - Invalid thread ports can cause errors
+    /// - Resuming threads can cause race conditions if not coordinated properly
+    ///
+    /// ## Architecture Notes
+    ///
+    /// On ARM64, `thread_resume()` is the preferred method for per-thread control.
+    /// On Intel, you may need to use `thread_set_state()` with `X86_THREAD_STATE64` flavor
+    /// to coordinate per-thread operations.
+    ///
+    /// ## Documentation
+    ///
+    /// See: [thread_resume(3) man page](https://developer.apple.com/documentation/kernel/1402805-thread_resume/)
+    pub fn thread_resume(target_act: thread_act_t) -> kern_return_t;
 }
 
 // Virtual Memory Functions

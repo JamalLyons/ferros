@@ -150,7 +150,6 @@ impl MacOSDebugger
     /// }
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    #[allow(unsafe_code)] // Required for task_for_pid() call
     pub fn has_debugging_permissions(&self) -> Result<bool>
     {
         unsafe {
@@ -290,7 +289,12 @@ impl MacOSDebugger
     ///
     /// **Returns**: Array of thread ports. The memory must be freed using `vm_deallocate()`.
     ///
-    /// See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    /// See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1537751-task_threads/)
+    ///
+    /// ## Implementation Notes
+    ///
+    /// - Deallocates old thread ports before getting new ones to prevent port leaks
+    /// - Updates the active thread to the first thread if the current one no longer exists
     ///
     /// ## Errors
     ///
@@ -305,6 +309,11 @@ impl MacOSDebugger
         self.ensure_attached()?;
 
         unsafe {
+            // Deallocate old thread ports before getting new ones to prevent port leaks
+            for thread in &self.threads {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), *thread);
+            }
+
             let mut threads: *mut thread_act_t = std::ptr::null_mut();
             let mut thread_count: mach_msg_type_number_t = 0;
             let result = task_threads(self.task, &mut threads, &mut thread_count);
@@ -318,7 +327,15 @@ impl MacOSDebugger
             let slice = std::slice::from_raw_parts(threads, thread_count as usize);
             self.threads = slice.to_vec();
             Self::deallocate_threads_array(threads, thread_count);
-            self.current_thread = self.threads.first().copied();
+
+            // Update active thread - use first thread if current one no longer exists
+            if let Some(current) = self.current_thread {
+                if !self.threads.contains(&current) {
+                    self.current_thread = self.threads.first().copied();
+                }
+            } else {
+                self.current_thread = self.threads.first().copied();
+            }
         }
 
         Ok(())
@@ -376,7 +393,6 @@ impl Debugger for MacOSDebugger
     /// // Process is now suspended and ready for debugging
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    #[allow(unsafe_code)] // Required for posix_spawn API calls
     fn launch(&mut self, program: &str, args: &[&str]) -> Result<()>
     {
         use std::ffi::CString;
@@ -498,7 +514,6 @@ impl Debugger for MacOSDebugger
     /// - `MachError::InvalidArgument`: Invalid PID
     /// - `MachError::ProcessNotFound`: Process doesn't exist
     /// - `AttachFailed`: Failed to get threads
-    #[allow(unsafe_code)] // Required for Mach API calls (task_for_pid, task_threads)
     fn attach(&mut self, pid: ProcessId) -> Result<()>
     {
         // Use mach2 crate for Mach APIs where available - it's better maintained than libc
@@ -529,11 +544,9 @@ impl Debugger for MacOSDebugger
                     if process_exists {
                         // Process exists but we got KERN_FAILURE -> permission denied
                         return Err(DebuggerError::PermissionDenied(format!(
-                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. \
-                             This means insufficient permissions.\n\n\
-                             Quick fix: Run with sudo:\n  sudo ferros attach {}\n\n\
-                             Alternatively, use launch() to spawn processes under debugger control, \
-                             which doesn't require special permissions.",
+                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This means insufficient \
+                             permissions.\n\nQuick fix: Run with sudo:\n  sudo ferros attach {}\n\nAlternatively, use \
+                             launch() to spawn processes under debugger control, which doesn't require special permissions.",
                             pid.0, pid.0
                         )));
                     }
@@ -577,18 +590,52 @@ impl Debugger for MacOSDebugger
 
     /// Detach from the process
     ///
-    /// On macOS, we don't actually need to do anything - the Mach ports
-    /// are automatically released when the struct is dropped. But we provide
-    /// this method for consistency with other platforms and to allow explicit
-    /// cleanup.
+    /// This function properly releases the Mach ports obtained during attachment.
+    /// It calls `mach_port_deallocate()` to release:
+    /// - The task port (obtained from `task_for_pid()`)
+    /// - All thread ports (obtained from `task_threads()`)
     ///
-    /// ## Note
+    /// ## Mach API: mach_port_deallocate()
     ///
-    /// Unlike Linux's `ptrace`, macOS doesn't have an explicit "detach" operation.
-    /// The task port is just a reference - when we stop using it, the kernel
-    /// automatically cleans it up.
+    /// ```c
+    /// kern_return_t mach_port_deallocate(
+    ///     mach_port_t target_task,  // Task port that owns the port
+    ///     mach_port_t name          // Port to deallocate
+    /// );
+    /// ```
+    ///
+    /// **Returns**: `KERN_SUCCESS` (0) on success, error code otherwise.
+    ///
+    /// See: [mach_port_deallocate documentation](https://developer.apple.com/documentation/kernel/1578777-mach_port_deallocate/)
+    ///
+    /// ## Implementation Notes
+    ///
+    /// - Deallocates the task port first, then all thread ports
+    /// - Errors during deallocation are logged but don't prevent cleanup
+    /// - After detaching, the debugger is in an uninitialized state
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process (no-op)
     fn detach(&mut self) -> Result<()>
     {
+        if !self.attached {
+            return Ok(());
+        }
+
+        unsafe {
+            // Deallocate all thread ports first
+            for thread in &self.threads {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), *thread);
+            }
+
+            // Deallocate the task port
+            if self.task != 0 {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), self.task);
+            }
+        }
+
+        // Clear all state
         self.task = 0;
         self.threads.clear();
         self.current_thread = None;
@@ -596,6 +643,7 @@ impl Debugger for MacOSDebugger
         self.attached = false;
         self.stopped = false;
         self.stop_reason = StopReason::Running;
+
         Ok(())
     }
 
@@ -868,5 +916,157 @@ impl Debugger for MacOSDebugger
     fn refresh_threads(&mut self) -> Result<()>
     {
         self.refresh_thread_list()
+    }
+}
+
+impl MacOSDebugger
+{
+    /// Suspend a specific thread
+    ///
+    /// This function suspends execution of a single thread within the target task.
+    /// Unlike `suspend()`, which suspends all threads, this allows fine-grained control
+    /// over individual threads.
+    ///
+    /// ## Mach API: thread_suspend()
+    ///
+    /// ```c
+    /// kern_return_t thread_suspend(thread_act_t target_act);
+    /// ```
+    ///
+    /// **Parameters**:
+    /// - `target_act`: Thread port (from `task_threads()`) to suspend
+    ///
+    /// **Returns**: `KERN_SUCCESS` (0) on success, error code otherwise.
+    ///
+    /// See: [thread_suspend documentation](https://developer.apple.com/documentation/kernel/1418833-thread_suspend/)
+    ///
+    /// ## Architecture Notes
+    ///
+    /// - **ARM64**: `thread_suspend()` is the preferred method for per-thread control
+    /// - **Intel**: You may need to use `thread_set_state()` with `X86_THREAD_STATE64` flavor
+    ///   to coordinate per-thread operations (not yet implemented)
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process
+    /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
+    /// - `SuspendFailed`: `thread_suspend()` failed
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::types::ThreadId;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let threads = debugger.threads()?;
+    /// if let Some(thread) = threads.first() {
+    ///     debugger.suspend_thread(*thread)?;
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    #[allow(unsafe_code)] // Required for thread_suspend() call
+    pub fn suspend_thread(&mut self, thread_id: ThreadId) -> Result<()>
+    {
+        self.ensure_attached()?;
+
+        let thread_port = thread_id.raw() as thread_act_t;
+        if !self.threads.contains(&thread_port) {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Thread {} is not part of process {}",
+                thread_id.raw(),
+                self.pid.0
+            )));
+        }
+
+        unsafe {
+            let result = ffi::thread_suspend(thread_port);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::SuspendFailed(format!(
+                    "thread_suspend failed for thread {}: {}",
+                    thread_id.raw(),
+                    result
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resume a specific thread
+    ///
+    /// This function resumes execution of a single thread within the target task.
+    /// The thread will continue from where it was suspended.
+    ///
+    /// ## Mach API: thread_resume()
+    ///
+    /// ```c
+    /// kern_return_t thread_resume(thread_act_t target_act);
+    /// ```
+    ///
+    /// **Parameters**:
+    /// - `target_act`: Thread port (from `task_threads()`) to resume
+    ///
+    /// **Returns**: `KERN_SUCCESS` (0) on success, error code otherwise.
+    ///
+    /// See: [thread_resume documentation](https://developer.apple.com/documentation/kernel/1418926-thread_resume/)
+    ///
+    /// ## Architecture Notes
+    ///
+    /// - **ARM64**: `thread_resume()` is the preferred method for per-thread control
+    /// - **Intel**: You may need to use `thread_set_state()` with `X86_THREAD_STATE64` flavor
+    ///   to coordinate per-thread operations (not yet implemented)
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process
+    /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
+    /// - `ResumeFailed`: `thread_resume()` failed
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::types::ThreadId;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let threads = debugger.threads()?;
+    /// if let Some(thread) = threads.first() {
+    ///     debugger.suspend_thread(*thread)?;
+    ///     // ... inspect thread state ...
+    ///     debugger.resume_thread(*thread)?;
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    #[allow(unsafe_code)] // Required for thread_resume() call
+    pub fn resume_thread(&mut self, thread_id: ThreadId) -> Result<()>
+    {
+        self.ensure_attached()?;
+
+        let thread_port = thread_id.raw() as thread_act_t;
+        if !self.threads.contains(&thread_port) {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Thread {} is not part of process {}",
+                thread_id.raw(),
+                self.pid.0
+            )));
+        }
+
+        unsafe {
+            let result = ffi::thread_resume(thread_port);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::ResumeFailed(format!(
+                    "thread_resume failed for thread {}: {}",
+                    thread_id.raw(),
+                    result
+                )));
+            }
+        }
+
+        Ok(())
     }
 }

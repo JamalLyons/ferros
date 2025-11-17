@@ -253,14 +253,14 @@ mod macos_impl
         println!("===================");
 
         // Special registers (same on all architectures)
-        println!("PC (Program Counter):      0x{:016x}", regs.pc);
-        println!("SP (Stack Pointer):       0x{:016x}", regs.sp);
-        println!("FP (Frame Pointer):      0x{:016x}", regs.fp);
+        println!("PC (Program Counter):      {}", regs.pc);
+        println!("SP (Stack Pointer):       {}", regs.sp);
+        println!("FP (Frame Pointer):      {}", regs.fp);
         println!("Status Register:          0x{:016x}", regs.status);
         println!();
 
         // General-purpose registers
-        // On ARM64, these are X0-X15
+        // On ARM64, these are X0-X30
         // On x86-64, these would be RAX, RBX, RCX, RDX, RSI, RDI, R8-R15
         println!("General-Purpose Registers:");
         for (i, value) in regs.general.iter().enumerate() {
@@ -271,8 +271,7 @@ mod macos_impl
             #[cfg(target_arch = "x86_64")]
             {
                 let names = [
-                    "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12", "R13", "R14",
-                    "R15",
+                    "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15",
                 ];
                 if i < names.len() {
                     println!("  {}:                      0x{:016x}", names[i], value);

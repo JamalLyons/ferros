@@ -25,7 +25,7 @@
 //! - **Explicit**: Clear about what they do and when they can fail
 
 use crate::error::Result;
-use crate::types::{Architecture, ProcessId, Registers, StopReason, ThreadId};
+use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
 
 /// Main debugger interface
 ///
@@ -69,7 +69,7 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::platform::macos::MacOSDebugger;
-    /// use ferros_core::types::ProcessId;
+    /// use ferros_core::types::{Address, ProcessId};
     /// use ferros_core::Debugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
@@ -119,7 +119,7 @@ pub trait Debugger
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// let regs = debugger.read_registers()?;
-    /// println!("Program counter: 0x{:x}", regs.pc);
+    /// println!("Program counter: {}", regs.pc);
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
     fn read_registers(&self) -> Result<Registers>;
@@ -165,15 +165,15 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::Debugger;
+    /// use ferros_core::{Address, Debugger};
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-    /// let data = debugger.read_memory(0x1000, 16)?;
+    /// let data = debugger.read_memory(Address::from(0x1000), 16)?;
     /// println!("Read {} bytes: {:?}", data.len(), data);
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>;
+    fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>;
 
     /// Write memory to the target process
     ///
@@ -201,15 +201,16 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::types::Address;
     /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let data = vec![0x41, 0x42, 0x43, 0x44];
-    /// debugger.write_memory(0x1000, &data)?;
+    /// debugger.write_memory(Address::from(0x1000), &data)?;
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize>;
+    fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>;
 
     /// Get memory regions for the attached process
     ///
@@ -240,7 +241,7 @@ pub trait Debugger
     /// let regions = debugger.get_memory_regions()?;
     /// for region in regions {
     ///     println!(
-    ///         "{:016x}-{:016x} {} {:?}",
+    ///         "{}-{} {} {:?}",
     ///         region.start, region.end, region.permissions, region.name
     ///     );
     /// }
@@ -248,34 +249,310 @@ pub trait Debugger
     /// ```
     fn get_memory_regions(&self) -> Result<Vec<crate::types::MemoryRegion>>;
 
-    /// CPU architecture of the debug target.
+    /// Get the CPU architecture of the debug target
+    ///
+    /// Returns the architecture of the process being debugged. This is typically
+    /// determined when attaching to the process, though some platforms may detect
+    /// it earlier.
+    ///
+    /// ## Platform-Specific Behavior
+    ///
+    /// - **macOS**: Uses the architecture of the debugger binary as a hint, but
+    ///   the actual target process architecture may differ (e.g., debugging x86-64
+    ///   process from ARM64 debugger)
+    /// - **Linux**: Detected from `/proc/[pid]/exe` or ELF headers
+    /// - **Windows**: Detected from PE headers
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::types::Architecture;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// match debugger.architecture() {
+    ///     Architecture::Arm64 => println!("Debugging ARM64 process"),
+    ///     Architecture::X86_64 => println!("Debugging x86-64 process"),
+    ///     Architecture::Unknown(name) => println!("Unknown architecture: {}", name),
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn architecture(&self) -> Architecture;
 
-    /// Whether the debugger is currently attached to a process.
+    /// Check whether the debugger is currently attached to a process
+    ///
+    /// Returns `true` if `attach()` has been called successfully and the debugger
+    /// is still connected to the target process. Returns `false` if:
+    /// - The debugger was never attached
+    /// - The debugger was detached via `detach()`
+    /// - The target process has exited
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// if !debugger.is_attached() {
+    ///     debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn is_attached(&self) -> bool;
 
-    /// Whether the debuggee is currently stopped/suspended.
+    /// Check whether the debuggee is currently stopped/suspended
+    ///
+    /// Returns `true` if the target process is currently stopped (suspended,
+    /// hit a breakpoint, received a signal, etc.). Returns `false` if the process
+    /// is running.
+    ///
+    /// ## Relationship to `stop_reason()`
+    ///
+    /// - `is_stopped() == true` → `stop_reason()` is not `StopReason::Running`
+    /// - `is_stopped() == false` → `stop_reason()` is `StopReason::Running`
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// if debugger.is_stopped() {
+    ///     println!("Process is stopped, can inspect registers/memory");
+    /// } else {
+    ///     println!("Process is running");
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn is_stopped(&self) -> bool;
 
-    /// Most recent stop reason.
+    /// Get the most recent stop reason
+    ///
+    /// Returns the reason why the process is currently stopped (if at all).
+    /// This can be used to determine what action to take next:
+    ///
+    /// - `StopReason::Running`: Process is running (not stopped)
+    /// - `StopReason::Suspended`: Process was explicitly suspended
+    /// - `StopReason::Signal(n)`: Process received a signal
+    /// - `StopReason::Breakpoint(addr)`: Process hit a breakpoint
+    /// - `StopReason::Exited(code)`: Process has exited
+    /// - `StopReason::Unknown`: Unknown reason
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::types::StopReason;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// match debugger.stop_reason() {
+    ///     StopReason::Breakpoint(addr) => {
+    ///         println!("Hit breakpoint at 0x{:x}", addr);
+    ///         // Inspect registers, memory, etc.
+    ///     }
+    ///     StopReason::Signal(sig) => {
+    ///         println!("Stopped by signal: {}", sig);
+    ///     }
+    ///     _ => {}
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn stop_reason(&self) -> StopReason;
 
-    /// Suspend execution of the target process.
+    /// Suspend execution of the target process
+    ///
+    /// Stops the target process from executing. After calling this, the process
+    /// will be in a stopped state and you can safely inspect its registers,
+    /// memory, and other state without it changing.
+    ///
+    /// ## Platform-Specific Behavior
+    ///
+    /// - **macOS**: Calls `task_suspend()` to suspend the Mach task
+    ///   - See: [task_suspend documentation](https://developer.apple.com/documentation/kernel/1402800-task_suspend)
+    /// - **Linux**: Will use `ptrace(PTRACE_INTERRUPT)` or `kill(pid, SIGSTOP)`
+    /// - **Windows**: Will use `SuspendThread()` for each thread
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `Io`: Failed to suspend the process (e.g., process already exited)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// debugger.suspend()?;
+    /// // Now safe to inspect process state
+    /// let regs = debugger.read_registers()?;
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn suspend(&mut self) -> Result<()>;
 
-    /// Resume execution after being stopped.
+    /// Resume execution after being stopped
+    ///
+    /// Resumes execution of the target process. The process will continue running
+    /// from where it was stopped (unless registers were modified).
+    ///
+    /// ## Platform-Specific Behavior
+    ///
+    /// - **macOS**: Calls `task_resume()` to resume the Mach task
+    ///   - See: [task_resume documentation](https://developer.apple.com/documentation/kernel/1402801-task_resume)
+    /// - **Linux**: Will use `ptrace(PTRACE_CONT)` to continue execution
+    /// - **Windows**: Will use `ResumeThread()` for each thread
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `Io`: Failed to resume the process (e.g., process already exited)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// debugger.suspend()?;
+    /// // ... inspect process state ...
+    /// debugger.resume()?; // Continue execution
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn resume(&mut self) -> Result<()>;
 
-    /// List available threads in the target process.
+    /// List all available threads in the target process
+    ///
+    /// Returns a vector of `ThreadId` values representing all threads currently
+    /// in the target process. This list is cached and may become stale if threads
+    /// are created or destroyed. Call `refresh_threads()` to update it.
+    ///
+    /// ## Platform-Specific Behavior
+    ///
+    /// - **macOS**: Returns thread ports from `task_threads()`
+    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    /// - **Linux**: Will parse `/proc/[pid]/task/` directory
+    /// - **Windows**: Will use `CreateToolhelp32Snapshot()` with `TH32CS_SNAPTHREAD`
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `Io`: Failed to enumerate threads
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let threads = debugger.threads()?;
+    /// println!("Process has {} threads", threads.len());
+    /// for thread in threads {
+    ///     println!("Thread: {}", thread.raw());
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn threads(&self) -> Result<Vec<ThreadId>>;
 
-    /// Currently selected thread (if any).
+    /// Get the currently selected active thread (if any)
+    ///
+    /// Returns `Some(thread_id)` if an active thread has been selected via
+    /// `set_active_thread()`, or `None` if no thread is selected. The active
+    /// thread is used for register operations (`read_registers()`, `write_registers()`).
+    ///
+    /// ## Default Behavior
+    ///
+    /// When attaching to a process, the first thread (typically the main thread)
+    /// is automatically selected as the active thread.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// if let Some(thread) = debugger.active_thread() {
+    ///     println!("Active thread: {}", thread.raw());
+    /// } else {
+    ///     println!("No active thread selected");
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn active_thread(&self) -> Option<ThreadId>;
 
-    /// Select the active thread that subsequent operations should target.
+    /// Select the active thread that subsequent operations should target
+    ///
+    /// Sets the active thread for register operations. After calling this, `read_registers()`
+    /// and `write_registers()` will operate on the specified thread.
+    ///
+    /// ## Parameters
+    ///
+    /// - `thread`: The thread ID to make active. Must be a valid thread from `threads()`.
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `InvalidArgument`: The thread ID is not valid (not in the thread list)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let threads = debugger.threads()?;
+    /// if let Some(thread) = threads.get(1) {
+    ///     debugger.set_active_thread(*thread)?;
+    ///     // Now read_registers() will read from thread 1
+    ///     let regs = debugger.read_registers()?;
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>;
 
-    /// Refresh the thread list from the operating system.
+    /// Refresh the thread list from the operating system
+    ///
+    /// Updates the cached thread list by querying the operating system for the
+    /// current set of threads in the target process. This should be called if:
+    /// - Threads may have been created or destroyed since the last call
+    /// - You need up-to-date thread information
+    ///
+    /// ## Note
+    ///
+    /// The active thread is preserved if it still exists. If the active thread
+    /// has exited, the first thread in the new list becomes the active thread.
+    ///
+    /// ## Platform-Specific Behavior
+    ///
+    /// - **macOS**: Calls `task_threads()` to refresh the thread list
+    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    /// - **Linux**: Will re-read `/proc/[pid]/task/` directory
+    /// - **Windows**: Will use `CreateToolhelp32Snapshot()` again
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `Io`: Failed to enumerate threads
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// // Thread list may be stale
+    /// debugger.refresh_threads()?; // Update thread list
+    /// let threads = debugger.threads()?; // Now up-to-date
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn refresh_threads(&mut self) -> Result<()>;
 
     // Future methods (commented out until implemented):

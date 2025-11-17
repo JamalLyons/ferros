@@ -20,7 +20,6 @@
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 //! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
-use std::convert::TryInto;
 use std::mem;
 
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t, vm_address_t, vm_size_t};
@@ -39,7 +38,7 @@ use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memo
 use crate::platform::macos::registers::read_registers_arm64;
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::read_registers_x86_64;
-use crate::types::{Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
+use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
 
 /// macOS debugger implementation using Mach APIs
 ///
@@ -118,6 +117,27 @@ impl MacOSDebugger
         })
     }
 
+    /// Ensure that the debugger is attached to a process
+    ///
+    /// This is an internal helper method that checks if the debugger is currently
+    /// attached. It returns an error if not attached, allowing methods to fail early
+    /// with a clear error message.
+    ///
+    /// ## Errors
+    ///
+    /// Returns `AttachFailed` if:
+    /// - The debugger was never attached (`attached == false`)
+    /// - The task port is invalid (`task == 0`)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// # use ferros_core::platform::macos::MacOSDebugger;
+    /// # let debugger = MacOSDebugger::new()?;
+    /// // This would fail if not attached
+    /// debugger.ensure_attached()?;
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
     fn ensure_attached(&self) -> Result<()>
     {
         if !self.attached || self.task == 0 {
@@ -126,15 +146,46 @@ impl MacOSDebugger
         Ok(())
     }
 
+    /// Get the Mach thread port for the currently active thread
+    ///
+    /// This is an internal helper method that returns the `thread_act_t` (Mach thread port)
+    /// for the active thread. It's used by register operations to know which thread
+    /// to read/write registers from.
+    ///
+    /// ## Errors
+    ///
+    /// Returns `InvalidArgument` if no active thread has been selected.
+    ///
+    /// ## See Also
+    ///
+    /// - `active_thread()`: Public API to get the active thread ID
+    /// - `set_active_thread()`: Public API to set the active thread
     fn active_thread_port(&self) -> Result<thread_act_t>
     {
         self.current_thread
             .ok_or_else(|| DebuggerError::InvalidArgument("No active thread selected".to_string()))
     }
 
+    /// Set the active thread using a Mach thread port
+    ///
+    /// This is an internal helper method that sets the active thread using a raw
+    /// `thread_act_t` (Mach thread port). It validates that the thread belongs
+    /// to the current process before setting it as active.
+    ///
+    /// ## Parameters
+    ///
+    /// - `port`: The Mach thread port (`thread_act_t`) to make active
+    ///
+    /// ## Errors
+    ///
+    /// Returns `InvalidArgument` if the thread port is not in the current thread list.
+    ///
+    /// ## See Also
+    ///
+    /// - `set_active_thread()`: Public API that takes a `ThreadId` instead
     fn set_active_thread_by_port(&mut self, port: thread_act_t) -> Result<()>
     {
-        if self.threads.iter().any(|&t| t == port) {
+        if self.threads.contains(&port) {
             self.current_thread = Some(port);
             Ok(())
         } else {
@@ -145,6 +196,26 @@ impl MacOSDebugger
         }
     }
 
+    /// Deallocate memory allocated by `task_threads()`
+    ///
+    /// This is an internal helper method that frees the memory allocated by the
+    /// Mach API `task_threads()`. The Mach API allocates memory for the thread
+    /// array that must be freed using `vm_deallocate()`.
+    ///
+    /// ## Parameters
+    ///
+    /// - `threads`: Pointer to the thread array allocated by `task_threads()`
+    /// - `count`: Number of threads in the array
+    ///
+    /// ## Safety
+    ///
+    /// This function is safe to call with any pointer and count. It checks for null
+    /// pointers and zero counts before attempting to deallocate.
+    ///
+    /// ## Mach API
+    ///
+    /// Uses `vm_deallocate()` to free the memory:
+    /// - See: [vm_deallocate documentation](https://developer.apple.com/documentation/kernel/1585284-vm_deallocate/)
     fn deallocate_threads_array(threads: *mut thread_act_t, count: mach_msg_type_number_t)
     {
         if threads.is_null() || count == 0 {
@@ -157,6 +228,36 @@ impl MacOSDebugger
         }
     }
 
+    /// Refresh the thread list from the operating system
+    ///
+    /// This is an internal helper method that updates the cached thread list by
+    /// calling `task_threads()` to get the current set of threads in the target
+    /// process. It also updates the active thread if the current one no longer exists.
+    ///
+    /// ## Mach API: task_threads()
+    ///
+    /// ```c
+    /// kern_return_t task_threads(
+    ///     task_t target_task,           // Task port from task_for_pid()
+    ///     thread_act_array_t *act_list, // Output: array of thread ports
+    ///     mach_msg_type_number_t *count // Output: number of threads
+    /// );
+    /// ```
+    ///
+    /// **Returns**: Array of thread ports. The memory must be freed using `vm_deallocate()`.
+    ///
+    /// See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    ///
+    /// ## Errors
+    ///
+    /// Returns `AttachFailed` if:
+    /// - Not attached to a process
+    /// - `task_threads()` fails
+    /// - No threads found in the process
+    ///
+    /// ## See Also
+    ///
+    /// - `refresh_threads()`: Public API that calls this method
     fn refresh_thread_list(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
@@ -394,7 +495,7 @@ impl Debugger for MacOSDebugger
     /// Read memory from the target process
     ///
     /// Uses `vm_read()` to read memory from the Mach task.
-    fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>
+    fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>
     {
         self.ensure_attached()?;
         read_memory(self.task, addr, len)
@@ -403,7 +504,7 @@ impl Debugger for MacOSDebugger
     /// Write memory to the target process
     ///
     /// Uses `vm_write()` to write memory to the Mach task.
-    fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize>
+    fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>
     {
         self.ensure_attached()?;
         write_memory(self.task, addr, data)
@@ -438,6 +539,33 @@ impl Debugger for MacOSDebugger
         self.stop_reason
     }
 
+    /// Suspend execution of the target process using Mach APIs
+    ///
+    /// Calls `task_suspend()` to suspend the Mach task. This stops all threads
+    /// in the process, allowing safe inspection of registers and memory.
+    ///
+    /// ## Mach API: task_suspend()
+    ///
+    /// ```c
+    /// kern_return_t task_suspend(task_t target_task);
+    /// ```
+    ///
+    /// **Parameters**:
+    /// - `target_task`: Task port from `task_for_pid()`
+    ///
+    /// **Returns**: `KERN_SUCCESS` (0) on success, error code otherwise.
+    ///
+    /// See: [task_suspend documentation](https://developer.apple.com/documentation/kernel/1402800-task_suspend)
+    ///
+    /// ## Implementation Notes
+    ///
+    /// - If the process is already stopped, this is a no-op
+    /// - Updates internal state (`stopped`, `stop_reason`) after successful suspension
+    /// - All threads in the task are suspended atomically
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process, or `task_suspend()` failed
     fn suspend(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
@@ -457,6 +585,33 @@ impl Debugger for MacOSDebugger
         Ok(())
     }
 
+    /// Resume execution of the target process using Mach APIs
+    ///
+    /// Calls `task_resume()` to resume the Mach task. This resumes all threads
+    /// in the process, allowing it to continue execution.
+    ///
+    /// ## Mach API: task_resume()
+    ///
+    /// ```c
+    /// kern_return_t task_resume(task_t target_task);
+    /// ```
+    ///
+    /// **Parameters**:
+    /// - `target_task`: Task port from `task_for_pid()`
+    ///
+    /// **Returns**: `KERN_SUCCESS` (0) on success, error code otherwise.
+    ///
+    /// See: [task_resume documentation](https://developer.apple.com/documentation/kernel/1402801-task_resume)
+    ///
+    /// ## Implementation Notes
+    ///
+    /// - If the process is already running, this is a no-op
+    /// - Updates internal state (`stopped`, `stop_reason`) after successful resume
+    /// - All threads in the task are resumed atomically
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process, or `task_resume()` failed
     fn resume(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
@@ -476,26 +631,64 @@ impl Debugger for MacOSDebugger
         Ok(())
     }
 
+    /// List all threads in the target process
+    ///
+    /// Returns the cached thread list as `ThreadId` values. The list is maintained
+    /// internally and updated when `refresh_threads()` is called.
+    ///
+    /// ## Thread List Caching
+    ///
+    /// The thread list is cached for performance. It's updated:
+    /// - When `attach()` is called (initial enumeration)
+    /// - When `refresh_threads()` is called (manual refresh)
+    ///
+    /// If threads are created or destroyed, call `refresh_threads()` to update the list.
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
     fn threads(&self) -> Result<Vec<ThreadId>>
     {
         self.ensure_attached()?;
         Ok(self.threads.iter().copied().map(|t| ThreadId::from(t as u64)).collect())
     }
 
+    /// Get the currently active thread
+    ///
+    /// Returns `Some(thread_id)` if an active thread has been selected, or `None`
+    /// if no thread is active. The active thread is used for register operations.
+    ///
+    /// ## Default Behavior
+    ///
+    /// When attaching to a process, the first thread (typically the main thread)
+    /// is automatically selected as the active thread.
     fn active_thread(&self) -> Option<ThreadId>
     {
         self.current_thread.map(|t| ThreadId::from(t as u64))
     }
 
+    /// Set the active thread for register operations
+    ///
+    /// Sets the active thread by converting the `ThreadId` to a Mach thread port
+    /// and calling `set_active_thread_by_port()`.
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process
+    /// - `InvalidArgument`: The thread ID is not valid (not in the thread list)
     fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>
     {
-        let port = thread
-            .raw()
-            .try_into()
-            .map_err(|_| DebuggerError::InvalidArgument(format!("Invalid thread id {}", thread.raw())))?;
-        self.set_active_thread_by_port(port)
+        self.set_active_thread_by_port(thread.raw() as thread_act_t)
     }
 
+    /// Refresh the thread list from the operating system
+    ///
+    /// Updates the cached thread list by calling `refresh_thread_list()`, which
+    /// queries the operating system for the current set of threads.
+    ///
+    /// ## Errors
+    ///
+    /// - `AttachFailed`: Not attached to a process, or `task_threads()` failed
     fn refresh_threads(&mut self) -> Result<()>
     {
         self.refresh_thread_list()

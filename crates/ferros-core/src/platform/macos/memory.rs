@@ -16,7 +16,7 @@ use crate::platform::macos::ffi;
 const VM_REGION_BASIC_INFO: c_int = 9;
 
 use crate::error::{DebuggerError, Result};
-use crate::types::MemoryRegion;
+use crate::types::{Address, MemoryRegion, MemoryRegionId};
 
 /// Read memory from a Mach task
 ///
@@ -60,7 +60,7 @@ use crate::types::MemoryRegion;
 /// ```
 ///
 /// See: [vm_read(3) man page](https://developer.apple.com/documentation/kernel/1585350-vm_read/)
-pub fn read_memory(task: mach_port_t, addr: u64, len: usize) -> Result<Vec<u8>>
+pub fn read_memory(task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u8>>
 {
     unsafe {
         let mut data: vm_offset_t = 0;
@@ -68,7 +68,7 @@ pub fn read_memory(task: mach_port_t, addr: u64, len: usize) -> Result<Vec<u8>>
 
         let result = ffi::vm_read(
             task as vm_map_t,
-            addr as vm_address_t,
+            addr.value() as vm_address_t,
             len as vm_size_t,
             &mut data,
             &mut data_count,
@@ -142,12 +142,12 @@ pub fn read_memory(task: mach_port_t, addr: u64, len: usize) -> Result<Vec<u8>>
 /// ```
 ///
 /// See: [vm_write(3) man page](https://developer.apple.com/documentation/kernel/1585462-vm_write/)
-pub fn write_memory(task: mach_port_t, addr: u64, data: &[u8]) -> Result<usize>
+pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usize>
 {
     unsafe {
         let result = ffi::vm_write(
             task as vm_map_t,
-            addr as vm_address_t,
+            addr.value() as vm_address_t,
             data.as_ptr() as vm_offset_t,
             data.len() as mach_msg_type_number_t,
         );
@@ -203,6 +203,7 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
 {
     let mut regions = Vec::new();
     let mut address: u64 = 0;
+    let mut region_id = 0usize;
 
     unsafe {
         loop {
@@ -253,11 +254,13 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
             // Note: macOS's mach_vm_region doesn't easily provide region names
             // (like "[heap]" or "[stack]"), so we leave it as None
             regions.push(MemoryRegion::new(
-                address,
-                address + size,
+                MemoryRegionId(region_id),
+                Address::from(address),
+                Address::from(address + size),
                 perms,
                 None, // macOS mach_vm_region doesn't provide names easily
             ));
+            region_id += 1;
 
             // Move to the next memory region
             // The next region starts right after this one ends

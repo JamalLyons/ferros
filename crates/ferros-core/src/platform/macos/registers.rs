@@ -27,7 +27,7 @@ use mach2::kern_return::KERN_SUCCESS;
 
 use crate::error::{DebuggerError, Result};
 use crate::platform::macos::ffi;
-use crate::types::Registers;
+use crate::types::{Address, Architecture, Registers};
 
 /// Read ARM64 registers from a thread
 ///
@@ -128,9 +128,9 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
         // - high = state_words[1]
         // - x0 = low | (high << 32)
         let read_u64 = |idx: usize| -> u64 {
-            let low = state_words[idx * 2] as u64;
-            let high = state_words[idx * 2 + 1] as u64;
-            low | (high << 32)
+            let low = state_words[idx * 2];
+            let high = state_words[idx * 2 + 1];
+            (low as u64) | ((high as u64) << 32)
         };
 
         // Parse the register values from the state array
@@ -142,28 +142,27 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
         // - Index 32: PC (program counter)
         // - Index 33: CPSR (status register) - but only first u32 is used, second is padding
         let mut regs = Registers::new();
+        regs.set_architecture(Architecture::Arm64);
 
         // Program Counter: Points to the next instruction to execute
         // This is at index 32 in the state array
-        regs.pc = read_u64(32);
+        regs.pc = Address::from(read_u64(32));
 
         // Stack Pointer: Points to the top of the stack
         // This is at index 31
-        regs.sp = read_u64(31);
+        regs.sp = Address::from(read_u64(31));
 
         // Frame Pointer: Points to the current stack frame
         // This is X29, at index 29
-        regs.fp = read_u64(29);
+        regs.fp = Address::from(read_u64(29));
 
         // CPSR (Current Program Status Register): Contains flags
         // This is a u32 at index 66 (33 * 2), not a u64
         // The second u32 at index 67 is padding
         regs.status = state_words[66] as u64;
 
-        // General-purpose registers: X0-X15
-        // These are the first 16 general-purpose registers, commonly used for
-        // function arguments (X0-X7) and local variables
-        regs.general = (0..16).map(read_u64).collect();
+        // General-purpose registers: X0-X30
+        regs.general = (0..=30).map(read_u64).collect();
 
         Ok(regs)
     }
@@ -226,9 +225,10 @@ pub fn read_registers_x86_64(thread: thread_act_t) -> Result<Registers>
         }
 
         let mut regs = Registers::new();
-        regs.pc = state.rip;
-        regs.sp = state.rsp;
-        regs.fp = state.rbp;
+        regs.set_architecture(Architecture::X86_64);
+        regs.pc = Address::from(state.rip);
+        regs.sp = Address::from(state.rsp);
+        regs.fp = Address::from(state.rbp);
         regs.status = state.rflags;
         regs.general = vec![
             state.rax, state.rbx, state.rcx, state.rdx, state.rsi, state.rdi, state.r8, state.r9, state.r10, state.r11,

@@ -33,7 +33,7 @@ mod macos_impl
     use std::process;
 
     use ferros_core::platform::macos::MacOSDebugger;
-    use ferros_core::types::ProcessId;
+    use ferros_core::types::{Address, ProcessId};
     use ferros_core::Debugger;
 
     pub fn main()
@@ -56,12 +56,13 @@ mod macos_impl
             }
         };
 
-        let var_addr: Option<u64> = args.get(2).and_then(|s| {
-            if let Some(stripped) = s.strip_prefix("0x") {
+        let var_addr: Option<Address> = args.get(2).and_then(|s| {
+            let value = if let Some(stripped) = s.strip_prefix("0x") {
                 u64::from_str_radix(stripped, 16).ok()
             } else {
                 s.parse().ok()
-            }
+            }?;
+            Some(Address::from(value))
         });
 
         println!("🔍 Ferros Memory Inspector");
@@ -80,7 +81,7 @@ mod macos_impl
         }
     }
 
-    fn inspect_memory(pid: u32, var_addr: Option<u64>) -> Result<(), ferros_core::error::DebuggerError>
+    fn inspect_memory(pid: u32, var_addr: Option<Address>) -> Result<(), ferros_core::error::DebuggerError>
     {
         let mut debugger = MacOSDebugger::new()?;
         debugger.attach(ProcessId::from(pid))?;
@@ -92,7 +93,7 @@ mod macos_impl
         let regions = debugger.get_memory_regions()?;
         for (i, region) in regions.iter().take(10).enumerate() {
             println!(
-                "{:2}. {:016x}-{:016x} {} ({} bytes) {:?}",
+                "{:2}. {}-{} {} ({} bytes) {:?}",
                 i + 1,
                 region.start,
                 region.end,
@@ -108,7 +109,7 @@ mod macos_impl
 
         // Task 1.2.2: Read memory
         if let Some(addr) = var_addr {
-            println!("📖 Reading memory at 0x{:016x}:", addr);
+            println!("📖 Reading memory at {}:", addr);
             let data = debugger.read_memory(addr, 8)?; // Read 8 bytes (u64)
             println!("   Raw bytes: {:?}", data);
 
@@ -130,7 +131,7 @@ mod macos_impl
             let new_value: u64 = 0xCAFEBABEDEADBEEF;
             let new_bytes = new_value.to_le_bytes();
             debugger.write_memory(addr, &new_bytes)?;
-            println!("   Wrote 0x{:016x} to address 0x{:016x}", new_value, addr);
+            println!("   Wrote 0x{:016x} to address {}", new_value, addr);
 
             // Verify the write
             let verify_data = debugger.read_memory(addr, 8)?;

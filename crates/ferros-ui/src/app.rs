@@ -174,20 +174,32 @@ impl App
             ViewMode::Registers => {
                 let i = self.registers_state.selected().unwrap_or(0);
                 let max = self.get_register_count().saturating_sub(1);
-                self.registers_state.select(Some(i.saturating_sub(1).min(max)));
+                if max == 0 {
+                    return;
+                }
+                let next = if i == 0 { max } else { i - 1 };
+                self.registers_state.select(Some(next));
             }
             ViewMode::Threads => {
                 let i = self.threads_state.selected().unwrap_or(0);
                 if let Ok(threads) = self.debugger.threads() {
                     let max = threads.len().saturating_sub(1);
-                    self.threads_state.select(Some(i.saturating_sub(1).min(max)));
+                    if max == 0 {
+                        return;
+                    }
+                    let next = if i == 0 { max } else { i - 1 };
+                    self.threads_state.select(Some(next));
                 }
             }
             ViewMode::MemoryRegions => {
                 let i = self.memory_regions_state.selected().unwrap_or(0);
                 if let Ok(regions) = self.debugger.get_memory_regions() {
                     let max = regions.len().saturating_sub(1);
-                    self.memory_regions_state.select(Some(i.saturating_sub(1).min(max)));
+                    if max == 0 {
+                        return;
+                    }
+                    let next = if i == 0 { max } else { i - 1 };
+                    self.memory_regions_state.select(Some(next));
                 }
             }
             ViewMode::Overview | ViewMode::Output => {}
@@ -201,20 +213,32 @@ impl App
             ViewMode::Registers => {
                 let i = self.registers_state.selected().unwrap_or(0);
                 let max = self.get_register_count().saturating_sub(1);
-                self.registers_state.select(Some((i + 1).min(max)));
+                if max == 0 {
+                    return;
+                }
+                let next = if i >= max { 0 } else { i + 1 };
+                self.registers_state.select(Some(next));
             }
             ViewMode::Threads => {
                 let i = self.threads_state.selected().unwrap_or(0);
                 if let Ok(threads) = self.debugger.threads() {
                     let max = threads.len().saturating_sub(1);
-                    self.threads_state.select(Some((i + 1).min(max)));
+                    if max == 0 {
+                        return;
+                    }
+                    let next = if i >= max { 0 } else { i + 1 };
+                    self.threads_state.select(Some(next));
                 }
             }
             ViewMode::MemoryRegions => {
                 let i = self.memory_regions_state.selected().unwrap_or(0);
                 if let Ok(regions) = self.debugger.get_memory_regions() {
                     let max = regions.len().saturating_sub(1);
-                    self.memory_regions_state.select(Some((i + 1).min(max)));
+                    if max == 0 {
+                        return;
+                    }
+                    let next = if i >= max { 0 } else { i + 1 };
+                    self.memory_regions_state.select(Some(next));
                 }
             }
             ViewMode::Overview | ViewMode::Output => {}

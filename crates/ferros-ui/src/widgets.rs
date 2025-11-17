@@ -9,6 +9,24 @@ use ratatui::Frame;
 
 use crate::app::App;
 
+/// Format a memory size in bytes to a human-readable string (KB, MB, or GB)
+fn format_memory_size(size_bytes: u64) -> String
+{
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if size_bytes >= GB {
+        format!("{:.2} GB", size_bytes as f64 / GB as f64)
+    } else if size_bytes >= MB {
+        format!("{:.2} MB", size_bytes as f64 / MB as f64)
+    } else if size_bytes >= KB {
+        format!("{:.2} KB", size_bytes as f64 / KB as f64)
+    } else {
+        format!("{size_bytes} B")
+    }
+}
+
 /// Draw the overview screen
 pub fn draw_overview(frame: &mut Frame, area: Rect, app: &App)
 {
@@ -258,12 +276,12 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
     let rows: Vec<Row> = regions
         .iter()
         .map(|region| {
-            let size_kb = region.size() / 1024;
+            let size_str = format_memory_size(region.size());
             Row::new(vec![
                 Cell::from(format!("{}", region.id.value())),
                 Cell::from(format!("{}", region.start)),
                 Cell::from(format!("{}", region.end)),
-                Cell::from(format!("{size_kb} KB")),
+                Cell::from(size_str),
                 Cell::from(region.permissions.clone()),
                 Cell::from(region.name.as_deref().unwrap_or("").to_string()),
             ])
@@ -275,7 +293,7 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
         Constraint::Length(5),
         Constraint::Length(18),
         Constraint::Length(18),
-        Constraint::Length(10),
+        Constraint::Length(12),
         Constraint::Length(6),
         Constraint::Min(0),
     ]

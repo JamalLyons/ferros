@@ -41,7 +41,11 @@ fn draw_debugger_info(frame: &mut Frame, area: Rect, app: &App)
         ]),
         Line::from(vec![
             Span::styled("Stop Reason: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{:?}", app.debugger.stop_reason())),
+            Span::raw(if app.debugger.is_stopped() {
+                format!("{:?}", app.debugger.stop_reason())
+            } else {
+                "N/A".to_string()
+            }),
         ]),
     ];
 

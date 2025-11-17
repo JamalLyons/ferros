@@ -168,6 +168,49 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<()>
+{
+    const ARM_THREAD_STATE64: c_int = 6;
+    const ARM_THREAD_STATE64_COUNT: mach_msg_type_number_t = 68;
+
+    let mut state_words: [natural_t; ARM_THREAD_STATE64_COUNT as usize] = [0; ARM_THREAD_STATE64_COUNT as usize];
+
+    let mut write_u64 = |idx: usize, value: u64| {
+        state_words[idx * 2] = (value & 0xFFFF_FFFF) as natural_t;
+        state_words[idx * 2 + 1] = (value >> 32) as natural_t;
+    };
+
+    // General-purpose registers X0-X30
+    for i in 0..=30 {
+        let mut value = regs.general.get(i).copied().unwrap_or(0);
+        if i == 29 {
+            value = regs.fp.value();
+        }
+        write_u64(i, value);
+    }
+
+    // SP and PC
+    write_u64(31, regs.sp.value());
+    write_u64(32, regs.pc.value());
+
+    // Status/CPSR (index 66, single u32)
+    state_words[66] = (regs.status & 0xFFFF_FFFF) as natural_t;
+
+    unsafe {
+        let result = ffi::thread_set_state(thread, ARM_THREAD_STATE64, state_words.as_ptr(), ARM_THREAD_STATE64_COUNT);
+
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::InvalidArgument(format!("thread_set_state failed: {}", result)));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn _unused_compile_assert_arm64_write() {}
+
 /// Read x86-64 registers from a thread
 ///
 /// **Not yet implemented** - will use `X86_THREAD_STATE64` flavor when ready.
@@ -238,3 +281,77 @@ pub fn read_registers_x86_64(thread: thread_act_t) -> Result<Registers>
         Ok(regs)
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+pub fn write_registers_x86_64(thread: thread_act_t, regs: &Registers) -> Result<()>
+{
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct X86ThreadState64
+    {
+        rax: u64,
+        rbx: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rsp: u64,
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rip: u64,
+        rflags: u64,
+        cs: u64,
+        fs: u64,
+        gs: u64,
+    }
+
+    const X86_THREAD_STATE64: c_int = 4;
+    const X86_THREAD_STATE64_COUNT: mach_msg_type_number_t = 42;
+
+    let mut state = X86ThreadState64::default();
+    let general = |idx| regs.general.get(idx).copied().unwrap_or(0);
+
+    state.rax = general(0);
+    state.rbx = general(1);
+    state.rcx = general(2);
+    state.rdx = general(3);
+    state.rsi = general(4);
+    state.rdi = general(5);
+    state.r8 = general(6);
+    state.r9 = general(7);
+    state.r10 = general(8);
+    state.r11 = general(9);
+    state.r12 = general(10);
+    state.r13 = general(11);
+    state.r14 = general(12);
+    state.r15 = general(13);
+    state.rbp = regs.fp.value();
+    state.rsp = regs.sp.value();
+    state.rip = regs.pc.value();
+    state.rflags = regs.status;
+
+    unsafe {
+        let result = ffi::thread_set_state(
+            thread,
+            X86_THREAD_STATE64,
+            &state as *const _ as *const natural_t,
+            X86_THREAD_STATE64_COUNT,
+        );
+
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::InvalidArgument(format!("thread_set_state failed: {}", result)));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn _unused_compile_assert_x86_write() {}

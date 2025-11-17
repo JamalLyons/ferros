@@ -55,9 +55,9 @@ use crate::error::{DebuggerError, Result};
 use crate::platform::macos::ffi;
 use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memory};
 #[cfg(target_arch = "aarch64")]
-use crate::platform::macos::registers::read_registers_arm64;
+use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
-use crate::platform::macos::registers::read_registers_x86_64;
+use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
 
 /// Shared exception state manipulated by the Mach exception loop and debugger methods.
@@ -901,12 +901,40 @@ impl Debugger for MacOSDebugger
     ///
     /// Will call `thread_set_state()` with the new register values.
     /// This requires careful handling of the thread state structure.
-    fn write_registers(&mut self, _regs: &Registers) -> Result<()>
+    fn write_registers(&mut self, regs: &Registers) -> Result<()>
     {
-        // TODO: Implement register writing using thread_set_state()
-        Err(DebuggerError::InvalidArgument(
-            "Register writing not yet implemented".to_string(),
-        ))
+        self.ensure_attached()?;
+        let thread = self.active_thread_port()?;
+
+        match self.architecture {
+            Architecture::Arm64 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    write_registers_arm64(thread, regs)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "arm64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::X86_64 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    write_registers_x86_64(thread, regs)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "x86_64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::Unknown(label) => {
+                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
+            }
+        }
     }
 
     /// Read memory from the target process

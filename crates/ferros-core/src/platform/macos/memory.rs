@@ -5,24 +5,37 @@
 //! On macOS, we use `vm_read()` and `vm_write()` to access process memory.
 //! These are Mach APIs that work with task ports obtained from `task_for_pid()`.
 
-use libc::{c_int, mach_msg_type_number_t, mach_port_t, vm_address_t, vm_map_t, vm_offset_t, vm_size_t};
+use std::cmp::min;
+use std::io::{Error, ErrorKind};
+
+use libc::{c_int, mach_port_t, vm_address_t, vm_map_t, vm_offset_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
-
-use crate::platform::macos::ffi;
-
-/// Constant for mach_vm_region() flavor
-/// This is the same constant used by both vm_region (deprecated) and mach_vm_region
-const VM_REGION_BASIC_INFO: c_int = 9;
+use mach2::message::mach_msg_type_number_t;
+#[cfg(target_os = "macos")]
+use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region_recurse};
+#[cfg(target_os = "macos")]
+use mach2::vm_region::{
+    vm_region_recurse_info_t, vm_region_submap_short_info_data_64_t, VM_REGION_SUBMAP_SHORT_INFO_COUNT_64,
+};
+#[cfg(target_os = "macos")]
+use mach2::vm_statistics::{
+    VM_MEMORY_MALLOC, VM_MEMORY_MALLOC_HUGE, VM_MEMORY_MALLOC_LARGE, VM_MEMORY_MALLOC_MEDIUM, VM_MEMORY_MALLOC_SMALL,
+    VM_MEMORY_MALLOC_TINY, VM_MEMORY_STACK,
+};
+#[cfg(target_os = "macos")]
+use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 
 use crate::error::{DebuggerError, Result};
+use crate::platform::macos::ffi;
 use crate::types::{Address, MemoryRegion, MemoryRegionId};
+
+const MAX_VM_READ_CHUNK: usize = 64 * 1024;
 
 /// Read memory from a Mach task
 ///
-/// Uses `vm_read()` to read memory from the target process. This function allocates memory
-/// in the current process's address space, copies the data from the target process, and
-/// then returns it as a `Vec<u8>`. The allocated memory is automatically deallocated.
+/// Uses `mach_vm_read_overwrite()` to read memory from the target process in bounded chunks.
+/// The data is streamed directly into the returned `Vec<u8>` to avoid transient Mach allocations.
 ///
 /// ## Parameters
 ///
@@ -62,38 +75,14 @@ use crate::types::{Address, MemoryRegion, MemoryRegionId};
 /// See: [vm_read(3) man page](https://developer.apple.com/documentation/kernel/1585350-vm_read/)
 pub fn read_memory(task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u8>>
 {
-    unsafe {
-        let mut data: vm_offset_t = 0;
-        let mut data_count: mach_msg_type_number_t = 0;
-
-        let result = ffi::vm_read(
-            task as vm_map_t,
-            addr.value() as vm_address_t,
-            len as vm_size_t,
-            &mut data,
-            &mut data_count,
-        );
-
-        if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("vm_read() failed with error code: {}", result),
-            )));
-        }
-
-        // Copy the data into a Vec<u8>
-        // vm_read() allocates memory in our address space, so we need to copy it
-        // to a Vec before deallocating the Mach-allocated memory
-        let bytes_read = data_count as usize;
-        let mut buffer = vec![0u8; bytes_read];
-        std::ptr::copy_nonoverlapping(data as *const u8, buffer.as_mut_ptr(), bytes_read);
-
-        // Deallocate the memory allocated by vm_read()
-        // vm_read() allocates memory that we must free
-        ffi::vm_deallocate(task as vm_map_t, data as vm_address_t, data_count as vm_size_t);
-
-        Ok(buffer)
+    if len == 0 {
+        return Ok(Vec::new());
     }
+
+    let mut buffer = vec![0u8; len];
+    let bytes_read = read_memory_into(task, addr, &mut buffer)?;
+    buffer.truncate(bytes_read);
+    Ok(buffer)
 }
 
 /// Write memory to a Mach task
@@ -144,6 +133,12 @@ pub fn read_memory(task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u
 /// See: [vm_write(3) man page](https://developer.apple.com/documentation/kernel/1585462-vm_write/)
 pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usize>
 {
+    if data.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_range(task, addr, data.len())?;
+
     unsafe {
         let result = ffi::vm_write(
             task as vm_map_t,
@@ -202,63 +197,49 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
 pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
 {
     let mut regions = Vec::new();
-    let mut address: u64 = 0;
+    let mut address: mach_vm_address_t = 0;
     let mut region_id = 0usize;
+    let mut depth: natural_t = 0;
 
     unsafe {
         loop {
-            let mut size: u64 = 0;
-            let mut info: ffi::VmRegionBasicInfoData = ffi::VmRegionBasicInfoData {
-                protection: 0,
-                max_protection: 0,
-                inheritance: 0,
-                shared: 0,
-                reserved: 0,
-                offset: 0,
-                behavior: 0,
-                user_wired_count: 0,
-            };
-            let mut info_count: mach_msg_type_number_t =
-                std::mem::size_of::<ffi::VmRegionBasicInfoData>() as mach_msg_type_number_t;
-            let mut object_name: mach_port_t = 0;
+            let mut size: mach_vm_size_t = 0;
+            let mut info = vm_region_submap_short_info_data_64_t::default();
+            let mut info_count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
 
-            let result = ffi::mach_vm_region(
+            let result = mach_vm_region_recurse(
                 task as vm_map_t,
                 &mut address,
                 &mut size,
-                VM_REGION_BASIC_INFO,
-                &mut info,
+                &mut depth,
+                &mut info as *mut _ as vm_region_recurse_info_t,
                 &mut info_count,
-                &mut object_name,
             );
 
-            if result != KERN_SUCCESS {
+            if result == libc::KERN_INVALID_ADDRESS {
                 break;
             }
-
-            // Convert protection flags to permission string
-            // VM_PROT_READ, VM_PROT_WRITE, and VM_PROT_EXECUTE are bit flags
-            // that can be combined (e.g., rwx, r-x, rw-)
-            let mut perms = String::new();
-            if (info.protection & libc::VM_PROT_READ as u32) != 0 {
-                perms.push('r');
-            }
-            if (info.protection & libc::VM_PROT_WRITE as u32) != 0 {
-                perms.push('w');
-            }
-            if (info.protection & libc::VM_PROT_EXECUTE as u32) != 0 {
-                perms.push('x');
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::Io(Error::other(format!(
+                    "mach_vm_region_recurse failed: {}",
+                    result
+                ))));
             }
 
-            // Create a MemoryRegion from the information we gathered
-            // Note: macOS's mach_vm_region doesn't easily provide region names
-            // (like "[heap]" or "[stack]"), so we leave it as None
+            if info.is_submap != 0 {
+                depth += 1;
+                continue;
+            }
+
+            let perms = protection_to_permissions(info.protection);
+            let name = region_name_from_user_tag(info.user_tag);
+
             regions.push(MemoryRegion::new(
                 MemoryRegionId(region_id),
                 Address::from(address),
                 Address::from(address + size),
                 perms,
-                None, // macOS mach_vm_region doesn't provide names easily
+                name,
             ));
             region_id += 1;
 
@@ -269,4 +250,268 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
     }
 
     Ok(regions)
+}
+
+/// Read memory directly into an existing buffer without allocating an intermediate Mach buffer.
+pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Result<usize>
+{
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_readable_range(task, addr, dst.len())?;
+
+    let mut total = 0usize;
+    let mut cursor = addr.value();
+
+    while total < dst.len() {
+        let chunk_len = min(MAX_VM_READ_CHUNK, dst.len() - total);
+        let mut actual: mach_vm_size_t = 0;
+
+        let result = unsafe {
+            mach_vm_read_overwrite(
+                task as vm_map_t,
+                cursor,
+                chunk_len as mach_vm_size_t,
+                dst[total..].as_mut_ptr() as mach_vm_address_t,
+                &mut actual,
+            )
+        };
+
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::Io(Error::other(format!(
+                "mach_vm_read_overwrite failed: {}",
+                result
+            ))));
+        }
+
+        if actual == 0 {
+            break;
+        }
+
+        total += actual as usize;
+        cursor += actual;
+    }
+
+    Ok(total)
+}
+
+/// Guard that temporarily changes the protection of a memory range and restores it on drop.
+pub struct MemoryProtectionGuard
+{
+    task: mach_port_t,
+    addr: mach_vm_address_t,
+    len: mach_vm_size_t,
+    original: c_int,
+    active: bool,
+}
+
+impl MemoryProtectionGuard
+{
+    /// Make the specified range writable (and readable/executable) until the guard is dropped.
+    pub fn make_writable(task: mach_port_t, addr: Address, len: usize) -> Result<Self>
+    {
+        Self::with_protection(
+            task,
+            addr,
+            len,
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE | libc::VM_PROT_EXECUTE,
+        )
+    }
+
+    /// Apply an arbitrary protection mask for the lifetime of the guard.
+    pub fn with_protection(task: mach_port_t, addr: Address, len: usize, protection: c_int) -> Result<Self>
+    {
+        if len == 0 {
+            return Ok(Self {
+                task,
+                addr: 0,
+                len: 0,
+                original: 0,
+                active: false,
+            });
+        }
+
+        let region = ensure_range(task, addr, len)?;
+        let (aligned_addr, aligned_len) = aligned_range(addr, len);
+        let original = region.protection as c_int;
+
+        change_protection(task, aligned_addr, aligned_len, protection)?;
+
+        Ok(Self {
+            task,
+            addr: aligned_addr,
+            len: aligned_len,
+            original,
+            active: true,
+        })
+    }
+}
+
+impl Drop for MemoryProtectionGuard
+{
+    fn drop(&mut self)
+    {
+        if self.active {
+            let _ = change_protection(self.task, self.addr, self.len, self.original);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegionInfo
+{
+    start: mach_vm_address_t,
+    size: mach_vm_size_t,
+    protection: u32,
+    #[allow(dead_code)] // Used in TUI for displaying region names
+    name: Option<String>,
+}
+
+fn ensure_readable_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
+{
+    ensure_range_with_permissions(task, addr, len, Some(libc::VM_PROT_READ as u32))
+}
+
+fn ensure_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
+{
+    ensure_range_with_permissions(task, addr, len, None)
+}
+
+fn ensure_range_with_permissions(task: mach_port_t, addr: Address, len: usize, required: Option<u32>) -> Result<RegionInfo>
+{
+    if len == 0 {
+        return region_for_address(task, addr)?
+            .ok_or_else(|| DebuggerError::Io(Error::other("address is not mapped in target task")));
+    }
+
+    let info = region_for_address(task, addr)?
+        .ok_or_else(|| DebuggerError::Io(Error::other("address is not mapped in target task")))?;
+
+    let start = addr.value();
+    let end = start
+        .checked_add(len as u64)
+        .ok_or_else(|| DebuggerError::Io(Error::other("address range overflowed")))?;
+    let region_end = info.start + info.size;
+
+    if end > region_end {
+        return Err(DebuggerError::Io(Error::other(
+            "requested range crosses a memory region boundary",
+        )));
+    }
+
+    if let Some(mask) = required {
+        if (info.protection & mask) != mask {
+            return Err(DebuggerError::Io(Error::new(
+                ErrorKind::PermissionDenied,
+                "memory range lacks required permissions",
+            )));
+        }
+    }
+
+    Ok(info)
+}
+
+fn region_for_address(task: mach_port_t, addr: Address) -> Result<Option<RegionInfo>>
+{
+    let mut target = addr.value();
+    let mut depth: natural_t = 0;
+
+    unsafe {
+        loop {
+            let mut size: mach_vm_size_t = 0;
+            let mut info = vm_region_submap_short_info_data_64_t::default();
+            let mut info_count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+
+            let result = mach_vm_region_recurse(
+                task as vm_map_t,
+                &mut target,
+                &mut size,
+                &mut depth,
+                &mut info as *mut _ as vm_region_recurse_info_t,
+                &mut info_count,
+            );
+
+            if result == libc::KERN_INVALID_ADDRESS {
+                return Ok(None);
+            }
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::Io(Error::other(format!(
+                    "mach_vm_region_recurse failed: {}",
+                    result
+                ))));
+            }
+
+            if info.is_submap != 0 {
+                depth += 1;
+                continue;
+            }
+
+            return Ok(Some(RegionInfo {
+                start: target,
+                size,
+                protection: info.protection as u32,
+                name: region_name_from_user_tag(info.user_tag),
+            }));
+        }
+    }
+}
+
+fn protection_to_permissions(protection: c_int) -> String
+{
+    let mut perms = String::new();
+    if (protection & libc::VM_PROT_READ) != 0 {
+        perms.push('r');
+    }
+    if (protection & libc::VM_PROT_WRITE) != 0 {
+        perms.push('w');
+    }
+    if (protection & libc::VM_PROT_EXECUTE) != 0 {
+        perms.push('x');
+    }
+    perms
+}
+
+fn region_name_from_user_tag(tag: u32) -> Option<String>
+{
+    match tag {
+        VM_MEMORY_STACK => Some("[stack]".to_string()),
+        VM_MEMORY_MALLOC
+        | VM_MEMORY_MALLOC_SMALL
+        | VM_MEMORY_MALLOC_MEDIUM
+        | VM_MEMORY_MALLOC_LARGE
+        | VM_MEMORY_MALLOC_HUGE
+        | VM_MEMORY_MALLOC_TINY => Some("[heap]".to_string()),
+        _ => None,
+    }
+}
+
+fn change_protection(task: mach_port_t, addr: mach_vm_address_t, len: mach_vm_size_t, protection: c_int) -> Result<()>
+{
+    unsafe {
+        let result = mach_vm_protect(task as vm_map_t, addr, len, 1, protection);
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::Io(Error::other(format!(
+                "mach_vm_protect (set maximum) failed: {}",
+                result
+            ))));
+        }
+
+        let result = mach_vm_protect(task as vm_map_t, addr, len, 0, protection);
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::Io(Error::other(format!("mach_vm_protect failed: {}", result))));
+        }
+    }
+
+    Ok(())
+}
+
+fn aligned_range(addr: Address, len: usize) -> (mach_vm_address_t, mach_vm_size_t)
+{
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+    let start = addr.value();
+    let end = start + len as u64;
+    let aligned_start = start & !(page_size - 1);
+    let aligned_end = (end + page_size - 1) & !(page_size - 1);
+    (aligned_start, aligned_end - aligned_start)
 }

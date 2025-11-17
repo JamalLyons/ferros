@@ -25,7 +25,7 @@
 //! - **Explicit**: Clear about what they do and when they can fail
 
 use crate::error::Result;
-use crate::types::{ProcessId, Registers};
+use crate::types::{Architecture, ProcessId, Registers, StopReason, ThreadId};
 
 /// Main debugger interface
 ///
@@ -247,6 +247,36 @@ pub trait Debugger
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
     fn get_memory_regions(&self) -> Result<Vec<crate::types::MemoryRegion>>;
+
+    /// CPU architecture of the debug target.
+    fn architecture(&self) -> Architecture;
+
+    /// Whether the debugger is currently attached to a process.
+    fn is_attached(&self) -> bool;
+
+    /// Whether the debuggee is currently stopped/suspended.
+    fn is_stopped(&self) -> bool;
+
+    /// Most recent stop reason.
+    fn stop_reason(&self) -> StopReason;
+
+    /// Suspend execution of the target process.
+    fn suspend(&mut self) -> Result<()>;
+
+    /// Resume execution after being stopped.
+    fn resume(&mut self) -> Result<()>;
+
+    /// List available threads in the target process.
+    fn threads(&self) -> Result<Vec<ThreadId>>;
+
+    /// Currently selected thread (if any).
+    fn active_thread(&self) -> Option<ThreadId>;
+
+    /// Select the active thread that subsequent operations should target.
+    fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>;
+
+    /// Refresh the thread list from the operating system.
+    fn refresh_threads(&mut self) -> Result<()>;
 
     // Future methods (commented out until implemented):
     //

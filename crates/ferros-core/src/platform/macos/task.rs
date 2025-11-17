@@ -20,11 +20,14 @@
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 //! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
-use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t};
+use std::convert::TryInto;
+use std::mem;
+
+use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t, vm_address_t, vm_size_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
-use mach2::task::task_threads;
+use mach2::task::{task_resume, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
@@ -32,16 +35,15 @@ use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::platform::macos::ffi;
 use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memory};
+#[cfg(target_arch = "aarch64")]
 use crate::platform::macos::registers::read_registers_arm64;
-use crate::types::{MemoryRegion, ProcessId, Registers};
+#[cfg(target_arch = "x86_64")]
+use crate::platform::macos::registers::read_registers_x86_64;
+use crate::types::{Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
 
 /// macOS debugger implementation using Mach APIs
 ///
-/// This struct holds the state needed to debug a process on macOS:
-///
-/// - `task`: A Mach port to the target process
-/// - `main_thread`: A Mach port to the main thread
-/// - `pid`: The process ID we're debugging
+/// This struct holds the state needed to debug a process on macOS.
 ///
 /// ## Lifecycle
 ///
@@ -63,19 +65,25 @@ pub struct MacOSDebugger
     /// See: [mach_port_t documentation](https://developer.apple.com/documentation/kernel/mach_port_t)
     task: mach_port_t,
 
-    /// Mach port to the main thread of the target process
-    ///
-    /// This is obtained from `task_threads()`. We use it to read/write
-    /// thread state. A value of 0 means we're not attached.
-    ///
-    /// See: [thread_act_t documentation](https://developer.apple.com/documentation/kernel/thread_act_t)
-    main_thread: thread_act_t,
+    /// Cached thread ports for the target task.
+    threads: Vec<thread_act_t>,
+
+    /// Active thread used for register operations.
+    current_thread: Option<thread_act_t>,
 
     /// Process ID of the target process
     ///
     /// Stored for reference and error messages. The actual debugging
     /// uses the `task` port, not the PID.
     pid: ProcessId,
+    /// Architecture metadata.
+    architecture: Architecture,
+    /// Whether we're currently attached to a process.
+    attached: bool,
+    /// Whether the process is currently suspended.
+    stopped: bool,
+    /// Last known stop reason.
+    stop_reason: StopReason,
 }
 
 impl MacOSDebugger
@@ -100,9 +108,77 @@ impl MacOSDebugger
     {
         Ok(Self {
             task: 0,
-            main_thread: 0,
+            threads: Vec::new(),
+            current_thread: None,
             pid: ProcessId(0),
+            architecture: Architecture::current(),
+            attached: false,
+            stopped: false,
+            stop_reason: StopReason::Running,
         })
+    }
+
+    fn ensure_attached(&self) -> Result<()>
+    {
+        if !self.attached || self.task == 0 {
+            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+        }
+        Ok(())
+    }
+
+    fn active_thread_port(&self) -> Result<thread_act_t>
+    {
+        self.current_thread
+            .ok_or_else(|| DebuggerError::InvalidArgument("No active thread selected".to_string()))
+    }
+
+    fn set_active_thread_by_port(&mut self, port: thread_act_t) -> Result<()>
+    {
+        if self.threads.iter().any(|&t| t == port) {
+            self.current_thread = Some(port);
+            Ok(())
+        } else {
+            Err(DebuggerError::InvalidArgument(format!(
+                "Thread {port} is not part of process {}",
+                self.pid.0
+            )))
+        }
+    }
+
+    fn deallocate_threads_array(threads: *mut thread_act_t, count: mach_msg_type_number_t)
+    {
+        if threads.is_null() || count == 0 {
+            return;
+        }
+
+        let size = (count as usize).saturating_mul(mem::size_of::<thread_act_t>()) as vm_size_t;
+        unsafe {
+            let _ = ffi::vm_deallocate(mach_task_self(), threads as vm_address_t, size);
+        }
+    }
+
+    fn refresh_thread_list(&mut self) -> Result<()>
+    {
+        self.ensure_attached()?;
+
+        unsafe {
+            let mut threads: *mut thread_act_t = std::ptr::null_mut();
+            let mut thread_count: mach_msg_type_number_t = 0;
+            let result = task_threads(self.task, &mut threads, &mut thread_count);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::AttachFailed(format!(
+                    "Failed to enumerate threads: {}",
+                    result
+                )));
+            }
+
+            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
+            self.threads = slice.to_vec();
+            Self::deallocate_threads_array(threads, thread_count);
+            self.current_thread = self.threads.first().copied();
+        }
+
+        Ok(())
     }
 }
 
@@ -203,15 +279,23 @@ impl Debugger for MacOSDebugger
 
             let result = task_threads(task, &mut threads, &mut thread_count);
             if result != KERN_SUCCESS || thread_count == 0 {
+                Self::deallocate_threads_array(threads, thread_count);
                 return Err(DebuggerError::AttachFailed(format!("Failed to get threads: {}", result)));
             }
 
-            // Step 3: Store the task port, main thread, and PID
-            // We use the first thread as the "main thread"
-            // Note: We don't free the threads array - it's managed by the kernel
+            // Step 3: Store the task port, PID, and thread list
+            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
             self.task = task;
-            self.main_thread = *threads;
             self.pid = pid;
+            self.threads = slice.to_vec();
+            Self::deallocate_threads_array(threads, thread_count);
+            self.current_thread = self.threads.first().copied();
+            self.attached = true;
+            self.stopped = false;
+            self.stop_reason = StopReason::Running;
+
+            // Suspend immediately so the debugger has control.
+            self.suspend()?;
 
             Ok(())
         }
@@ -231,10 +315,13 @@ impl Debugger for MacOSDebugger
     /// automatically cleans it up.
     fn detach(&mut self) -> Result<()>
     {
-        // On macOS, we don't need explicit detach
-        // The task port is released when the struct is dropped
         self.task = 0;
-        self.main_thread = 0;
+        self.threads.clear();
+        self.current_thread = None;
+        self.pid = ProcessId(0);
+        self.attached = false;
+        self.stopped = false;
+        self.stop_reason = StopReason::Running;
         Ok(())
     }
 
@@ -254,20 +341,38 @@ impl Debugger for MacOSDebugger
     /// This is done at compile time, so there's no runtime overhead.
     fn read_registers(&self) -> Result<Registers>
     {
-        if self.main_thread == 0 {
-            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
+        self.ensure_attached()?;
+        let thread = self.active_thread_port()?;
+
+        match self.architecture {
+            Architecture::Arm64 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    read_registers_arm64(thread)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "arm64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::X86_64 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    read_registers_x86_64(thread)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "x86_64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::Unknown(label) => {
+                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
+            }
         }
-
-        #[cfg(target_arch = "aarch64")]
-        return read_registers_arm64(self.main_thread);
-
-        #[cfg(target_arch = "x86_64")]
-        return Err(DebuggerError::InvalidArgument(
-            "x86_64 support not yet implemented".to_string(),
-        ));
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        return Err(DebuggerError::InvalidArgument("Unsupported architecture".to_string()));
     }
 
     /// Write registers to the attached process
@@ -291,9 +396,7 @@ impl Debugger for MacOSDebugger
     /// Uses `vm_read()` to read memory from the Mach task.
     fn read_memory(&self, addr: u64, len: usize) -> Result<Vec<u8>>
     {
-        if self.task == 0 {
-            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
-        }
+        self.ensure_attached()?;
         read_memory(self.task, addr, len)
     }
 
@@ -302,9 +405,7 @@ impl Debugger for MacOSDebugger
     /// Uses `vm_write()` to write memory to the Mach task.
     fn write_memory(&mut self, addr: u64, data: &[u8]) -> Result<usize>
     {
-        if self.task == 0 {
-            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
-        }
+        self.ensure_attached()?;
         write_memory(self.task, addr, data)
     }
 
@@ -313,9 +414,90 @@ impl Debugger for MacOSDebugger
     /// Uses `vm_region()` to enumerate memory regions in the Mach task.
     fn get_memory_regions(&self) -> Result<Vec<MemoryRegion>>
     {
-        if self.task == 0 {
-            return Err(DebuggerError::AttachFailed("Not attached to a process".to_string()));
-        }
+        self.ensure_attached()?;
         get_memory_regions(self.task)
+    }
+
+    fn architecture(&self) -> Architecture
+    {
+        self.architecture
+    }
+
+    fn is_attached(&self) -> bool
+    {
+        self.attached
+    }
+
+    fn is_stopped(&self) -> bool
+    {
+        self.stopped
+    }
+
+    fn stop_reason(&self) -> StopReason
+    {
+        self.stop_reason
+    }
+
+    fn suspend(&mut self) -> Result<()>
+    {
+        self.ensure_attached()?;
+        if self.stopped {
+            return Ok(());
+        }
+
+        unsafe {
+            let result = task_suspend(self.task);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::AttachFailed(format!("task_suspend failed: {}", result)));
+            }
+        }
+
+        self.stopped = true;
+        self.stop_reason = StopReason::Suspended;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()>
+    {
+        self.ensure_attached()?;
+        if !self.stopped {
+            return Ok(());
+        }
+
+        unsafe {
+            let result = task_resume(self.task);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::AttachFailed(format!("task_resume failed: {}", result)));
+            }
+        }
+
+        self.stopped = false;
+        self.stop_reason = StopReason::Running;
+        Ok(())
+    }
+
+    fn threads(&self) -> Result<Vec<ThreadId>>
+    {
+        self.ensure_attached()?;
+        Ok(self.threads.iter().copied().map(|t| ThreadId::from(t as u64)).collect())
+    }
+
+    fn active_thread(&self) -> Option<ThreadId>
+    {
+        self.current_thread.map(|t| ThreadId::from(t as u64))
+    }
+
+    fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>
+    {
+        let port = thread
+            .raw()
+            .try_into()
+            .map_err(|_| DebuggerError::InvalidArgument(format!("Invalid thread id {}", thread.raw())))?;
+        self.set_active_thread_by_port(port)
+    }
+
+    fn refresh_threads(&mut self) -> Result<()>
+    {
+        self.refresh_thread_list()
     }
 }

@@ -6,6 +6,8 @@
 //! the debugger to work with concepts like "process ID" and "registers" without
 //! knowing whether we're on macOS, Linux, or Windows.
 
+use std::fmt;
+
 /// Process identifier (PID)
 ///
 /// A PID is a unique number assigned to each running process by the operating
@@ -48,6 +50,31 @@ impl From<ProcessId> for u32
     fn from(pid: ProcessId) -> Self
     {
         pid.0
+    }
+}
+
+/// Thread identifier
+///
+/// A thread identifier uniquely identifies a thread within a process. The exact
+/// representation is platform-specific, so we store it in a `u64` and provide
+/// conversion helpers per platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(pub u64);
+
+impl ThreadId
+{
+    /// Raw representation of the thread identifier.
+    pub fn raw(&self) -> u64
+    {
+        self.0
+    }
+}
+
+impl From<u64> for ThreadId
+{
+    fn from(value: u64) -> Self
+    {
+        Self(value)
     }
 }
 
@@ -171,6 +198,24 @@ impl Default for Registers
     }
 }
 
+/// Reason the debuggee is currently stopped (if at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason
+{
+    /// Process is running.
+    Running,
+    /// Process/task has been explicitly suspended.
+    Suspended,
+    /// Stopped because a specific signal was delivered.
+    Signal(i32),
+    /// Hit a breakpoint at the provided address.
+    Breakpoint(u64),
+    /// Process exited with status code.
+    Exited(i32),
+    /// Unknown/other reason.
+    Unknown,
+}
+
 /// Memory region in a process
 ///
 /// Represents a contiguous region of memory in the target process,
@@ -227,6 +272,52 @@ pub struct MemoryRegion
     /// like `"/usr/bin/example"`. On macOS, this is typically `None`
     /// as `mach_vm_region()` doesn't easily provide region names.
     pub name: Option<String>,
+}
+
+/// CPU architecture of the debug target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Architecture
+{
+    /// 64-bit ARM (Apple Silicon)
+    Arm64,
+    /// 64-bit x86 (Intel/AMD)
+    X86_64,
+    /// Any other architecture (or unknown)
+    Unknown(&'static str),
+}
+
+impl Architecture
+{
+    /// Architecture of the currently running debugger binary.
+    pub const fn current() -> Self
+    {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Architecture::Arm64
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            Architecture::X86_64
+        }
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Architecture::Unknown(std::env::consts::ARCH)
+        }
+    }
+}
+
+impl fmt::Display for Architecture
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        match self {
+            Architecture::Arm64 => write!(f, "arm64"),
+            Architecture::X86_64 => write!(f, "x86_64"),
+            Architecture::Unknown(name) => write!(f, "{name}"),
+        }
+    }
 }
 
 impl MemoryRegion

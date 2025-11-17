@@ -183,9 +183,58 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 #[cfg(target_arch = "x86_64")]
 pub fn read_registers_x86_64(thread: thread_act_t) -> Result<Registers>
 {
-    // TODO: Implement x86-64 register reading
-    // Will use X86_THREAD_STATE64 = 4, X86_THREAD_STATE64_COUNT = 42
-    Err(DebuggerError::InvalidArgument(
-        "x86_64 support not yet implemented".to_string(),
-    ))
+    #[repr(C)]
+    #[derive(Default)]
+    struct X86ThreadState64
+    {
+        rax: u64,
+        rbx: u64,
+        rcx: u64,
+        rdx: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rsp: u64,
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rip: u64,
+        rflags: u64,
+        cs: u64,
+        fs: u64,
+        gs: u64,
+    }
+
+    const X86_THREAD_STATE64: c_int = 4;
+    const X86_THREAD_STATE64_COUNT: mach_msg_type_number_t = 42;
+
+    unsafe {
+        let mut state = X86ThreadState64::default();
+        let mut count = X86_THREAD_STATE64_COUNT;
+        let result = ffi::thread_get_state(thread, X86_THREAD_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::ReadRegistersFailed(format!(
+                "thread_get_state failed: {}",
+                result
+            )));
+        }
+
+        let mut regs = Registers::new();
+        regs.pc = state.rip;
+        regs.sp = state.rsp;
+        regs.fp = state.rbp;
+        regs.status = state.rflags;
+        regs.general = vec![
+            state.rax, state.rbx, state.rcx, state.rdx, state.rsi, state.rdi, state.r8, state.r9, state.r10, state.r11,
+            state.r12, state.r13, state.r14, state.r15,
+        ];
+
+        Ok(regs)
+    }
 }

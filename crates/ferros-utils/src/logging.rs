@@ -46,6 +46,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::{env, io};
 
+use chrono::Utc;
 use tracing::Level;
 use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::fmt::{self};
@@ -185,6 +186,43 @@ pub fn init_logging_with_level(level: LogLevel, format: LogFormat) -> Result<(),
     init_logging_internal(format, level.into())
 }
 
+/// Initialize logging for TUI mode (file-only, no stdout)
+///
+/// This function configures logging to write only to a file, not to stdout/stderr,
+/// which prevents log messages from interfering with the TUI display.
+///
+/// The log file will be created in the user's home directory at `~/.ferros/YYYY-MM-DD-ferros-tui.log`
+/// or falls back to `/tmp/YYYY-MM-DD-ferros-tui.log` if home directory is not accessible.
+///
+/// ## Example
+///
+/// ```rust,no_run
+/// use ferros_utils::init_logging_for_tui;
+///
+/// init_logging_for_tui().expect("Failed to initialize logging for TUI");
+/// // Now all log messages go to file only, not interfering with TUI
+/// ```
+///
+/// ## Errors
+///
+/// Returns an error if logging is already initialized or file creation fails.
+pub fn init_logging_for_tui() -> Result<PathBuf, LoggingError>
+{
+    // Determine log file path with date prefix
+    let today = Utc::now().format("%Y-%m-%d");
+    let log_file = if let Ok(home) = env::var("HOME") {
+        let ferros_dir = PathBuf::from(home).join(".ferros");
+        // Create directory if it doesn't exist
+        std::fs::create_dir_all(&ferros_dir).map_err(LoggingError::FileError)?;
+        ferros_dir.join(format!("{today}-ferros-tui.log"))
+    } else {
+        PathBuf::from("/tmp").join(format!("{today}-ferros-tui.log"))
+    };
+
+    init_logging_file_only(log_file.clone(), LogFormat::Pretty, Level::INFO)?;
+    Ok(log_file)
+}
+
 /// Internal initialization function
 #[allow(clippy::unnecessary_wraps)]
 fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), LoggingError>
@@ -272,6 +310,73 @@ fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), 
                 // Console only
                 Registry::default().with(console_layer).init();
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Internal initialization function for file-only logging
+/// Used by TUI mode to prevent stdout interference
+#[allow(clippy::unnecessary_wraps)]
+fn init_logging_file_only(log_file: PathBuf, format: LogFormat, default_level: Level) -> Result<(), LoggingError>
+{
+    // Build environment filter
+    // RUST_LOG can override the default level with more specific filters
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
+
+    match format {
+        LogFormat::Pretty => {
+            // File logging only with pretty format
+            // Use rolling::never() since we're already including the date in the filename
+            let file_appender = tracing_appender::rolling::never(
+                log_file.parent().unwrap_or(&PathBuf::from(".")),
+                log_file.file_name().unwrap_or_default(),
+            );
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+            // Store the guard to prevent it from being dropped
+            std::mem::forget(_guard);
+
+            let file_layer = fmt::layer()
+                .with_writer(non_blocking)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_timer(ChronoUtc::rfc_3339())
+                .with_ansi(false) // No ANSI in files
+                .with_filter(env_filter);
+
+            Registry::default().with(file_layer).init();
+        }
+        LogFormat::Json => {
+            // File logging only with JSON format
+            // Use rolling::never() since we're already including the date in the filename
+            let file_appender = tracing_appender::rolling::never(
+                log_file.parent().unwrap_or(&PathBuf::from(".")),
+                log_file.file_name().unwrap_or_default(),
+            );
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+            // Store the guard to prevent it from being dropped
+            std::mem::forget(_guard);
+
+            let file_layer = fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_timer(ChronoUtc::rfc_3339())
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_filter(env_filter);
+
+            Registry::default().with(file_layer).init();
         }
     }
 

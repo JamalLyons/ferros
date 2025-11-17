@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use ferros_core::debugger::create_debugger;
 use ferros_core::types::ProcessId;
 use ferros_core::{Debugger, Result as DebuggerResult};
-use ferros_utils::{debug, info, init_logging, init_logging_with_level, LogFormat, LogLevel};
+use ferros_utils::{debug, info, init_logging, init_logging_for_tui, init_logging_with_level, LogFormat, LogLevel};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]
@@ -74,14 +74,36 @@ enum Commands
     Detach,
     /// Show debugger information (architecture, status, etc.)
     Info,
+    /// Change directory to the log directory for easy log viewing
+    FindLogs,
 }
 
 fn main()
 {
     let cli = Cli::parse();
 
+    // Check if we're running in TUI mode (non-headless attach/launch)
+    let is_tui_mode = matches!(
+        cli.command,
+        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. }
+    );
+
     // Initialize logging with CLI flags or environment variables
-    let log_result = if let Some(level_str) = &cli.log_level {
+    let _log_file_path = if is_tui_mode {
+        // For TUI mode, use file-only logging to prevent stdout interference
+        match init_logging_for_tui() {
+            Ok(path) => {
+                // Log once to indicate where logs are being written
+                // Note: This will go to the log file since we're in TUI mode
+                info!("Logs are being written to: {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize logging: {}", e);
+                process::exit(1);
+            }
+        }
+    } else if let Some(level_str) = &cli.log_level {
         // Parse log level from CLI
         let level = level_str.parse::<LogLevel>().unwrap_or_else(|_| {
             eprintln!("Invalid log level: {}. Use: error, warn, info, debug, or trace", level_str);
@@ -95,22 +117,37 @@ fn main()
             .and_then(|f| f.parse::<LogFormat>().ok())
             .unwrap_or(LogFormat::Pretty);
 
-        init_logging_with_level(level, format)
+        if let Err(e) = init_logging_with_level(level, format) {
+            eprintln!("Failed to initialize logging: {}", e);
+            process::exit(1);
+        }
+        None
     } else {
         // Use environment variables or defaults
-        init_logging()
+        if let Err(e) = init_logging() {
+            eprintln!("Failed to initialize logging: {}", e);
+            process::exit(1);
+        }
+        None
     };
-
-    if let Err(e) = log_result {
-        eprintln!("Failed to initialize logging: {}", e);
-        process::exit(1);
-    }
 
     // Check if we need async runtime for TUI (default mode, unless --headless is used)
     let needs_async = matches!(
         cli.command,
         Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. }
     );
+
+    // Handle find-logs command early (before async runtime)
+    if matches!(cli.command, Commands::FindLogs) {
+        let log_dir = if let Ok(home) = std::env::var("HOME") {
+            std::path::PathBuf::from(home).join(".ferros")
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+
+        println!("{}", log_dir.display());
+        return;
+    }
 
     if needs_async {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -308,6 +345,10 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
                 "Note: This command requires an attached process. State management will be added in a future version."
             );
             Err(ferros_core::error::DebuggerError::NotAttached)
+        }
+        Commands::FindLogs => {
+            // This should be handled in main() before reaching here
+            unreachable!("FindLogs should be handled in main()")
         }
     }
 }

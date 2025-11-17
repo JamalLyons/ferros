@@ -297,26 +297,11 @@ pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
 {
     // For now, show a message that output capture is not yet implemented
     // In the future, this would show captured stdout/stderr from the process
-    let mut output_text = vec![
-        Line::from(vec![Span::styled(
-            "Process Output",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-    ];
-
-    if let Some(pid) = app.pid {
-        output_text.push(Line::from(format!("Process PID: {pid}")));
-        output_text.push(Line::from(""));
-    }
+    let mut output_text = vec![];
 
     if app.process_output.is_empty() {
         output_text.extend(vec![
             Line::from("Process output capture is not yet implemented."),
-            Line::from(""),
-            Line::from("The process output should be visible in the terminal"),
-            Line::from("where you launched ferros. However, when the TUI"),
-            Line::from("enters alternate screen mode, output may be hidden."),
             Line::from(""),
             Line::from("To see process output:"),
             Line::from("  • Use 'ferros launch --headless' to see output directly"),

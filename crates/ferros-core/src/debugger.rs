@@ -47,6 +47,50 @@ use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, Thre
 /// in a `Mutex` or use channels to communicate with a debugger thread.
 pub trait Debugger
 {
+    /// Launch a new process under debugger control
+    ///
+    /// Spawns a new process from the given executable path and arguments, and
+    /// immediately attaches the debugger to it. The process starts in a suspended
+    /// state, allowing you to set breakpoints before it begins execution.
+    ///
+    /// ## Platform-specific behavior
+    ///
+    /// - **macOS**: Uses `posix_spawn()` with `POSIX_SPAWN_START_SUSPENDED` flag,
+    ///   then calls `attach()` to get the task port. This avoids permission issues
+    ///   that can occur when attaching to already-running processes.
+    /// - **Linux**: Will use `fork()` + `execve()` with `PTRACE_TRACEME`
+    /// - **Windows**: Will use `CreateProcess()` with `DEBUG_PROCESS` flag
+    ///
+    /// ## Advantages over `attach()`
+    ///
+    /// - Avoids permission issues (no need for sudo or entitlements when launching)
+    /// - Process starts suspended, so you can set breakpoints before execution
+    /// - More reliable than attaching to a running process
+    ///
+    /// ## Parameters
+    ///
+    /// - `program`: Path to the executable to launch
+    /// - `args`: Command-line arguments (first argument should be the program name)
+    ///
+    /// ## Errors
+    ///
+    /// - `InvalidArgument`: Invalid program path or arguments
+    /// - `AttachFailed`: Failed to spawn process or attach to it
+    /// - `Io`: I/O error (e.g., file not found, permission denied)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::Debugger;
+    ///
+    /// let mut debugger = MacOSDebugger::new()?;
+    /// debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
+    /// // Process is now suspended and ready for debugging
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    fn launch(&mut self, program: &str, args: &[&str]) -> Result<()>;
+
     /// Attach to a running process
     ///
     /// This establishes a connection to the target process, allowing you

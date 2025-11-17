@@ -2,40 +2,65 @@
 
 Low-level debugging primitives and process control for Ferros.
 
-## Overview
+## Platform Support
 
-`ferros-core` provides the foundational debugging capabilities for the Ferros debugger, including:
+### macOS
 
-- Process control and manipulation
-- Breakpoint management
-- Stack unwinding
-- Register inspection
-- Memory mapping and inspection
-- Platform-specific debugging APIs (ptrace, Mach ports, Windows Debug API)
+**Minimum Requirements:**
+- macOS 10.5 (Leopard) or later (for `POSIX_SPAWN_START_SUSPENDED`)
+- Recommended: macOS 10.15 (Catalina) or later
+
+**Architecture Support:**
+- ✅ ARM64 (Apple Silicon) - Primary target
+- ✅ x86_64 (Intel Mac) - Supported for compatibility
+
+**Permissions:**
+
+To debug processes on macOS, you have two options:
+
+1. **Launch processes** (recommended): Use `launch()` to spawn processes under debugger control.
+   This doesn't require special permissions.
+
+2. **Attach to running processes**: Requires either:
+   - Running with `sudo`
+   - Code signing with the `com.apple.security.cs.debugger` entitlement
+   
+   See `ferros.entitlements` for the entitlement file template.
+
+### Linux
+
+⏳ Coming soon
+
+### Windows
+
+⏳ Coming soon
 
 ## Usage
 
-Add `ferros-core` to your `Cargo.toml`:
+```rust
+use ferros_core::platform::macos::MacOSDebugger;
+use ferros_core::Debugger;
 
-```toml
-[dependencies]
-ferros-core = "0.0.0"
+// Launch a process under debugger control (recommended)
+let mut debugger = MacOSDebugger::new()?;
+debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
+// Process is now suspended and ready for debugging
+
+// Or attach to an existing process (requires permissions)
+debugger.attach(ProcessId::from(12345))?;
+
+// Inspect the process
+let regs = debugger.read_registers()?;
+println!("Program counter: 0x{:x}", regs.pc);
 ```
 
-## Platform Support
+## Features
 
-- **macOS**: 10.9+ (Mavericks) for Intel, 11.0+ (Big Sur) for Apple Silicon
-- **Linux**: Planned (ptrace)
-- **Windows**: Planned (WinDbg APIs)
-
-## Requirements
-
-- **Rust**: Edition 2021 (Rust 1.56.0 or newer)
-- **macOS**: Uses Mach APIs (`task_for_pid`, `mach_vm_region`, etc.)
-  - Requires debugging entitlements or `sudo` for process attachment
-  - See [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
-
-## License
-
-Licensed under the Apache License, Version 2.0. See the [repository](https://github.com/jamallyons/ferros) for details.
-
+- ✅ Process attachment and launching
+- ✅ Register reading (ARM64 and x86_64)
+- ✅ Memory reading and writing
+- ✅ Memory region enumeration
+- ✅ Thread enumeration
+- ⏳ Register writing (coming soon)
+- ⏳ Breakpoints (coming soon)
+- ⏳ Single-step execution (coming soon)

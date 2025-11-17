@@ -337,7 +337,8 @@ impl From<u64> for ThreadId
 /// use ferros_core::types::{Architecture, Arm64Register, RegisterId, Registers};
 ///
 /// let mut regs = Registers::new().with_arch(Architecture::Arm64);
-/// regs.set(RegisterId::Arm64(Arm64Register::X(0)), 0x1234)?;
+/// regs.general = vec![0; 31]; // Initialize ARM64 registers
+/// regs.set(RegisterId::Arm64(Arm64Register::X(0)), 0x1234);
 /// let x0 = regs.get(RegisterId::Arm64(Arm64Register::X(0)));
 /// ```
 ///

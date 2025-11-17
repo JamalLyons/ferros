@@ -357,3 +357,138 @@ extern "C" {
         object_name: *mut mach_port_t,
     ) -> kern_return_t;
 }
+
+// Process Spawning Functions
+//
+// These functions spawn new processes under debugger control using posix_spawn.
+#[link(name = "c", kind = "dylib")]
+extern "C" {
+    /// Spawn a new process with control over its initial state
+    ///
+    /// This function creates a new process from the given executable path and arguments.
+    /// It provides fine-grained control over the process's initial state, including
+    /// whether it starts suspended.
+    ///
+    /// ## Parameters
+    ///
+    /// - `pid`: Output parameter - receives the PID of the spawned process
+    /// - `path`: Path to the executable to spawn
+    /// - `file_actions`: File actions to perform (can be null)
+    /// - `attrp`: Spawn attributes (controls behavior like POSIX_SPAWN_START_SUSPENDED)
+    /// - `argv`: Array of argument strings (null-terminated)
+    /// - `envp`: Array of environment variable strings (null-terminated, can be null)
+    ///
+    /// ## Returns
+    ///
+    /// - `0` on success
+    /// - Non-zero errno value on failure
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It spawns a new process
+    /// - Invalid paths or arguments can cause errors
+    /// - The spawned process inherits the current process's permissions
+    ///
+    /// See: [posix_spawn(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/posix_spawn.2.html)
+    pub fn posix_spawn(
+        pid: *mut libc::pid_t,
+        path: *const libc::c_char,
+        file_actions: *const libc::posix_spawn_file_actions_t,
+        attrp: *const libc::posix_spawnattr_t,
+        argv: *const *const libc::c_char,
+        envp: *const *const libc::c_char,
+    ) -> libc::c_int;
+
+    /// Initialize spawn attributes structure
+    ///
+    /// Initializes a `posix_spawnattr_t` structure for use with `posix_spawn()`.
+    /// Must be called before setting any attributes.
+    ///
+    /// ## Parameters
+    ///
+    /// - `attrp`: Pointer to the attributes structure to initialize
+    ///
+    /// ## Returns
+    ///
+    /// - `0` on success
+    /// - Non-zero errno value on failure
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It modifies the attributes structure
+    /// - Must be paired with `posix_spawnattr_destroy()`
+    ///
+    /// See: [posix_spawnattr_init(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawnattr_init.3.html)
+    pub fn posix_spawnattr_init(attrp: *mut libc::posix_spawnattr_t) -> libc::c_int;
+
+    /// Destroy spawn attributes structure
+    ///
+    /// Frees resources associated with a `posix_spawnattr_t` structure.
+    /// Must be called after use to avoid memory leaks.
+    ///
+    /// ## Parameters
+    ///
+    /// - `attrp`: Pointer to the attributes structure to destroy
+    ///
+    /// ## Returns
+    ///
+    /// - `0` on success
+    /// - Non-zero errno value on failure
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It frees memory
+    /// - Must only be called on initialized attributes
+    ///
+    /// See: [posix_spawnattr_destroy(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawnattr_destroy.3.html)
+    pub fn posix_spawnattr_destroy(attrp: *mut libc::posix_spawnattr_t) -> libc::c_int;
+
+    /// Set spawn flags
+    ///
+    /// Sets flags that control the behavior of the spawned process.
+    /// Common flags include:
+    /// - `POSIX_SPAWN_START_SUSPENDED`: Start the process in a suspended state
+    ///
+    /// ## Parameters
+    ///
+    /// - `attrp`: Pointer to the attributes structure
+    /// - `flags`: Flags to set (bitwise OR of flag values)
+    ///
+    /// ## Returns
+    ///
+    /// - `0` on success
+    /// - Non-zero errno value on failure
+    ///
+    /// ## Safety
+    ///
+    /// This function is unsafe because:
+    /// - It modifies the attributes structure
+    /// - Must be called on an initialized attributes structure
+    ///
+    /// See: [posix_spawnattr_setflags(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawnattr_setflags.3.html)
+    pub fn posix_spawnattr_setflags(attrp: *mut libc::posix_spawnattr_t, flags: libc::c_short) -> libc::c_int;
+}
+
+/// Spawn flags for posix_spawn
+///
+/// These constants define flags that can be passed to `posix_spawnattr_setflags()`.
+/// They control the behavior of the spawned process.
+pub mod spawn_flags
+{
+    use libc::c_short;
+
+    /// Start the process in a suspended state
+    ///
+    /// When this flag is set, the spawned process will be created but will not
+    /// start executing until explicitly resumed. This is essential for debuggers
+    /// that need to set breakpoints before the process starts running.
+    ///
+    /// On macOS, this uses Mach's `task_suspend()` internally to suspend the
+    /// process immediately after creation.
+    ///
+    /// See: [POSIX_SPAWN_START_SUSPENDED documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
+    pub const POSIX_SPAWN_START_SUSPENDED: c_short = 0x0080;
+}

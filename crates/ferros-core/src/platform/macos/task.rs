@@ -117,6 +117,54 @@ impl MacOSDebugger
         })
     }
 
+    /// Check if the debugger has permissions to attach to processes
+    ///
+    /// This function attempts to get a task port for the current process (self)
+    /// to verify that debugging permissions are available. This is useful for
+    /// checking permissions before attempting to attach to other processes.
+    ///
+    /// ## Returns
+    ///
+    /// - `Ok(true)`: Debugging permissions are available
+    /// - `Ok(false)`: Debugging permissions are not available (need sudo or entitlements)
+    /// - `Err(...)`: Error occurred while checking permissions
+    ///
+    /// ## Note
+    ///
+    /// This function checks permissions by attempting `task_for_pid()` on the current
+    /// process. Even if this succeeds, attaching to other processes may still fail
+    /// due to System Integrity Protection (SIP) restrictions.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    ///
+    /// let debugger = MacOSDebugger::new()?;
+    /// if debugger.has_debugging_permissions()? {
+    ///     println!("✅ Debugging permissions available");
+    /// } else {
+    ///     println!("❌ Need sudo or entitlements to debug processes");
+    ///     println!("   Use launch() instead, or run with sudo");
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    #[allow(unsafe_code)] // Required for task_for_pid() call
+    pub fn has_debugging_permissions(&self) -> Result<bool>
+    {
+        unsafe {
+            let current_pid = libc::getpid();
+            let mut task: mach_port_t = 0;
+            let result = ffi::task_for_pid(mach_task_self(), current_pid, &mut task);
+
+            match result {
+                KERN_SUCCESS => Ok(true),
+                libc::KERN_PROTECTION_FAILURE => Ok(false),
+                _ => Err(DebuggerError::MachError(result.into())),
+            }
+        }
+    }
+
     /// Ensure that the debugger is attached to a process
     ///
     /// This is an internal helper method that checks if the debugger is currently
@@ -131,13 +179,8 @@ impl MacOSDebugger
     ///
     /// ## Example
     ///
-    /// ```rust,no_run
-    /// # use ferros_core::platform::macos::MacOSDebugger;
-    /// # let debugger = MacOSDebugger::new()?;
-    /// // This would fail if not attached
-    /// debugger.ensure_attached()?;
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
-    /// ```
+    /// This is an internal helper method. Public methods like `read_registers()`
+    /// call this internally to ensure the debugger is attached before proceeding.
     fn ensure_attached(&self) -> Result<()>
     {
         if !self.attached || self.task == 0 {
@@ -283,6 +326,134 @@ impl MacOSDebugger
 
 impl Debugger for MacOSDebugger
 {
+    /// Launch a new process under debugger control using posix_spawn
+    ///
+    /// This function:
+    /// 1. Uses `posix_spawn()` with `POSIX_SPAWN_START_SUSPENDED` to spawn the process
+    /// 2. Immediately attaches to it using `attach()` to get the task port
+    /// 3. The process remains suspended, ready for debugging
+    ///
+    /// ## Advantages
+    ///
+    /// - Process starts suspended, so you can set breakpoints before execution
+    /// - More reliable than attaching to already-running processes
+    /// - Better control over the process lifecycle
+    ///
+    /// ## Note on Permissions
+    ///
+    /// Even when launching processes, `attach()` is still called internally to get
+    /// the task port, which requires debugging permissions. However, launching
+    /// processes you own may have different permission requirements than attaching
+    /// to arbitrary processes. If you encounter permission errors, try:
+    /// - Running with `sudo`
+    /// - Code signing with the `com.apple.security.cs.debugger` entitlement
+    ///
+    /// ## Platform Requirements
+    ///
+    /// - **macOS 10.5+**: `POSIX_SPAWN_START_SUSPENDED` flag is available
+    /// - **Architecture**: Supports both ARM64 (Apple Silicon) and x86_64 (Intel)
+    ///
+    /// ## Parameters
+    ///
+    /// - `program`: Path to the executable to launch (must be absolute or in PATH)
+    /// - `args`: Command-line arguments (first argument should typically be the program name)
+    ///
+    /// ## Errors
+    ///
+    /// - `InvalidArgument`: Invalid program path or empty arguments
+    /// - `AttachFailed`: Failed to spawn process or attach to it
+    /// - `Io`: I/O error (e.g., file not found, permission denied)
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::Debugger;
+    ///
+    /// let mut debugger = MacOSDebugger::new()?;
+    /// debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
+    /// // Process is now suspended and ready for debugging
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    #[allow(unsafe_code)] // Required for posix_spawn API calls
+    fn launch(&mut self, program: &str, args: &[&str]) -> Result<()>
+    {
+        use std::ffi::CString;
+        use std::ptr;
+
+        // Validate inputs
+        if program.is_empty() {
+            return Err(DebuggerError::InvalidArgument("Program path cannot be empty".to_string()));
+        }
+        if args.is_empty() {
+            return Err(DebuggerError::InvalidArgument("Arguments cannot be empty".to_string()));
+        }
+
+        // Convert program path to CString
+        let program_cstr =
+            CString::new(program).map_err(|e| DebuggerError::InvalidArgument(format!("Invalid program path: {}", e)))?;
+
+        // Convert arguments to CStrings
+        let mut arg_cstrs = Vec::new();
+        for arg in args {
+            arg_cstrs
+                .push(CString::new(*arg).map_err(|e| DebuggerError::InvalidArgument(format!("Invalid argument: {}", e)))?);
+        }
+
+        // Create argv array (null-terminated)
+        let mut argv: Vec<*const libc::c_char> = arg_cstrs.iter().map(|s| s.as_ptr()).collect();
+        argv.push(ptr::null());
+
+        unsafe {
+            // Initialize spawn attributes
+            let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+            let result = ffi::posix_spawnattr_init(&mut attr);
+            if result != 0 {
+                return Err(DebuggerError::AttachFailed(format!(
+                    "Failed to initialize spawn attributes: {}",
+                    std::io::Error::from_raw_os_error(result)
+                )));
+            }
+
+            // Set POSIX_SPAWN_START_SUSPENDED flag
+            // This ensures the process starts suspended, allowing us to set breakpoints
+            let flags_result = ffi::posix_spawnattr_setflags(&mut attr, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED);
+            if flags_result != 0 {
+                let _ = ffi::posix_spawnattr_destroy(&mut attr);
+                return Err(DebuggerError::AttachFailed(format!(
+                    "Failed to set spawn flags: {}",
+                    std::io::Error::from_raw_os_error(flags_result)
+                )));
+            }
+
+            // Spawn the process
+            let mut pid: libc::pid_t = 0;
+            let spawn_result = ffi::posix_spawn(
+                &mut pid,
+                program_cstr.as_ptr(),
+                ptr::null(), // No file actions
+                &attr,       // Use attributes with START_SUSPENDED flag
+                argv.as_ptr(),
+                ptr::null(), // Use current environment
+            );
+
+            // Clean up attributes
+            let _ = ffi::posix_spawnattr_destroy(&mut attr);
+
+            if spawn_result != 0 {
+                return Err(DebuggerError::AttachFailed(format!(
+                    "Failed to spawn process '{}': {}",
+                    program,
+                    std::io::Error::from_raw_os_error(spawn_result)
+                )));
+            }
+
+            // Attach to the spawned process
+            // Since we launched it, we should have permission to attach
+            self.attach(ProcessId::from(pid as u32))
+        }
+    }
+
     /// Attach to a running process using Mach APIs
     ///
     /// This function:

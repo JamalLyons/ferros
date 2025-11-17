@@ -10,6 +10,7 @@ use ratatui::Frame;
 use crate::app::App;
 
 /// Format a memory size in bytes to a human-readable string (KB, MB, or GB)
+#[allow(clippy::large_stack_arrays)]
 fn format_memory_size(size_bytes: u64) -> String
 {
     const KB: u64 = 1024;
@@ -17,11 +18,20 @@ fn format_memory_size(size_bytes: u64) -> String
     const GB: u64 = MB * 1024;
 
     if size_bytes >= GB {
-        format!("{:.2} GB", size_bytes as f64 / GB as f64)
+        let whole = size_bytes / GB;
+        let remainder = size_bytes % GB;
+        let fraction = (remainder * 100) / GB;
+        format!("{whole}.{fraction:02} GB")
     } else if size_bytes >= MB {
-        format!("{:.2} MB", size_bytes as f64 / MB as f64)
+        let whole = size_bytes / MB;
+        let remainder = size_bytes % MB;
+        let fraction = (remainder * 100) / MB;
+        format!("{whole}.{fraction:02} MB")
     } else if size_bytes >= KB {
-        format!("{:.2} KB", size_bytes as f64 / KB as f64)
+        let whole = size_bytes / KB;
+        let remainder = size_bytes % KB;
+        let fraction = (remainder * 100) / KB;
+        format!("{whole}.{fraction:02} KB")
     } else {
         format!("{size_bytes} B")
     }

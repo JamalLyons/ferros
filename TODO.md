@@ -8,8 +8,7 @@ This list captures concrete work needed to reach feature parity with production 
 
 - [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
 - [x] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
-- [ ] **Breakpoints & watchpoints:** Add software breakpoints (BRK/INT3), hardware breakpoints, and data watchpoints with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
-- [ ] **Single-step & range stepping:** Implement instruction stepping, range stepping, and “continue until” to support `n/next/step/finish` flows.
+- [x] **Breakpoints & watchpoints:** Add software breakpoints (BRK/INT3), hardware breakpoints, and data watchpoints with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
 - [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
 - [ ] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
 - [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.

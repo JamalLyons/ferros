@@ -383,25 +383,12 @@ fn _unused_compile_assert_x86_write() {}
 
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ArmNeonState64
 {
     v: [u128; 32],
     fpsr: u32,
     fpcr: u32,
-}
-
-#[cfg(target_arch = "aarch64")]
-impl Default for ArmNeonState64
-{
-    fn default() -> Self
-    {
-        Self {
-            v: [0; 32],
-            fpsr: 0,
-            fpcr: 0,
-        }
-    }
 }
 
 #[cfg(target_arch = "aarch64")]

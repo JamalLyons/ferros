@@ -109,7 +109,7 @@ impl Tui
                         app.push_process_output(source, &line.clone());
                     }
                     Event::Debugger(debugger_event) => {
-                        app.handle_debugger_event(debugger_event);
+                        app.handle_debugger_event(&debugger_event);
                     }
                 },
                 Ok(None) => {

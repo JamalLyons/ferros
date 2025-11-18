@@ -26,6 +26,7 @@
 
 use std::fs::File;
 
+use crate::breakpoints::{BreakpointId, BreakpointInfo, BreakpointRequest};
 use crate::error::{DebuggerError, Result};
 use crate::events::DebuggerEventReceiver;
 use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
@@ -247,6 +248,61 @@ pub trait Debugger
         Err(DebuggerError::InvalidArgument(
             "Per-thread register access not supported for this debugger".to_string(),
         ))
+    }
+
+    /// Add a breakpoint or watchpoint.
+    fn add_breakpoint(&mut self, request: BreakpointRequest) -> Result<BreakpointId>
+    {
+        let _ = request;
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// Remove a breakpoint by id.
+    fn remove_breakpoint(&mut self, _id: BreakpointId) -> Result<()>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// Enable a disabled breakpoint.
+    fn enable_breakpoint(&mut self, _id: BreakpointId) -> Result<()>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// Disable an active breakpoint.
+    fn disable_breakpoint(&mut self, _id: BreakpointId) -> Result<()>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// Toggle a breakpoint's enabled state. Returns the new enabled state.
+    fn toggle_breakpoint(&mut self, _id: BreakpointId) -> Result<bool>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// Query information about a specific breakpoint.
+    fn breakpoint_info(&self, _id: BreakpointId) -> Result<BreakpointInfo>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Breakpoints are not supported on this debugger".to_string(),
+        ))
+    }
+
+    /// List all known breakpoints.
+    fn breakpoints(&self) -> Vec<BreakpointInfo>
+    {
+        Vec::new()
     }
 
     /// Read memory from the target process

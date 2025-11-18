@@ -1,6 +1,7 @@
 //! Application state and logic
 
 use std::collections::VecDeque;
+use std::fmt::Write;
 
 use ferros_core::events::{format_stop_reason, DebuggerEvent};
 use ferros_core::types::StopReason;
@@ -345,15 +346,15 @@ impl App
     }
 
     /// Consume an asynchronous debugger event from the core backend.
-    pub fn handle_debugger_event(&mut self, event: DebuggerEvent)
+    pub fn handle_debugger_event(&mut self, event: &DebuggerEvent)
     {
         match event {
             DebuggerEvent::TargetStopped { reason, thread } => {
                 self.target_is_stopped = true;
-                self.last_stop_reason = reason;
-                let mut message = format_stop_reason(reason);
+                self.last_stop_reason = *reason;
+                let mut message = format_stop_reason(*reason);
                 if let Some(thread_id) = thread {
-                    message.push_str(&format!(" (thread {})", thread_id.raw()));
+                    let _ = write!(message, " (thread {})", thread_id.raw());
                 }
                 self.record_stop_event(message);
             }

@@ -23,6 +23,7 @@
 use std::fs::File;
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::SystemTime;
 use std::{mem, thread};
 
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, natural_t, thread_act_t, vm_address_t, vm_size_t};
@@ -51,7 +52,12 @@ use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
 use mach2::task::{task_resume, task_set_exception_ports, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
+use tracing::warn;
 
+use crate::breakpoints::{
+    BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
+    BreakpointStore,
+};
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::events::{self, DebuggerEvent};
@@ -138,6 +144,8 @@ pub struct MacOSDebugger
     exception_resume_tx: Option<mpsc::Sender<ExceptionLoopCommand>>,
     /// Shared exception state observed by both the handler loop and debugger.
     exception_state: Arc<Mutex<ExceptionSharedState>>,
+    /// Breakpoint store shared with the exception handler.
+    breakpoints: Arc<Mutex<BreakpointStore>>,
     /// Event channel sender for higher-level consumers.
     event_tx: events::DebuggerEventSender,
     /// Event channel receiver handed out to frontends.
@@ -183,6 +191,7 @@ impl MacOSDebugger
             exception_thread: None,
             exception_resume_tx: None,
             exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
+            breakpoints: Arc::new(Mutex::new(BreakpointStore::new())),
             event_tx,
             event_rx: Some(event_rx),
             capture_output: false,
@@ -437,6 +446,95 @@ impl MacOSDebugger
                 thread.raw(),
                 self.pid.0
             )))
+        }
+    }
+
+    fn software_trap_bytes(&self) -> Result<Vec<u8>>
+    {
+        match self.architecture {
+            Architecture::Arm64 => Ok(vec![0x00, 0x00, 0x20, 0xD4]), // BRK #0
+            Architecture::X86_64 => Ok(vec![0xCC]),                  // INT3
+            Architecture::Unknown(label) => Err(DebuggerError::InvalidArgument(format!(
+                "Software breakpoints unsupported for architecture: {label}"
+            ))),
+        }
+    }
+
+    fn install_software_breakpoint(&mut self, address: Address) -> Result<BreakpointId>
+    {
+        self.ensure_attached()?;
+        let trap = self.software_trap_bytes()?;
+
+        {
+            let store = self.breakpoints.lock().unwrap();
+            if store.id_for_kind(address, BreakpointKind::Software).is_some() {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "Breakpoint already exists at 0x{:016x}",
+                    address.value()
+                )));
+            }
+        }
+
+        let original = self.read_memory(address, trap.len())?;
+        if original.len() != trap.len() {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Unable to read {} bytes at 0x{:016x} to install breakpoint",
+                trap.len(),
+                address.value()
+            )));
+        }
+
+        let written = self.write_memory(address, &trap)?;
+        if written != trap.len() {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Failed to write breakpoint trap at 0x{:016x}",
+                address.value()
+            )));
+        }
+
+        let mut info = BreakpointInfo::new(BreakpointId::from_raw(0), address, BreakpointKind::Software);
+        info.state = BreakpointState::Resolved;
+        info.enabled = true;
+        info.resolved_at = Some(SystemTime::now());
+
+        let entry = BreakpointEntry {
+            info,
+            payload: BreakpointPayload::Software {
+                original_bytes: original,
+            },
+        };
+
+        let mut store = self.breakpoints.lock().unwrap();
+        Ok(store.insert(entry))
+    }
+
+    fn restore_software_breakpoint(&mut self, entry: &BreakpointEntry) -> Result<()>
+    {
+        if let BreakpointPayload::Software { original_bytes } = &entry.payload {
+            let written = self.write_memory(entry.info.address, original_bytes)?;
+            if written != original_bytes.len() {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "Failed to restore original instruction at 0x{:016x}",
+                    entry.info.address.value()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_all_breakpoints(&mut self)
+    {
+        let entries = {
+            let mut store = self.breakpoints.lock().unwrap();
+            store.drain()
+        };
+
+        for entry in entries {
+            if let BreakpointPayload::Software { .. } = entry.payload {
+                if let Err(err) = self.restore_software_breakpoint(&entry) {
+                    warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
+                }
+            }
         }
     }
 
@@ -702,12 +800,13 @@ impl MacOSDebugger
 
                 let (tx, rx) = mpsc::channel();
                 let shared_state = Arc::clone(&self.exception_state);
+                let breakpoints = Arc::clone(&self.breakpoints);
                 let architecture = self.architecture;
                 let event_tx = self.event_tx.clone();
                 info!("Spawning Mach exception handler thread");
                 let handle = thread::Builder::new()
                     .name("ferros-mac-exc".to_string())
-                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture, event_tx))
+                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture, event_tx, breakpoints))
                     .map_err(|e| {
                         let _ = mach_port_destroy(self_task, port);
                         DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}"))
@@ -773,6 +872,130 @@ impl Debugger for MacOSDebugger
     fn take_event_receiver(&mut self) -> Option<events::DebuggerEventReceiver>
     {
         self.event_rx.take()
+    }
+
+    fn add_breakpoint(&mut self, request: BreakpointRequest) -> Result<BreakpointId>
+    {
+        match request {
+            BreakpointRequest::Software { address } => self.install_software_breakpoint(address),
+            BreakpointRequest::Hardware { .. } => Err(DebuggerError::InvalidArgument(
+                "Hardware breakpoints are not yet supported on macOS".to_string(),
+            )),
+            BreakpointRequest::Watchpoint { .. } => Err(DebuggerError::InvalidArgument(
+                "Watchpoints are not yet supported on macOS".to_string(),
+            )),
+        }
+    }
+
+    fn remove_breakpoint(&mut self, id: BreakpointId) -> Result<()>
+    {
+        let entry = {
+            let mut store = self.breakpoints.lock().unwrap();
+            store.remove(id)
+        }
+        .ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
+
+        if entry.info.kind == BreakpointKind::Software && entry.info.enabled {
+            self.restore_software_breakpoint(&entry)?;
+        }
+        Ok(())
+    }
+
+    fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
+    {
+        let address = {
+            let store = self.breakpoints.lock().unwrap();
+            let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
+            if entry.info.enabled {
+                return Ok(());
+            }
+            if entry.info.kind != BreakpointKind::Software {
+                return Err(DebuggerError::InvalidArgument(
+                    "Only software breakpoints can be toggled on macOS".to_string(),
+                ));
+            }
+            entry.info.address
+        };
+
+        let trap = self.software_trap_bytes()?;
+        let written = self.write_memory(address, &trap)?;
+        if written != trap.len() {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Failed to re-arm breakpoint at 0x{:016x}",
+                address.value()
+            )));
+        }
+
+        let mut store = self.breakpoints.lock().unwrap();
+        if let Some(entry) = store.get_mut(id) {
+            entry.info.state = BreakpointState::Resolved;
+            entry.info.enabled = true;
+            entry.info.resolved_at = Some(SystemTime::now());
+        }
+        Ok(())
+    }
+
+    fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
+    {
+        let (address, bytes) = {
+            let store = self.breakpoints.lock().unwrap();
+            let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
+            if !entry.info.enabled {
+                return Ok(());
+            }
+            if let BreakpointPayload::Software { original_bytes } = &entry.payload {
+                (entry.info.address, original_bytes.clone())
+            } else {
+                return Err(DebuggerError::InvalidArgument(
+                    "Only software breakpoints can be toggled on macOS".to_string(),
+                ));
+            }
+        };
+
+        let written = self.write_memory(address, &bytes)?;
+        if written != bytes.len() {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "Failed to disable breakpoint at 0x{:016x}",
+                address.value()
+            )));
+        }
+
+        let mut store = self.breakpoints.lock().unwrap();
+        if let Some(entry) = store.get_mut(id) {
+            entry.info.state = BreakpointState::Disabled;
+            entry.info.enabled = false;
+        }
+        Ok(())
+    }
+
+    fn toggle_breakpoint(&mut self, id: BreakpointId) -> Result<bool>
+    {
+        let enabled = {
+            let store = self.breakpoints.lock().unwrap();
+            store
+                .get(id)
+                .ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?
+                .info
+                .enabled
+        };
+        if enabled {
+            self.disable_breakpoint(id)?;
+            Ok(false)
+        } else {
+            self.enable_breakpoint(id)?;
+            Ok(true)
+        }
+    }
+
+    fn breakpoint_info(&self, id: BreakpointId) -> Result<BreakpointInfo>
+    {
+        let store = self.breakpoints.lock().unwrap();
+        store.info(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))
+    }
+
+    fn breakpoints(&self) -> Vec<BreakpointInfo>
+    {
+        self.breakpoints.lock().unwrap().list()
     }
 
     fn read_registers_for(&self, thread: ThreadId) -> Result<Registers>
@@ -1135,6 +1358,7 @@ impl Debugger for MacOSDebugger
         }
 
         self.stop_exception_handler();
+        self.restore_all_breakpoints();
 
         let pid = self.pid.0;
         info!("Detaching from process {}", pid);
@@ -1440,6 +1664,7 @@ fn run_exception_loop(
     shared_state: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
     event_tx: events::DebuggerEventSender,
+    breakpoints: Arc<Mutex<BreakpointStore>>,
 )
 {
     use std::mem::MaybeUninit;
@@ -1492,6 +1717,11 @@ fn run_exception_loop(
             shared.stopped = true;
             shared.stop_reason = stop_reason;
             shared.pending_thread = Some(thread_port);
+        }
+
+        if let StopReason::Breakpoint(addr) = stop_reason {
+            let mut store = breakpoints.lock().unwrap();
+            store.record_hit(Address::from(addr));
         }
 
         if let Err(err) = event_tx.send(DebuggerEvent::TargetStopped {
@@ -1704,6 +1934,7 @@ impl Drop for MacOSDebugger
 {
     fn drop(&mut self)
     {
+        self.restore_all_breakpoints();
         self.stop_exception_handler();
     }
 }

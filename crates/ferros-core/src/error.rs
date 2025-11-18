@@ -108,6 +108,10 @@ pub enum DebuggerError
     #[error("No breakpoint at address 0x{0:016x}")]
     NoBreakpoint(u64),
 
+    /// No breakpoint exists for the given identifier.
+    #[error("No breakpoint with id {0}")]
+    BreakpointIdNotFound(u64),
+
     /// Failed to suspend the target process
     ///
     /// This error occurs when `suspend()` fails. This can happen if:

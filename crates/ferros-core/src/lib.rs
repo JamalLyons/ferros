@@ -28,12 +28,14 @@
 
 #![allow(unsafe_code)] // Required for low-level system APIs (Mach, ptrace, etc.)
 
+pub mod breakpoints;
 pub mod debugger;
 pub mod error;
 pub mod events;
 pub mod platform;
 pub mod types;
 
+pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
 pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};

@@ -206,7 +206,7 @@ impl X86_64Register
 }
 
 /// 128-bit SIMD register value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VectorRegisterValue
 {
     bytes: [u8; 16],
@@ -242,14 +242,6 @@ impl VectorRegisterValue
     pub const fn as_u128(&self) -> u128
     {
         u128::from_le_bytes(self.bytes)
-    }
-}
-
-impl Default for VectorRegisterValue
-{
-    fn default() -> Self
-    {
-        Self { bytes: [0; 16] }
     }
 }
 

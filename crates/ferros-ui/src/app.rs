@@ -51,6 +51,8 @@ pub struct App
     pub process_output: VecDeque<ProcessOutputLine>,
     /// Number of lines scrolled back from the end of the output buffer
     pub output_scrollback: usize,
+    /// Timestamp of last thread list refresh (to avoid refreshing too frequently)
+    last_thread_refresh: std::time::Instant,
 }
 
 /// Different view modes in the TUI
@@ -97,25 +99,39 @@ impl App
             error_message: None,
             process_output: VecDeque::new(),
             output_scrollback: 0,
+            last_thread_refresh: std::time::Instant::now(),
         }
     }
 
     /// Cleanup when quitting - detach from process
-    pub fn cleanup(&mut self)
+    ///
+    /// This is an async function to avoid blocking the async runtime.
+    /// It performs cleanup operations like killing launched processes and detaching.
+    pub async fn cleanup(&mut self)
     {
         if self.debugger.is_attached() {
             // If we launched the process, kill it first before detaching
             // This ensures clean shutdown
             if self.was_launched {
                 if let Some(pid) = self.pid {
-                    // Try graceful shutdown first
-                    let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).output();
+                    // Try graceful shutdown first (non-blocking)
+                    let pid_str = pid.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = std::process::Command::new("kill").arg("-TERM").arg(&pid_str).output();
+                    })
+                    .await
+                    .ok();
 
-                    // Wait a bit for graceful shutdown
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    // Wait a bit for graceful shutdown (async)
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-                    // Force kill if still running
-                    let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                    // Force kill if still running (non-blocking)
+                    let pid_str = pid.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = std::process::Command::new("kill").arg("-9").arg(&pid_str).output();
+                    })
+                    .await
+                    .ok();
                 }
             }
 
@@ -137,6 +153,7 @@ impl App
 
         match key_event.code {
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => {
+                self.error_message = Some("Quitting...".to_string());
                 self.should_quit = true;
                 return true;
             }
@@ -289,9 +306,15 @@ impl App
     /// Update the application state (called on each tick)
     pub fn tick(&mut self)
     {
-        // Refresh thread list periodically
+        // Refresh thread list periodically, but not too frequently
+        // Mach thread ports are ephemeral and change on each refresh, so we only
+        // refresh every 2 seconds to avoid showing constantly changing thread IDs
         if self.debugger.is_attached() {
-            let _ = self.debugger.refresh_threads();
+            const THREAD_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+            if self.last_thread_refresh.elapsed() >= THREAD_REFRESH_INTERVAL {
+                let _ = self.debugger.refresh_threads();
+                self.last_thread_refresh = std::time::Instant::now();
+            }
         }
     }
 

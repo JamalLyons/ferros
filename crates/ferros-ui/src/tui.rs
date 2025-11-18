@@ -124,22 +124,34 @@ impl Tui
 
         info!("Ferros TUI closing");
 
+        // Restore terminal IMMEDIATELY so user sees normal output right away
+        // This prevents the frozen appearance during cleanup
+        Self::restore()?;
+
         // Stop the event handler to allow the program to exit
         event_handler.stop();
-        for handle in output_tasks.drain(..) {
-            if let Err(e) = handle.await {
-                warn!("Process output task exited with error: {e}");
+
+        // Don't wait indefinitely for output tasks - use timeout
+        // This prevents blocking if tasks are stuck reading from pipes
+        let output_handles = std::mem::take(&mut output_tasks);
+        let timeout_result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            for handle in output_handles {
+                if let Err(e) = handle.await {
+                    warn!("Process output task exited with error: {e}");
+                }
             }
+        })
+        .await;
+        if timeout_result.is_err() {
+            warn!("Output tasks didn't finish in time, dropping");
         }
 
-        // Cleanup before restoring terminal
-        app.cleanup();
+        // Cleanup after terminal is restored (async, non-blocking)
+        // User can see what's happening in normal terminal mode
+        app.cleanup().await;
 
         // Flush stdout to ensure any messages are visible
         let _ = std::io::stdout().flush();
-
-        // Restore terminal to normal mode
-        Self::restore()?;
 
         info!("Ferros TUI closed");
 

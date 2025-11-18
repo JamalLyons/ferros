@@ -4,6 +4,20 @@
 //!
 //! On macOS, we use `vm_read()` and `vm_write()` to access process memory.
 //! These are Mach APIs that work with task ports obtained from `task_for_pid()`.
+//!
+//! ## Mach Memory APIs
+//!
+//! - **vm_read()**: Read memory from a target process
+//! - **vm_write()**: Write memory to a target process
+//! - **mach_vm_region()**: Enumerate memory regions in a process
+//! - **mach_vm_protect()**: Change memory protection flags
+//!
+//! ## References
+//!
+//! - [vm_read(3) man page](https://developer.apple.com/documentation/kernel/1402149-vm_read/)
+//! - [vm_write(3) man page](https://developer.apple.com/documentation/kernel/1402149-vm_write/)
+//! - [mach_vm_region(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_region/)
+//! - [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
 
 use std::cmp::min;
 use std::collections::HashMap;
@@ -30,11 +44,10 @@ use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 use once_cell::sync::Lazy;
 
 use crate::error::{DebuggerError, Result};
-use crate::platform::macos::ffi;
+use crate::platform::macos::{constants, ffi};
 use crate::types::{Address, MemoryRegion, MemoryRegionId};
 
-const MAX_VM_READ_CHUNK: usize = 64 * 1024;
-const PATTERN_SCAN_CHUNK: usize = 64 * 1024;
+// Use constants from the centralized constants module
 
 static SYSTEM_PAGE_SIZE: Lazy<usize> = Lazy::new(|| unsafe {
     let size = libc::sysconf(libc::_SC_PAGESIZE);
@@ -413,7 +426,7 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
     let mut cursor = addr.value();
 
     while total < dst.len() {
-        let chunk_len = min(MAX_VM_READ_CHUNK, dst.len() - total);
+        let chunk_len = min(constants::MAX_VM_READ_CHUNK, dst.len() - total);
         let mut actual: mach_vm_size_t = 0;
 
         let result = unsafe {
@@ -475,7 +488,12 @@ pub fn format_hexdump(base: Address, bytes: &[u8], width: usize) -> String
     out
 }
 
-/// Reads memory (optionally using a cache) and produces a hexdump string.
+/// Read and format memory as a hexdump string.
+///
+/// Convenience function that reads memory and formats it using `format_hexdump()`.
+/// Uses `read_memory()` internally.
+///
+/// See: [vm_read(3) man page](https://developer.apple.com/documentation/kernel/1585350-vm_read/)
 pub fn hexdump_memory(
     task: mach_port_t,
     cache: Option<&MemoryCache>,
@@ -500,7 +518,27 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize>
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
-/// Searches for a byte pattern in the target memory, returning the first match if found.
+/// Search for a byte pattern in memory.
+///
+/// Scans memory for a specific byte pattern, similar to `grep` for memory.
+/// Can use a `MemoryCache` for faster repeated searches.
+///
+/// ## Parameters
+///
+/// - `task`: Mach task port
+/// - `cache`: Optional memory cache (speeds up repeated searches)
+/// - `start`: Starting address to search from
+/// - `len`: Number of bytes to search
+/// - `pattern`: Byte pattern to search for
+///
+/// ## Returns
+///
+/// `Some(address)` if the pattern is found, `None` otherwise.
+///
+/// ## Implementation
+///
+/// Reads memory in chunks and searches for the pattern, handling boundary
+/// cases where the pattern might span chunk boundaries.
 pub fn find_pattern(
     task: mach_port_t,
     cache: Option<&MemoryCache>,
@@ -515,7 +553,7 @@ pub fn find_pattern(
 
     let mut scanned = 0usize;
     while scanned < len {
-        let chunk_len = min(PATTERN_SCAN_CHUNK, len - scanned);
+        let chunk_len = min(constants::PATTERN_SCAN_CHUNK, len - scanned);
         let addr = Address::from(start.value().saturating_add(scanned as u64));
         let chunk = if let Some(cache) = cache {
             cache.read(task, addr, chunk_len)?
@@ -544,6 +582,22 @@ pub fn find_pattern(
 }
 
 /// Guard that temporarily changes the protection of a memory range and restores it on drop.
+///
+/// This RAII guard uses `mach_vm_protect()` to temporarily change memory protection
+/// (e.g., make read-only memory writable) and automatically restores the original
+/// protection when dropped.
+///
+/// ## Use Cases
+///
+/// - Installing software breakpoints (need to write INT3/BRK to code segments)
+/// - Temporarily making memory writable for patching
+///
+/// ## Safety
+///
+/// The guard ensures memory protection is restored even if an error occurs,
+/// preventing memory corruption or security issues.
+///
+/// See: [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
 pub struct MemoryProtectionGuard
 {
     task: mach_port_t,
@@ -556,6 +610,10 @@ pub struct MemoryProtectionGuard
 impl MemoryProtectionGuard
 {
     /// Make the specified range writable (and readable/executable) until the guard is dropped.
+    ///
+    /// Sets protection to `VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE`.
+    ///
+    /// See: [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
     pub fn make_writable(task: mach_port_t, addr: Address, len: usize) -> Result<Self>
     {
         Self::with_protection(
@@ -567,6 +625,10 @@ impl MemoryProtectionGuard
     }
 
     /// Apply an arbitrary protection mask for the lifetime of the guard.
+    ///
+    /// Allows setting custom protection flags (e.g., `VM_PROT_READ | VM_PROT_EXECUTE`).
+    ///
+    /// See: [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
     pub fn with_protection(task: mach_port_t, addr: Address, len: usize, protection: c_int) -> Result<Self>
     {
         if len == 0 {

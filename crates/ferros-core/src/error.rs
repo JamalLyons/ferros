@@ -177,8 +177,22 @@ pub enum DebuggerError
     /// - The thread has exited
     /// - The thread state structure doesn't match what we expect
     /// - The architecture is different than expected
-    #[error("Failed to read registers: {0}")]
-    ReadRegistersFailed(String),
+    ///
+    /// ## Context
+    ///
+    /// - `operation`: Description of what operation was being performed (e.g., "read ARM64 registers")
+    /// - `thread_id`: Optional thread ID if the operation was thread-specific
+    /// - `details`: Additional error details from the underlying system call
+    #[error("Failed to read registers: {operation}")]
+    ReadRegistersFailed
+    {
+        /// Description of the operation that failed
+        operation: String,
+        /// Thread ID if the operation was thread-specific
+        thread_id: Option<crate::types::ThreadId>,
+        /// Additional error details
+        details: String,
+    },
 
     /// macOS-specific Mach API error
     ///

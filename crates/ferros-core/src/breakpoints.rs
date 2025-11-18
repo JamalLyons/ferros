@@ -6,6 +6,7 @@
 //! restoring traps but can use this structure to track ids, states, and hit
 //! counts in a thread-safe manner.
 
+pub mod builder;
 use std::collections::HashMap;
 use std::time::SystemTime;
 

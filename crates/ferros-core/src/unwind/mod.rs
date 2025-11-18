@@ -1,3 +1,31 @@
+//! # Stack Unwinding
+//!
+//! DWARF CFI (Call Frame Information) based stack unwinding with fallback heuristics.
+//!
+//! This module implements stack unwinding using DWARF CFI from `.eh_frame` and `.debug_frame`
+//! sections, with fallback strategies for when CFI is unavailable:
+//!
+//! 1. **CFI-based unwinding**: Uses DWARF CFI to compute CFA (Canonical Frame Address) and
+//!    register recovery rules.
+//! 2. **Frame pointer fallback**: Uses the frame pointer register (RBP on x86-64, X29 on ARM64)
+//!    to walk the stack.
+//! 3. **Stack scan fallback**: Scans the stack for values that look like return addresses.
+//! 4. **Link register fallback**: Uses the link register (LR on ARM64) as the return address.
+//!
+//! ## DWARF CFI Sections
+//!
+//! - **`.eh_frame`**: Exception handling frame information (used at runtime)
+//! - **`.debug_frame`**: Debug frame information (used by debuggers)
+//!
+//! Both sections contain FDEs (Frame Description Entries) that describe how to unwind
+//! the stack for each function.
+//!
+//! ## References
+//!
+//! - [DWARF Debugging Information Format](https://dwarfstd.org/)
+//! - [DWARF CFI Specification](https://dwarfstd.org/doc/DWARF5.pdf#page=179)
+//! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
+
 use gimli::{
     self, BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, Register, RegisterRule, UnwindContext, UnwindSection,
 };
@@ -7,12 +35,42 @@ use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
 use crate::types::{Address, Architecture, FrameId, FrameKind, FrameStatus, Registers, StackFrame, ThreadId};
 
 /// Minimal memory accessor required for stack unwinding.
+///
+/// This trait allows the unwinder to read memory from the target process
+/// to recover register values and compute the CFA (Canonical Frame Address).
+///
+/// ## Implementation Notes
+///
+/// Implementations should handle:
+/// - Invalid memory addresses (return errors, don't panic)
+/// - Partial reads (if memory is partially unmapped)
+/// - Endianness (matches target architecture)
 pub trait MemoryAccess
 {
+    /// Read a 64-bit value from the given address.
+    ///
+    /// Returns an error if the address is invalid or unreadable.
     fn read_u64(&self, address: Address) -> Result<u64>;
 }
 
 /// CFI-driven stack unwinder with frame-pointer fallbacks.
+///
+/// This unwinder attempts to build a call stack by:
+///
+/// 1. Using DWARF CFI from `.eh_frame` or `.debug_frame` sections
+/// 2. Falling back to frame pointer walking if CFI is unavailable
+/// 3. Falling back to stack scanning if frame pointer is unavailable
+/// 4. Falling back to link register (ARM64) if available
+///
+/// ## Architecture Support
+///
+/// - **x86-64**: Uses RBP (frame pointer) and RSP (stack pointer)
+/// - **ARM64**: Uses X29 (frame pointer), X30 (link register), and SP (stack pointer)
+///
+/// ## Inlined Frames
+///
+/// The unwinder detects inlined functions using DWARF line information and creates
+/// multiple `StackFrame` entries for a single physical frame when inlining is present.
 pub struct StackUnwinder<'a, M>
 {
     architecture: Architecture,
@@ -22,6 +80,13 @@ pub struct StackUnwinder<'a, M>
 
 impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 {
+    /// Create a new stack unwinder.
+    ///
+    /// ## Parameters
+    ///
+    /// - `architecture`: Target architecture (x86-64 or ARM64)
+    /// - `symbols`: Symbol cache for resolving addresses to functions
+    /// - `memory`: Memory accessor for reading process memory
     pub fn new(architecture: Architecture, symbols: &'a SymbolCache, memory: &'a M) -> Self
     {
         Self {
@@ -31,6 +96,37 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
+    /// Unwind the call stack starting from the given registers.
+    ///
+    /// This method walks the stack frame by frame, using CFI when available
+    /// and falling back to heuristics when CFI is unavailable.
+    ///
+    /// ## Parameters
+    ///
+    /// - `thread`: Thread ID for frame identification
+    /// - `regs`: Initial register state (PC, SP, FP, etc.)
+    /// - `max_frames`: Maximum number of frames to unwind
+    ///
+    /// ## Returns
+    ///
+    /// A vector of `StackFrame` entries, ordered from most recent (top) to oldest (bottom).
+    /// Each frame includes:
+    /// - Frame ID (stable identifier)
+    /// - Program counter (PC)
+    /// - Stack pointer (SP)
+    /// - Frame pointer (FP) if available
+    /// - Symbolication (function name, source location)
+    /// - Frame status (complete, incomplete, error)
+    ///
+    /// ## Frame Status
+    ///
+    /// - `Complete`: Frame was successfully unwound with CFI
+    /// - `Incomplete`: Frame was unwound using fallback heuristics
+    /// - `Error`: Frame unwinding failed
+    ///
+    /// ## Errors
+    ///
+    /// Returns an error if memory reads fail or CFI parsing fails.
     pub fn unwind(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<Vec<StackFrame>>
     {
         let mut frames = Vec::new();

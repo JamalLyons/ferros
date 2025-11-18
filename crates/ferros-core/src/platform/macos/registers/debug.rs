@@ -2,23 +2,30 @@
 //!
 //! Functions to read/write CPU debug registers for hardware breakpoints.
 //!
+//! This module provides low-level access to CPU debug registers used for hardware
+//! breakpoints. Unlike general-purpose registers (see [arm64](arm64) and [x86_64](x86_64)),
+//! debug registers are special CPU registers dedicated to breakpoint and watchpoint control.
+//!
 //! ## Flavors
 //!
-//! - **x86-64**: `x86_DEBUG_STATE64` (11)
-//! - **ARM64**: `ARM_DEBUG_STATE64` (15)
+//! - **x86-64**: `x86_DEBUG_STATE64` (flavor 11) - Uses DR0-DR7 registers
+//! - **ARM64**: `ARM_DEBUG_STATE64` (flavor 15) - Uses DBGBVR/DBGBCR registers
+//!
+//! ## See Also
+//!
+//! - [arm64](arm64) - General-purpose ARM64 register access
+//! - [x86_64](x86_64) - General-purpose x86-64 register access
+//! - [breakpoints](../breakpoints) - High-level breakpoint management
 
-use libc::{c_int, mach_msg_type_number_t, natural_t, thread_act_t};
+use libc::{natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 
 use crate::error::{DebuggerError, Result};
-use crate::platform::macos::ffi;
+use crate::platform::macos::{constants, ffi};
 use crate::types::Address;
 
-#[cfg(target_arch = "x86_64")]
-const X86_DEBUG_STATE64: c_int = 11;
-#[cfg(target_arch = "x86_64")]
-const X86_DEBUG_STATE64_COUNT: mach_msg_type_number_t = 16; // 64 bytes / 4 = 16 ints
+// Use constants from the centralized constants module
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
@@ -35,10 +42,7 @@ struct X86DebugState64
     dr7: u64,
 }
 
-#[cfg(target_arch = "aarch64")]
-const ARM_DEBUG_STATE64: c_int = 15;
-#[cfg(target_arch = "aarch64")]
-const ARM_DEBUG_STATE64_COUNT: mach_msg_type_number_t = 130; // 520 bytes / 4 = 130 ints
+// Use constants from the centralized constants module
 
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
@@ -53,7 +57,43 @@ struct ArmDebugState64
 }
 
 /// Set a hardware breakpoint at the given address.
-/// Returns the slot index used (0-3 for x86, 0-15 for ARM).
+///
+/// Hardware breakpoints use CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64)
+/// to break on instruction execution without modifying code. This is useful for:
+///
+/// - Read-only code sections
+/// - Self-modifying code
+/// - Performance-critical paths
+///
+/// ## Limitations
+///
+/// - **x86-64**: Only 4 hardware breakpoints available (DR0-DR3)
+/// - **ARM64**: Up to 16 hardware breakpoints available (DBGBVR0-15)
+///
+/// ## Mach APIs Used
+///
+/// - **thread_get_state()**: Reads current debug register state
+/// - **thread_set_state()**: Writes updated debug register state
+///
+/// ## Thread State Flavors
+///
+/// - **x86-64**: `x86_DEBUG_STATE64` (flavor 11)
+/// - **ARM64**: `ARM_DEBUG_STATE64` (flavor 15)
+///
+/// ## Returns
+///
+/// The slot index used (0-3 for x86-64, 0-15 for ARM64).
+///
+/// ## Errors
+///
+/// Returns `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `InvalidArgument` if all hardware breakpoint slots are in use.
+///
+/// ## See Also
+///
+/// - `clear_hardware_breakpoint()`: Removes a hardware breakpoint
+/// - [thread_get_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
+/// - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn set_hardware_breakpoint(thread: thread_act_t, address: Address) -> Result<u32>
 {
     #[cfg(target_arch = "x86_64")]
@@ -67,6 +107,30 @@ pub fn set_hardware_breakpoint(thread: thread_act_t, address: Address) -> Result
 }
 
 /// Clear a hardware breakpoint from the given slot.
+///
+/// This disables the hardware breakpoint in the specified slot by clearing
+/// the corresponding enable bit in the debug control register.
+///
+/// ## Mach APIs Used
+///
+/// - **thread_get_state()**: Reads current debug register state
+/// - **thread_set_state()**: Writes updated debug register state
+///
+/// ## Parameters
+///
+/// - `thread`: The thread port to modify
+/// - `slot`: The slot index (0-3 for x86-64, 0-15 for ARM64)
+///
+/// ## Errors
+///
+/// Returns `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `InvalidArgument` if the slot index is out of range.
+///
+/// ## See Also
+///
+/// - `set_hardware_breakpoint()`: Sets a hardware breakpoint
+/// - [thread_get_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
+/// - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn clear_hardware_breakpoint(thread: thread_act_t, slot: u32) -> Result<()>
 {
     #[cfg(target_arch = "x86_64")]
@@ -84,8 +148,13 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
 {
     unsafe {
         let mut state = X86DebugState64::default();
-        let mut count = X86_DEBUG_STATE64_COUNT;
-        let kr = ffi::thread_get_state(thread, X86_DEBUG_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+        let mut count = constants::X86_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::X86_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
 
         if kr != KERN_SUCCESS {
             return Err(DebuggerError::MachError(kr.into()));
@@ -133,9 +202,9 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
 
         let kr = ffi::thread_set_state(
             thread,
-            X86_DEBUG_STATE64,
+            constants::X86_DEBUG_STATE64,
             &state as *const _ as *const natural_t,
-            X86_DEBUG_STATE64_COUNT,
+            constants::X86_DEBUG_STATE64_COUNT,
         );
 
         if kr != KERN_SUCCESS {
@@ -151,8 +220,13 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
 {
     unsafe {
         let mut state = X86DebugState64::default();
-        let mut count = X86_DEBUG_STATE64_COUNT;
-        let kr = ffi::thread_get_state(thread, X86_DEBUG_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+        let mut count = constants::X86_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::X86_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
 
         if kr != KERN_SUCCESS {
             return Err(DebuggerError::MachError(kr.into()));
@@ -163,9 +237,9 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
 
         let kr = ffi::thread_set_state(
             thread,
-            X86_DEBUG_STATE64,
+            constants::X86_DEBUG_STATE64,
             &state as *const _ as *const natural_t,
-            X86_DEBUG_STATE64_COUNT,
+            constants::X86_DEBUG_STATE64_COUNT,
         );
 
         if kr != KERN_SUCCESS {
@@ -181,8 +255,13 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
 {
     unsafe {
         let mut state = ArmDebugState64::default();
-        let mut count = ARM_DEBUG_STATE64_COUNT;
-        let kr = ffi::thread_get_state(thread, ARM_DEBUG_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+        let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
 
         if kr != KERN_SUCCESS {
             return Err(DebuggerError::MachError(kr.into()));
@@ -225,13 +304,13 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
         // BAS = 1111 (Match all bytes)
         // Note: The exact value might depend on kernel enforcement, but 0x1E5 is common.
 
-        state.bcr[slot] = 0x1E5;
+        state.bcr[slot] = constants::ARM64_BP_CTRL_USER_EXEC;
 
         let kr = ffi::thread_set_state(
             thread,
-            ARM_DEBUG_STATE64,
+            constants::ARM_DEBUG_STATE64,
             &state as *const _ as *const natural_t,
-            ARM_DEBUG_STATE64_COUNT,
+            constants::ARM_DEBUG_STATE64_COUNT,
         );
 
         if kr != KERN_SUCCESS {
@@ -247,8 +326,13 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
 {
     unsafe {
         let mut state = ArmDebugState64::default();
-        let mut count = ARM_DEBUG_STATE64_COUNT;
-        let kr = ffi::thread_get_state(thread, ARM_DEBUG_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
+        let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
 
         if kr != KERN_SUCCESS {
             return Err(DebuggerError::MachError(kr.into()));
@@ -263,9 +347,9 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
 
         let kr = ffi::thread_set_state(
             thread,
-            ARM_DEBUG_STATE64,
+            constants::ARM_DEBUG_STATE64,
             &state as *const _ as *const natural_t,
-            ARM_DEBUG_STATE64_COUNT,
+            constants::ARM_DEBUG_STATE64_COUNT,
         );
 
         if kr != KERN_SUCCESS {

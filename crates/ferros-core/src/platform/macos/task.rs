@@ -23,41 +23,28 @@
 use std::fs::File;
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::SystemTime;
-use std::{mem, thread};
+use std::thread;
 
-use libc::{c_int, mach_msg_type_number_t, mach_port_t, natural_t, thread_act_t, vm_address_t, vm_size_t};
-#[cfg(target_os = "macos")]
-use mach2::exc::{__Reply__exception_raise_t, __Request__exception_raise_t};
+use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
-    exception_behavior_t, exception_mask_t, exception_type_t, EXCEPTION_DEFAULT, EXC_ARITHMETIC, EXC_BAD_ACCESS,
-    EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION,
-    EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXC_SOFTWARE, MACH_EXCEPTION_CODES,
+    exception_behavior_t, exception_mask_t, EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS,
+    EXC_MASK_BAD_INSTRUCTION, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, MACH_EXCEPTION_CODES,
 };
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
 use mach2::mach_port::{mach_port_allocate, mach_port_destroy, mach_port_insert_right};
 #[cfg(target_os = "macos")]
-use mach2::message::{
-    mach_msg, mach_msg_header_t, mach_msg_size_t, MACH_MSGH_BITS, MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE,
-    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_RCV_LARGE, MACH_RCV_MSG, MACH_SEND_MSG,
-};
-#[cfg(target_os = "macos")]
-use mach2::ndr::NDR_record;
+use mach2::message::MACH_MSG_TYPE_MAKE_SEND;
 #[cfg(target_os = "macos")]
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
 #[cfg(target_os = "macos")]
 use mach2::task::{task_resume, task_set_exception_ports, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
-use tracing::warn;
 
-use crate::breakpoints::{
-    BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
-    BreakpointStore,
-};
+use crate::breakpoints::{BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointRequest, BreakpointStore};
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::events::{self, DebuggerEvent};
@@ -66,38 +53,10 @@ use crate::platform::macos::memory::{get_memory_regions, write_memory, MemoryCac
 use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
-use crate::platform::macos::{debug_registers, ffi};
+use crate::platform::macos::{breakpoints, exception, ffi, launch, threads};
 use crate::symbols::{ImageDescriptor, SymbolCache};
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
 use crate::unwind::{MemoryAccess, StackUnwinder};
-
-/// Shared exception state manipulated by the Mach exception loop and debugger methods.
-#[derive(Debug)]
-struct ExceptionSharedState
-{
-    stopped: bool,
-    stop_reason: StopReason,
-    pending_thread: Option<thread_act_t>,
-}
-
-impl ExceptionSharedState
-{
-    fn new() -> Self
-    {
-        Self {
-            stopped: false,
-            stop_reason: StopReason::Running,
-            pending_thread: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ExceptionLoopCommand
-{
-    Continue,
-    Shutdown,
-}
 
 /// macOS debugger implementation using Mach APIs
 ///
@@ -143,9 +102,9 @@ pub struct MacOSDebugger
     /// Thread running the Mach exception handling loop.
     exception_thread: Option<thread::JoinHandle<()>>,
     /// Channel used to signal the exception loop (resume/shutdown).
-    exception_resume_tx: Option<mpsc::Sender<ExceptionLoopCommand>>,
+    exception_resume_tx: Option<mpsc::Sender<exception::ExceptionLoopCommand>>,
     /// Shared exception state observed by both the handler loop and debugger.
-    exception_state: Arc<Mutex<ExceptionSharedState>>,
+    exception_state: Arc<Mutex<exception::ExceptionSharedState>>,
     /// Breakpoint store shared with the exception handler.
     breakpoints: Arc<Mutex<BreakpointStore>>,
     /// Event channel sender for higher-level consumers.
@@ -162,6 +121,95 @@ pub struct MacOSDebugger
     symbol_cache: SymbolCache,
     /// Cached memory pages for repeated reads.
     memory_cache: MemoryCache,
+}
+
+// Trait implementations for modular operations
+impl breakpoints::BreakpointOperations for MacOSDebugger
+{
+    fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>
+    {
+        crate::platform::macos::memory::read_memory(self.task, addr, len)
+    }
+
+    fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>
+    {
+        write_memory(self.task, addr, data)
+    }
+
+    fn thread_ports(&self) -> &[thread_act_t]
+    {
+        &self.threads
+    }
+
+    fn architecture(&self) -> Architecture
+    {
+        self.architecture
+    }
+
+    fn ensure_attached(&self) -> Result<()>
+    {
+        if !self.attached || self.task == 0 {
+            return Err(DebuggerError::NotAttached);
+        }
+        Ok(())
+    }
+}
+
+impl threads::ThreadOperations for MacOSDebugger
+{
+    fn task_port(&self) -> libc::mach_port_t
+    {
+        self.task
+    }
+
+    fn thread_ports_mut(&mut self) -> &mut Vec<thread_act_t>
+    {
+        &mut self.threads
+    }
+
+    fn thread_ports(&self) -> &[thread_act_t]
+    {
+        &self.threads
+    }
+
+    fn current_thread(&self) -> Option<thread_act_t>
+    {
+        self.current_thread
+    }
+
+    fn set_current_thread(&mut self, thread: Option<thread_act_t>)
+    {
+        self.current_thread = thread;
+    }
+
+    fn pid(&self) -> u32
+    {
+        self.pid.0
+    }
+}
+
+impl launch::LaunchOperations for MacOSDebugger
+{
+    fn capture_output(&self) -> bool
+    {
+        self.capture_output
+    }
+
+    fn set_stdout_pipe(&mut self, fd: RawFd)
+    {
+        use std::fs::File;
+        unsafe {
+            self.stdout_pipe = Some(File::from_raw_fd(fd));
+        }
+    }
+
+    fn set_stderr_pipe(&mut self, fd: RawFd)
+    {
+        use std::fs::File;
+        unsafe {
+            self.stderr_pipe = Some(File::from_raw_fd(fd));
+        }
+    }
 }
 
 impl MacOSDebugger
@@ -196,7 +244,7 @@ impl MacOSDebugger
             exception_port: MACH_PORT_NULL,
             exception_thread: None,
             exception_resume_tx: None,
-            exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
+            exception_state: Arc::new(Mutex::new(exception::ExceptionSharedState::new())),
             breakpoints: Arc::new(Mutex::new(BreakpointStore::new())),
             event_tx,
             event_rx: Some(event_rx),
@@ -224,66 +272,6 @@ impl MacOSDebugger
         if let Err(err) = self.event_tx.send(DebuggerEvent::TargetResumed) {
             tracing::warn!("Failed to dispatch resume event: {err}");
         }
-    }
-
-    fn create_pipe_pair(label: &str) -> Result<(RawFd, RawFd)>
-    {
-        let mut fds = [0; 2];
-        unsafe {
-            if libc::pipe(fds.as_mut_ptr()) != 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(DebuggerError::AttachFailed(format!("Failed to create {label} pipe: {err}")));
-            }
-
-            for fd in &fds {
-                if libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) == -1 {
-                    let err = std::io::Error::last_os_error();
-                    // Best effort cleanup
-                    let _ = libc::close(fds[0]);
-                    let _ = libc::close(fds[1]);
-                    return Err(DebuggerError::AttachFailed(format!(
-                        "Failed to configure {label} pipe: {err}"
-                    )));
-                }
-            }
-        }
-
-        Ok((fds[0], fds[1]))
-    }
-
-    fn close_pipe_pair(pipe: &mut Option<(RawFd, RawFd)>)
-    {
-        if let Some((read_fd, write_fd)) = pipe.take() {
-            unsafe {
-                let _ = libc::close(read_fd);
-                let _ = libc::close(write_fd);
-            }
-        }
-    }
-
-    fn ensure_file_action_success(
-        desc: &str,
-        result: c_int,
-        attr: &mut libc::posix_spawnattr_t,
-        file_actions: &mut libc::posix_spawn_file_actions_t,
-        stdout_pipe_fds: &mut Option<(RawFd, RawFd)>,
-        stderr_pipe_fds: &mut Option<(RawFd, RawFd)>,
-    ) -> Result<()>
-    {
-        if result == 0 {
-            return Ok(());
-        }
-
-        let err = std::io::Error::from_raw_os_error(result);
-        unsafe {
-            let _ = libc::posix_spawn_file_actions_destroy(file_actions);
-        }
-        unsafe {
-            let _ = ffi::posix_spawnattr_destroy(attr);
-        }
-        Self::close_pipe_pair(stdout_pipe_fds);
-        Self::close_pipe_pair(stderr_pipe_fds);
-        Err(DebuggerError::AttachFailed(format!("Failed to {desc}: {err}")))
     }
 
     /// Check if the debugger has permissions to attach to processes
@@ -339,6 +327,19 @@ impl MacOSDebugger
     /// This obtains the Mach task port and thread list for the target PID but
     /// does not modify the task's execution state. Callers decide whether to
     /// suspend or resume after attaching.
+    ///
+    /// ## Mach APIs Used
+    ///
+    /// - **task_for_pid()**: Obtains a Mach task port for the process
+    /// - **task_threads()**: Enumerates all threads in the task
+    ///
+    /// ## Permissions
+    ///
+    /// Requires debugging permissions (sudo or entitlements) to call `task_for_pid()`.
+    ///
+    /// See:
+    /// - [task_for_pid(3) man page](https://developer.apple.com/documentation/kernel/1402149-task_for_pid/)
+    /// - [task_threads(3) man page](https://developer.apple.com/documentation/kernel/1402149-task_threads/)
     fn attach_task(&mut self, pid: ProcessId) -> Result<()>
     {
         use tracing::{debug, info, trace};
@@ -373,7 +374,7 @@ impl MacOSDebugger
 
             let result = task_threads(task, &mut threads, &mut thread_count);
             if result != KERN_SUCCESS || thread_count == 0 {
-                Self::deallocate_threads_array(threads, thread_count);
+                threads::ThreadManager::deallocate_threads_array(threads, thread_count);
                 return Err(DebuggerError::AttachFailed(format!("Failed to get threads: {}", result)));
             }
 
@@ -381,7 +382,7 @@ impl MacOSDebugger
             self.task = task;
             self.pid = pid;
             self.threads = slice.to_vec();
-            Self::deallocate_threads_array(threads, thread_count);
+            threads::ThreadManager::deallocate_threads_array(threads, thread_count);
             self.current_thread = self.threads.first().copied();
             self.attached = true;
         }
@@ -439,177 +440,46 @@ impl MacOSDebugger
     /// - `set_active_thread()`: Public API to set the active thread
     fn active_thread_port(&self) -> Result<thread_act_t>
     {
-        self.current_thread
-            .ok_or_else(|| DebuggerError::InvalidArgument("No active thread selected".to_string()))
+        threads::ThreadManager::active_thread_port(self)
     }
 
     fn thread_port_for_id(&self, thread: ThreadId) -> Result<thread_act_t>
     {
-        self.ensure_attached()?;
-        let port = thread.raw() as thread_act_t;
-        if self.threads.contains(&port) {
-            Ok(port)
-        } else {
-            Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}. Call refresh_threads() to update the thread list.",
-                thread.raw(),
-                self.pid.0
-            )))
-        }
+        threads::ThreadManager::thread_port_for_id(self, thread)
     }
 
-    fn software_trap_bytes(&self) -> Result<Vec<u8>>
-    {
-        match self.architecture {
-            Architecture::Arm64 => Ok(vec![0x00, 0x00, 0x20, 0xD4]), // BRK #0
-            Architecture::X86_64 => Ok(vec![0xCC]),                  // INT3
-            Architecture::Unknown(label) => Err(DebuggerError::InvalidArgument(format!(
-                "Software breakpoints unsupported for architecture: {label}"
-            ))),
-        }
-    }
-
+    // Internal breakpoint methods - these are wrappers around BreakpointManager
+    // methods. They're kept for potential future use or internal consistency.
+    #[allow(dead_code)]
     fn install_software_breakpoint(&mut self, address: Address) -> Result<BreakpointId>
     {
-        self.ensure_attached()?;
-        let trap = self.software_trap_bytes()?;
-
-        {
-            let store = self.breakpoints.lock().unwrap();
-            if store.id_for_kind(address, BreakpointKind::Software).is_some() {
-                return Err(DebuggerError::InvalidArgument(format!(
-                    "Breakpoint already exists at 0x{:016x}",
-                    address.value()
-                )));
-            }
-        }
-
-        let original = self.read_memory(address, trap.len())?;
-        if original.len() != trap.len() {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "Unable to read {} bytes at 0x{:016x} to install breakpoint",
-                trap.len(),
-                address.value()
-            )));
-        }
-
-        let written = self.write_memory(address, &trap)?;
-        if written != trap.len() {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "Failed to write breakpoint trap at 0x{:016x}",
-                address.value()
-            )));
-        }
-
-        let mut info = BreakpointInfo::new(BreakpointId::from_raw(0), address, BreakpointKind::Software);
-        info.state = BreakpointState::Resolved;
-        info.enabled = true;
-        info.resolved_at = Some(SystemTime::now());
-
-        let entry = BreakpointEntry {
-            info,
-            payload: BreakpointPayload::Software {
-                original_bytes: original,
-            },
-        };
-
-        let mut store = self.breakpoints.lock().unwrap();
-        Ok(store.insert(entry))
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::install_software_breakpoint(self, &breakpoints, address)
     }
 
+    #[allow(dead_code)]
     fn install_hardware_breakpoint(&mut self, address: Address) -> Result<BreakpointId>
     {
-        self.ensure_attached()?;
-
-        {
-            let store = self.breakpoints.lock().unwrap();
-            if store.id_for_kind(address, BreakpointKind::Hardware).is_some() {
-                return Err(DebuggerError::InvalidArgument(format!(
-                    "Hardware breakpoint already exists at 0x{:016x}",
-                    address.value()
-                )));
-            }
-        }
-
-        // Install on all threads
-        let mut used_slot = None;
-
-        for &thread in &self.threads {
-            let slot = debug_registers::set_hardware_breakpoint(thread, address)?;
-            if let Some(s) = used_slot {
-                if s != slot {
-                    tracing::warn!("Hardware breakpoint slots inconsistent across threads: {} vs {}", s, slot);
-                }
-            } else {
-                used_slot = Some(slot);
-            }
-        }
-
-        let slot = used_slot
-            .ok_or_else(|| DebuggerError::AttachFailed("No threads available to set hardware breakpoint".into()))?;
-
-        let mut info = BreakpointInfo::new(BreakpointId::from_raw(0), address, BreakpointKind::Hardware);
-        info.state = BreakpointState::Resolved;
-        info.enabled = true;
-        info.resolved_at = Some(SystemTime::now());
-
-        let entry = BreakpointEntry {
-            info,
-            payload: BreakpointPayload::Hardware { address, slot },
-        };
-
-        let mut store = self.breakpoints.lock().unwrap();
-        Ok(store.insert(entry))
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::install_hardware_breakpoint(self, &breakpoints, address)
     }
 
+    #[allow(dead_code)]
     fn restore_software_breakpoint(&mut self, entry: &BreakpointEntry) -> Result<()>
     {
-        if let BreakpointPayload::Software { original_bytes } = &entry.payload {
-            let written = self.write_memory(entry.info.address, original_bytes)?;
-            if written != original_bytes.len() {
-                return Err(DebuggerError::InvalidArgument(format!(
-                    "Failed to restore original instruction at 0x{:016x}",
-                    entry.info.address.value()
-                )));
-            }
-        }
-        Ok(())
+        breakpoints::BreakpointManager::restore_software_breakpoint(self, entry)
     }
 
+    #[allow(dead_code)]
     fn remove_hardware_breakpoint(&mut self, entry: &BreakpointEntry) -> Result<()>
     {
-        if let BreakpointPayload::Hardware { slot, .. } = &entry.payload {
-            for &thread in &self.threads {
-                // Best effort removal
-                if let Err(e) = debug_registers::clear_hardware_breakpoint(thread, *slot) {
-                    tracing::warn!("Failed to clear hardware breakpoint on thread {}: {}", thread, e);
-                }
-            }
-        }
-        Ok(())
+        breakpoints::BreakpointManager::remove_hardware_breakpoint(self, entry)
     }
 
     fn restore_all_breakpoints(&mut self)
     {
-        let entries = {
-            let mut store = self.breakpoints.lock().unwrap();
-            store.drain()
-        };
-
-        for entry in entries {
-            if let BreakpointPayload::Software { .. } = entry.payload {
-                if let Err(err) = self.restore_software_breakpoint(&entry) {
-                    warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
-                }
-            } else if let BreakpointPayload::Hardware { .. } = entry.payload {
-                if let Err(err) = self.remove_hardware_breakpoint(&entry) {
-                    warn!(
-                        "Failed to remove hardware breakpoint 0x{:016x}: {err}",
-                        entry.info.address.value()
-                    );
-                }
-            }
-        }
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::restore_all_breakpoints(self, &breakpoints);
     }
 
     fn read_registers_from_port(&self, thread: thread_act_t) -> Result<Registers>
@@ -697,117 +567,13 @@ impl MacOSDebugger
     /// - `set_active_thread()`: Public API that takes a `ThreadId` instead
     fn set_active_thread_by_port(&mut self, port: thread_act_t) -> Result<()>
     {
-        if self.threads.contains(&port) {
-            self.current_thread = Some(port);
-            Ok(())
-        } else {
-            Err(DebuggerError::InvalidArgument(format!(
-                "Thread {port} is not part of process {}",
-                self.pid.0
-            )))
-        }
+        threads::ThreadManager::set_active_thread_by_port(self, port)
     }
 
-    /// Deallocate memory allocated by `task_threads()`
-    ///
-    /// This is an internal helper method that frees the memory allocated by the
-    /// Mach API `task_threads()`. The Mach API allocates memory for the thread
-    /// array that must be freed using `vm_deallocate()`.
-    ///
-    /// ## Parameters
-    ///
-    /// - `threads`: Pointer to the thread array allocated by `task_threads()`
-    /// - `count`: Number of threads in the array
-    ///
-    /// ## Safety
-    ///
-    /// This function is safe to call with any pointer and count. It checks for null
-    /// pointers and zero counts before attempting to deallocate.
-    ///
-    /// ## Mach API
-    ///
-    /// Uses `vm_deallocate()` to free the memory:
-    /// - See: [vm_deallocate documentation](https://developer.apple.com/documentation/kernel/1585284-vm_deallocate/)
-    fn deallocate_threads_array(threads: *mut thread_act_t, count: mach_msg_type_number_t)
-    {
-        if threads.is_null() || count == 0 {
-            return;
-        }
-
-        let size = (count as usize).saturating_mul(mem::size_of::<thread_act_t>()) as vm_size_t;
-        unsafe {
-            let _ = ffi::vm_deallocate(mach_task_self(), threads as vm_address_t, size);
-        }
-    }
-
-    /// Refresh the thread list from the operating system
-    ///
-    /// This is an internal helper method that updates the cached thread list by
-    /// calling `task_threads()` to get the current set of threads in the target
-    /// process. It also updates the active thread if the current one no longer exists.
-    ///
-    /// ## Mach API: task_threads()
-    ///
-    /// ```c
-    /// kern_return_t task_threads(
-    ///     task_t target_task,           // Task port from task_for_pid()
-    ///     thread_act_array_t *act_list, // Output: array of thread ports
-    ///     mach_msg_type_number_t *count // Output: number of threads
-    /// );
-    /// ```
-    ///
-    /// **Returns**: Array of thread ports. The memory must be freed using `vm_deallocate()`.
-    ///
-    /// See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1537751-task_threads/)
-    ///
-    /// ## Implementation Notes
-    ///
-    /// - Deallocates old thread ports before getting new ones to prevent port leaks
-    /// - Updates the active thread to the first thread if the current one no longer exists
-    ///
-    /// ## Errors
-    ///
-    /// Returns `NotAttached` if not attached to a process.
-    /// Returns `AttachFailed` if `task_threads()` fails or no threads found.
-    ///
-    /// ## See Also
-    ///
-    /// - `refresh_threads()`: Public API that calls this method
     fn refresh_thread_list(&mut self) -> Result<()>
     {
         self.ensure_attached()?;
-
-        unsafe {
-            // Deallocate old thread ports before getting new ones to prevent port leaks
-            for thread in &self.threads {
-                let _ = ffi::mach_port_deallocate(mach_task_self(), *thread);
-            }
-
-            let mut threads: *mut thread_act_t = std::ptr::null_mut();
-            let mut thread_count: mach_msg_type_number_t = 0;
-            let result = task_threads(self.task, &mut threads, &mut thread_count);
-            if result != KERN_SUCCESS {
-                return Err(DebuggerError::AttachFailed(format!(
-                    "Failed to enumerate threads: {}",
-                    result
-                )));
-            }
-
-            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
-            self.threads = slice.to_vec();
-            Self::deallocate_threads_array(threads, thread_count);
-
-            // Update active thread - use first thread if current one no longer exists
-            if let Some(current) = self.current_thread {
-                if !self.threads.contains(&current) {
-                    self.current_thread = self.threads.first().copied();
-                }
-            } else {
-                self.current_thread = self.threads.first().copied();
-            }
-        }
-
-        Ok(())
+        threads::ThreadManager::refresh_thread_list(self)
     }
 
     /// Attempt to continue execution if we're currently stopped inside the Mach exception loop.
@@ -827,12 +593,48 @@ impl MacOSDebugger
             .ok_or_else(|| DebuggerError::ResumeFailed("exception handler not running".to_string()))?;
 
         sender
-            .send(ExceptionLoopCommand::Continue)
+            .send(exception::ExceptionLoopCommand::Continue)
             .map_err(|_| DebuggerError::ResumeFailed("failed to signal exception handler".to_string()))?;
 
         Ok(true)
     }
 
+    /// Start the Mach exception handler thread.
+    ///
+    /// This creates a Mach receive port, registers it with `task_set_exception_ports()`,
+    /// and spawns a background thread to handle exceptions (breakpoints, signals, etc.).
+    ///
+    /// ## Mach APIs Used
+    ///
+    /// - **mach_port_allocate()**: Creates a Mach receive port
+    /// - **mach_port_insert_right()**: Makes the port sendable
+    /// - **task_set_exception_ports()**: Registers the exception port with the task
+    ///
+    /// ## Exception Mask
+    ///
+    /// The handler receives:
+    /// - `EXC_MASK_BREAKPOINT`: Software breakpoints (INT3/BRK)
+    /// - `EXC_MASK_BAD_ACCESS`: Memory access violations
+    /// - `EXC_MASK_BAD_INSTRUCTION`: Illegal instructions
+    /// - `EXC_MASK_ARITHMETIC`: Arithmetic exceptions (div by zero, overflow)
+    /// - `EXC_MASK_SOFTWARE`: Software-generated exceptions
+    ///
+    /// ## Thread Safety
+    ///
+    /// The exception handler runs in a separate thread and communicates via channels.
+    /// See `exception::run_exception_loop()` for the handler implementation.
+    ///
+    /// ## Errors
+    ///
+    /// Returns `MachError` if port allocation or exception port registration fails.
+    /// Returns `AttachFailed` if the handler thread cannot be spawned.
+    ///
+    /// ## See Also
+    ///
+    /// - `stop_exception_handler()`: Stops the exception handler
+    /// - `exception::run_exception_loop()`: The exception handling loop
+    /// - [task_set_exception_ports(3) man page](https://developer.apple.com/documentation/kernel/1402149-task_set_exception_ports/)
+    /// - [mach_port_allocate(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_port_allocate/)
     fn start_exception_handler(&mut self) -> Result<()>
     {
         #[cfg(target_os = "macos")]
@@ -865,7 +667,7 @@ impl MacOSDebugger
                     | EXC_MASK_ARITHMETIC
                     | EXC_MASK_SOFTWARE;
                 let behavior: exception_behavior_t = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as exception_behavior_t;
-                let flavor = thread_state_flavor_for_arch(self.architecture);
+                let flavor = exception::thread_state_flavor_for_arch(self.architecture);
                 kr = task_set_exception_ports(self.task, mask, port, behavior, flavor);
                 if kr != KERN_SUCCESS {
                     let _ = mach_port_destroy(self_task, port);
@@ -874,13 +676,15 @@ impl MacOSDebugger
 
                 let (tx, rx) = mpsc::channel();
                 let shared_state = Arc::clone(&self.exception_state);
-                let breakpoints = Arc::clone(&self.breakpoints);
+                let breakpoints = self.breakpoints.clone();
                 let architecture = self.architecture;
                 let event_tx = self.event_tx.clone();
                 info!("Spawning Mach exception handler thread");
                 let handle = thread::Builder::new()
                     .name("ferros-mac-exc".to_string())
-                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture, event_tx, breakpoints))
+                    .spawn(move || {
+                        exception::run_exception_loop(port, rx, shared_state, architecture, event_tx, breakpoints)
+                    })
                     .map_err(|e| {
                         let _ = mach_port_destroy(self_task, port);
                         DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}"))
@@ -900,7 +704,7 @@ impl MacOSDebugger
         #[cfg(target_os = "macos")]
         {
             if let Some(tx) = self.exception_resume_tx.take() {
-                let _ = tx.send(ExceptionLoopCommand::Shutdown);
+                let _ = tx.send(exception::ExceptionLoopCommand::Shutdown);
             }
 
             if self.exception_port != MACH_PORT_NULL {
@@ -950,159 +754,42 @@ impl Debugger for MacOSDebugger
 
     fn add_breakpoint(&mut self, request: BreakpointRequest) -> Result<BreakpointId>
     {
-        match request {
-            BreakpointRequest::Software { address } => self.install_software_breakpoint(address),
-            BreakpointRequest::Hardware { address } => self.install_hardware_breakpoint(address),
-            BreakpointRequest::Watchpoint { .. } => Err(DebuggerError::InvalidArgument(
-                "Watchpoints are not yet supported on macOS".to_string(),
-            )),
-        }
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::add_breakpoint(self, &breakpoints, request)
     }
 
     fn remove_breakpoint(&mut self, id: BreakpointId) -> Result<()>
     {
-        let entry = {
-            let mut store = self.breakpoints.lock().unwrap();
-            store.remove(id)
-        }
-        .ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
-
-        if entry.info.enabled {
-            match entry.info.kind {
-                BreakpointKind::Software => self.restore_software_breakpoint(&entry)?,
-                BreakpointKind::Hardware => self.remove_hardware_breakpoint(&entry)?,
-                _ => {}
-            }
-        }
-        Ok(())
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::remove_breakpoint(self, &breakpoints, id)
     }
 
     fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
     {
-        let (kind, address) = {
-            let store = self.breakpoints.lock().unwrap();
-            let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
-            if entry.info.enabled {
-                return Ok(());
-            }
-            (entry.info.kind, entry.info.address)
-        };
-
-        match kind {
-            BreakpointKind::Software => {
-                let trap = self.software_trap_bytes()?;
-                let written = self.write_memory(address, &trap)?;
-                if written != trap.len() {
-                    return Err(DebuggerError::InvalidArgument(format!(
-                        "Failed to re-arm breakpoint at 0x{:016x}",
-                        address.value()
-                    )));
-                }
-            }
-            BreakpointKind::Hardware => {
-                // Re-install on all threads
-                let mut used_slot = None;
-                for &thread in &self.threads {
-                    let slot = debug_registers::set_hardware_breakpoint(thread, address)?;
-                    if let Some(s) = used_slot {
-                        if s != slot {
-                            tracing::warn!("Hardware breakpoint slots inconsistent: {} vs {}", s, slot);
-                        }
-                    } else {
-                        used_slot = Some(slot);
-                    }
-                }
-
-                if let Some(new_slot) = used_slot {
-                    let mut store = self.breakpoints.lock().unwrap();
-                    if let Some(entry) = store.get_mut(id) {
-                        entry.payload = BreakpointPayload::Hardware { address, slot: new_slot };
-                    }
-                }
-            }
-            _ => return Err(DebuggerError::InvalidArgument("Watchpoints not supported".into())),
-        }
-
-        let mut store = self.breakpoints.lock().unwrap();
-        if let Some(entry) = store.get_mut(id) {
-            entry.info.state = BreakpointState::Resolved;
-            entry.info.enabled = true;
-            entry.info.resolved_at = Some(SystemTime::now());
-        }
-        Ok(())
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::enable_breakpoint(self, &breakpoints, id)
     }
 
     fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
     {
-        let (kind, address, payload) = {
-            let store = self.breakpoints.lock().unwrap();
-            let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
-            if !entry.info.enabled {
-                return Ok(());
-            }
-            (entry.info.kind, entry.info.address, entry.payload.clone())
-        };
-
-        match kind {
-            BreakpointKind::Software => {
-                if let BreakpointPayload::Software { original_bytes } = payload {
-                    let written = self.write_memory(address, &original_bytes)?;
-                    if written != original_bytes.len() {
-                        return Err(DebuggerError::InvalidArgument(format!(
-                            "Failed to disable breakpoint at 0x{:016x}",
-                            address.value()
-                        )));
-                    }
-                }
-            }
-            BreakpointKind::Hardware => {
-                if let BreakpointPayload::Hardware { slot, .. } = payload {
-                    for &thread in &self.threads {
-                        if let Err(e) = debug_registers::clear_hardware_breakpoint(thread, slot) {
-                            tracing::warn!("Failed to clear hardware breakpoint: {}", e);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let mut store = self.breakpoints.lock().unwrap();
-        if let Some(entry) = store.get_mut(id) {
-            entry.info.state = BreakpointState::Disabled;
-            entry.info.enabled = false;
-        }
-        Ok(())
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::disable_breakpoint(self, &breakpoints, id)
     }
 
     fn toggle_breakpoint(&mut self, id: BreakpointId) -> Result<bool>
     {
-        let enabled = {
-            let store = self.breakpoints.lock().unwrap();
-            store
-                .get(id)
-                .ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?
-                .info
-                .enabled
-        };
-        if enabled {
-            self.disable_breakpoint(id)?;
-            Ok(false)
-        } else {
-            self.enable_breakpoint(id)?;
-            Ok(true)
-        }
+        let breakpoints = self.breakpoints.clone();
+        breakpoints::BreakpointManager::toggle_breakpoint(self, &breakpoints, id)
     }
 
     fn breakpoint_info(&self, id: BreakpointId) -> Result<BreakpointInfo>
     {
-        let store = self.breakpoints.lock().unwrap();
-        store.info(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))
+        breakpoints::BreakpointManager::breakpoint_info(&self.breakpoints, id)
     }
 
     fn breakpoints(&self) -> Vec<BreakpointInfo>
     {
-        self.breakpoints.lock().unwrap().list()
+        breakpoints::BreakpointManager::breakpoints(&self.breakpoints)
     }
 
     fn read_registers_for(&self, thread: ThreadId) -> Result<Registers>
@@ -1213,209 +900,21 @@ impl Debugger for MacOSDebugger
     /// ```
     fn launch(&mut self, program: &str, args: &[&str]) -> Result<ProcessId>
     {
-        use std::ffi::CString;
-        use std::ptr;
-
-        use tracing::{debug, info, trace};
+        use tracing::{debug, info};
 
         info!("Launching process: {} with args: {:?}", program, args);
-        debug!("Validating launch parameters");
-
-        // Validate inputs
-        if program.is_empty() {
-            return Err(DebuggerError::InvalidArgument("Program path cannot be empty".to_string()));
+        let pid = launch::LaunchManager::launch(self, program, args)?;
+        debug!("Attaching to spawned process");
+        // Attach to the spawned process
+        let process_id = ProcessId::from(pid as u32);
+        self.attach_task(process_id)?;
+        {
+            let mut shared = self.exception_state.lock().unwrap();
+            shared.stopped = true;
+            shared.stop_reason = StopReason::Suspended;
         }
-        if args.is_empty() {
-            return Err(DebuggerError::InvalidArgument("Arguments cannot be empty".to_string()));
-        }
-
-        // Convert program path to CString
-        let program_cstr =
-            CString::new(program).map_err(|e| DebuggerError::InvalidArgument(format!("Invalid program path: {}", e)))?;
-
-        // Convert arguments to CStrings
-        let mut arg_cstrs = Vec::new();
-        for arg in args {
-            arg_cstrs
-                .push(CString::new(*arg).map_err(|e| DebuggerError::InvalidArgument(format!("Invalid argument: {}", e)))?);
-        }
-
-        // Create argv array (null-terminated)
-        let mut argv: Vec<*const libc::c_char> = arg_cstrs.iter().map(|s| s.as_ptr()).collect();
-        argv.push(ptr::null());
-
-        let mut stdout_pipe_fds: Option<(RawFd, RawFd)> = None;
-        let mut stderr_pipe_fds: Option<(RawFd, RawFd)> = None;
-
-        if self.capture_output {
-            stdout_pipe_fds = Some(Self::create_pipe_pair("stdout")?);
-            stderr_pipe_fds = Some(Self::create_pipe_pair("stderr")?);
-        }
-
-        unsafe {
-            debug!("Initializing posix_spawn attributes");
-            // Initialize spawn attributes
-            let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
-            let result = ffi::posix_spawnattr_init(&mut attr);
-            if result != 0 {
-                Self::close_pipe_pair(&mut stdout_pipe_fds);
-                Self::close_pipe_pair(&mut stderr_pipe_fds);
-                return Err(DebuggerError::AttachFailed(format!(
-                    "Failed to initialize spawn attributes: {}",
-                    std::io::Error::from_raw_os_error(result)
-                )));
-            }
-
-            debug!("Setting POSIX_SPAWN_START_SUSPENDED flag");
-            // Set POSIX_SPAWN_START_SUSPENDED flag
-            let flags_result = ffi::posix_spawnattr_setflags(&mut attr, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED);
-            if flags_result != 0 {
-                let _ = ffi::posix_spawnattr_destroy(&mut attr);
-                Self::close_pipe_pair(&mut stdout_pipe_fds);
-                Self::close_pipe_pair(&mut stderr_pipe_fds);
-                return Err(DebuggerError::AttachFailed(format!(
-                    "Failed to set spawn flags: {}",
-                    std::io::Error::from_raw_os_error(flags_result)
-                )));
-            }
-
-            let mut file_actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
-            let mut file_actions_initialized = false;
-
-            if self.capture_output {
-                file_actions_initialized = true;
-                let init_result = libc::posix_spawn_file_actions_init(&mut file_actions);
-                if init_result != 0 {
-                    let _ = ffi::posix_spawnattr_destroy(&mut attr);
-                    Self::close_pipe_pair(&mut stdout_pipe_fds);
-                    Self::close_pipe_pair(&mut stderr_pipe_fds);
-                    return Err(DebuggerError::AttachFailed(format!(
-                        "Failed to initialize file actions: {}",
-                        std::io::Error::from_raw_os_error(init_result)
-                    )));
-                }
-
-                if let Some((read_fd, write_fd)) = stdout_pipe_fds {
-                    let result = libc::posix_spawn_file_actions_addclose(&mut file_actions, read_fd);
-                    Self::ensure_file_action_success(
-                        "close stdout read end",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-
-                    let result = libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDOUT_FILENO);
-                    Self::ensure_file_action_success(
-                        "redirect stdout",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-
-                    let result = libc::posix_spawn_file_actions_addclose(&mut file_actions, write_fd);
-                    Self::ensure_file_action_success(
-                        "close stdout write end",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-                }
-
-                if let Some((read_fd, write_fd)) = stderr_pipe_fds {
-                    let result = libc::posix_spawn_file_actions_addclose(&mut file_actions, read_fd);
-                    Self::ensure_file_action_success(
-                        "close stderr read end",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-
-                    let result = libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDERR_FILENO);
-                    Self::ensure_file_action_success(
-                        "redirect stderr",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-
-                    let result = libc::posix_spawn_file_actions_addclose(&mut file_actions, write_fd);
-                    Self::ensure_file_action_success(
-                        "close stderr write end",
-                        result,
-                        &mut attr,
-                        &mut file_actions,
-                        &mut stdout_pipe_fds,
-                        &mut stderr_pipe_fds,
-                    )?;
-                }
-            }
-
-            trace!("Calling posix_spawn");
-            // Spawn the process
-            let mut pid: libc::pid_t = 0;
-            let spawn_result = ffi::posix_spawn(
-                &mut pid,
-                program_cstr.as_ptr(),
-                if file_actions_initialized {
-                    &file_actions
-                } else {
-                    ptr::null()
-                },
-                &attr, // Use attributes with START_SUSPENDED flag
-                argv.as_ptr(),
-                ptr::null(), // Use current environment
-            );
-
-            if file_actions_initialized {
-                let _ = libc::posix_spawn_file_actions_destroy(&mut file_actions);
-            }
-
-            // Clean up attributes
-            let _ = ffi::posix_spawnattr_destroy(&mut attr);
-
-            if spawn_result != 0 {
-                Self::close_pipe_pair(&mut stdout_pipe_fds);
-                Self::close_pipe_pair(&mut stderr_pipe_fds);
-                return Err(DebuggerError::AttachFailed(format!(
-                    "Failed to spawn process '{}': {}",
-                    program,
-                    std::io::Error::from_raw_os_error(spawn_result)
-                )));
-            }
-
-            if let Some((read_fd, write_fd)) = stdout_pipe_fds.take() {
-                let _ = libc::close(write_fd);
-                self.stdout_pipe = Some(File::from_raw_fd(read_fd));
-            }
-
-            if let Some((read_fd, write_fd)) = stderr_pipe_fds.take() {
-                let _ = libc::close(write_fd);
-                self.stderr_pipe = Some(File::from_raw_fd(read_fd));
-            }
-
-            info!("Successfully spawned process with PID: {}", pid);
-            debug!("Attaching to spawned process");
-            // Attach to the spawned process
-            let process_id = ProcessId::from(pid as u32);
-            self.attach_task(process_id)?;
-            {
-                let mut shared = self.exception_state.lock().unwrap();
-                shared.stopped = true;
-                shared.stop_reason = StopReason::Suspended;
-            }
-            info!("Successfully launched and attached to process {}", pid);
-            Ok(process_id)
-        }
+        info!("Successfully launched and attached to process {}", pid);
+        Ok(process_id)
     }
 
     /// Attach to a running process using Mach APIs
@@ -1813,279 +1312,6 @@ impl Debugger for MacOSDebugger
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_exception_loop(
-    exception_port: mach_port_t,
-    resume_rx: mpsc::Receiver<ExceptionLoopCommand>,
-    shared_state: Arc<Mutex<ExceptionSharedState>>,
-    architecture: Architecture,
-    event_tx: events::DebuggerEventSender,
-    breakpoints: Arc<Mutex<BreakpointStore>>,
-)
-{
-    use std::mem::MaybeUninit;
-
-    use tracing::{debug, error};
-
-    loop {
-        let mut request = MaybeUninit::<__Request__exception_raise_t>::uninit();
-        let recv_size = std::mem::size_of::<__Request__exception_raise_t>() as mach_msg_size_t;
-
-        let kr = unsafe {
-            mach_msg(
-                request.as_mut_ptr() as *mut mach_msg_header_t,
-                MACH_RCV_MSG | MACH_RCV_LARGE,
-                0,
-                recv_size,
-                exception_port,
-                MACH_MSG_TIMEOUT_NONE,
-                MACH_PORT_NULL,
-            )
-        };
-
-        if kr != MACH_MSG_SUCCESS {
-            if kr == mach2::message::MACH_RCV_PORT_DIED || kr == mach2::message::MACH_RCV_INVALID_NAME {
-                debug!("Mach exception port closed, exiting handler loop");
-                break;
-            }
-            continue;
-        }
-
-        let message = unsafe { request.assume_init() };
-        let thread_port = message.thread.name as thread_act_t;
-        let codes = [message.code[0] as i64, message.code[1] as i64];
-
-        let rewound_pc = if message.exception == EXC_BREAKPOINT as exception_type_t {
-            match rewind_breakpoint_pc(thread_port, architecture) {
-                Ok(value) => value,
-                Err(err) => {
-                    error!("Failed to rewind breakpoint PC: {err}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let stop_reason = stop_reason_from_exception(message.exception, rewound_pc, codes);
-        {
-            let mut shared = shared_state.lock().unwrap();
-            shared.stopped = true;
-            shared.stop_reason = stop_reason;
-            shared.pending_thread = Some(thread_port);
-        }
-
-        if let StopReason::Breakpoint(addr) = stop_reason {
-            let mut store = breakpoints.lock().unwrap();
-            store.record_hit(Address::from(addr));
-        }
-
-        if let Err(err) = event_tx.send(DebuggerEvent::TargetStopped {
-            reason: stop_reason,
-            thread: Some(ThreadId::from(thread_port as u64)),
-        }) {
-            tracing::warn!("Failed to send stop event from Mach loop: {err}");
-        }
-
-        match resume_rx.recv() {
-            Ok(ExceptionLoopCommand::Continue) => {
-                if let Err(err) = send_exception_reply(&message) {
-                    error!("Failed to send Mach exception reply: {err}");
-                    break;
-                }
-
-                let mut shared = shared_state.lock().unwrap();
-                shared.stopped = false;
-                shared.stop_reason = StopReason::Running;
-                shared.pending_thread = None;
-
-                if let Err(err) = event_tx.send(DebuggerEvent::TargetResumed) {
-                    tracing::warn!("Failed to send resume event from Mach loop: {err}");
-                }
-            }
-            Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
-                let mut shared = shared_state.lock().unwrap();
-                shared.stopped = false;
-                shared.stop_reason = StopReason::Running;
-                shared.pending_thread = None;
-                break;
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn send_exception_reply(request: &__Request__exception_raise_t) -> Result<()>
-{
-    let mut reply = __Reply__exception_raise_t {
-        Head: mach_msg_header_t {
-            msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0),
-            msgh_size: std::mem::size_of::<__Reply__exception_raise_t>() as mach_msg_size_t,
-            msgh_remote_port: request.Head.msgh_local_port,
-            msgh_local_port: MACH_PORT_NULL,
-            msgh_voucher_port: MACH_PORT_NULL,
-            msgh_id: request.Head.msgh_id + 100,
-        },
-        NDR: unsafe { NDR_record },
-        RetCode: KERN_SUCCESS,
-    };
-
-    let kr = unsafe {
-        mach_msg(
-            &mut reply.Head,
-            MACH_SEND_MSG,
-            reply.Head.msgh_size,
-            0,
-            MACH_PORT_NULL,
-            MACH_MSG_TIMEOUT_NONE,
-            MACH_PORT_NULL,
-        )
-    };
-
-    if kr != MACH_MSG_SUCCESS {
-        return Err(DebuggerError::ResumeFailed(format!("mach_msg reply failed: {}", kr)));
-    }
-
-    Ok(())
-}
-
-fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
-{
-    match architecture {
-        Architecture::Arm64 => 6,
-        Architecture::X86_64 => 4,
-        Architecture::Unknown(_) => 6,
-    }
-}
-
-fn rewind_breakpoint_pc(thread: thread_act_t, architecture: Architecture) -> Result<Option<u64>>
-{
-    match architecture {
-        Architecture::Arm64 => rewind_breakpoint_pc_arm64(thread),
-        Architecture::X86_64 => rewind_breakpoint_pc_x86(thread),
-        Architecture::Unknown(_) => Ok(None),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn rewind_breakpoint_pc_arm64(thread: thread_act_t) -> Result<Option<u64>>
-{
-    const ARM_THREAD_STATE64: c_int = 6;
-    const ARM_THREAD_STATE64_COUNT: mach_msg_type_number_t = 68;
-    const INSTRUCTION_SIZE: u64 = 4;
-
-    unsafe {
-        let mut state: [natural_t; ARM_THREAD_STATE64_COUNT as usize] = [0; ARM_THREAD_STATE64_COUNT as usize];
-        let mut count = ARM_THREAD_STATE64_COUNT;
-        let mut kr = ffi::thread_get_state(thread, ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count);
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
-        }
-
-        let read_u64 = |idx: usize, buf: &[natural_t]| -> u64 {
-            let lo = buf[idx * 2] as u64;
-            let hi = buf[idx * 2 + 1] as u64;
-            lo | (hi << 32)
-        };
-
-        let pc = read_u64(32, &state);
-        let new_pc = pc.saturating_sub(INSTRUCTION_SIZE);
-        state[64] = (new_pc & 0xFFFF_FFFF) as natural_t;
-        state[65] = (new_pc >> 32) as natural_t;
-
-        kr = ffi::thread_set_state(thread, ARM_THREAD_STATE64, state.as_ptr(), ARM_THREAD_STATE64_COUNT);
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
-        }
-
-        Ok(Some(new_pc))
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn rewind_breakpoint_pc_arm64(_thread: thread_act_t) -> Result<Option<u64>>
-{
-    Ok(None)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn rewind_breakpoint_pc_x86(thread: thread_act_t) -> Result<Option<u64>>
-{
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct X86ThreadState64
-    {
-        rax: u64,
-        rbx: u64,
-        rcx: u64,
-        rdx: u64,
-        rdi: u64,
-        rsi: u64,
-        rbp: u64,
-        rsp: u64,
-        r8: u64,
-        r9: u64,
-        r10: u64,
-        r11: u64,
-        r12: u64,
-        r13: u64,
-        r14: u64,
-        r15: u64,
-        rip: u64,
-        rflags: u64,
-        cs: u64,
-        fs: u64,
-        gs: u64,
-    }
-
-    const X86_THREAD_STATE64: c_int = 4;
-    const X86_THREAD_STATE64_COUNT: mach_msg_type_number_t = 42;
-    const INSTRUCTION_SIZE: u64 = 1;
-
-    unsafe {
-        let mut state = X86ThreadState64::default();
-        let mut count = X86_THREAD_STATE64_COUNT;
-        let mut kr = ffi::thread_get_state(thread, X86_THREAD_STATE64, &mut state as *mut _ as *mut natural_t, &mut count);
-
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
-        }
-
-        let new_pc = state.rip.saturating_sub(INSTRUCTION_SIZE);
-        state.rip = new_pc;
-
-        kr = ffi::thread_set_state(
-            thread,
-            X86_THREAD_STATE64,
-            &state as *const _ as *const natural_t,
-            X86_THREAD_STATE64_COUNT,
-        );
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
-        }
-
-        Ok(Some(new_pc))
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn rewind_breakpoint_pc_x86(_thread: thread_act_t) -> Result<Option<u64>>
-{
-    Ok(None)
-}
-
-fn stop_reason_from_exception(exception: exception_type_t, pc: Option<u64>, _codes: [i64; 2]) -> StopReason
-{
-    match exception as u32 {
-        EXC_BREAKPOINT => StopReason::Breakpoint(pc.unwrap_or(0)),
-        EXC_BAD_ACCESS => StopReason::Signal(libc::SIGSEGV),
-        EXC_BAD_INSTRUCTION => StopReason::Signal(libc::SIGILL),
-        EXC_ARITHMETIC => StopReason::Signal(libc::SIGFPE),
-        EXC_SOFTWARE => StopReason::Signal(libc::SIGTRAP),
-        _ => StopReason::Unknown,
-    }
-}
-
 impl Drop for MacOSDebugger
 {
     fn drop(&mut self)
@@ -2143,32 +1369,10 @@ impl MacOSDebugger
     /// }
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    #[allow(unsafe_code)] // Required for thread_suspend() call
     pub fn suspend_thread(&mut self, thread_id: ThreadId) -> Result<()>
     {
         self.ensure_attached()?;
-
-        let thread_port = thread_id.raw() as thread_act_t;
-        if !self.threads.contains(&thread_port) {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}",
-                thread_id.raw(),
-                self.pid.0
-            )));
-        }
-
-        unsafe {
-            let result = ffi::thread_suspend(thread_port);
-            if result != KERN_SUCCESS {
-                return Err(DebuggerError::SuspendFailed(format!(
-                    "thread_suspend failed for thread {}: {}",
-                    thread_id.raw(),
-                    result
-                )));
-            }
-        }
-
-        Ok(())
+        threads::ThreadManager::suspend_thread(self, thread_id)
     }
 
     /// Resume a specific thread
@@ -2222,27 +1426,130 @@ impl MacOSDebugger
     pub fn resume_thread(&mut self, thread_id: ThreadId) -> Result<()>
     {
         self.ensure_attached()?;
+        threads::ThreadManager::resume_thread(self, thread_id)
+    }
 
-        let thread_port = thread_id.raw() as thread_act_t;
-        if !self.threads.contains(&thread_port) {
+    /// Read a 64-bit value from memory at the given address.
+    ///
+    /// This is a convenience method that reads 8 bytes and interprets them as a little-endian u64.
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process
+    /// - `InvalidArgument`: Invalid memory address or unable to read 8 bytes
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::types::Address;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let value = debugger.read_memory_u64(Address::from(0x1000))?;
+    /// println!("Value at 0x1000: 0x{:016x}", value);
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    pub fn read_memory_u64(&self, addr: Address) -> Result<u64>
+    {
+        self.ensure_attached()?;
+        self.memory_cache.read_u64(self.task, addr)
+    }
+
+    /// Read a 32-bit value from memory at the given address.
+    ///
+    /// This is a convenience method that reads 4 bytes and interprets them as a little-endian u32.
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process
+    /// - `InvalidArgument`: Invalid memory address or unable to read 4 bytes
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::types::Address;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// let value = debugger.read_memory_u32(Address::from(0x1000))?;
+    /// println!("Value at 0x1000: 0x{:08x}", value);
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    pub fn read_memory_u32(&self, addr: Address) -> Result<u32>
+    {
+        self.ensure_attached()?;
+        let bytes = self.memory_cache.read(self.task, addr, 4)?;
+        if bytes.len() < 4 {
             return Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}",
-                thread_id.raw(),
-                self.pid.0
+                "Unable to read 4 bytes from address 0x{:016x}",
+                addr.value()
             )));
         }
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
 
-        unsafe {
-            let result = ffi::thread_resume(thread_port);
-            if result != KERN_SUCCESS {
-                return Err(DebuggerError::ResumeFailed(format!(
-                    "thread_resume failed for thread {}: {}",
-                    thread_id.raw(),
-                    result
-                )));
+    /// Find symbol information for a given address.
+    ///
+    /// This method symbolicates an address, returning function names and source locations
+    /// if available. It automatically loads binary images from memory regions if needed.
+    ///
+    /// ## Symbolication
+    ///
+    /// Symbolication maps an address to:
+    /// - Function name (demangled if available)
+    /// - Source file and line number (if DWARF debug info is present)
+    /// - Multiple frames for inlined functions
+    ///
+    /// ## Errors
+    ///
+    /// - `NotAttached`: Not attached to a process
+    /// - `InvalidArgument`: Failed to load binary images
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_core::types::Address;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = MacOSDebugger::new()?;
+    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// if let Some(symbolication) = debugger.find_symbol(Address::from(0x100001000))? {
+    ///     for frame in symbolication.frames {
+    ///         println!("Function: {}", frame.symbol.display_name());
+    ///         if let Some(loc) = frame.location {
+    ///             if let Some(line) = loc.line {
+    ///                 println!("  {}:{}", loc.file, line);
+    ///             } else {
+    ///                 println!("  {}", loc.file);
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    pub fn find_symbol(&mut self, address: Address) -> Result<Option<crate::symbols::Symbolication>>
+    {
+        self.ensure_attached()?;
+
+        // Ensure images are loaded
+        let regions = get_memory_regions(self.task)?;
+        for region in regions {
+            if let Some(name) = &region.name {
+                if name.starts_with('/') && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('[')) {
+                    let desc = crate::symbols::ImageDescriptor {
+                        path: std::path::PathBuf::from(name),
+                        load_address: region.start.value(),
+                    };
+                    let _ = self.symbol_cache.load_image(desc);
+                }
             }
         }
 
-        Ok(())
+        Ok(self.symbol_cache.symbolicate(address))
     }
 }

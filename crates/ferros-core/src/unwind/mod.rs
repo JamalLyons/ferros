@@ -1,4 +1,6 @@
-use gimli::{self, BaseAddresses, CfaRule, DebugFrame, Register, RegisterRule};
+use gimli::{
+    self, BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, Register, RegisterRule, UnwindContext, UnwindSection,
+};
 
 use crate::error::{DebuggerError, Result};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
@@ -82,6 +84,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Ok(None)
     }
 
+    #[allow(dead_code)]
     fn evaluate_rule(&self, rule: &RegisterRule<usize>, regs: &Registers, cfa: u64) -> Result<u64>
     {
         match rule {
@@ -115,14 +118,17 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             bases = bases.set_eh_frame_hdr(image.relocated_address(hdr_vmaddr));
         }
 
-        // TODO: Implement proper FDE lookup using gimli 0.32 API
-        // For now, return None to allow fallback heuristics
-        // The gimli 0.32 API requires iterating FDEs and checking address ranges
-        let _eh_frame = gimli::EhFrame::new(eh_bytes, image.endian());
-        let _bases = bases;
-        let _pc = regs.pc.value();
+        let mut eh_frame = EhFrame::new(eh_bytes, image.endian());
+        eh_frame.set_address_size(self.architecture.pointer_size_bytes());
 
-        Ok(None)
+        if let Some((_hdr_vmaddr, hdr_bytes)) = image.eh_frame_hdr_section() {
+            let header = EhFrameHdr::new(hdr_bytes, image.endian());
+            if let Some(step) = self.unwind_with_eh_frame_hdr(&eh_frame, header, bases.clone(), regs)? {
+                return Ok(Some(step));
+            }
+        }
+
+        self.unwind_with_cfi(&eh_frame, bases, regs)
     }
 
     fn try_unwind_debug_frame(&self, image: &BinaryImage, regs: &Registers) -> Result<Option<UnwindStep>>
@@ -137,14 +143,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             .set_text(text_base)
             .set_eh_frame(image.relocated_address(df_vmaddr));
 
-        // TODO: Implement proper FDE lookup for .debug_frame using gimli 0.32 API
-        let _debug_frame = DebugFrame::new(df_bytes, image.endian());
-        let _bases = bases;
-        let _pc = regs.pc.value();
-
-        Ok(None)
+        let mut debug_frame = DebugFrame::new(df_bytes, image.endian());
+        debug_frame.set_address_size(self.architecture.pointer_size_bytes());
+        self.unwind_with_cfi(&debug_frame, bases, regs)
     }
 
+    #[allow(dead_code)]
     fn build_step_from_row(&self, regs: &Registers, row: &gimli::UnwindTableRow<usize>) -> Result<Option<UnwindStep>>
     {
         let cfa = match row.cfa() {
@@ -290,6 +294,93 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     }
 }
 
+impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
+{
+    fn unwind_with_eh_frame_hdr<R>(
+        &self,
+        eh_frame: &EhFrame<R>,
+        header: EhFrameHdr<R>,
+        bases: BaseAddresses,
+        regs: &Registers,
+    ) -> Result<Option<UnwindStep>>
+    where
+        R: gimli::Reader<Offset = usize>,
+    {
+        let parsed = header
+            .parse(&bases, self.architecture.pointer_size_bytes())
+            .map_err(|err| map_gimli_error("parsing .eh_frame_hdr", err))?;
+        let Some(table) = parsed.table() else {
+            return Ok(None);
+        };
+
+        let pc = regs.pc.value();
+        let pointer = table
+            .lookup(pc, &bases)
+            .map_err(|err| map_gimli_error("looking up FDE in .eh_frame_hdr", err))?;
+        let offset = table
+            .pointer_to_offset(pointer)
+            .map_err(|err| map_gimli_error("resolving FDE pointer", err))?;
+
+        let partial = eh_frame
+            .partial_fde_from_offset(&bases, offset)
+            .map_err(|err| map_gimli_error("loading FDE from .eh_frame_hdr", err))?;
+        let fde = partial
+            .parse(|section, base_addresses, cie_offset| section.cie_from_offset(base_addresses, cie_offset))
+            .map_err(|err| map_gimli_error("parsing frame description entry", err))?;
+
+        if !fde.contains(pc) {
+            return Ok(None);
+        }
+
+        let mut ctx = UnwindContext::<usize>::new();
+        match fde.unwind_info_for_address(eh_frame, &bases, &mut ctx, pc) {
+            Ok(row) => self.build_step_from_row(regs, row),
+            Err(gimli::Error::NoUnwindInfoForAddress) => Ok(None),
+            Err(err) => Err(map_gimli_error("evaluating unwind row", err)),
+        }
+    }
+
+    fn unwind_with_cfi<R, Section>(
+        &self,
+        section: &Section,
+        bases: BaseAddresses,
+        regs: &Registers,
+    ) -> Result<Option<UnwindStep>>
+    where
+        R: gimli::Reader<Offset = usize>,
+        Section: gimli::UnwindSection<R>,
+    {
+        let pc = regs.pc.value();
+        let mut entries = section.entries(&bases);
+        let mut ctx = UnwindContext::<usize>::new();
+        while let Some(entry) = entries.next().map_err(|err| map_gimli_error("reading unwind entry", err))? {
+            let gimli::CieOrFde::Fde(partial) = entry else {
+                continue;
+            };
+            let fde = partial
+                .parse(|unwind_section, base_addresses, cie_offset| {
+                    unwind_section.cie_from_offset(base_addresses, cie_offset)
+                })
+                .map_err(|err| map_gimli_error("parsing frame description entry", err))?;
+            if !fde.contains(pc) {
+                continue;
+            }
+
+            match fde.unwind_info_for_address(section, &bases, &mut ctx, pc) {
+                Ok(row) => {
+                    if let Some(step) = self.build_step_from_row(regs, row)? {
+                        return Ok(Some(step));
+                    }
+                }
+                Err(gimli::Error::NoUnwindInfoForAddress) => continue,
+                Err(err) => return Err(map_gimli_error("evaluating unwind row", err)),
+            }
+        }
+
+        Ok(None)
+    }
+}
+
 struct UnwindStep
 {
     next: Registers,
@@ -350,6 +441,7 @@ fn append_logical_frames(
         status,
     });
 }
+#[allow(dead_code)]
 fn read_register_value(architecture: Architecture, regs: &Registers, register: Register) -> Option<u64>
 {
     let reg_num = register.0;
@@ -390,4 +482,9 @@ fn return_register(architecture: Architecture) -> Register
         Architecture::X86_64 => Register(16), // RA (return address, same as RIP)
         _ => Register(0),
     }
+}
+
+fn map_gimli_error(context: &str, err: gimli::Error) -> DebuggerError
+{
+    DebuggerError::InvalidArgument(format!("{context}: {err}"))
 }

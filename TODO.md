@@ -11,7 +11,7 @@ This list captures concrete work needed to reach feature parity with production 
 - [x] **Breakpoints & watchpoints:** Add software breakpoints (BRK/INT3), hardware breakpoints, and data watchpoints with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
 - [x] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
 - [x] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
-- [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
+- [x] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
 - [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping.
 - [ ] **Remote/recording support:** Define a `ferros-protocol` transport (TCP/Unix socket) plus optional record/replay support (rr-style) so sessions can be remote or deterministic.
 - [ ] **Cross-platform parity:** Implement `LinuxDebugger` (ptrace + /proc) and `WindowsDebugger` (DbgHelp/DbgEng) so the `Debugger` factory stops erroring on non-macOS hosts and we can debug on the same platforms that LLDB/GDB support by default.

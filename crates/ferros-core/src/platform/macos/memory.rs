@@ -58,12 +58,20 @@ pub struct MemoryCache
     pages: RwLock<HashMap<u64, Arc<Vec<u8>>>>,
 }
 
+impl Default for MemoryCache
+{
+    fn default() -> Self
+    {
+        Self::with_page_size(*SYSTEM_PAGE_SIZE)
+    }
+}
+
 impl MemoryCache
 {
     /// Create a cache using the system page size.
     pub fn new() -> Self
     {
-        Self::with_page_size(*SYSTEM_PAGE_SIZE)
+        Self::default()
     }
 
     /// Create a cache with a custom page size (must be power of two).
@@ -439,7 +447,7 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
 /// Formats bytes into a traditional hex + ASCII view.
 pub fn format_hexdump(base: Address, bytes: &[u8], width: usize) -> String
 {
-    let width = width.max(8).min(32);
+    let width = width.clamp(8, 32);
     let mut out = String::new();
     for (offset, chunk) in bytes.chunks(width).enumerate() {
         let addr = base.value().saturating_add((offset * width) as u64);

@@ -29,15 +29,15 @@ fn looks_like_address(value: u64) -> bool
     // - Heap: 0x000000020... to 0x000000040...
     // - Code: 0x000000010... to 0x000000020...
     // - Mapped: Various ranges
-    
+
     // Very small values (< 0x1000) are likely not addresses
     if value < 0x1000 {
         return false;
     }
 
-    // Very large values (> 0x7fffffffffff) are likely not valid user-space addresses
+    // Very large values (> 0x7fff_ffff_ffff) are likely not valid user-space addresses
     // (sign bit would be set, or beyond typical address space)
-    if value > 0x7fffffffffff {
+    if value > 0x7fff_ffff_ffff {
         return false;
     }
 

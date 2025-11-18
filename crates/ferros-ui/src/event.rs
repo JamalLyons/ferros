@@ -33,7 +33,6 @@ pub struct EventHandler
     receiver: mpsc::Receiver<Event>,
     sender: mpsc::Sender<Event>,
     should_stop: Arc<AtomicBool>,
-    #[allow(dead_code)] // Kept for potential future use (e.g., aborting the task)
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -94,7 +93,10 @@ impl EventHandler
         }
     }
 
-    /// Stop the event handler and wait for the background task to finish
+    /// Stop the event handler gracefully
+    ///
+    /// This sets the stop flag and drops the receiver, allowing the background
+    /// task to exit cleanly on its next iteration.
     pub fn stop(&mut self)
     {
         self.should_stop.store(true, Ordering::Relaxed);
@@ -106,6 +108,37 @@ impl EventHandler
             let (_sender, receiver) = mpsc::channel(1);
             receiver
         }));
+    }
+
+    /// Abort the event handler task immediately
+    ///
+    /// This forcefully terminates the background task without waiting for
+    /// it to finish its current operation. Use this when you need immediate
+    /// shutdown, such as during error handling or cleanup.
+    ///
+    /// ## Note
+    ///
+    /// After calling `abort()`, the event handler should not be used further.
+    /// The receiver will be closed and no more events will be produced.
+    pub fn abort(&mut self)
+    {
+        self.should_stop.store(true, Ordering::Relaxed);
+        self.handle.abort();
+        // Drop the receiver to ensure channel is closed
+        drop(std::mem::replace(&mut self.receiver, {
+            let (_sender, receiver) = mpsc::channel(1);
+            receiver
+        }));
+    }
+
+    /// Check if the event handler task is still running
+    ///
+    /// Returns `true` if the background task is still active, `false` if it has finished.
+    /// This can be useful for monitoring the health of the event handler.
+    #[must_use]
+    pub fn is_running(&self) -> bool
+    {
+        !self.handle.is_finished()
     }
 
     /// Get the next event (async)

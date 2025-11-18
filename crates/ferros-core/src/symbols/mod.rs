@@ -55,7 +55,6 @@ pub struct BinaryImage
     eh_frame: Option<SectionBlob>,
     eh_frame_hdr: Option<SectionBlob>,
     debug_frame: Option<SectionBlob>,
-    #[allow(dead_code)]
     dwarf_cache: OnceCell<OwnedDwarf>,
     context_cache: OnceCell<Context<OwnedReader>>,
     type_cache: RwLock<HashMap<String, Arc<TypeSummary>>>,
@@ -138,8 +137,28 @@ impl BinaryImage
         self.runtime_range
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn pointer_size(&self) -> u8
+    /// Get the pointer size in bytes for this binary image
+    ///
+    /// Returns the size of a pointer (address) for the architecture
+    /// this binary was compiled for. This is typically 8 bytes for
+    /// 64-bit architectures (Arm64, X86_64) and 4 bytes for 32-bit architectures.
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// use ferros_core::symbols::SymbolCache;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cache = SymbolCache::new();
+    /// // After loading an image...
+    /// // let image = cache.get_image(image_id)?;
+    /// // let ptr_size = image.pointer_size();
+    /// // println!("Pointer size: {} bytes", ptr_size);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn pointer_size(&self) -> u8
     {
         self.architecture.pointer_size_bytes()
     }
@@ -208,7 +227,6 @@ impl BinaryImage
         }
     }
 
-    #[allow(dead_code)]
     fn dwarf(&self) -> Result<&OwnedDwarf>
     {
         self.dwarf_cache.get_or_try_init(|| {

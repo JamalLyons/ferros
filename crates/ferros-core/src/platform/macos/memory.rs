@@ -611,8 +611,6 @@ struct RegionInfo
     start: mach_vm_address_t,
     size: mach_vm_size_t,
     protection: u32,
-    #[allow(dead_code)] // Used in TUI for displaying region names
-    name: Option<String>,
 }
 
 fn ensure_readable_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
@@ -698,7 +696,6 @@ fn region_for_address(task: mach_port_t, addr: Address) -> Result<Option<RegionI
                 start: target,
                 size,
                 protection: info.protection as u32,
-                name: region_name_from_user_tag(info.user_tag),
             }));
         }
     }

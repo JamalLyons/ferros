@@ -84,7 +84,6 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Ok(None)
     }
 
-    #[allow(dead_code)]
     fn evaluate_rule(&self, rule: &RegisterRule<usize>, regs: &Registers, cfa: u64) -> Result<u64>
     {
         match rule {
@@ -148,7 +147,6 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         self.unwind_with_cfi(&debug_frame, bases, regs)
     }
 
-    #[allow(dead_code)]
     fn build_step_from_row(&self, regs: &Registers, row: &gimli::UnwindTableRow<usize>) -> Result<Option<UnwindStep>>
     {
         let cfa = match row.cfa() {
@@ -441,7 +439,6 @@ fn append_logical_frames(
         status,
     });
 }
-#[allow(dead_code)]
 fn read_register_value(architecture: Architecture, regs: &Registers, register: Register) -> Option<u64>
 {
     let reg_num = register.0;
@@ -474,7 +471,6 @@ fn read_register_value(architecture: Architecture, regs: &Registers, register: R
     }
 }
 
-#[allow(dead_code)]
 fn return_register(architecture: Architecture) -> Register
 {
     match architecture {

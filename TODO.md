@@ -7,7 +7,7 @@ This list captures concrete work needed to reach feature parity with production 
 ## ferros-core (debugger engine)
 
 - [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
-- [ ] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
+- [x] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
 - [ ] **Breakpoints & watchpoints:** Add software breakpoints (BRK/INT3), hardware breakpoints, and data watchpoints with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
 - [ ] **Single-step & range stepping:** Implement instruction stepping, range stepping, and “continue until” to support `n/next/step/finish` flows.
 - [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.

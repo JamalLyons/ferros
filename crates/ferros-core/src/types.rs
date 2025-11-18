@@ -205,6 +205,66 @@ impl X86_64Register
     }
 }
 
+/// 128-bit SIMD register value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorRegisterValue
+{
+    bytes: [u8; 16],
+}
+
+impl VectorRegisterValue
+{
+    /// Create a new vector register from raw bytes (little-endian).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self
+    {
+        Self { bytes }
+    }
+
+    /// Create a vector register from a 128-bit integer (little-endian).
+    #[must_use]
+    pub const fn from_u128(value: u128) -> Self
+    {
+        Self {
+            bytes: value.to_le_bytes(),
+        }
+    }
+
+    /// Access the raw bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; 16]
+    {
+        &self.bytes
+    }
+
+    /// Convert to a 128-bit integer (little-endian).
+    #[must_use]
+    pub const fn as_u128(&self) -> u128
+    {
+        u128::from_le_bytes(self.bytes)
+    }
+}
+
+impl Default for VectorRegisterValue
+{
+    fn default() -> Self
+    {
+        Self { bytes: [0; 16] }
+    }
+}
+
+/// Architecture-agnostic floating point status/control registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FloatingPointState
+{
+    /// ARM64 FPSR or equivalent (if available).
+    pub fpsr: Option<u32>,
+    /// ARM64 FPCR or equivalent (if available).
+    pub fpcr: Option<u32>,
+    /// x86 MXCSR (if available).
+    pub mxcsr: Option<u32>,
+}
+
 use std::fmt;
 use std::ops::{Add, Sub};
 
@@ -365,6 +425,10 @@ pub struct Registers
     /// - **ARM64**: CPSR (Current Program Status Register)
     /// - **x86-64**: RFLAGS (contains condition flags)
     pub status: u64,
+    /// SIMD/vector registers (architecture-specific; 128-bit lanes).
+    pub vector: Vec<VectorRegisterValue>,
+    /// Floating-point status/control registers (architecture-specific metadata).
+    pub floating: FloatingPointState,
     /// CPU architecture (used for architecture-specific register access)
     architecture: Architecture,
 }
@@ -391,6 +455,8 @@ impl Registers
             fp: Address::ZERO,
             general: Vec::new(),
             status: 0,
+            vector: Vec::new(),
+            floating: FloatingPointState::default(),
             architecture: Architecture::Unknown("unknown"),
         }
     }
@@ -538,6 +604,34 @@ impl Registers
     pub(crate) fn set_architecture(&mut self, architecture: Architecture)
     {
         self.architecture = architecture;
+    }
+
+    /// Read-only view of the SIMD/vector registers.
+    #[must_use]
+    pub fn vector_registers(&self) -> &[VectorRegisterValue]
+    {
+        &self.vector
+    }
+
+    /// Mutable view of the SIMD/vector registers.
+    #[must_use]
+    pub fn vector_registers_mut(&mut self) -> &mut [VectorRegisterValue]
+    {
+        &mut self.vector
+    }
+
+    /// Floating point status/control state.
+    #[must_use]
+    pub fn floating_point_state(&self) -> &FloatingPointState
+    {
+        &self.floating
+    }
+
+    /// Mutable floating point state.
+    #[must_use]
+    pub fn floating_point_state_mut(&mut self) -> &mut FloatingPointState
+    {
+        &mut self.floating
     }
 }
 

@@ -41,5 +41,6 @@ pub use events::{format_stop_reason, DebuggerEvent, DebuggerEventReceiver, Debug
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacOSDebugger;
 pub use types::{
-    Address, Architecture, MemoryRegion, MemoryRegionId, ProcessId, RegisterId, Registers, StopReason, ThreadId,
+    Address, Architecture, FloatingPointState, MemoryRegion, MemoryRegionId, ProcessId, RegisterId, Registers, StopReason,
+    ThreadId, VectorRegisterValue,
 };

@@ -425,6 +425,87 @@ impl MacOSDebugger
             .ok_or_else(|| DebuggerError::InvalidArgument("No active thread selected".to_string()))
     }
 
+    fn thread_port_for_id(&self, thread: ThreadId) -> Result<thread_act_t>
+    {
+        self.ensure_attached()?;
+        let port = thread.raw() as thread_act_t;
+        if self.threads.contains(&port) {
+            Ok(port)
+        } else {
+            Err(DebuggerError::InvalidArgument(format!(
+                "Thread {} is not part of process {}. Call refresh_threads() to update the thread list.",
+                thread.raw(),
+                self.pid.0
+            )))
+        }
+    }
+
+    fn read_registers_from_port(&self, thread: thread_act_t) -> Result<Registers>
+    {
+        match self.architecture {
+            Architecture::Arm64 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    read_registers_arm64(thread)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "arm64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::X86_64 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    read_registers_x86_64(thread)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "x86_64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::Unknown(label) => {
+                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
+            }
+        }
+    }
+
+    fn write_registers_to_port(&self, thread: thread_act_t, regs: &Registers) -> Result<()>
+    {
+        match self.architecture {
+            Architecture::Arm64 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    write_registers_arm64(thread, regs)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "arm64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::X86_64 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    write_registers_x86_64(thread, regs)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(DebuggerError::InvalidArgument(
+                        "x86_64 register access not supported on this build".to_string(),
+                    ))
+                }
+            }
+            Architecture::Unknown(label) => {
+                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
+            }
+        }
+    }
+
     /// Set the active thread using a Mach thread port
     ///
     /// This is an internal helper method that sets the active thread using a raw
@@ -692,6 +773,18 @@ impl Debugger for MacOSDebugger
     fn take_event_receiver(&mut self) -> Option<events::DebuggerEventReceiver>
     {
         self.event_rx.take()
+    }
+
+    fn read_registers_for(&self, thread: ThreadId) -> Result<Registers>
+    {
+        let port = self.thread_port_for_id(thread)?;
+        self.read_registers_from_port(port)
+    }
+
+    fn write_registers_for(&mut self, thread: ThreadId, regs: &Registers) -> Result<()>
+    {
+        let port = self.thread_port_for_id(thread)?;
+        self.write_registers_to_port(port, regs)
     }
 
     /// Launch a new process under debugger control using posix_spawn
@@ -1096,80 +1189,14 @@ impl Debugger for MacOSDebugger
     {
         self.ensure_attached()?;
         let thread = self.active_thread_port()?;
-
-        match self.architecture {
-            Architecture::Arm64 => {
-                #[cfg(target_arch = "aarch64")]
-                {
-                    read_registers_arm64(thread)
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    Err(DebuggerError::InvalidArgument(
-                        "arm64 register access not supported on this build".to_string(),
-                    ))
-                }
-            }
-            Architecture::X86_64 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    read_registers_x86_64(thread)
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    Err(DebuggerError::InvalidArgument(
-                        "x86_64 register access not supported on this build".to_string(),
-                    ))
-                }
-            }
-            Architecture::Unknown(label) => {
-                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
-            }
-        }
+        self.read_registers_from_port(thread)
     }
 
-    /// Write registers to the attached process
-    ///
-    /// **Not yet implemented** - will use `thread_set_state()` when ready.
-    ///
-    /// ## Future Implementation
-    ///
-    /// Will call `thread_set_state()` with the new register values.
-    /// This requires careful handling of the thread state structure.
     fn write_registers(&mut self, regs: &Registers) -> Result<()>
     {
         self.ensure_attached()?;
         let thread = self.active_thread_port()?;
-
-        match self.architecture {
-            Architecture::Arm64 => {
-                #[cfg(target_arch = "aarch64")]
-                {
-                    write_registers_arm64(thread, regs)
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    Err(DebuggerError::InvalidArgument(
-                        "arm64 register access not supported on this build".to_string(),
-                    ))
-                }
-            }
-            Architecture::X86_64 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    write_registers_x86_64(thread, regs)
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    Err(DebuggerError::InvalidArgument(
-                        "x86_64 register access not supported on this build".to_string(),
-                    ))
-                }
-            }
-            Architecture::Unknown(label) => {
-                Err(DebuggerError::InvalidArgument(format!("Unsupported architecture: {label}")))
-            }
-        }
+        self.write_registers_to_port(thread, regs)
     }
 
     /// Read memory from the target process

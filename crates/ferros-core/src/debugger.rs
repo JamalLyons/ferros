@@ -26,7 +26,7 @@
 
 use std::fs::File;
 
-use crate::error::Result;
+use crate::error::{DebuggerError, Result};
 use crate::events::DebuggerEventReceiver;
 use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
 
@@ -226,6 +226,28 @@ pub trait Debugger
     ///
     /// Not yet implemented - returns `InvalidArgument` error.
     fn write_registers(&mut self, regs: &Registers) -> Result<()>;
+
+    /// Read registers for a specific thread without changing the active thread.
+    ///
+    /// Default implementation returns `InvalidArgument` if the backend does not support
+    /// per-thread register access without switching the active thread.
+    fn read_registers_for(&self, _thread: ThreadId) -> Result<Registers>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Per-thread register access not supported for this debugger".to_string(),
+        ))
+    }
+
+    /// Write registers for a specific thread without changing the active thread.
+    ///
+    /// Default implementation returns `InvalidArgument` if the backend does not support
+    /// per-thread register access without switching the active thread.
+    fn write_registers_for(&mut self, _thread: ThreadId, _regs: &Registers) -> Result<()>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Per-thread register access not supported for this debugger".to_string(),
+        ))
+    }
 
     /// Read memory from the target process
     ///

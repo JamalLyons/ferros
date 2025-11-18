@@ -21,13 +21,19 @@
 /// - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 /// - [ARM64 Register Layout](https://developer.arm.com/documentation/102374/0101/Registers-in-AArch64---general-purpose-registers)
 /// - [ARM_THREAD_STATE64 structure](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/arm/_structs.h)
+#[cfg(target_arch = "x86_64")]
+use std::mem::MaybeUninit;
+
 use libc::{c_int, mach_msg_type_number_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
+use mach2::kern_return::KERN_INVALID_ARGUMENT;
+#[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
+use tracing::debug;
 
 use crate::error::{DebuggerError, Result};
 use crate::platform::macos::ffi;
-use crate::types::{Address, Architecture, Registers};
+use crate::types::{Address, Architecture, Registers, VectorRegisterValue};
 
 /// Read ARM64 registers from a thread
 ///
@@ -164,6 +170,12 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
         // General-purpose registers: X0-X30
         regs.general = (0..=30).map(read_u64).collect();
 
+        if let Some(neon) = fetch_arm64_neon_state(thread)? {
+            regs.vector = neon.v.iter().map(|&value| VectorRegisterValue::from_u128(value)).collect();
+            regs.floating.fpsr = Some(neon.fpsr);
+            regs.floating.fpcr = Some(neon.fpcr);
+        }
+
         Ok(regs)
     }
 }
@@ -204,6 +216,8 @@ pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<(
             return Err(DebuggerError::InvalidArgument(format!("thread_set_state failed: {}", result)));
         }
     }
+
+    write_arm64_neon_state(thread, regs)?;
 
     Ok(())
 }
@@ -278,6 +292,15 @@ pub fn read_registers_x86_64(thread: thread_act_t) -> Result<Registers>
             state.r12, state.r13, state.r14, state.r15,
         ];
 
+        if let Some(float_state) = fetch_x86_float_state(thread)? {
+            regs.vector = float_state
+                .fpu_xmm
+                .iter()
+                .map(|reg| VectorRegisterValue::from_bytes(reg.bytes))
+                .collect();
+            regs.floating.mxcsr = Some(float_state.fpu_mxcsr);
+        }
+
         Ok(regs)
     }
 }
@@ -350,8 +373,251 @@ pub fn write_registers_x86_64(thread: thread_act_t, regs: &Registers) -> Result<
         }
     }
 
+    write_x86_simd_state(thread, regs)?;
+
     Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
 fn _unused_compile_assert_x86_write() {}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ArmNeonState64
+{
+    v: [u128; 32],
+    fpsr: u32,
+    fpcr: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Default for ArmNeonState64
+{
+    fn default() -> Self
+    {
+        Self {
+            v: [0; 32],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const ARM_NEON_STATE64: c_int = 17;
+#[cfg(target_arch = "aarch64")]
+const ARM_NEON_STATE64_COUNT: mach_msg_type_number_t =
+    (std::mem::size_of::<ArmNeonState64>() / std::mem::size_of::<natural_t>()) as mach_msg_type_number_t;
+
+#[cfg(target_arch = "aarch64")]
+fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>>
+{
+    let mut state = ArmNeonState64::default();
+    let mut count = ARM_NEON_STATE64_COUNT;
+    let kr = unsafe { ffi::thread_get_state(thread, ARM_NEON_STATE64, &mut state as *mut _ as *mut natural_t, &mut count) };
+
+    if kr == KERN_SUCCESS {
+        Ok(Some(state))
+    } else if kr == KERN_INVALID_ARGUMENT {
+        debug!("ARM NEON state not available on this system");
+        Ok(None)
+    } else {
+        Err(DebuggerError::ReadRegistersFailed(format!(
+            "thread_get_state(ARM_NEON_STATE64) failed: {}",
+            kr
+        )))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<()>
+{
+    if regs.vector.is_empty() && regs.floating.fpsr.is_none() && regs.floating.fpcr.is_none() {
+        return Ok(());
+    }
+
+    let mut state = fetch_arm64_neon_state(thread)?
+        .ok_or_else(|| DebuggerError::InvalidArgument("ARM NEON state not available on this hardware build".to_string()))?;
+
+    for (idx, value) in regs.vector.iter().take(state.v.len()).enumerate() {
+        state.v[idx] = value.as_u128();
+    }
+    if let Some(fpsr) = regs.floating.fpsr {
+        state.fpsr = fpsr;
+    }
+    if let Some(fpcr) = regs.floating.fpcr {
+        state.fpcr = fpcr;
+    }
+
+    let kr = unsafe {
+        ffi::thread_set_state(
+            thread,
+            ARM_NEON_STATE64,
+            &state as *const _ as *const natural_t,
+            ARM_NEON_STATE64_COUNT,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::InvalidArgument(format!(
+            "thread_set_state(ARM_NEON_STATE64) failed: {}",
+            kr
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmstRegister
+{
+    bytes: [u8; 10],
+    reserved: [u8; 6],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for MmstRegister
+{
+    fn default() -> Self
+    {
+        Self {
+            bytes: [0; 10],
+            reserved: [0; 6],
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XmmRegister
+{
+    bytes: [u8; 16],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for XmmRegister
+{
+    fn default() -> Self
+    {
+        Self { bytes: [0; 16] }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct X86FloatState64
+{
+    fpu_reserved: [i32; 2],
+    fpu_fcw: u16,
+    fpu_fsw: u16,
+    fpu_ftw: u8,
+    fpu_rsrv1: u8,
+    fpu_fop: u16,
+    fpu_ip: u32,
+    fpu_cs: u16,
+    fpu_rsrv2: u16,
+    fpu_dp: u32,
+    fpu_ds: u16,
+    fpu_rsrv3: u16,
+    fpu_mxcsr: u32,
+    fpu_mxcsrmask: u32,
+    fpu_stmm: [MmstRegister; 8],
+    fpu_xmm: [XmmRegister; 16],
+    fpu_rsrv4: [u8; 6 * 16],
+    fpu_reserved1: i32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Default for X86FloatState64
+{
+    fn default() -> Self
+    {
+        Self {
+            fpu_reserved: [0; 2],
+            fpu_fcw: 0,
+            fpu_fsw: 0,
+            fpu_ftw: 0,
+            fpu_rsrv1: 0,
+            fpu_fop: 0,
+            fpu_ip: 0,
+            fpu_cs: 0,
+            fpu_rsrv2: 0,
+            fpu_dp: 0,
+            fpu_ds: 0,
+            fpu_rsrv3: 0,
+            fpu_mxcsr: 0,
+            fpu_mxcsrmask: 0,
+            fpu_stmm: [MmstRegister::default(); 8],
+            fpu_xmm: [XmmRegister::default(); 16],
+            fpu_rsrv4: [0; 6 * 16],
+            fpu_reserved1: 0,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const X86_FLOAT_STATE64: c_int = 5;
+#[cfg(target_arch = "x86_64")]
+const X86_FLOAT_STATE64_COUNT: mach_msg_type_number_t =
+    (std::mem::size_of::<X86FloatState64>() / std::mem::size_of::<natural_t>()) as mach_msg_type_number_t;
+
+#[cfg(target_arch = "x86_64")]
+fn fetch_x86_float_state(thread: thread_act_t) -> Result<Option<X86FloatState64>>
+{
+    let mut state = MaybeUninit::<X86FloatState64>::zeroed();
+    let mut count = X86_FLOAT_STATE64_COUNT;
+    let kr = unsafe { ffi::thread_get_state(thread, X86_FLOAT_STATE64, state.as_mut_ptr() as *mut natural_t, &mut count) };
+
+    if kr == KERN_SUCCESS {
+        Ok(Some(unsafe { state.assume_init() }))
+    } else if kr == KERN_INVALID_ARGUMENT {
+        debug!("x86 FLOAT state not available on this system");
+        Ok(None)
+    } else {
+        Err(DebuggerError::ReadRegistersFailed(format!(
+            "thread_get_state(x86_FLOAT_STATE64) failed: {}",
+            kr
+        )))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_x86_simd_state(thread: thread_act_t, regs: &Registers) -> Result<()>
+{
+    if regs.vector.is_empty() && regs.floating.mxcsr.is_none() {
+        return Ok(());
+    }
+
+    let mut state = fetch_x86_float_state(thread)?.ok_or_else(|| {
+        DebuggerError::InvalidArgument("x86 floating-point state not available on this hardware build".to_string())
+    })?;
+
+    for (idx, value) in regs.vector.iter().take(state.fpu_xmm.len()).enumerate() {
+        state.fpu_xmm[idx].bytes.copy_from_slice(value.bytes());
+    }
+
+    if let Some(mxcsr) = regs.floating.mxcsr {
+        state.fpu_mxcsr = mxcsr;
+    }
+
+    let kr = unsafe {
+        ffi::thread_set_state(
+            thread,
+            X86_FLOAT_STATE64,
+            &state as *const _ as *const natural_t,
+            X86_FLOAT_STATE64_COUNT,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::InvalidArgument(format!(
+            "thread_set_state(x86_FLOAT_STATE64) failed: {}",
+            kr
+        )));
+    }
+
+    Ok(())
+}

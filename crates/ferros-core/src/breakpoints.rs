@@ -134,7 +134,7 @@ pub enum BreakpointPayload
     },
     Hardware
     {
-        address: Address
+        address: Address, slot: u32
     },
     Watchpoint
     {
@@ -227,7 +227,9 @@ impl BreakpointStore
 
     pub fn record_hit(&mut self, address: Address) -> Option<BreakpointInfo>
     {
-        let id = self.id_for_kind(address, BreakpointKind::Software)?;
+        let id = self
+            .id_for_kind(address, BreakpointKind::Software)
+            .or_else(|| self.id_for_kind(address, BreakpointKind::Hardware))?;
         let entry = self.by_id.get_mut(&id)?;
         if !entry.info.enabled {
             return None;

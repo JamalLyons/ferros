@@ -61,12 +61,12 @@ use crate::breakpoints::{
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::events::{self, DebuggerEvent};
-use crate::platform::macos::ffi;
 use crate::platform::macos::memory::{get_memory_regions, write_memory, MemoryCache};
 #[cfg(target_arch = "aarch64")]
 use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
+use crate::platform::macos::{debug_registers, ffi};
 use crate::symbols::{ImageDescriptor, SymbolCache};
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
 use crate::unwind::{MemoryAccess, StackUnwinder};
@@ -517,6 +517,51 @@ impl MacOSDebugger
         Ok(store.insert(entry))
     }
 
+    fn install_hardware_breakpoint(&mut self, address: Address) -> Result<BreakpointId>
+    {
+        self.ensure_attached()?;
+
+        {
+            let store = self.breakpoints.lock().unwrap();
+            if store.id_for_kind(address, BreakpointKind::Hardware).is_some() {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "Hardware breakpoint already exists at 0x{:016x}",
+                    address.value()
+                )));
+            }
+        }
+
+        // Install on all threads
+        let mut used_slot = None;
+
+        for &thread in &self.threads {
+            let slot = debug_registers::set_hardware_breakpoint(thread, address)?;
+            if let Some(s) = used_slot {
+                if s != slot {
+                    tracing::warn!("Hardware breakpoint slots inconsistent across threads: {} vs {}", s, slot);
+                }
+            } else {
+                used_slot = Some(slot);
+            }
+        }
+
+        let slot = used_slot
+            .ok_or_else(|| DebuggerError::AttachFailed("No threads available to set hardware breakpoint".into()))?;
+
+        let mut info = BreakpointInfo::new(BreakpointId::from_raw(0), address, BreakpointKind::Hardware);
+        info.state = BreakpointState::Resolved;
+        info.enabled = true;
+        info.resolved_at = Some(SystemTime::now());
+
+        let entry = BreakpointEntry {
+            info,
+            payload: BreakpointPayload::Hardware { address, slot },
+        };
+
+        let mut store = self.breakpoints.lock().unwrap();
+        Ok(store.insert(entry))
+    }
+
     fn restore_software_breakpoint(&mut self, entry: &BreakpointEntry) -> Result<()>
     {
         if let BreakpointPayload::Software { original_bytes } = &entry.payload {
@@ -526,6 +571,19 @@ impl MacOSDebugger
                     "Failed to restore original instruction at 0x{:016x}",
                     entry.info.address.value()
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_hardware_breakpoint(&mut self, entry: &BreakpointEntry) -> Result<()>
+    {
+        if let BreakpointPayload::Hardware { slot, .. } = &entry.payload {
+            for &thread in &self.threads {
+                // Best effort removal
+                if let Err(e) = debug_registers::clear_hardware_breakpoint(thread, *slot) {
+                    tracing::warn!("Failed to clear hardware breakpoint on thread {}: {}", thread, e);
+                }
             }
         }
         Ok(())
@@ -542,6 +600,13 @@ impl MacOSDebugger
             if let BreakpointPayload::Software { .. } = entry.payload {
                 if let Err(err) = self.restore_software_breakpoint(&entry) {
                     warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
+                }
+            } else if let BreakpointPayload::Hardware { .. } = entry.payload {
+                if let Err(err) = self.remove_hardware_breakpoint(&entry) {
+                    warn!(
+                        "Failed to remove hardware breakpoint 0x{:016x}: {err}",
+                        entry.info.address.value()
+                    );
                 }
             }
         }
@@ -887,9 +952,7 @@ impl Debugger for MacOSDebugger
     {
         match request {
             BreakpointRequest::Software { address } => self.install_software_breakpoint(address),
-            BreakpointRequest::Hardware { .. } => Err(DebuggerError::InvalidArgument(
-                "Hardware breakpoints are not yet supported on macOS".to_string(),
-            )),
+            BreakpointRequest::Hardware { address } => self.install_hardware_breakpoint(address),
             BreakpointRequest::Watchpoint { .. } => Err(DebuggerError::InvalidArgument(
                 "Watchpoints are not yet supported on macOS".to_string(),
             )),
@@ -904,35 +967,60 @@ impl Debugger for MacOSDebugger
         }
         .ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
 
-        if entry.info.kind == BreakpointKind::Software && entry.info.enabled {
-            self.restore_software_breakpoint(&entry)?;
+        if entry.info.enabled {
+            match entry.info.kind {
+                BreakpointKind::Software => self.restore_software_breakpoint(&entry)?,
+                BreakpointKind::Hardware => self.remove_hardware_breakpoint(&entry)?,
+                _ => {}
+            }
         }
         Ok(())
     }
 
     fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
     {
-        let address = {
+        let (kind, address) = {
             let store = self.breakpoints.lock().unwrap();
             let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
             if entry.info.enabled {
                 return Ok(());
             }
-            if entry.info.kind != BreakpointKind::Software {
-                return Err(DebuggerError::InvalidArgument(
-                    "Only software breakpoints can be toggled on macOS".to_string(),
-                ));
-            }
-            entry.info.address
+            (entry.info.kind, entry.info.address)
         };
 
-        let trap = self.software_trap_bytes()?;
-        let written = self.write_memory(address, &trap)?;
-        if written != trap.len() {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "Failed to re-arm breakpoint at 0x{:016x}",
-                address.value()
-            )));
+        match kind {
+            BreakpointKind::Software => {
+                let trap = self.software_trap_bytes()?;
+                let written = self.write_memory(address, &trap)?;
+                if written != trap.len() {
+                    return Err(DebuggerError::InvalidArgument(format!(
+                        "Failed to re-arm breakpoint at 0x{:016x}",
+                        address.value()
+                    )));
+                }
+            }
+            BreakpointKind::Hardware => {
+                // Re-install on all threads
+                let mut used_slot = None;
+                for &thread in &self.threads {
+                    let slot = debug_registers::set_hardware_breakpoint(thread, address)?;
+                    if let Some(s) = used_slot {
+                        if s != slot {
+                            tracing::warn!("Hardware breakpoint slots inconsistent: {} vs {}", s, slot);
+                        }
+                    } else {
+                        used_slot = Some(slot);
+                    }
+                }
+
+                if let Some(new_slot) = used_slot {
+                    let mut store = self.breakpoints.lock().unwrap();
+                    if let Some(entry) = store.get_mut(id) {
+                        entry.payload = BreakpointPayload::Hardware { address, slot: new_slot };
+                    }
+                }
+            }
+            _ => return Err(DebuggerError::InvalidArgument("Watchpoints not supported".into())),
         }
 
         let mut store = self.breakpoints.lock().unwrap();
@@ -946,27 +1034,37 @@ impl Debugger for MacOSDebugger
 
     fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()>
     {
-        let (address, bytes) = {
+        let (kind, address, payload) = {
             let store = self.breakpoints.lock().unwrap();
             let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
             if !entry.info.enabled {
                 return Ok(());
             }
-            if let BreakpointPayload::Software { original_bytes } = &entry.payload {
-                (entry.info.address, original_bytes.clone())
-            } else {
-                return Err(DebuggerError::InvalidArgument(
-                    "Only software breakpoints can be toggled on macOS".to_string(),
-                ));
-            }
+            (entry.info.kind, entry.info.address, entry.payload.clone())
         };
 
-        let written = self.write_memory(address, &bytes)?;
-        if written != bytes.len() {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "Failed to disable breakpoint at 0x{:016x}",
-                address.value()
-            )));
+        match kind {
+            BreakpointKind::Software => {
+                if let BreakpointPayload::Software { original_bytes } = payload {
+                    let written = self.write_memory(address, &original_bytes)?;
+                    if written != original_bytes.len() {
+                        return Err(DebuggerError::InvalidArgument(format!(
+                            "Failed to disable breakpoint at 0x{:016x}",
+                            address.value()
+                        )));
+                    }
+                }
+            }
+            BreakpointKind::Hardware => {
+                if let BreakpointPayload::Hardware { slot, .. } = payload {
+                    for &thread in &self.threads {
+                        if let Err(e) = debug_registers::clear_hardware_breakpoint(thread, slot) {
+                            tracing::warn!("Failed to clear hardware breakpoint: {}", e);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
 
         let mut store = self.breakpoints.lock().unwrap();

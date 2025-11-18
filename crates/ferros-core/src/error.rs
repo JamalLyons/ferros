@@ -25,10 +25,11 @@ use thiserror::Error;
 ///
 /// 1. **Process errors**: ProcessNotFound, AttachFailed, NotAttached
 /// 2. **State errors**: NotStopped, SuspendFailed, ResumeFailed
-/// 3. **Breakpoint errors**: NoBreakpoint
+/// 3. **Breakpoint errors**: NoBreakpoint, BreakpointIdNotFound
 /// 4. **Permission errors**: PermissionDenied
-/// 5. **Platform errors**: MachError (macOS-specific)
-/// 6. **I/O errors**: Io (for file operations, etc.)
+/// 5. **Resource errors**: ResourceExhausted (hardware breakpoint/watchpoint limits)
+/// 6. **Platform errors**: MachError (macOS-specific)
+/// 7. **I/O errors**: Io (for file operations, etc.)
 #[derive(Error, Debug)]
 pub enum DebuggerError
 {
@@ -111,6 +112,46 @@ pub enum DebuggerError
     /// No breakpoint exists for the given identifier.
     #[error("No breakpoint with id {0}")]
     BreakpointIdNotFound(u64),
+
+    /// A required resource has been exhausted
+    ///
+    /// This error occurs when attempting to use a resource that has reached its
+    /// hardware or system-imposed limit. Common scenarios:
+    ///
+    /// - **Hardware breakpoints**: CPU debug registers are full
+    ///   - x86-64: Maximum 4 hardware breakpoints (DR0-DR3)
+    ///   - ARM64: Maximum 16 hardware breakpoints (DBGBVR0-15)
+    /// - **Watchpoints**: Hardware watchpoint registers are full
+    /// - **Threads**: Maximum number of threads reached (platform-dependent)
+    ///
+    /// ## Solution
+    ///
+    /// Remove some existing breakpoints/watchpoints before adding new ones, or
+    /// use software breakpoints which don't have hardware limits.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::breakpoints::BreakpointRequest;
+    /// use ferros_core::error::DebuggerError;
+    /// use ferros_core::types::Address;
+    /// use ferros_core::Debugger;
+    ///
+    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
+    /// # let address = Address::from(0x1000);
+    /// let breakpoint_id = match debugger.add_breakpoint(BreakpointRequest::Hardware { address }) {
+    ///     Err(DebuggerError::ResourceExhausted(msg)) => {
+    ///         println!("Hardware breakpoint limit reached: {}", msg);
+    ///         // Try software breakpoint instead
+    ///         debugger.add_breakpoint(BreakpointRequest::Software { address })?
+    ///     }
+    ///     Ok(id) => id,
+    ///     Err(e) => return Err(e),
+    /// };
+    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// ```
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
 
     /// Failed to suspend the target process
     ///

@@ -9,6 +9,42 @@ use ratatui::Frame;
 
 use crate::app::{App, ProcessOutputLine, ProcessOutputSource};
 
+/// Check if a register value looks like a valid memory address
+///
+/// This is a heuristic that checks if a u64 value could be a pointer/address.
+/// On 64-bit systems, valid user-space addresses are typically:
+/// - Non-zero
+/// - Within reasonable memory ranges (not too small, not too large)
+/// - Often aligned (though not always)
+fn looks_like_address(value: u64) -> bool
+{
+    // Zero is not a valid address (null pointer)
+    if value == 0 {
+        return false;
+    }
+
+    // On 64-bit systems, addresses are typically in certain ranges
+    // macOS ARM64 user-space addresses are typically:
+    // - Stack: 0x000000016... to 0x000000017...
+    // - Heap: 0x000000020... to 0x000000040...
+    // - Code: 0x000000010... to 0x000000020...
+    // - Mapped: Various ranges
+    
+    // Very small values (< 0x1000) are likely not addresses
+    if value < 0x1000 {
+        return false;
+    }
+
+    // Very large values (> 0x7fffffffffff) are likely not valid user-space addresses
+    // (sign bit would be set, or beyond typical address space)
+    if value > 0x7fffffffffff {
+        return false;
+    }
+
+    // If it's in a reasonable range, it could be an address
+    true
+}
+
 /// Format a memory size in bytes to a human-readable string (KB, MB, or GB)
 #[allow(clippy::large_stack_arrays)]
 fn format_memory_size(size_bytes: u64) -> String
@@ -175,10 +211,15 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
     match arch {
         Architecture::Arm64 => {
             for (i, val) in registers.general.iter().enumerate() {
+                let address_cell = if looks_like_address(*val) {
+                    format!("0x{val:016x}")
+                } else {
+                    String::new()
+                };
                 rows.push(Row::new(vec![
                     Cell::from(format!("X{i}")),
                     Cell::from(format!("0x{val:016x}")),
-                    Cell::from(""),
+                    Cell::from(address_cell),
                 ]));
             }
         }
@@ -190,20 +231,30 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
             .into_boxed_slice();
             for (i, val) in registers.general.iter().enumerate() {
                 if i < reg_names.len() {
+                    let address_cell = if looks_like_address(*val) {
+                        format!("0x{val:016x}")
+                    } else {
+                        String::new()
+                    };
                     rows.push(Row::new(vec![
                         Cell::from(reg_names[i]),
                         Cell::from(format!("0x{val:016x}")),
-                        Cell::from(""),
+                        Cell::from(address_cell),
                     ]));
                 }
             }
         }
         Architecture::Unknown(_) => {
             for (i, val) in registers.general.iter().enumerate() {
+                let address_cell = if looks_like_address(*val) {
+                    format!("0x{val:016x}")
+                } else {
+                    String::new()
+                };
                 rows.push(Row::new(vec![
                     Cell::from(format!("R{i}")),
                     Cell::from(format!("0x{val:016x}")),
-                    Cell::from(""),
+                    Cell::from(address_cell),
                 ]));
             }
         }

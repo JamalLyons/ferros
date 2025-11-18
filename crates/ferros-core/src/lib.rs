@@ -30,12 +30,14 @@
 
 pub mod debugger;
 pub mod error;
+pub mod events;
 pub mod platform;
 pub mod types;
 
 pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
+pub use events::{format_stop_reason, DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender};
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacOSDebugger;
 pub use types::{

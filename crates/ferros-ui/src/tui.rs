@@ -79,7 +79,7 @@ impl Tui
 
         let mut app = App::new(debugger, pid, was_launched);
         let mut event_handler = crate::event::EventHandler::new();
-        let mut output_tasks = spawn_process_output_tasks(&mut app, event_handler.sender());
+        let mut background_tasks = spawn_background_tasks(&mut app, event_handler.sender());
 
         loop {
             // Check if we should quit before drawing
@@ -108,6 +108,9 @@ impl Tui
                     Event::ProcessOutput { source, line } => {
                         app.push_process_output(source, &line.clone());
                     }
+                    Event::Debugger(debugger_event) => {
+                        app.handle_debugger_event(debugger_event);
+                    }
                 },
                 Ok(None) => {
                     // Channel closed
@@ -133,7 +136,7 @@ impl Tui
 
         // Don't wait indefinitely for output tasks - use timeout
         // This prevents blocking if tasks are stuck reading from pipes
-        let output_handles = std::mem::take(&mut output_tasks);
+        let output_handles = std::mem::take(&mut background_tasks);
         let timeout_result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             for handle in output_handles {
                 if let Err(e) = handle.await {
@@ -185,7 +188,7 @@ impl Tui
     }
 }
 
-fn spawn_process_output_tasks(app: &mut App, sender: mpsc::Sender<Event>) -> Vec<JoinHandle<()>>
+fn spawn_background_tasks(app: &mut App, sender: mpsc::Sender<Event>) -> Vec<JoinHandle<()>>
 {
     let mut handles = Vec::new();
 
@@ -194,7 +197,11 @@ fn spawn_process_output_tasks(app: &mut App, sender: mpsc::Sender<Event>) -> Vec
     }
 
     if let Some(stderr) = app.debugger.take_process_stderr() {
-        handles.push(spawn_output_reader(stderr, ProcessOutputSource::Stderr, sender));
+        handles.push(spawn_output_reader(stderr, ProcessOutputSource::Stderr, sender.clone()));
+    }
+
+    if let Some(events) = app.debugger.take_event_receiver() {
+        handles.push(spawn_debugger_event_forwarder(events, sender));
     }
 
     handles
@@ -215,6 +222,20 @@ fn spawn_output_reader(file: File, source: ProcessOutputSource, sender: mpsc::Se
                     warn!("Failed to read process output: {err}");
                     break;
                 }
+            }
+        }
+    })
+}
+
+fn spawn_debugger_event_forwarder(
+    receiver: ferros_core::events::DebuggerEventReceiver,
+    sender: mpsc::Sender<Event>,
+) -> JoinHandle<()>
+{
+    tokio::task::spawn_blocking(move || {
+        while let Ok(event) = receiver.recv() {
+            if sender.blocking_send(Event::Debugger(event)).is_err() {
+                break;
             }
         }
     })

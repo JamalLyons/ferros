@@ -2,11 +2,15 @@
 
 use std::collections::VecDeque;
 
+use ferros_core::events::{format_stop_reason, DebuggerEvent};
+use ferros_core::types::StopReason;
 use ferros_core::Debugger;
 use ratatui::widgets::TableState;
 
 /// Maximum number of process output lines retained in memory.
 const MAX_PROCESS_OUTPUT_LINES: usize = 4096;
+/// Maximum number of debugger stop events retained.
+const MAX_STOP_EVENTS: usize = 128;
 
 /// Indicates which stream produced a captured line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,12 @@ pub struct App
     pub output_scrollback: usize,
     /// Timestamp of last thread list refresh (to avoid refreshing too frequently)
     last_thread_refresh: std::time::Instant,
+    /// Whether the target is currently stopped.
+    pub target_is_stopped: bool,
+    /// Last reported stop reason.
+    pub last_stop_reason: StopReason,
+    /// Recent stop/resume events for display.
+    pub stop_event_log: VecDeque<String>,
 }
 
 /// Different view modes in the TUI
@@ -77,6 +87,13 @@ impl App
     #[must_use]
     pub fn new(debugger: Box<dyn Debugger>, pid: Option<u32>, was_launched: bool) -> Self
     {
+        let initial_is_stopped = debugger.is_stopped();
+        let initial_stop_reason = if initial_is_stopped {
+            debugger.stop_reason()
+        } else {
+            StopReason::Running
+        };
+
         let mut registers_state = TableState::default();
         registers_state.select(Some(0));
 
@@ -86,7 +103,7 @@ impl App
         let mut memory_regions_state = TableState::default();
         memory_regions_state.select(Some(0));
 
-        Self {
+        let mut app = Self {
             debugger,
             pid,
             was_launched,
@@ -100,7 +117,16 @@ impl App
             process_output: VecDeque::new(),
             output_scrollback: 0,
             last_thread_refresh: std::time::Instant::now(),
+            target_is_stopped: initial_is_stopped,
+            last_stop_reason: initial_stop_reason,
+            stop_event_log: VecDeque::new(),
+        };
+
+        if initial_is_stopped {
+            app.record_stop_event(format_stop_reason(initial_stop_reason));
         }
+
+        app
     }
 
     /// Cleanup when quitting - detach from process
@@ -315,6 +341,50 @@ impl App
                 let _ = self.debugger.refresh_threads();
                 self.last_thread_refresh = std::time::Instant::now();
             }
+        }
+    }
+
+    /// Consume an asynchronous debugger event from the core backend.
+    pub fn handle_debugger_event(&mut self, event: DebuggerEvent)
+    {
+        match event {
+            DebuggerEvent::TargetStopped { reason, thread } => {
+                self.target_is_stopped = true;
+                self.last_stop_reason = reason;
+                let mut message = format_stop_reason(reason);
+                if let Some(thread_id) = thread {
+                    message.push_str(&format!(" (thread {})", thread_id.raw()));
+                }
+                self.record_stop_event(message);
+            }
+            DebuggerEvent::TargetResumed => {
+                self.target_is_stopped = false;
+                self.last_stop_reason = StopReason::Running;
+                self.record_stop_event("Target resumed execution".to_string());
+            }
+        }
+    }
+
+    fn record_stop_event(&mut self, message: String)
+    {
+        self.stop_event_log.push_back(message);
+        if self.stop_event_log.len() > MAX_STOP_EVENTS {
+            self.stop_event_log.pop_front();
+        }
+    }
+
+    /// User-facing summary of the current stop state.
+    #[must_use]
+    pub fn status_message(&self) -> String
+    {
+        if !self.debugger.is_attached() {
+            return "Not attached to a process".to_string();
+        }
+
+        if self.target_is_stopped {
+            format_stop_reason(self.last_stop_reason)
+        } else {
+            "Process is running".to_string()
         }
     }
 

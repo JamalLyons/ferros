@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use ferros_core::events::DebuggerEvent;
 use tokio::sync::mpsc;
 
 use crate::app::ProcessOutputSource;
@@ -22,6 +23,8 @@ pub enum Event
     {
         source: ProcessOutputSource, line: String
     },
+    /// Asynchronous debugger state change.
+    Debugger(DebuggerEvent),
 }
 
 /// Event handler that reads from crossterm and produces TUI events

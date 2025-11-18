@@ -54,6 +54,7 @@ use mach2::traps::mach_task_self;
 
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
+use crate::events::{self, DebuggerEvent};
 use crate::platform::macos::ffi;
 use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memory};
 #[cfg(target_arch = "aarch64")]
@@ -137,6 +138,10 @@ pub struct MacOSDebugger
     exception_resume_tx: Option<mpsc::Sender<ExceptionLoopCommand>>,
     /// Shared exception state observed by both the handler loop and debugger.
     exception_state: Arc<Mutex<ExceptionSharedState>>,
+    /// Event channel sender for higher-level consumers.
+    event_tx: events::DebuggerEventSender,
+    /// Event channel receiver handed out to frontends.
+    event_rx: Option<events::DebuggerEventReceiver>,
     /// Whether stdout/stderr should be captured for launched processes.
     capture_output: bool,
     /// Read end of the stdout pipe for the most recently launched process.
@@ -165,6 +170,8 @@ impl MacOSDebugger
     /// ```
     pub fn new() -> Result<Self>
     {
+        let (event_tx, event_rx) = events::event_channel();
+
         Ok(Self {
             task: 0,
             threads: Vec::new(),
@@ -176,10 +183,30 @@ impl MacOSDebugger
             exception_thread: None,
             exception_resume_tx: None,
             exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
+            event_tx,
+            event_rx: Some(event_rx),
             capture_output: false,
             stdout_pipe: None,
             stderr_pipe: None,
         })
+    }
+
+    fn publish_stop_event(&self, reason: StopReason, thread: Option<thread_act_t>)
+    {
+        let thread_id = thread.map(|port| ThreadId::from(port as u64));
+        if let Err(err) = self.event_tx.send(DebuggerEvent::TargetStopped {
+            reason,
+            thread: thread_id,
+        }) {
+            tracing::warn!("Failed to dispatch stop event: {err}");
+        }
+    }
+
+    fn publish_resumed_event(&self)
+    {
+        if let Err(err) = self.event_tx.send(DebuggerEvent::TargetResumed) {
+            tracing::warn!("Failed to dispatch resume event: {err}");
+        }
     }
 
     fn create_pipe_pair(label: &str) -> Result<(RawFd, RawFd)>
@@ -595,10 +622,11 @@ impl MacOSDebugger
                 let (tx, rx) = mpsc::channel();
                 let shared_state = Arc::clone(&self.exception_state);
                 let architecture = self.architecture;
+                let event_tx = self.event_tx.clone();
                 info!("Spawning Mach exception handler thread");
                 let handle = thread::Builder::new()
                     .name("ferros-mac-exc".to_string())
-                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture))
+                    .spawn(move || run_exception_loop(port, rx, shared_state, architecture, event_tx))
                     .map_err(|e| {
                         let _ = mach_port_destroy(self_task, port);
                         DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}"))
@@ -659,6 +687,11 @@ impl Debugger for MacOSDebugger
     fn take_process_stderr(&mut self) -> Option<File>
     {
         self.stderr_pipe.take()
+    }
+
+    fn take_event_receiver(&mut self) -> Option<events::DebuggerEventReceiver>
+    {
+        self.event_rx.take()
     }
 
     /// Launch a new process under debugger control using posix_spawn
@@ -1240,6 +1273,7 @@ impl Debugger for MacOSDebugger
             shared.stop_reason = StopReason::Suspended;
             shared.pending_thread = None;
         }
+        self.publish_stop_event(StopReason::Suspended, None);
         info!("Successfully suspended process {}", self.pid.0);
         Ok(())
     }
@@ -1302,6 +1336,7 @@ impl Debugger for MacOSDebugger
             shared.stop_reason = StopReason::Running;
             shared.pending_thread = None;
         }
+        self.publish_resumed_event();
         info!("Successfully resumed process {}", self.pid.0);
         Ok(())
     }
@@ -1377,6 +1412,7 @@ fn run_exception_loop(
     resume_rx: mpsc::Receiver<ExceptionLoopCommand>,
     shared_state: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
+    event_tx: events::DebuggerEventSender,
 )
 {
     use std::mem::MaybeUninit;
@@ -1431,6 +1467,13 @@ fn run_exception_loop(
             shared.pending_thread = Some(thread_port);
         }
 
+        if let Err(err) = event_tx.send(DebuggerEvent::TargetStopped {
+            reason: stop_reason,
+            thread: Some(ThreadId::from(thread_port as u64)),
+        }) {
+            tracing::warn!("Failed to send stop event from Mach loop: {err}");
+        }
+
         match resume_rx.recv() {
             Ok(ExceptionLoopCommand::Continue) => {
                 if let Err(err) = send_exception_reply(&message) {
@@ -1442,6 +1485,10 @@ fn run_exception_loop(
                 shared.stopped = false;
                 shared.stop_reason = StopReason::Running;
                 shared.pending_thread = None;
+
+                if let Err(err) = event_tx.send(DebuggerEvent::TargetResumed) {
+                    tracing::warn!("Failed to send resume event from Mach loop: {err}");
+                }
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
                 let mut shared = shared_state.lock().unwrap();

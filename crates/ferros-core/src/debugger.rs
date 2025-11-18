@@ -27,6 +27,7 @@
 use std::fs::File;
 
 use crate::error::Result;
+use crate::events::DebuggerEventReceiver;
 use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
 
 /// Main debugger interface
@@ -68,6 +69,17 @@ pub trait Debugger
     ///
     /// Returns `None` if output capture is disabled or unsupported.
     fn take_process_stderr(&mut self) -> Option<File>
+    {
+        None
+    }
+
+    /// Take ownership of the debugger event receiver, if supported.
+    ///
+    /// This is used by interactive frontends (TUI/GUI) or headless event loops to
+    /// react to stop/resume notifications without polling [`Debugger::is_stopped`].
+    /// The default implementation returns `None`, indicating the backend does not
+    /// expose an event channel.
+    fn take_event_receiver(&mut self) -> Option<DebuggerEventReceiver>
     {
         None
     }

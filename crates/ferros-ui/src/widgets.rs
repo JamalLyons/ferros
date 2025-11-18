@@ -1,6 +1,7 @@
 //! Widget components for displaying debugger information
 
-use ferros_core::types::{Architecture, StopReason};
+use ferros_core::events::format_stop_reason;
+use ferros_core::types::Architecture;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -101,12 +102,12 @@ fn draw_debugger_info(frame: &mut Frame, area: Rect, app: &App)
         ]),
         Line::from(vec![
             Span::styled("Stopped: ", Style::default().fg(Color::Yellow)),
-            Span::raw(if app.debugger.is_stopped() { "Yes" } else { "No" }),
+            Span::raw(if app.target_is_stopped { "Yes" } else { "No" }),
         ]),
         Line::from(vec![
             Span::styled("Stop Reason: ", Style::default().fg(Color::Yellow)),
-            Span::raw(if app.debugger.is_stopped() {
-                format!("{:?}", app.debugger.stop_reason())
+            Span::raw(if app.target_is_stopped {
+                format_stop_reason(app.last_stop_reason)
             } else {
                 "N/A".to_string()
             }),
@@ -148,20 +149,13 @@ fn draw_debugger_info(frame: &mut Frame, area: Rect, app: &App)
 /// Draw status information
 fn draw_status(frame: &mut Frame, area: Rect, app: &App)
 {
-    let status_text = if app.debugger.is_attached() {
-        match app.debugger.stop_reason() {
-            StopReason::Running => "Process is running",
-            StopReason::Suspended => "Process is suspended",
-            StopReason::Signal(sig) => &format!("Stopped by signal: {sig}"),
-            StopReason::Breakpoint(addr) => &format!("Hit breakpoint at 0x{addr:x}"),
-            StopReason::Exited(code) => &format!("Process exited with code: {code}"),
-            StopReason::Unknown => "Stopped for unknown reason",
-        }
-    } else {
-        "Not attached to a process"
-    };
+    let mut lines = vec![Line::from(app.status_message())];
 
-    let status = Paragraph::new(status_text)
+    if let Some(latest) = app.stop_event_log.back() {
+        lines.push(Line::from(format!("Last event: {latest}")));
+    }
+
+    let status = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Status"))
         .style(Style::default().fg(Color::Green));
 

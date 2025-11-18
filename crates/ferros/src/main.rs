@@ -217,6 +217,7 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
                 // In headless mode, detach after showing info
                 debugger.detach()?;
             } else {
+                println!("Running Ferros TUI");
                 ferros_ui::run_tui(debugger, Some(pid.0), true).await?;
             }
             Ok(())

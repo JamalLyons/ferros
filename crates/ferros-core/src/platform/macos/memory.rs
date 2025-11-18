@@ -232,7 +232,8 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
             }
 
             let perms = protection_to_permissions(info.protection);
-            let name = region_name_from_user_tag(info.user_tag);
+            // Try to get name from user_tag first, then fall back to heuristics
+            let name = region_name_from_user_tag(info.user_tag).or_else(|| region_name_from_heuristics(info.protection));
 
             regions.push(MemoryRegion::new(
                 MemoryRegionId(region_id),
@@ -484,6 +485,39 @@ fn region_name_from_user_tag(tag: u32) -> Option<String>
         | VM_MEMORY_MALLOC_TINY => Some("[heap]".to_string()),
         _ => None,
     }
+}
+
+/// Generate region names based on heuristics when user_tag doesn't provide one
+///
+/// This function uses permission flags to infer likely region types.
+/// It's not perfect but provides better UX than empty names.
+fn region_name_from_heuristics(protection: c_int) -> Option<String>
+{
+    use libc::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
+
+    // Code segments: readable and executable (typically rx or r-x)
+    if (protection & VM_PROT_EXECUTE) != 0 && (protection & VM_PROT_READ) != 0 {
+        if (protection & VM_PROT_WRITE) == 0 {
+            // Read-only executable = code segment
+            return Some("[code]".to_string());
+        }
+        // Writable executable = self-modifying code (rare, but possible)
+        return Some("[code (writable)]".to_string());
+    }
+
+    // Data segments: readable, writable, but not executable
+    if (protection & VM_PROT_READ) != 0 && (protection & VM_PROT_WRITE) != 0 && (protection & VM_PROT_EXECUTE) == 0 {
+        // Could be data segment, but we already handle heap via user_tag
+        // This might be a data segment or anonymous mapping
+        return Some("[data]".to_string());
+    }
+
+    // Read-only, non-executable = likely a mapped file or read-only data
+    if (protection & VM_PROT_READ) != 0 && (protection & VM_PROT_WRITE) == 0 && (protection & VM_PROT_EXECUTE) == 0 {
+        return Some("[rodata]".to_string());
+    }
+
+    None
 }
 
 fn change_protection(task: mach_port_t, addr: mach_vm_address_t, len: mach_vm_size_t, protection: c_int) -> Result<()>

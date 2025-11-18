@@ -29,7 +29,7 @@ use std::fs::File;
 use crate::breakpoints::{BreakpointId, BreakpointInfo, BreakpointRequest};
 use crate::error::{DebuggerError, Result};
 use crate::events::DebuggerEventReceiver;
-use crate::types::{Address, Architecture, ProcessId, Registers, StopReason, ThreadId};
+use crate::types::{Address, Architecture, ProcessId, Registers, StackFrame, StopReason, ThreadId};
 
 /// Main debugger interface
 ///
@@ -303,6 +303,19 @@ pub trait Debugger
     fn breakpoints(&self) -> Vec<BreakpointInfo>
     {
         Vec::new()
+    }
+
+    /// Capture a stack trace for the active thread.
+    ///
+    /// Implementations should prefer DWARF CFI unwinding (via gimli) and fall back to
+    /// frame-pointer heuristics when debug info is missing.
+    ///
+    /// The default implementation returns `InvalidArgument`.
+    fn stack_trace(&mut self, _max_frames: usize) -> Result<Vec<StackFrame>>
+    {
+        Err(DebuggerError::InvalidArgument(
+            "Stack unwinding is not supported on this debugger".to_string(),
+        ))
     }
 
     /// Read memory from the target process

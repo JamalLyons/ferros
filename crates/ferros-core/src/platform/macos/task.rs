@@ -62,12 +62,14 @@ use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::events::{self, DebuggerEvent};
 use crate::platform::macos::ffi;
-use crate::platform::macos::memory::{get_memory_regions, read_memory, write_memory};
+use crate::platform::macos::memory::{get_memory_regions, write_memory, MemoryCache};
 #[cfg(target_arch = "aarch64")]
 use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
-use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StopReason, ThreadId};
+use crate::symbols::{ImageDescriptor, SymbolCache};
+use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
+use crate::unwind::{MemoryAccess, StackUnwinder};
 
 /// Shared exception state manipulated by the Mach exception loop and debugger methods.
 #[derive(Debug)]
@@ -156,6 +158,10 @@ pub struct MacOSDebugger
     stdout_pipe: Option<File>,
     /// Read end of the stderr pipe for the most recently launched process.
     stderr_pipe: Option<File>,
+    /// Symbol cache for DWARF and symbol resolution.
+    symbol_cache: SymbolCache,
+    /// Cached memory pages for repeated reads.
+    memory_cache: MemoryCache,
 }
 
 impl MacOSDebugger
@@ -197,6 +203,8 @@ impl MacOSDebugger
             capture_output: false,
             stdout_pipe: None,
             stderr_pipe: None,
+            symbol_cache: SymbolCache::new(),
+            memory_cache: MemoryCache::new(),
         })
     }
 
@@ -383,6 +391,7 @@ impl MacOSDebugger
             shared.stopped = false;
             shared.stop_reason = StopReason::Running;
             shared.pending_thread = None;
+            self.memory_cache.clear();
         }
 
         self.start_exception_handler()?;
@@ -1010,6 +1019,51 @@ impl Debugger for MacOSDebugger
         self.write_registers_to_port(port, regs)
     }
 
+    fn stack_trace(&mut self, max_frames: usize) -> Result<Vec<StackFrame>>
+    {
+        self.ensure_attached()?;
+        let thread = self.active_thread_port()?;
+        let thread_id = ThreadId::from(thread as u64);
+        let regs = self.read_registers_from_port(thread)?;
+
+        // Load images into symbol cache if not already loaded
+        let regions = get_memory_regions(self.task)?;
+        for region in regions {
+            if let Some(name) = &region.name {
+                if name.starts_with('/') && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('[')) {
+                    let desc = ImageDescriptor {
+                        path: std::path::PathBuf::from(name),
+                        load_address: region.start.value(),
+                    };
+                    let _ = self.symbol_cache.load_image(desc);
+                }
+            }
+        }
+
+        // Implement MemoryAccess for MacOSDebugger
+        struct MacOSMemoryAccess<'a>
+        {
+            task: mach_port_t,
+            cache: &'a MemoryCache,
+        }
+
+        impl<'a> MemoryAccess for MacOSMemoryAccess<'a>
+        {
+            fn read_u64(&self, address: Address) -> Result<u64>
+            {
+                self.cache.read_u64(self.task, address)
+            }
+        }
+
+        let memory = MacOSMemoryAccess {
+            task: self.task,
+            cache: &self.memory_cache,
+        };
+
+        let unwinder = StackUnwinder::new(self.architecture, &self.symbol_cache, &memory);
+        unwinder.unwind(thread_id, &regs, max_frames)
+    }
+
     /// Launch a new process under debugger control using posix_spawn
     ///
     /// This function:
@@ -1429,7 +1483,7 @@ impl Debugger for MacOSDebugger
     fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>
     {
         self.ensure_attached()?;
-        read_memory(self.task, addr, len)
+        self.memory_cache.read(self.task, addr, len)
     }
 
     /// Write memory to the target process
@@ -1438,7 +1492,11 @@ impl Debugger for MacOSDebugger
     fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>
     {
         self.ensure_attached()?;
-        write_memory(self.task, addr, data)
+        let written = write_memory(self.task, addr, data)?;
+        if written > 0 {
+            self.memory_cache.invalidate_range(addr, written);
+        }
+        Ok(written)
     }
 
     /// Get memory regions for the attached process

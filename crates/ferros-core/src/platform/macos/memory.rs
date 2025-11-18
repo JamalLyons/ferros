@@ -6,7 +6,9 @@
 //! These are Mach APIs that work with task ports obtained from `task_for_pid()`.
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
+use std::sync::{Arc, RwLock};
 
 use libc::{c_int, mach_port_t, vm_address_t, vm_map_t, vm_offset_t};
 #[cfg(target_os = "macos")]
@@ -25,12 +27,149 @@ use mach2::vm_statistics::{
 };
 #[cfg(target_os = "macos")]
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
+use once_cell::sync::Lazy;
 
 use crate::error::{DebuggerError, Result};
 use crate::platform::macos::ffi;
 use crate::types::{Address, MemoryRegion, MemoryRegionId};
 
 const MAX_VM_READ_CHUNK: usize = 64 * 1024;
+const PATTERN_SCAN_CHUNK: usize = 64 * 1024;
+
+static SYSTEM_PAGE_SIZE: Lazy<usize> = Lazy::new(|| unsafe {
+    let size = libc::sysconf(libc::_SC_PAGESIZE);
+    if size <= 0 {
+        4096
+    } else {
+        size as usize
+    }
+});
+
+fn page_align_down(value: u64, page_size: usize) -> u64
+{
+    let mask = !(page_size as u64 - 1);
+    value & mask
+}
+
+/// Simple read-through memory cache that stores pages fetched from the target.
+pub struct MemoryCache
+{
+    page_size: usize,
+    pages: RwLock<HashMap<u64, Arc<Vec<u8>>>>,
+}
+
+impl MemoryCache
+{
+    /// Create a cache using the system page size.
+    pub fn new() -> Self
+    {
+        Self::with_page_size(*SYSTEM_PAGE_SIZE)
+    }
+
+    /// Create a cache with a custom page size (must be power of two).
+    pub fn with_page_size(page_size: usize) -> Self
+    {
+        let size = page_size.max(1024).next_power_of_two();
+        Self {
+            page_size: size,
+            pages: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Clears all cached pages.
+    pub fn clear(&self)
+    {
+        self.pages.write().unwrap().clear();
+    }
+
+    /// Invalidates any cached pages overlapping the provided range.
+    pub fn invalidate_range(&self, addr: Address, len: usize)
+    {
+        if len == 0 {
+            return;
+        }
+        let start = addr.value();
+        let end = start.saturating_add(len as u64);
+        let mut pages = self.pages.write().unwrap();
+        let page_size = self.page_size as u64;
+        let mut base = page_align_down(start, self.page_size);
+        while base < end {
+            pages.remove(&base);
+            base = base.saturating_add(page_size);
+        }
+    }
+
+    fn fetch_page(&self, task: mach_port_t, base: u64) -> Result<Arc<Vec<u8>>>
+    {
+        if let Some(existing) = self.pages.read().unwrap().get(&base) {
+            return Ok(existing.clone());
+        }
+
+        let mut pages = self.pages.write().unwrap();
+        if let Some(existing) = pages.get(&base) {
+            return Ok(existing.clone());
+        }
+
+        let data = read_memory(task, Address::from(base), self.page_size)?;
+        let arc = Arc::new(data);
+        pages.insert(base, arc.clone());
+        Ok(arc)
+    }
+
+    /// Reads a range, using cached pages when available.
+    pub fn read(&self, task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u8>>
+    {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut output = vec![0u8; len];
+        let mut copied = 0usize;
+        let page_size = self.page_size as u64;
+        while copied < len {
+            let absolute = addr.value().saturating_add(copied as u64);
+            let page_base = page_align_down(absolute, self.page_size);
+            let page_offset = (absolute - page_base) as usize;
+            let remaining = len - copied;
+            let chunk = remaining.min(self.page_size - page_offset);
+            let page = self.fetch_page(task, page_base)?;
+
+            if page_offset + chunk > page.len() {
+                // Page shorter than expected; fall back to direct read.
+                let bytes = read_memory(task, Address::from(absolute), chunk)?;
+                output[copied..copied + bytes.len()].copy_from_slice(&bytes);
+                copied += bytes.len();
+                continue;
+            }
+
+            output[copied..copied + chunk].copy_from_slice(&page[page_offset..page_offset + chunk]);
+            copied += chunk;
+            if chunk == 0 {
+                break;
+            }
+            if (page_base + page_size) <= absolute {
+                break;
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Reads a 64-bit little-endian value.
+    pub fn read_u64(&self, task: mach_port_t, addr: Address) -> Result<u64>
+    {
+        let bytes = self.read(task, addr, 8)?;
+        if bytes.len() < 8 {
+            return Err(DebuggerError::Io(Error::new(
+                ErrorKind::UnexpectedEof,
+                "failed to read full 8 bytes",
+            )));
+        }
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+}
 
 /// Read memory from a Mach task
 ///
@@ -295,6 +434,105 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
     }
 
     Ok(total)
+}
+
+/// Formats bytes into a traditional hex + ASCII view.
+pub fn format_hexdump(base: Address, bytes: &[u8], width: usize) -> String
+{
+    let width = width.max(8).min(32);
+    let mut out = String::new();
+    for (offset, chunk) in bytes.chunks(width).enumerate() {
+        let addr = base.value().saturating_add((offset * width) as u64);
+        out.push_str(&format!("{addr:016x}: "));
+
+        for i in 0..width {
+            if i < chunk.len() {
+                out.push_str(&format!("{:02x} ", chunk[i]));
+            } else {
+                out.push_str("   ");
+            }
+        }
+
+        out.push(' ');
+        for byte in chunk {
+            let ch = if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            };
+            out.push(ch);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Reads memory (optionally using a cache) and produces a hexdump string.
+pub fn hexdump_memory(
+    task: mach_port_t,
+    cache: Option<&MemoryCache>,
+    addr: Address,
+    len: usize,
+    width: usize,
+) -> Result<String>
+{
+    let bytes = if let Some(cache) = cache {
+        cache.read(task, addr, len)?
+    } else {
+        read_memory(task, addr, len)?
+    };
+    Ok(format_hexdump(addr, &bytes, width))
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize>
+{
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Searches for a byte pattern in the target memory, returning the first match if found.
+pub fn find_pattern(
+    task: mach_port_t,
+    cache: Option<&MemoryCache>,
+    start: Address,
+    len: usize,
+    pattern: &[u8],
+) -> Result<Option<Address>>
+{
+    if pattern.is_empty() {
+        return Ok(Some(start));
+    }
+
+    let mut scanned = 0usize;
+    while scanned < len {
+        let chunk_len = min(PATTERN_SCAN_CHUNK, len - scanned);
+        let addr = Address::from(start.value().saturating_add(scanned as u64));
+        let chunk = if let Some(cache) = cache {
+            cache.read(task, addr, chunk_len)?
+        } else {
+            read_memory(task, addr, chunk_len)?
+        };
+
+        if let Some(pos) = find_subslice(&chunk, pattern) {
+            let absolute = start.value().saturating_add(scanned as u64 + pos as u64);
+            return Ok(Some(Address::from(absolute)));
+        }
+
+        if chunk_len < pattern.len() {
+            break;
+        }
+
+        // Overlap by pattern length to catch boundary matches.
+        let step = chunk_len.saturating_sub(pattern.len().saturating_sub(1));
+        if step == 0 {
+            break;
+        }
+        scanned += step;
+    }
+
+    Ok(None)
 }
 
 /// Guard that temporarily changes the protection of a memory range and restores it on drop.

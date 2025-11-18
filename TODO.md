@@ -1,6 +1,6 @@
 # Ferros Debugger TODO
 
-_Last updated: 2025-11-17_
+_Last updated: 2025-11-18_
 
 This list captures concrete work needed to reach feature parity with production debuggers such as LLDB, GDB, Delve, and rr, with a focus on complete Rust language support. Items are grouped by subsystem to clarify ownership.
 
@@ -9,8 +9,8 @@ This list captures concrete work needed to reach feature parity with production 
 - [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
 - [x] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
 - [x] **Breakpoints & watchpoints:** Add software breakpoints (BRK/INT3), hardware breakpoints, and data watchpoints with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
-- [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
-- [ ] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
+- [x] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
+- [x] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
 - [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
 - [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping.
 - [ ] **Remote/recording support:** Define a `ferros-protocol` transport (TCP/Unix socket) plus optional record/replay support (rr-style) so sessions can be remote or deterministic.

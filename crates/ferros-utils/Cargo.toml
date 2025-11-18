@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 thiserror = { workspace = true }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "registry", "chrono"] }
 tracing-appender = "0.2"
 chrono = "0.4.42"

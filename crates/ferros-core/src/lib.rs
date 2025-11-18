@@ -33,7 +33,9 @@ pub mod debugger;
 pub mod error;
 pub mod events;
 pub mod platform;
+pub mod symbols;
 pub mod types;
+pub mod unwind;
 
 pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
 pub use debugger::Debugger;
@@ -42,7 +44,9 @@ pub use error::{DebuggerError, Result};
 pub use events::{format_stop_reason, DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender};
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacOSDebugger;
+pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
-    Address, Architecture, FloatingPointState, MemoryRegion, MemoryRegionId, ProcessId, RegisterId, Registers, StopReason,
-    ThreadId, VectorRegisterValue,
+    Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,
+    RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName, ThreadId,
+    VectorRegisterValue,
 };

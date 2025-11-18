@@ -28,4 +28,5 @@ multiple_crate_versions = { level = "allow", priority = -1 }
 # Workspace dependencies
 [workspace.dependencies]
 thiserror = "2.0.17"
+tracing = "0.1"
 

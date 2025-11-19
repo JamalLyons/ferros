@@ -166,6 +166,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Ok(frames)
     }
 
+    /// Attempt a single unwind step using available DWARF metadata for the image that
+    /// contains the supplied program counter.
     fn unwind_once(&self, regs: &Registers) -> Result<Option<UnwindStep>>
     {
         let Some(image) = self.symbols.image_for_address(regs.pc) else {
@@ -180,6 +182,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Ok(None)
     }
 
+    /// Evaluate a DWARF register rule using the provided register state and computed
+    /// Canonical Frame Address.
     fn evaluate_rule(&self, rule: &RegisterRule<usize>, regs: &Registers, cfa: u64) -> Result<u64>
     {
         match rule {
@@ -199,6 +203,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
+    /// Attempt to unwind the current frame using `.eh_frame` data (and header table
+    /// when available) from the binary image that owns the PC.
     fn try_unwind_eh_frame(&self, image: &BinaryImage, regs: &Registers) -> Result<Option<UnwindStep>>
     {
         let Some((eh_vmaddr, eh_bytes)) = image.eh_frame_section() else {
@@ -226,6 +232,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         self.unwind_with_cfi(&eh_frame, bases, regs)
     }
 
+    /// Attempt to unwind the current frame using `.debug_frame` data when the runtime
+    /// `.eh_frame` path is unavailable.
     fn try_unwind_debug_frame(&self, image: &BinaryImage, regs: &Registers) -> Result<Option<UnwindStep>>
     {
         let Some((df_vmaddr, df_bytes)) = image.debug_frame_section() else {
@@ -243,6 +251,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         self.unwind_with_cfi(&debug_frame, bases, regs)
     }
 
+    /// Translate a resolved DWARF unwind row into the `Registers` describing the next
+    /// frame. Returns `Ok(None)` when the row cannot produce a valid next PC.
     fn build_step_from_row(&self, regs: &Registers, row: &gimli::UnwindTableRow<usize>) -> Result<Option<UnwindStep>>
     {
         let cfa = match row.cfa() {
@@ -279,6 +289,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }))
     }
 
+    /// Walk the frame-pointer chain (RBP/X29) when structured unwind info is missing.
     fn frame_pointer_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
     {
         match self.architecture {
@@ -338,6 +349,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
+    /// Heuristically scan the stack for a plausible return address when both CFI and
+    /// frame-pointer strategies fail.
     fn stack_scan_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
     {
         if regs.sp == Address::ZERO {
@@ -366,6 +379,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
+    /// ARM64-only heuristic that treats the link register as the next return address.
     fn link_register_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
     {
         if self.architecture != Architecture::Arm64 {
@@ -390,6 +404,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 
 impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 {
+    /// Use the `.eh_frame_hdr` index to locate an FDE quickly and evaluate the unwind
+    /// row for the current PC.
     fn unwind_with_eh_frame_hdr<R>(
         &self,
         eh_frame: &EhFrame<R>,
@@ -434,6 +450,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
+    /// Iterate through an unwind section, parsing each FDE until one contains the
+    /// current PC, then evaluate it to produce the next frame.
     fn unwind_with_cfi<R, Section>(
         &self,
         section: &Section,

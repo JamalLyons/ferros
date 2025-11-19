@@ -54,9 +54,9 @@ use crate::platform::macos::registers::{read_registers_arm64, write_registers_ar
 #[cfg(target_arch = "x86_64")]
 use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
 use crate::platform::macos::{breakpoints, exception, ffi, launch, threads};
+use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
 use crate::symbols::{ImageDescriptor, SymbolCache};
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
-use crate::unwind::{MemoryAccess, StackUnwinder};
 
 /// macOS debugger implementation using Mach APIs
 ///

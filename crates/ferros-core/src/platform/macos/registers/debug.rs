@@ -13,8 +13,8 @@
 //!
 //! ## See Also
 //!
-//! - [arm64](arm64) - General-purpose ARM64 register access
-//! - [x86_64](x86_64) - General-purpose x86-64 register access
+//! - `arm64` module - General-purpose ARM64 register access
+//! - `x86_64` module - General-purpose x86-64 register access
 //! - [breakpoints](../breakpoints) - High-level breakpoint management
 
 use libc::{natural_t, thread_act_t};

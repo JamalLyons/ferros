@@ -1,4 +1,26 @@
 //! Binary image parsing and DWARF section loading.
+//!
+//! This module provides functionality to parse binary images (executables and
+//! shared libraries) and load their DWARF debugging sections. It handles:
+//!
+//! - Binary format parsing (ELF, Mach-O, PE)
+//! - DWARF section extraction (`.debug_info`, `.debug_line`, etc.)
+//! - Address relocation (mapping runtime addresses to file addresses)
+//! - Symbolication (mapping addresses to function names and source locations)
+//! - Type information extraction
+//!
+//! ## Image Descriptors
+//!
+//! An `ImageDescriptor` describes a binary image that's mapped into the debuggee's
+//! address space. It contains the path to the binary file and its load address
+//! (the address where the binary is mapped at runtime).
+//!
+//! ## Address Relocation
+//!
+//! When a binary is loaded at runtime, it may be mapped at a different address
+//! than its link-time address. The `BinaryImage` handles this relocation by
+//! computing a "slide" (offset) between the file's virtual addresses and the
+//! runtime addresses.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -19,19 +41,69 @@ use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, Architecture, SourceLocation};
 
-/// Describes a binary image mapped in the debuggee.
+/// Describes a binary image mapped in the debuggee's address space.
+///
+/// This structure contains the information needed to locate and parse a binary
+/// image (executable or shared library) that's loaded in the target process.
+///
+/// ## Example
+///
+/// ```rust
+/// use std::path::PathBuf;
+///
+/// use ferros_core::symbols::ImageDescriptor;
+///
+/// let descriptor = ImageDescriptor {
+///     path: PathBuf::from("/usr/bin/my_program"),
+///     load_address: 0x100000000, // Address where binary is loaded
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct ImageDescriptor
 {
+    /// Path to the binary file on disk
+    ///
+    /// This should be an absolute path to the executable or shared library.
     pub path: PathBuf,
+    /// Load address where the binary is mapped in the debuggee's address space
+    ///
+    /// This is the base address where the binary's `__TEXT` segment (or equivalent)
+    /// is loaded at runtime. Used to compute address relocation.
     pub load_address: u64,
 }
 
+/// Unique identifier for a binary image.
+///
+/// This ID is computed from the image's path and load address, ensuring that
+/// the same binary loaded at different addresses gets different IDs. It's used
+/// as a key in the symbol cache to distinguish between multiple instances of
+/// the same binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageId(u64);
 
 impl ImageId
 {
+    /// Create an `ImageId` from a path and load address.
+    ///
+    /// The ID is computed by hashing the path and load address together. This
+    /// ensures that the same binary loaded at different addresses gets different IDs.
+    ///
+    /// ## Parameters
+    ///
+    /// - `path`: Path to the binary file
+    /// - `load_address`: Load address where the binary is mapped
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use ferros_core::symbols::ImageId;
+    ///
+    /// let id1 = ImageId::from_parts(Path::new("/usr/bin/prog"), 0x100000000);
+    /// let id2 = ImageId::from_parts(Path::new("/usr/bin/prog"), 0x200000000);
+    /// assert_ne!(id1, id2); // Different load addresses = different IDs
+    /// ```
     pub fn from_parts(path: &Path, load_address: u64) -> Self
     {
         use std::collections::hash_map::DefaultHasher;
@@ -41,6 +113,21 @@ impl ImageId
         ImageId(hasher.finish())
     }
 
+    /// Get the raw `u64` value of this image ID.
+    ///
+    /// This is useful for serialization or debugging. The value is a hash
+    /// of the path and load address.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use std::path::Path;
+    ///
+    /// use ferros_core::symbols::ImageId;
+    ///
+    /// let id = ImageId::from_parts(Path::new("/usr/bin/prog"), 0x100000000);
+    /// let raw = id.as_u64();
+    /// ```
     pub fn as_u64(self) -> u64
     {
         self.0
@@ -115,6 +202,25 @@ fn load_section_blob<'data>(file: &object::File<'data>, names: &[&str]) -> Resul
 }
 
 /// Cached binary image with DWARF + unwind metadata.
+///
+/// This structure represents a parsed binary image (executable or shared library)
+/// with all its DWARF debugging sections loaded and cached. It provides methods
+/// for:
+///
+/// - Address symbolication (mapping addresses to function names and source locations)
+/// - Type information extraction
+/// - Unwind information access (`.eh_frame`, `.debug_frame`)
+///
+/// ## Caching
+///
+/// The `BinaryImage` caches parsed DWARF data and symbolication contexts to avoid
+/// re-parsing on every lookup. The caches are lazily initialized on first use.
+///
+/// ## Address Relocation
+///
+/// The image handles address relocation between file addresses (link-time addresses)
+/// and runtime addresses (where the binary is actually loaded). Use `file_address()`
+/// to convert a runtime address to a file address for DWARF lookups.
 pub struct BinaryImage
 {
     id: ImageId,
@@ -209,6 +315,25 @@ impl BinaryImage
         self.runtime_range
     }
 
+    /// Get the pointer size in bytes for this image's architecture.
+    ///
+    /// Returns 8 for 64-bit architectures (ARM64, x86-64), or 8 for unknown
+    /// architectures (defaults to 64-bit).
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    /// use ferros_core::types::Address;
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// assert_eq!(image.pointer_size(), 8); // 64-bit
+    /// ```
     pub fn pointer_size(&self) -> u8
     {
         self.architecture.pointer_size_bytes()
@@ -243,27 +368,141 @@ impl BinaryImage
         self.debug_frame.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
     }
 
+    /// Get the unique identifier for this image.
+    ///
+    /// The ID is computed from the image's path and load address.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// let id = image.id();
+    /// ```
     pub fn id(&self) -> ImageId
     {
         self.id
     }
 
+    /// Get the path to the binary file.
+    ///
+    /// Returns the absolute path to the binary file on disk.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// let path = image.path();
+    /// ```
     pub fn path(&self) -> &Path
     {
         &self.path
     }
 
+    /// Get the CPU architecture of this image.
+    ///
+    /// Returns `Architecture::Arm64` for ARM64 binaries, `Architecture::X86_64`
+    /// for x86-64 binaries, or `Architecture::Unknown` for other architectures.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    /// use ferros_core::types::Architecture;
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// match image.architecture() {
+    ///     Architecture::Arm64 => println!("ARM64 binary"),
+    ///     Architecture::X86_64 => println!("x86-64 binary"),
+    ///     _ => println!("Unknown architecture"),
+    /// }
+    /// ```
     pub fn architecture(&self) -> Architecture
     {
         self.architecture
     }
 
+    /// Check if an address is within this image's address range.
+    ///
+    /// Returns `true` if the address falls within the image's runtime address
+    /// range (from `load_address` to `load_address + size`).
+    ///
+    /// ## Parameters
+    ///
+    /// - `address`: The runtime address to check
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    /// use ferros_core::types::Address;
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// let addr = Address::from(0x100001000);
+    /// if image.contains(addr) {
+    ///     println!("Address is in this image");
+    /// }
+    /// ```
     pub fn contains(&self, address: Address) -> bool
     {
         let addr = address.value();
         addr >= self.runtime_range.0 && addr < self.runtime_range.1
     }
 
+    /// Convert a runtime address to a file address (link-time address).
+    ///
+    /// This method handles address relocation by subtracting the "slide" (offset
+    /// between runtime and file addresses). Returns `None` if the address is not
+    /// within this image's address range.
+    ///
+    /// ## Parameters
+    ///
+    /// - `address`: The runtime address to convert
+    ///
+    /// ## Returns
+    ///
+    /// `Some(file_address)` if the address is within this image, `None` otherwise.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    /// use ferros_core::types::Address;
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// let runtime_addr = Address::from(0x100001000);
+    /// if let Some(file_addr) = image.file_address(runtime_addr) {
+    ///     // Use file_addr for DWARF lookups
+    /// }
+    /// ```
     pub fn file_address(&self, address: Address) -> Option<u64>
     {
         let value = address.value();
@@ -328,6 +567,43 @@ impl BinaryImage
         })
     }
 
+    /// Symbolicate an address to function names and source locations.
+    ///
+    /// This method maps a runtime address to its corresponding function name
+    /// and source location using DWARF line information. It handles inlined
+    /// functions by returning multiple frames (outermost to innermost).
+    ///
+    /// ## Parameters
+    ///
+    /// - `address`: The runtime address to symbolicate
+    ///
+    /// ## Returns
+    ///
+    /// `Some(symbolication)` if the address is found in this image, `None` otherwise.
+    /// The symbolication contains multiple frames for inlined functions.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    /// use ferros_core::types::Address;
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// let addr = Address::from(0x100001000);
+    /// if let Some(symbolication) = image.symbolicate(addr) {
+    ///     for frame in symbolication.frames {
+    ///         println!("Function: {}", frame.symbol.display_name());
+    ///         if let Some(loc) = frame.location {
+    ///             println!("Location: {}:{}", loc.file, loc.line.unwrap_or(0));
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub fn symbolicate(&self, address: Address) -> Option<Symbolication>
     {
         let file_addr = self.file_address(address)?;
@@ -369,6 +645,45 @@ impl BinaryImage
         })
     }
 
+    /// Describe a type by name using DWARF type information.
+    ///
+    /// This method searches through the image's DWARF type information to find
+    /// a type definition matching the given name. It returns a summary of the
+    /// type's structure (fields, variants, etc.).
+    ///
+    /// ## Parameters
+    ///
+    /// - `name`: The type name to look up (e.g., "std::option::Option", "Point")
+    ///
+    /// ## Returns
+    ///
+    /// `Ok(Some(summary))` if the type is found, `Ok(None)` if not found,
+    /// or an error if DWARF parsing fails.
+    ///
+    /// ## Caching
+    ///
+    /// Type summaries are cached after first lookup to avoid re-parsing DWARF
+    /// on subsequent requests for the same type.
+    ///
+    /// ## Example
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
+    ///
+    /// let mut cache = SymbolCache::new();
+    /// let descriptor = ImageDescriptor {
+    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let image = cache.load_image(descriptor).unwrap();
+    /// if let Ok(Some(summary)) = image.describe_type("std::option::Option") {
+    ///     println!("Type: {}", summary.name);
+    ///     println!("Kind: {:?}", summary.kind);
+    ///     for field in &summary.fields {
+    ///         println!("Field: {:?}", field.name);
+    ///     }
+    /// }
+    /// ```
     pub fn describe_type(&self, name: &str) -> Result<Option<Arc<TypeSummary>>>
     {
         if let Some(existing) = self.type_cache.read().unwrap().get(name) {

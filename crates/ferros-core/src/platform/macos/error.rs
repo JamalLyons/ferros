@@ -26,7 +26,6 @@ use thiserror::Error;
 /// ## References
 ///
 /// - [kern_return_t documentation](https://developer.apple.com/documentation/kernel/kern_return_t)
-/// - [Mach Kernel Return Codes](https://developer.apple.com/documentation/kernel/kern_return_t)
 #[derive(Error, Debug)]
 pub enum MachError
 {

@@ -28,7 +28,7 @@ use libc::{c_int, mach_msg_type_number_t};
 /// Used with `thread_get_state()` and `thread_set_state()` to read/write
 /// ARM64 general-purpose registers (X0-X30, SP, PC, CPSR).
 ///
-/// See: [ARM_THREAD_STATE64](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/arm/_structs.h)
+/// See: [ARM_THREAD_STATE64](https://developer.arm.com/documentation/101407/0543/Debugging/Debug-Windows-and-Dialogs/System-and-Thread-Viewer/Thread-States)
 #[cfg(target_arch = "aarch64")]
 pub const ARM_THREAD_STATE64: c_int = 6;
 
@@ -44,8 +44,6 @@ pub const ARM_THREAD_STATE64_COUNT: mach_msg_type_number_t = 68;
 /// Used with `thread_get_state()` and `thread_set_state()` to read/write
 /// x86-64 general-purpose registers (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP,
 /// R8-R15, RIP, RFLAGS, CS, FS, GS).
-///
-/// See: [X86_THREAD_STATE64](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/i386/_structs.h)
 #[cfg(target_arch = "x86_64")]
 pub const X86_THREAD_STATE64: c_int = 4;
 

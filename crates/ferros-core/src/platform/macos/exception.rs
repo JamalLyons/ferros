@@ -13,10 +13,8 @@
 //!
 //! ## References
 //!
-//! - [task_set_exception_ports(3) man page](https://developer.apple.com/documentation/kernel/1402149-task_set_exception_ports/)
-//! - [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
-//! - [thread_get_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
-//! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
+//! - [task_set_exception_ports(3) man page](https://developer.apple.com/documentation/kernel/1538049-task_set_exception_ports/)
+//! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
 use std::sync::{mpsc, Arc, Mutex};

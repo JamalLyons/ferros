@@ -177,6 +177,9 @@ impl BreakpointStore
         BreakpointId::from_raw(self.next_id)
     }
 
+    /// Insert a new breakpoint entry and return the identifier that should be used
+    /// by the backend for future lookups. If the provided entry already contains an
+    /// id (non-zero), it is preserved; otherwise a fresh id is allocated.
     pub fn insert(&mut self, mut entry: BreakpointEntry) -> BreakpointId
     {
         let id = if entry.info.id.raw() == 0 {
@@ -191,21 +194,26 @@ impl BreakpointStore
         id
     }
 
+    /// Retrieve an immutable reference to a breakpoint entry by id.
     pub fn get(&self, id: BreakpointId) -> Option<&BreakpointEntry>
     {
         self.by_id.get(&id)
     }
 
+    /// Retrieve a mutable reference to a breakpoint entry by id.
     pub fn get_mut(&mut self, id: BreakpointId) -> Option<&mut BreakpointEntry>
     {
         self.by_id.get_mut(&id)
     }
 
+    /// Return the identifier that matches a given address and kind combination, if
+    /// one exists.
     pub fn id_for_kind(&self, address: Address, kind: BreakpointKind) -> Option<BreakpointId>
     {
         self.by_kind.get(&(address, kind)).copied()
     }
 
+    /// Remove a breakpoint from the store, returning the entry if it was present.
     pub fn remove(&mut self, id: BreakpointId) -> Option<BreakpointEntry>
     {
         if let Some(entry) = self.by_id.remove(&id) {
@@ -216,16 +224,21 @@ impl BreakpointStore
         }
     }
 
+    /// List all breakpoint infos currently tracked by the store. Each info value
+    /// represents the public state for the corresponding entry.
     pub fn list(&self) -> Vec<BreakpointInfo>
     {
         self.by_id.values().map(|entry| entry.info.clone()).collect()
     }
 
+    /// Fetch the public info for a specific breakpoint id.
     pub fn info(&self, id: BreakpointId) -> Option<BreakpointInfo>
     {
         self.by_id.get(&id).map(|entry| entry.info.clone())
     }
 
+    /// Record that a breakpoint at the provided address was hit. The entry's hit
+    /// counter is incremented only if the breakpoint is currently enabled.
     pub fn record_hit(&mut self, address: Address) -> Option<BreakpointInfo>
     {
         let id = self
@@ -239,6 +252,8 @@ impl BreakpointStore
         Some(entry.info.clone())
     }
 
+    /// Drain the store, returning all entries and resetting the internal
+    /// bookkeeping maps.
     pub fn drain(&mut self) -> Vec<BreakpointRecord>
     {
         self.by_kind.clear();

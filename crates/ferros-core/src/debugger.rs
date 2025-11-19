@@ -101,9 +101,8 @@ pub trait Debugger
     ///
     /// ## Advantages over `attach()`
     ///
-    /// - Avoids permission issues (no need for sudo or entitlements when launching)
+    /// - Less permission issues than attaching to a running process
     /// - Process starts suspended, so you can set breakpoints before execution
-    /// - More reliable than attaching to a running process
     ///
     /// ## Parameters
     ///
@@ -134,7 +133,7 @@ pub trait Debugger
     ///
     /// This establishes a connection to the target process, allowing you
     /// to inspect and control it. The process continues running normally
-    /// after attachment (unlike some debuggers that stop it immediately).
+    /// after attachment.
     ///
     /// ## Platform-specific behavior
     ///
@@ -544,7 +543,7 @@ pub trait Debugger
     /// ## Platform-Specific Behavior
     ///
     /// - **macOS**: Calls `task_suspend()` to suspend the Mach task
-    ///   - See: [task_suspend documentation](https://developer.apple.com/documentation/kernel/1402800-task_suspend)
+    ///   - See: [task_suspend documentation](https://developer.apple.com/documentation/kernel/1538100-task_suspend/)
     /// - **Linux**: Will use `ptrace(PTRACE_INTERRUPT)` or `kill(pid, SIGSTOP)`
     /// - **Windows**: Will use `SuspendThread()` for each thread
     ///
@@ -575,7 +574,7 @@ pub trait Debugger
     /// ## Platform-Specific Behavior
     ///
     /// - **macOS**: Calls `task_resume()` to resume the Mach task
-    ///   - See: [task_resume documentation](https://developer.apple.com/documentation/kernel/1402801-task_resume)
+    ///   - See: [task_resume documentation](https://developer.apple.com/documentation/kernel/1537977-task_resume/)
     /// - **Linux**: Will use `ptrace(PTRACE_CONT)` to continue execution
     /// - **Windows**: Will use `ResumeThread()` for each thread
     ///
@@ -607,7 +606,7 @@ pub trait Debugger
     /// ## Platform-Specific Behavior
     ///
     /// - **macOS**: Returns thread ports from `task_threads()`
-    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1537751-task_threads/)
     /// - **Linux**: Will parse `/proc/[pid]/task/` directory
     /// - **Windows**: Will use `CreateToolhelp32Snapshot()` with `TH32CS_SNAPTHREAD`
     ///
@@ -705,7 +704,7 @@ pub trait Debugger
     /// ## Platform-Specific Behavior
     ///
     /// - **macOS**: Calls `task_threads()` to refresh the thread list
-    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1402802-task_threads)
+    ///   - See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1537751-task_threads/)
     /// - **Linux**: Will re-read `/proc/[pid]/task/` directory
     /// - **Windows**: Will use `CreateToolhelp32Snapshot()` again
     ///

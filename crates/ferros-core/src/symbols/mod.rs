@@ -24,8 +24,8 @@
 //! ## References
 //!
 //! - [DWARF Debugging Information Format](https://dwarfstd.org/)
-//! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
-//! - [addr2line crate documentation](https://docs.rs/addr2line/latest/addr2line/)
+//! - [gimli crate documentation](https://docs.rs/gimli/0.32.3/gimli/)
+//! - [addr2line crate documentation](https://docs.rs/addr2line/0.25.1/addr2line/)
 
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
@@ -33,6 +33,7 @@ pub mod cache;
 pub mod demangle;
 pub mod extractor;
 pub mod image;
+pub mod unwind;
 
 // Shared type aliases
 pub(crate) type OwnedReader = EndianArcSlice<RunTimeEndian>;

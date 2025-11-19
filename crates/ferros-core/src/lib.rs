@@ -35,7 +35,6 @@ pub mod events;
 pub mod platform;
 pub mod symbols;
 pub mod types;
-pub mod unwind;
 
 pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
 pub use debugger::Debugger;

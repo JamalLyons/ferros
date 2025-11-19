@@ -47,12 +47,38 @@ use crate::types::{Address, Architecture, Registers, VectorRegisterValue};
 /// This function reads the CPU registers from an ARM64 thread using the
 /// `thread_get_state()` Mach API with the `ARM_THREAD_STATE64` flavor.
 ///
+/// ## Parameters
+///
+/// - `thread`: The Mach thread port to read registers from
+///
+/// ## Returns
+///
+/// `Ok(Registers)` containing all register values, or an error if:
+/// - `thread_get_state()` failed
+/// - NEON state read failed (non-fatal, logged as debug)
+///
+/// ## Registers Read
+///
+/// - General-purpose registers: X0-X30 (31 registers)
+/// - Stack pointer (SP)
+/// - Frame pointer (FP/X29)
+/// - Program counter (PC)
+/// - Current Program Status Register (CPSR)
+/// - NEON/SIMD registers: V0-V31 (if available)
+/// - Floating-point status registers: FPSR, FPCR (if available)
+///
 /// ## Mach API: thread_get_state()
 ///
 /// **Flavor**: `ARM_THREAD_STATE64` = 6
 /// **Count**: `ARM_THREAD_STATE64_COUNT` = 68 (number of `u32` values)
 ///
-/// See: [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
+/// ## Errors
+///
+/// - `DebuggerError::ReadRegistersFailed`: `thread_get_state()` failed
+///
+/// ## See Also
+///
+/// - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 {
     unsafe {
@@ -118,6 +144,40 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 ///
 /// This function writes CPU registers to an ARM64 thread using the
 /// `thread_set_state()` Mach API with the `ARM_THREAD_STATE64` flavor.
+///
+/// ## Parameters
+///
+/// - `thread`: The Mach thread port to write registers to
+/// - `regs`: The `Registers` structure containing the register values to write
+///
+/// ## Mach API: thread_set_state()
+///
+/// **Flavor**: `ARM_THREAD_STATE64` = 6
+/// **Count**: `ARM_THREAD_STATE64_COUNT` = 68 (number of `u32` values)
+///
+/// ## Registers Written
+///
+/// - General-purpose registers: X0-X30
+/// - Stack pointer (SP)
+/// - Frame pointer (FP/X29)
+/// - Program counter (PC)
+/// - Current Program Status Register (CPSR)
+/// - NEON/SIMD registers (if available)
+/// - Floating-point status registers (FPSR, FPCR)
+///
+/// ## Returns
+///
+/// `Ok(())` if the registers were successfully written, or an error if:
+/// - `thread_set_state()` failed
+/// - NEON state is not available (if attempting to write vector registers)
+///
+/// ## Errors
+///
+/// - `DebuggerError::InvalidArgument`: `thread_set_state()` failed or NEON state unavailable
+///
+/// ## See Also
+///
+/// - [thread_set_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
     let mut state_words: [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize] =
@@ -162,15 +222,47 @@ pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<(
     Ok(())
 }
 
+/// ARM64 NEON/SIMD state structure.
+///
+/// This structure represents the NEON (Advanced SIMD) register state for ARM64,
+/// including 32 128-bit vector registers (V0-V31) and floating-point status/control
+/// registers (FPSR, FPCR).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ArmNeonState64
 {
+    /// Vector registers V0-V31 (32 × 128-bit = 32 × u128)
     v: [u128; 32],
+    /// Floating-Point Status Register (FPSR)
     fpsr: u32,
+    /// Floating-Point Control Register (FPCR)
     fpcr: u32,
 }
 
+/// Fetch ARM64 NEON/SIMD state from a thread.
+///
+/// This function reads the NEON vector registers and floating-point status/control
+/// registers from an ARM64 thread using the `ARM_NEON_STATE64` flavor.
+///
+/// ## Parameters
+///
+/// - `thread`: The Mach thread port to read from
+///
+/// ## Returns
+///
+/// `Ok(Some(state))` if NEON state is available and successfully read,
+/// `Ok(None)` if NEON state is not available on this system,
+/// or an error if `thread_get_state()` failed for other reasons.
+///
+/// ## Mach API: thread_get_state()
+///
+/// **Flavor**: `ARM_NEON_STATE64` = 5
+/// **Count**: `ARM_NEON_STATE64_COUNT` = 68
+///
+/// ## Note
+///
+/// NEON state may not be available on all ARM64 systems. This function gracefully
+/// handles the case where NEON is not supported by returning `Ok(None)`.
 fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>>
 {
     let mut state = ArmNeonState64::default();
@@ -198,6 +290,37 @@ fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>
     }
 }
 
+/// Write ARM64 NEON/SIMD state to a thread.
+///
+/// This function writes NEON vector registers and floating-point status/control
+/// registers to an ARM64 thread using the `ARM_NEON_STATE64` flavor.
+///
+/// ## Parameters
+///
+/// - `thread`: The Mach thread port to write to
+/// - `regs`: The `Registers` structure containing vector and floating-point state
+///
+/// ## Behavior
+///
+/// - If no vector registers or floating-point state is set in `regs`, this function
+///   returns `Ok(())` without performing any operations.
+/// - Only the first 32 vector registers are written (V0-V31).
+/// - FPSR and FPCR are written if they are set in `regs.floating`.
+///
+/// ## Returns
+///
+/// `Ok(())` if the NEON state was successfully written, or an error if:
+/// - NEON state is not available on this system
+/// - `thread_set_state()` failed
+///
+/// ## Errors
+///
+/// - `DebuggerError::InvalidArgument`: NEON state not available or `thread_set_state()` failed
+///
+/// ## Mach API: thread_set_state()
+///
+/// **Flavor**: `ARM_NEON_STATE64` = 5
+/// **Count**: `ARM_NEON_STATE64_COUNT` = 68
 fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
     if regs.vector.is_empty() && regs.floating.fpsr.is_none() && regs.floating.fpcr.is_none() {

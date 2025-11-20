@@ -5,9 +5,9 @@
 **A Rust-native debugger built from the same element as Rust itself.**
 
 [![GitHub stars](https://img.shields.io/github/stars/jamallyons/ferros.svg?style=social&label=Star)](https://github.com/jamallyons/ferros)
-[![GitHub forks](https://img.shields.io/github/forks/jamallyons/ferros.svg?style=social&label=Fork)](https://github.com/jamallyons/ferros/fork)
-[![GitHub issues](https://img.shields.io/github/issues/jamallyons/ferros.svg)](https://github.com/jamallyons/ferros/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/jamallyons/ferros.svg)](https://github.com/jamallyons/ferros/pulls)
+![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/ferros)
+[![Lines of Code](https://img.shields.io/endpoint?url=https%3A%2F%2Ftokei.kojix2.net%2Fbadge%2Fgithub%2Fjamallyons%2Fferros%2Flines)](https://tokei.kojix2.net/github/jamallyons/ferros)
+![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ferros_rs)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 <img src="https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/master/assets/ferros-logo.png" alt="Ferros Logo" width="300" style="border-radius: 50%;">
@@ -20,31 +20,6 @@ Unlike traditional debuggers that retrofit C-style semantics onto Rust programs,
 
 ---
 
-## 🎯 What Makes Ferros Different?
-
-While existing Rust debugging solutions are either platform-limited or retrofitted from C/C++ debuggers, Ferros is built **from the ground up** for Rust developers.
-
-### Why Not Use Existing Debuggers?
-
-| Solution | Limitations |
-|----------|-------------|
-| **BugStalker** | Linux-only, no macOS or Windows support |
-| **GDB/LLDB** | C/C++ semantics, doesn't understand Rust's ownership model |
-| **CodeLLDB** | Generic debugger extension, no Rust-specific features |
-
-### What Ferros Brings
-
-✅ **Cross-Platform First**: macOS support now, with Linux and Windows planned — unlike Linux-only alternatives  
-✅ **Rust-Native Understanding**: Built to understand ownership, lifetimes, borrows, and MIR — not retrofitted C semantics  
-✅ **MIR-Level Debugging**: Debug at the compiler's intermediate representation for precise control flow analysis  
-✅ **Hybrid Architecture**: Combines symbolic debugging and interpreted execution in a single tool  
-✅ **Modern Design**: Designed for Rust's safety guarantees from day one, not adapted from older debuggers  
-
-> **Built from the same element as Rust.**  
-> A debugger that speaks Rust's language.
-
----
-
 ## ✨ Mission
 
 To give Rust developers a **first-class, language-native debugging experience** — fast, intuitive, and designed for Rust's safety guarantees.
@@ -53,19 +28,30 @@ Ferros aims to become the Rust ecosystem's standard debugging platform, compleme
 
 ---
 
-## 🔧 Key Features
+## 🎯 What Makes Ferros Different?
 
-| Feature | Description |
-|---------|-------------|
-| **Rust-Native Inspection** | Understands ownership, borrows, lifetimes, and async tasks directly |
-| **MIR Integration** | Debug at the mid-level IR to analyze compiler-accurate control flow |
-| **Hybrid Execution Engine** | Combine symbolic simulation with native process control for precise debugging |
-| **Zero-Cost Breakpoints** | Lightweight traps integrated with Rust's runtime model |
-| **Memory Safety Visualization** | Visualize move semantics, borrows, and drops in real time |
-| **Cross-Platform Support** | Linux (ptrace), macOS (Mach ports), and Windows (WinDbg APIs) |
-| **Cargo Integration** | Seamless `cargo ferros` workflow for launching and inspecting projects |
+While existing Rust debugging solutions are either platform-limited or retrofitted from C/C++ debuggers, Ferros is built **from the ground up** for Rust developers.
 
-> **Note:** Ferros is currently in active development. See [ROADMAP.md](./ROADMAP.md) for current status.
+| Solution | Limitations |
+|----------|-------------|
+| **BugStalker** | Linux-only, no macOS or Windows support |
+| **GDB/LLDB** | C/C++ semantics, doesn't understand Rust's ownership model |
+| **CodeLLDB** | Generic debugger extension, no Rust-specific features |
+
+**Ferros brings:**
+- ✅ **Cross-Platform First**: macOS support now, with Linux and Windows planned
+- ✅ **Rust-Native Understanding**: Built to understand ownership, lifetimes, borrows, and MIR
+- ✅ **MIR-Level Debugging**: Debug at the compiler's intermediate representation
+- ✅ **Hybrid Architecture**: Combines symbolic debugging and interpreted execution
+- ✅ **Modern Design**: Designed for Rust's safety guarantees from day one
+
+---
+
+## 📊 Current Status
+
+Ferros is currently in **active development** with core infrastructure in place.
+
+📖 **See [ROADMAP.md](./ROADMAP.md) for detailed development milestones and progress tracking.**
 
 ---
 
@@ -90,7 +76,7 @@ ferros/
 
 ## 🚀 Quick Start
 
-> **Coming Soon!** Ferros is currently in early development. Check back soon for installation instructions.
+> **Note:** Ferros is currently in early development. Installation and usage instructions will be available in future releases.
 
 Once available, you'll be able to:
 
@@ -105,7 +91,7 @@ cargo ferros run
 ferros attach <pid>
 ```
 
-## 📋 Requirements
+### Requirements
 
 - **Rust**: Edition 2021 (Rust 1.56.0 or newer)
 - **macOS**: 10.9+ (Mavericks) for Intel Macs, 11.0+ (Big Sur) for Apple Silicon

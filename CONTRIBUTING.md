@@ -196,10 +196,8 @@ Significant contributors may be invited to join the Ferros core team.
 By contributing to Ferros, you agree that your contributions will be licensed under:
 
 ```
-MIT OR Apache-2.0
+Apache-2.0
 ```
-
-This follows the same dual-license model as the Rust project.
 
 ---
 

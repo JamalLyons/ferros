@@ -3,9 +3,9 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
 
-use ferros_core::events::{format_stop_reason, DebuggerEvent};
-use ferros_core::types::StopReason;
 use ferros_core::Debugger;
+use ferros_core::events::{DebuggerEvent, format_stop_reason};
+use ferros_core::types::StopReason;
 use ratatui::widgets::TableState;
 
 /// Maximum number of process output lines retained in memory.
@@ -139,27 +139,27 @@ impl App
         if self.debugger.is_attached() {
             // If we launched the process, kill it first before detaching
             // This ensures clean shutdown
-            if self.was_launched {
-                if let Some(pid) = self.pid {
-                    // Try graceful shutdown first (non-blocking)
-                    let pid_str = pid.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = std::process::Command::new("kill").arg("-TERM").arg(&pid_str).output();
-                    })
-                    .await
-                    .ok();
+            if self.was_launched
+                && let Some(pid) = self.pid
+            {
+                // Try graceful shutdown first (non-blocking)
+                let pid_str = pid.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::process::Command::new("kill").arg("-TERM").arg(&pid_str).output();
+                })
+                .await
+                .ok();
 
-                    // Wait a bit for graceful shutdown (async)
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // Wait a bit for graceful shutdown (async)
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-                    // Force kill if still running (non-blocking)
-                    let pid_str = pid.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        let _ = std::process::Command::new("kill").arg("-9").arg(&pid_str).output();
-                    })
-                    .await
-                    .ok();
-                }
+                // Force kill if still running (non-blocking)
+                let pid_str = pid.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::process::Command::new("kill").arg("-9").arg(&pid_str).output();
+                })
+                .await
+                .ok();
             }
 
             // Detach from the process

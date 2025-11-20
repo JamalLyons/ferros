@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use ferros_core::debugger::create_debugger;
 use ferros_core::types::ProcessId;
 use ferros_core::{Debugger, Result as DebuggerResult};
-use ferros_utils::{debug, info, init_logging, init_logging_for_tui, init_logging_with_level, LogFormat, LogLevel};
+use ferros_utils::{LogFormat, LogLevel, debug, info, init_logging, init_logging_for_tui, init_logging_with_level};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]

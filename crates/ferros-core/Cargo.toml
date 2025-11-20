@@ -1,7 +1,7 @@
 [package]
 name = "ferros-core"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 description = "Low-level debugging primitives and process control for Ferros."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"

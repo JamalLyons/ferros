@@ -21,9 +21,9 @@ use super::Address;
 /// ## Example
 ///
 /// ```rust,no_run
+/// use ferros_core::Debugger;
 /// use ferros_core::platform::macos::MacOSDebugger;
 /// use ferros_core::types::ProcessId;
-/// use ferros_core::Debugger;
 ///
 /// let pid = ProcessId::from(12345);
 /// let mut debugger = MacOSDebugger::new()?;
@@ -64,8 +64,8 @@ impl From<ProcessId> for u32
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::types::ThreadId;
 /// use ferros_core::Debugger;
+/// use ferros_core::types::ThreadId;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -134,8 +134,8 @@ impl From<u64> for ThreadId
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::types::StopReason;
 /// use ferros_core::Debugger;
+/// use ferros_core::types::StopReason;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -201,8 +201,8 @@ pub enum StopReason
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::types::MemoryRegionId;
 /// use ferros_core::Debugger;
+/// use ferros_core::types::MemoryRegionId;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -477,8 +477,8 @@ impl MemoryRegion
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::types::Architecture;
 /// use ferros_core::Debugger;
+/// use ferros_core::types::Architecture;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;

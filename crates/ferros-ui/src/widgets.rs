@@ -2,11 +2,11 @@
 
 use ferros_core::events::format_stop_reason;
 use ferros_core::types::Architecture;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::{App, ProcessOutputLine, ProcessOutputSource};
 

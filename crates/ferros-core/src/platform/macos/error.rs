@@ -86,7 +86,7 @@ pub enum MachError
 /// use libc::{c_int, mach_port_t};
 /// use mach2::kern_return::KERN_SUCCESS;
 ///
-/// extern "C" {
+/// unsafe extern "C" {
 ///     fn task_for_pid(
 ///         target_task: mach_port_t,
 ///         pid: c_int,

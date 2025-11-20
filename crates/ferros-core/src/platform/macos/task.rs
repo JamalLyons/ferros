@@ -22,14 +22,14 @@
 
 use std::fs::File;
 use std::os::fd::{FromRawFd, RawFd};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
-    exception_behavior_t, exception_mask_t, EXCEPTION_DEFAULT, EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS,
-    EXC_MASK_BAD_INSTRUCTION, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, MACH_EXCEPTION_CODES,
+    EXC_MASK_ARITHMETIC, EXC_MASK_BAD_ACCESS, EXC_MASK_BAD_INSTRUCTION, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE,
+    EXCEPTION_DEFAULT, MACH_EXCEPTION_CODES, exception_behavior_t, exception_mask_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
@@ -48,7 +48,7 @@ use crate::breakpoints::{BreakpointEntry, BreakpointId, BreakpointInfo, Breakpoi
 use crate::debugger::Debugger;
 use crate::error::{DebuggerError, Result};
 use crate::events::{self, DebuggerEvent};
-use crate::platform::macos::memory::{get_memory_regions, write_memory, MemoryCache};
+use crate::platform::macos::memory::{MemoryCache, get_memory_regions, write_memory};
 #[cfg(target_arch = "aarch64")]
 use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
@@ -222,9 +222,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ProcessId;
-    /// use ferros_core::Debugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.attach(ProcessId::from(12345))?;
@@ -814,14 +814,15 @@ impl Debugger for MacOSDebugger
         // Load images into symbol cache if not already loaded
         let regions = get_memory_regions(self.task)?;
         for region in regions {
-            if let Some(name) = &region.name {
-                if name.starts_with('/') && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('[')) {
-                    let desc = ImageDescriptor {
-                        path: std::path::PathBuf::from(name),
-                        load_address: region.start.value(),
-                    };
-                    let _ = self.symbol_cache.load_image(desc);
-                }
+            if let Some(name) = &region.name
+                && name.starts_with('/')
+                && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
+            {
+                let desc = ImageDescriptor {
+                    path: std::path::PathBuf::from(name),
+                    load_address: region.start.value(),
+                };
+                let _ = self.symbol_cache.load_image(desc);
             }
         }
 
@@ -890,8 +891,8 @@ impl Debugger for MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::Debugger;
+    /// use ferros_core::platform::macos::MacOSDebugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
@@ -1357,9 +1358,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ThreadId;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1408,9 +1409,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ThreadId;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1441,9 +1442,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1469,9 +1470,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1512,9 +1513,9 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1539,14 +1540,15 @@ impl MacOSDebugger
         // Ensure images are loaded
         let regions = get_memory_regions(self.task)?;
         for region in regions {
-            if let Some(name) = &region.name {
-                if name.starts_with('/') && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('[')) {
-                    let desc = crate::symbols::ImageDescriptor {
-                        path: std::path::PathBuf::from(name),
-                        load_address: region.start.value(),
-                    };
-                    let _ = self.symbol_cache.load_image(desc);
-                }
+            if let Some(name) = &region.name
+                && name.starts_with('/')
+                && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
+            {
+                let desc = crate::symbols::ImageDescriptor {
+                    path: std::path::PathBuf::from(name),
+                    load_address: region.start.value(),
+                };
+                let _ = self.symbol_cache.load_image(desc);
             }
         }
 

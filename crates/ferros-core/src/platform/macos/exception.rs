@@ -17,21 +17,21 @@
 //! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use libc::{c_int, mach_port_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exc::{__Reply__exception_raise_t, __Request__exception_raise_t};
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
-    exception_type_t, EXC_ARITHMETIC, EXC_BAD_ACCESS, EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_SOFTWARE,
+    EXC_ARITHMETIC, EXC_BAD_ACCESS, EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_SOFTWARE, exception_type_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
 use mach2::message::{
-    mach_msg, mach_msg_header_t, mach_msg_size_t, MACH_MSGH_BITS, MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE,
-    MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_RCV_LARGE, MACH_RCV_MSG, MACH_SEND_MSG,
+    MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_RCV_LARGE, MACH_RCV_MSG,
+    MACH_SEND_MSG, mach_msg, mach_msg_header_t, mach_msg_size_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;

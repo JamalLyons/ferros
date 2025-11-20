@@ -24,9 +24,9 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 /// ## Example
 ///
 /// ```rust,no_run
+/// use ferros_core::Debugger;
 /// use ferros_core::breakpoints::builder::BreakpointBuilder;
 /// use ferros_core::types::Address;
-/// use ferros_core::Debugger;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
@@ -121,8 +121,8 @@ impl BreakpointBuilder
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::breakpoints::builder::BreakpointBuilder;
     /// use ferros_core::breakpoints::WatchpointAccess;
+    /// use ferros_core::breakpoints::builder::BreakpointBuilder;
     /// use ferros_core::types::Address;
     ///
     /// let builder = BreakpointBuilder::watchpoint(Address::from(0x1000), 8, WatchpointAccess::Write);
@@ -283,9 +283,9 @@ impl BreakpointBuilder
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::breakpoints::builder::BreakpointBuilder;
     /// use ferros_core::types::Address;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;

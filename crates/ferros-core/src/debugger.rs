@@ -118,8 +118,8 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::Debugger;
+    /// use ferros_core::platform::macos::MacOSDebugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// let pid = debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
@@ -150,9 +150,9 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::{Address, ProcessId};
-    /// use ferros_core::Debugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.attach(ProcessId::from(12345))?;
@@ -373,8 +373,8 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::types::Address;
     /// use ferros_core::Debugger;
+    /// use ferros_core::types::Address;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -438,8 +438,8 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::types::Architecture;
     /// use ferros_core::Debugger;
+    /// use ferros_core::types::Architecture;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -515,8 +515,8 @@ pub trait Debugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::types::StopReason;
     /// use ferros_core::Debugger;
+    /// use ferros_core::types::StopReason;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -593,6 +593,7 @@ pub trait Debugger
     /// debugger.suspend()?;
     /// // ... inspect process state ...
     /// debugger.resume()?; // Continue execution
+    ///
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
     fn resume(&mut self) -> Result<()>;
@@ -723,6 +724,7 @@ pub trait Debugger
     /// // Thread list may be stale
     /// debugger.refresh_threads()?; // Update thread list
     /// let threads = debugger.threads()?; // Now up-to-date
+    ///
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
     fn refresh_threads(&mut self) -> Result<()>;
@@ -757,9 +759,9 @@ pub trait Debugger
 /// ## Example
 ///
 /// ```rust,no_run
+/// use ferros_core::Debugger;
 /// use ferros_core::debugger::create_debugger;
 /// use ferros_core::types::ProcessId;
-/// use ferros_core::Debugger;
 ///
 /// let mut debugger = create_debugger()?;
 /// debugger.attach(ProcessId::from(12345))?;

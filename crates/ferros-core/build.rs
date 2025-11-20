@@ -49,17 +49,19 @@ fn check_macos_requirements()
     // as that's when 64-bit support became standard
     let min_macos_version = (10, 9, 0);
 
-    if let Some(version) = get_macos_version() {
-        if version < min_macos_version {
+    match get_macos_version() {
+        Some(version) if version < min_macos_version => {
             panic!(
                 "ferros-core requires macOS {}.{}.{} or newer, found {}.{}.{}",
                 min_macos_version.0, min_macos_version.1, min_macos_version.2, version.0, version.1, version.2
             );
         }
-    } else {
-        // If we can't detect macOS version, warn but don't fail
-        // (might be cross-compiling)
-        println!("cargo:warning=could not detect macOS version");
+        None => {
+            // If we can't detect macOS version, warn but don't fail
+            // (might be cross-compiling)
+            println!("cargo:warning=could not detect macOS version");
+        }
+        _ => {} // Version is OK
     }
 }
 
@@ -70,13 +72,13 @@ fn check_macos_arm64_requirements()
     // Apple Silicon (ARM64) requires macOS 11.0+ (Big Sur)
     let min_macos_version = (11, 0, 0);
 
-    if let Some(version) = get_macos_version() {
-        if version < min_macos_version {
-            panic!(
-                "ferros-core on Apple Silicon requires macOS {}.{}.{} or newer (Big Sur+), found {}.{}.{}",
-                min_macos_version.0, min_macos_version.1, min_macos_version.2, version.0, version.1, version.2
-            );
-        }
+    if let Some(version) = get_macos_version()
+        && version < min_macos_version
+    {
+        panic!(
+            "ferros-core on Apple Silicon requires macOS {}.{}.{} or newer (Big Sur+), found {}.{}.{}",
+            min_macos_version.0, min_macos_version.1, min_macos_version.2, version.0, version.1, version.2
+        );
     }
 }
 

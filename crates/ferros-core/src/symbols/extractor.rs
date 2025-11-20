@@ -21,8 +21,8 @@
 //! patterns in type names and fields (e.g., `__state`, `__poll_state`, `GenFuture`).
 
 use gimli::{
-    constants, Attribute, AttributeValue, DebugTypeSignature, DebuggingInformationEntry, Reader, Unit, UnitOffset,
-    UnitSectionOffset, UnitType,
+    Attribute, AttributeValue, DebugTypeSignature, DebuggingInformationEntry, Reader, Unit, UnitOffset, UnitSectionOffset,
+    UnitType, constants,
 };
 
 use super::demangle::{is_trait_object, map_dwarf_error};
@@ -340,22 +340,20 @@ impl<'a> TypeExtractor<'a>
 
     fn entry_size_bits(&self, entry: &DebuggingInformationEntry<'_, '_, OwnedReader>) -> Result<Option<u64>>
     {
-        if let Some(attr) = entry
+        if let Ok(Some(attr)) = entry
             .attr(constants::DW_AT_bit_size)
-            .map_err(|err| map_dwarf_error("reading DW_AT_bit_size", err))?
+            .map_err(|err| map_dwarf_error("reading DW_AT_bit_size", err))
+            && let Some(bits) = attr.udata_value()
         {
-            if let Some(bits) = attr.udata_value() {
-                return Ok(Some(bits));
-            }
+            return Ok(Some(bits));
         }
 
-        if let Some(attr) = entry
+        if let Ok(Some(attr)) = entry
             .attr(constants::DW_AT_byte_size)
-            .map_err(|err| map_dwarf_error("reading DW_AT_byte_size", err))?
+            .map_err(|err| map_dwarf_error("reading DW_AT_byte_size", err))
+            && let Some(bytes) = attr.udata_value()
         {
-            if let Some(bytes) = attr.udata_value() {
-                return Ok(Some(bytes * 8));
-            }
+            return Ok(Some(bytes * 8));
         }
 
         Ok(None)
@@ -513,22 +511,20 @@ impl<'a> TypeExtractor<'a>
 
     fn field_offset_bits(&self, entry: &DebuggingInformationEntry<'_, '_, OwnedReader>) -> Result<Option<u64>>
     {
-        if let Some(attr) = entry
+        if let Ok(Some(attr)) = entry
             .attr(constants::DW_AT_data_bit_offset)
-            .map_err(|err| map_dwarf_error("reading DW_AT_data_bit_offset", err))?
+            .map_err(|err| map_dwarf_error("reading DW_AT_data_bit_offset", err))
+            && let Some(bits) = attr.udata_value()
         {
-            if let Some(bits) = attr.udata_value() {
-                return Ok(Some(bits));
-            }
+            return Ok(Some(bits));
         }
 
-        if let Some(attr) = entry
+        if let Ok(Some(attr)) = entry
             .attr(constants::DW_AT_data_member_location)
-            .map_err(|err| map_dwarf_error("reading DW_AT_data_member_location", err))?
+            .map_err(|err| map_dwarf_error("reading DW_AT_data_member_location", err))
+            && let Some(bytes) = attr.udata_value()
         {
-            if let Some(bytes) = attr.udata_value() {
-                return Ok(Some(bytes * 8));
-            }
+            return Ok(Some(bytes * 8));
         }
 
         Ok(None)

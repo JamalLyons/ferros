@@ -12,10 +12,10 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use ferros_core::platform::macos::guards::ThreadSuspendGuard;
-//! use ferros_core::platform::macos::MacOSDebugger;
-//! use ferros_core::types::ThreadId;
 //! use ferros_core::Debugger;
+//! use ferros_core::platform::macos::MacOSDebugger;
+//! use ferros_core::platform::macos::guards::ThreadSuspendGuard;
+//! use ferros_core::types::ThreadId;
 //!
 //! # let mut debugger = MacOSDebugger::new()?;
 //! # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -46,10 +46,10 @@ use crate::platform::macos::ffi;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::guards::ThreadSuspendGuard;
-/// use ferros_core::platform::macos::MacOSDebugger;
-/// use ferros_core::types::ThreadId;
 /// use ferros_core::Debugger;
+/// use ferros_core::platform::macos::MacOSDebugger;
+/// use ferros_core::platform::macos::guards::ThreadSuspendGuard;
+/// use ferros_core::types::ThreadId;
 ///
 /// # let mut debugger = MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -145,11 +145,11 @@ impl Drop for ThreadSuspendGuard
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::breakpoints::BreakpointRequest;
-/// use ferros_core::platform::macos::guards::BreakpointRestoreGuard;
-/// use ferros_core::platform::macos::MacOSDebugger;
-/// use ferros_core::types::Address;
 /// use ferros_core::Debugger;
+/// use ferros_core::breakpoints::BreakpointRequest;
+/// use ferros_core::platform::macos::MacOSDebugger;
+/// use ferros_core::platform::macos::guards::BreakpointRestoreGuard;
+/// use ferros_core::types::Address;
 ///
 /// # let mut debugger = MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;

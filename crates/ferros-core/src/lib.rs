@@ -40,7 +40,7 @@ pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRe
 pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
-pub use events::{format_stop_reason, DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender};
+pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacOSDebugger;
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};

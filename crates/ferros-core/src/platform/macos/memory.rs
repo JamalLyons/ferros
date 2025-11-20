@@ -32,7 +32,7 @@ use mach2::message::mach_msg_type_number_t;
 use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region_recurse};
 #[cfg(target_os = "macos")]
 use mach2::vm_region::{
-    vm_region_recurse_info_t, vm_region_submap_short_info_data_64_t, VM_REGION_SUBMAP_SHORT_INFO_COUNT_64,
+    VM_REGION_SUBMAP_SHORT_INFO_COUNT_64, vm_region_recurse_info_t, vm_region_submap_short_info_data_64_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::vm_statistics::{
@@ -51,11 +51,7 @@ use crate::types::{Address, MemoryRegion, MemoryRegionId};
 
 static SYSTEM_PAGE_SIZE: Lazy<usize> = Lazy::new(|| unsafe {
     let size = libc::sysconf(libc::_SC_PAGESIZE);
-    if size <= 0 {
-        4096
-    } else {
-        size as usize
-    }
+    if size <= 0 { 4096 } else { size as usize }
 });
 
 fn page_align_down(value: u64, page_size: usize) -> u64
@@ -707,13 +703,13 @@ fn ensure_range_with_permissions(task: mach_port_t, addr: Address, len: usize, r
         )));
     }
 
-    if let Some(mask) = required {
-        if (info.protection & mask) != mask {
-            return Err(DebuggerError::Io(Error::new(
-                ErrorKind::PermissionDenied,
-                "memory range lacks required permissions",
-            )));
-        }
+    if let Some(mask) = required
+        && (info.protection & mask) != mask
+    {
+        return Err(DebuggerError::Io(Error::new(
+            ErrorKind::PermissionDenied,
+            "memory range lacks required permissions",
+        )));
     }
 
     Ok(info)

@@ -32,7 +32,7 @@
 //! ## Examples
 //!
 //! ```rust,no_run
-//! use ferros_utils::{init_logging_with_level, LogFormat, LogLevel};
+//! use ferros_utils::{LogFormat, LogLevel, init_logging_with_level};
 //!
 //! // Initialize with specific log level
 //! init_logging_with_level(LogLevel::Debug, LogFormat::Pretty)
@@ -172,7 +172,7 @@ pub fn init_logging() -> Result<(), LoggingError>
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_utils::{init_logging_with_level, LogFormat, LogLevel};
+/// use ferros_utils::{LogFormat, LogLevel, init_logging_with_level};
 ///
 /// init_logging_with_level(LogLevel::Debug, LogFormat::Pretty)
 ///     .expect("Failed to initialize logging");

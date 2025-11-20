@@ -78,7 +78,7 @@ pub struct VmRegionBasicInfoData
 //
 // These functions deal with Mach tasks (processes) and obtaining access to them.
 #[link(name = "c", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     // Get a Mach port to a process by PID
     ///
     /// This function obtains a Mach task port for the process with the given PID.
@@ -154,7 +154,7 @@ extern "C" {
 //
 // These functions read and write thread state (registers) from threads.
 #[link(name = "c", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     // Read thread state (registers) from a thread
     ///
     /// This function reads the CPU register values from a thread. The registers
@@ -305,7 +305,7 @@ extern "C" {
 // These functions read and write memory in other processes, and enumerate
 // memory regions.
 #[link(name = "c", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     /// Read memory from a Mach task
     ///
     /// This function reads memory from the target process's address space.
@@ -457,7 +457,7 @@ extern "C" {
 //
 // These functions spawn new processes under debugger control using posix_spawn.
 #[link(name = "c", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     /// Spawn a new process with control over its initial state
     ///
     /// This function creates a new process from the given executable path and arguments.

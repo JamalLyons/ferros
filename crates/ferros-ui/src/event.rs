@@ -1,7 +1,7 @@
 //! Event handling for the TUI
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
@@ -63,15 +63,14 @@ impl EventHandler
                     .checked_sub(last_tick.elapsed())
                     .unwrap_or_else(|| Duration::from_secs(0));
 
-                if event::poll(timeout).unwrap_or(false) {
-                    if let Ok(CrosstermEvent::Key(key)) = event::read() {
-                        if key.kind == KeyEventKind::Press {
-                            // Use blocking send since we're in a blocking context
-                            // If send fails (receiver dropped), break
-                            if sender_clone.blocking_send(Event::Key(key)).is_err() {
-                                break;
-                            }
-                        }
+                if event::poll(timeout).unwrap_or(false)
+                    && let Ok(CrosstermEvent::Key(key)) = event::read()
+                    && key.kind == KeyEventKind::Press
+                {
+                    // Use blocking send since we're in a blocking context
+                    // If send fails (receiver dropped), break
+                    if sender_clone.blocking_send(Event::Key(key)).is_err() {
+                        break;
                     }
                 }
 

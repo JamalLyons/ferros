@@ -423,13 +423,13 @@ impl BreakpointManager
                 if let Err(err) = Self::restore_software_breakpoint(ops, &entry) {
                     tracing::warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
                 }
-            } else if let BreakpointPayload::Hardware { .. } = entry.payload {
-                if let Err(err) = Self::remove_hardware_breakpoint(ops, &entry) {
-                    tracing::warn!(
-                        "Failed to remove hardware breakpoint 0x{:016x}: {err}",
-                        entry.info.address.value()
-                    );
-                }
+            } else if let BreakpointPayload::Hardware { .. } = entry.payload
+                && let Err(err) = Self::remove_hardware_breakpoint(ops, &entry)
+            {
+                tracing::warn!(
+                    "Failed to remove hardware breakpoint 0x{:016x}: {err}",
+                    entry.info.address.value()
+                );
             }
         }
     }

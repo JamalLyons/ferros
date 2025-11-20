@@ -132,10 +132,10 @@ pub enum DebuggerError
     /// ## Example
     ///
     /// ```rust,no_run
+    /// use ferros_core::Debugger;
     /// use ferros_core::breakpoints::BreakpointRequest;
     /// use ferros_core::error::DebuggerError;
     /// use ferros_core::types::Address;
-    /// use ferros_core::Debugger;
     ///
     /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # let address = Address::from(0x1000);

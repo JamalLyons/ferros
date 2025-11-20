@@ -129,10 +129,10 @@ The CLI supports several commands:
 
 #### Key Code References
 
-- **Main entry point**: [`crates/ferros/src/main.rs:81`](../../crates/ferros/src/main.rs#L81)
-- **Command definitions**: [`crates/ferros/src/main.rs:30-79`](../../crates/ferros/src/main.rs#L30-L79)
-- **Async command handler**: [`crates/ferros/src/main.rs:164-230`](../../crates/ferros/src/main.rs#L164-L230)
-- **Headless command handler**: [`crates/ferros/src/main.rs:232-358`](../../crates/ferros/src/main.rs#L232-L358)
+- **Main entry point**: [`crates/ferros/src/main.rs:81`](../crates/ferros/src/main.rs#L81)
+- **Command definitions**: [`crates/ferros/src/main.rs:30-79`](../crates/ferros/src/main.rs#L30-L79)
+- **Async command handler**: [`crates/ferros/src/main.rs:164-230`](../crates/ferros/src/main.rs#L164-L230)
+- **Headless command handler**: [`crates/ferros/src/main.rs:232-358`](../crates/ferros/src/main.rs#L232-L358)
 
 #### Design Decisions
 
@@ -144,7 +144,7 @@ The CLI supports several commands:
 
 ### ferros-core
 
-**Location**: [`crates/ferros-core/`](../../crates/ferros-core/)
+**Location**: [`crates/ferros-core/`](../crates/ferros-core/)
 
 The `ferros-core` crate is the heart of Ferros. It provides platform-agnostic debugging primitives through the `Debugger` trait and platform-specific implementations.
 
@@ -189,7 +189,7 @@ ferros-core/src/
 
 #### The Debugger Trait
 
-The `Debugger` trait is the central abstraction in Ferros. It defines what operations a debugger can perform, regardless of the underlying platform. This trait is defined in [`crates/ferros-core/src/debugger.rs`](../../crates/ferros-core/src/debugger.rs).
+The `Debugger` trait is the central abstraction in Ferros. It defines what operations a debugger can perform, regardless of the underlying platform. This trait is defined in [`crates/ferros-core/src/debugger.rs`](../crates/ferros-core/src/debugger.rs).
 
 **Key Methods**:
 
@@ -201,7 +201,7 @@ The `Debugger` trait is the central abstraction in Ferros. It defines what opera
 - **Stack Unwinding**: `stack_trace()`
 - **State Queries**: `is_attached()`, `is_stopped()`, `stop_reason()`, `architecture()`
 
-**Code Reference**: [`crates/ferros-core/src/debugger.rs:52-743`](../../crates/ferros-core/src/debugger.rs#L52-L743)
+**Code Reference**: [`crates/ferros-core/src/debugger.rs:52-743`](../crates/ferros-core/src/debugger.rs#L52-L743)
 
 #### Platform Factory
 
@@ -211,11 +211,11 @@ The `create_debugger()` function automatically creates the correct debugger impl
 pub fn create_debugger() -> Result<Box<dyn Debugger>>
 ```
 
-**Code Reference**: [`crates/ferros-core/src/debugger.rs:774-788`](../../crates/ferros-core/src/debugger.rs#L774-L788)
+**Code Reference**: [`crates/ferros-core/src/debugger.rs:774-788`](../crates/ferros-core/src/debugger.rs#L774-L788)
 
 #### Error Handling
 
-All debugger operations return `Result<T, DebuggerError>`. The error types are defined in [`crates/ferros-core/src/error.rs`](../../crates/ferros-core/src/error.rs) and use `thiserror` for structured error handling.
+All debugger operations return `Result<T, DebuggerError>`. The error types are defined in [`crates/ferros-core/src/error.rs`](../crates/ferros-core/src/error.rs) and use `thiserror` for structured error handling.
 
 **Common Error Types**:
 - `NotAttached`: Operation requires an attached process
@@ -226,13 +226,13 @@ All debugger operations return `Result<T, DebuggerError>`. The error types are d
 
 #### Event System
 
-The event system allows debugger backends to notify higher layers about asynchronous state changes (e.g., process stopped, breakpoint hit) without polling. Events are defined in [`crates/ferros-core/src/events.rs`](../../crates/ferros-core/src/events.rs).
+The event system allows debugger backends to notify higher layers about asynchronous state changes (e.g., process stopped, breakpoint hit) without polling. Events are defined in [`crates/ferros-core/src/events.rs`](../crates/ferros-core/src/events.rs).
 
 **Event Types**:
 - `TargetStopped { reason, thread }`: Process stopped for a reason
 - `TargetResumed`: Process resumed execution
 
-**Code Reference**: [`crates/ferros-core/src/events.rs:14-27`](../../crates/ferros-core/src/events.rs#L14-L27)
+**Code Reference**: [`crates/ferros-core/src/events.rs:14-27`](../crates/ferros-core/src/events.rs#L14-L27)
 
 #### Breakpoint Management
 
@@ -248,7 +248,7 @@ Breakpoints are managed through the `breakpoints` module. The system supports:
 - `BreakpointInfo`: Public information about a breakpoint
 - `BreakpointStore`: Thread-safe storage for breakpoint state
 
-**Code Reference**: [`crates/ferros-core/src/breakpoints/mod.rs`](../../crates/ferros-core/src/breakpoints/mod.rs)
+**Code Reference**: [`crates/ferros-core/src/breakpoints/mod.rs`](../crates/ferros-core/src/breakpoints/mod.rs)
 
 #### Symbol Resolution
 
@@ -260,7 +260,7 @@ The `symbols` module provides symbol resolution, DWARF parsing, and type introsp
 - **`TypeExtractor`**: Extracts type information from DWARF
 - **`BinaryImage`**: Represents a loaded binary and its DWARF sections
 
-**Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../../crates/ferros-core/src/symbols/mod.rs)
+**Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../crates/ferros-core/src/symbols/mod.rs)
 
 #### Type System
 
@@ -275,11 +275,11 @@ The `types` module defines core types used throughout Ferros:
 - **`StopReason`**: Reason why process stopped
 - **`Architecture`**: CPU architecture (ARM64, x86_64, etc.)
 
-**Code Reference**: [`crates/ferros-core/src/types/mod.rs`](../../crates/ferros-core/src/types/mod.rs)
+**Code Reference**: [`crates/ferros-core/src/types/mod.rs`](../crates/ferros-core/src/types/mod.rs)
 
 #### Platform-Specific Implementation (macOS)
 
-The macOS implementation uses Mach APIs to interact with processes. The main implementation is in [`crates/ferros-core/src/platform/macos/task.rs`](../../crates/ferros-core/src/platform/macos/task.rs).
+The macOS implementation uses Mach APIs to interact with processes. The main implementation is in [`crates/ferros-core/src/platform/macos/task.rs`](../crates/ferros-core/src/platform/macos/task.rs).
 
 **Key Mach APIs Used**:
 - `task_for_pid()`: Get Mach port to a process
@@ -293,13 +293,13 @@ The macOS implementation uses Mach APIs to interact with processes. The main imp
 - **ARM64**: Uses `ARM_THREAD_STATE64` flavor
 - **x86_64**: Uses `X86_THREAD_STATE64` flavor
 
-**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../../crates/ferros-core/src/platform/macos/mod.rs)
+**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../crates/ferros-core/src/platform/macos/mod.rs)
 
 ---
 
 ### ferros-ui
 
-**Location**: [`crates/ferros-ui/`](../../crates/ferros-ui/)
+**Location**: [`crates/ferros-ui/`](../crates/ferros-ui/)
 
 The `ferros-ui` crate provides a Terminal User Interface (TUI) built with `ratatui`. It provides an interactive debugging experience with multiple views.
 
@@ -317,7 +317,7 @@ ferros-ui/src/
 
 #### Application State
 
-The `App` struct in [`crates/ferros-ui/src/app.rs`](../../crates/ferros-ui/src/app.rs) manages the application state:
+The `App` struct in [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs) manages the application state:
 
 - **Debugger instance**: The `Debugger` trait object
 - **View modes**: Overview, Registers, Threads, Memory Regions, Output
@@ -325,7 +325,7 @@ The `App` struct in [`crates/ferros-ui/src/app.rs`](../../crates/ferros-ui/src/a
 - **Process output**: Captured stdout/stderr from launched processes
 - **Stop events**: Log of stop/resume events
 
-**Code Reference**: [`crates/ferros-ui/src/app.rs:33-67`](../../crates/ferros-ui/src/app.rs#L33-L67)
+**Code Reference**: [`crates/ferros-ui/src/app.rs:33-67`](../crates/ferros-ui/src/app.rs#L33-L67)
 
 #### View Modes
 
@@ -337,11 +337,11 @@ The TUI supports multiple view modes:
 4. **Memory Regions**: Memory map of the process
 5. **Output**: Process stdout/stderr output
 
-**Code Reference**: [`crates/ferros-ui/src/app.rs:70-83`](../../crates/ferros-ui/src/app.rs#L70-L83)
+**Code Reference**: [`crates/ferros-ui/src/app.rs:70-83`](../crates/ferros-ui/src/app.rs#L70-L83)
 
 #### Event Loop
 
-The TUI event loop in [`crates/ferros-ui/src/tui.rs`](../../crates/ferros-ui/src/tui.rs) handles:
+The TUI event loop in [`crates/ferros-ui/src/tui.rs`](../crates/ferros-ui/src/tui.rs) handles:
 
 - **Keyboard input**: User commands (suspend, resume, navigate, quit)
 - **Terminal rendering**: Updates the display on each tick
@@ -354,7 +354,7 @@ The TUI event loop in [`crates/ferros-ui/src/tui.rs`](../../crates/ferros-ui/src
 - Debugger event forwarding
 - Graceful shutdown with cleanup
 
-**Code Reference**: [`crates/ferros-ui/src/tui.rs:70-172`](../../crates/ferros-ui/src/tui.rs#L70-L172)
+**Code Reference**: [`crates/ferros-ui/src/tui.rs:70-172`](../crates/ferros-ui/src/tui.rs#L70-L172)
 
 #### Keyboard Commands
 
@@ -365,13 +365,13 @@ The TUI event loop in [`crates/ferros-ui/src/tui.rs`](../../crates/ferros-ui/src
 - **`↑`/`↓`**: Navigate tables
 - **`Ctrl+A`**: Attach to process (future)
 
-**Code Reference**: [`crates/ferros-ui/src/app.rs:175-236`](../../crates/ferros-ui/src/app.rs#L175-L236)
+**Code Reference**: [`crates/ferros-ui/src/app.rs:175-236`](../crates/ferros-ui/src/app.rs#L175-L236)
 
 ---
 
 ### ferros-protocol
 
-**Location**: [`crates/ferros-protocol/`](../../crates/ferros-protocol/)
+**Location**: [`crates/ferros-protocol/`](../crates/ferros-protocol/)
 
 The `ferros-protocol` crate is currently a placeholder for future remote debugging capabilities. It will define structured messages for communication between the debugger and frontends (TUI, GUI, or remote clients).
 
@@ -380,13 +380,13 @@ The `ferros-protocol` crate is currently a placeholder for future remote debuggi
 - Protocol versioning for backward compatibility
 - Support for remote debugging over network
 
-**Code Reference**: [`crates/ferros-protocol/src/lib.rs`](../../crates/ferros-protocol/src/lib.rs)
+**Code Reference**: [`crates/ferros-protocol/src/lib.rs`](../crates/ferros-protocol/src/lib.rs)
 
 ---
 
 ### ferros-mir
 
-**Location**: [`crates/ferros-mir/`](../../crates/ferros-mir/)
+**Location**: [`crates/ferros-mir/`](../crates/ferros-mir/)
 
 The `ferros-mir` crate is currently a placeholder for MIR (Mid-level Intermediate Representation) integration. This will enable debugging at the Rust compiler's intermediate representation level.
 
@@ -396,19 +396,19 @@ The `ferros-mir` crate is currently a placeholder for MIR (Mid-level Intermediat
 - Type and lifetime introspection
 - Integration with `rustc` internals
 
-**Code Reference**: [`crates/ferros-mir/src/lib.rs`](../../crates/ferros-mir/src/lib.rs)
+**Code Reference**: [`crates/ferros-mir/src/lib.rs`](../crates/ferros-mir/src/lib.rs)
 
 ---
 
 ### ferros-utils
 
-**Location**: [`crates/ferros-utils/`](../../crates/ferros-utils/)
+**Location**: [`crates/ferros-utils/`](../crates/ferros-utils/)
 
 The `ferros-utils` crate provides shared utilities used across the workspace, primarily logging infrastructure.
 
 #### Logging Module
 
-The logging module in [`crates/ferros-utils/src/logging.rs`](../../crates/ferros-utils/src/logging.rs) provides structured logging using `tracing`:
+The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-utils/src/logging.rs) provides structured logging using `tracing`:
 
 **Features**:
 - Multiple output formats (pretty, JSON)
@@ -421,7 +421,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../../crates/ferros
 - `init_logging_with_level()`: Initialize with explicit level/format
 - `init_logging_for_tui()`: Initialize file-only logging for TUI
 
-**Code Reference**: [`crates/ferros-utils/src/logging.rs:152-224`](../../crates/ferros-utils/src/logging.rs#L152-L224)
+**Code Reference**: [`crates/ferros-utils/src/logging.rs:152-224`](../crates/ferros-utils/src/logging.rs#L152-L224)
 
 ---
 
@@ -430,7 +430,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../../crates/ferros
 ### Launching a Process
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../../crates/ferros/src/main.rs#L182-L223)
+2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../crates/ferros/src/main.rs#L182-L223)
 3. **Create debugger**: `create_debugger()` returns platform-specific implementation
 4. **Launch process**: `debugger.launch()` spawns process in suspended state
 5. **Resume process**: `debugger.resume()` starts execution
@@ -439,7 +439,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../../crates/ferros
 ### Attaching to a Process
 
 1. **User invokes**: `ferros attach <pid>`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:167-180`](../../crates/ferros/src/main.rs#L167-L180)
+2. **CLI parses command**: [`crates/ferros/src/main.rs:167-180`](../crates/ferros/src/main.rs#L167-L180)
 3. **Create debugger**: Platform-specific debugger instance
 4. **Attach to process**: `debugger.attach(pid)` gets Mach port (macOS) or uses ptrace (Linux)
 5. **Start TUI**: Interactive debugging session begins
@@ -474,7 +474,7 @@ Ferros uses a trait-based approach to abstract platform differences. The `Debugg
 
 ### macOS Implementation
 
-**Location**: [`crates/ferros-core/src/platform/macos/`](../../crates/ferros-core/src/platform/macos/)
+**Location**: [`crates/ferros-core/src/platform/macos/`](../crates/ferros-core/src/platform/macos/)
 
 **Key Files**:
 - **`task.rs`**: Main `MacOSDebugger` implementation
@@ -484,7 +484,7 @@ Ferros uses a trait-based approach to abstract platform differences. The `Debugg
 - **`threads.rs`**: Thread enumeration and management
 - **`registers/`**: Architecture-specific register handling
 
-**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../../crates/ferros-core/src/platform/macos/mod.rs)
+**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../crates/ferros-core/src/platform/macos/mod.rs)
 
 ### Future: Linux Implementation
 
@@ -526,7 +526,7 @@ Errors are propagated using the `?` operator:
 let regs = debugger.read_registers()?;  // Propagates DebuggerError
 ```
 
-**Code Reference**: [`crates/ferros-core/src/error.rs`](../../crates/ferros-core/src/error.rs)
+**Code Reference**: [`crates/ferros-core/src/error.rs`](../crates/ferros-core/src/error.rs)
 
 ---
 
@@ -562,10 +562,10 @@ The `ferros-protocol` crate will enable:
 Ferros is designed with a clear separation of concerns, allowing each component to be developed and tested independently. The trait-based platform abstraction enables cross-platform support while maintaining a clean API.
 
 For contributors, the key entry points are:
-- **CLI**: [`crates/ferros/src/main.rs`](../../crates/ferros/src/main.rs)
-- **Core API**: [`crates/ferros-core/src/debugger.rs`](../../crates/ferros-core/src/debugger.rs)
-- **Platform Implementation**: [`crates/ferros-core/src/platform/`](../../crates/ferros-core/src/platform/)
-- **TUI**: [`crates/ferros-ui/src/app.rs`](../../crates/ferros-ui/src/app.rs)
+- **CLI**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
+- **Core API**: [`crates/ferros-core/src/debugger.rs`](../crates/ferros-core/src/debugger.rs)
+- **Platform Implementation**: [`crates/ferros-core/src/platform/`](../crates/ferros-core/src/platform/)
+- **TUI**: [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs)
 
 Each module is well-documented with Rustdoc comments, and the codebase follows Rust best practices for safety, performance, and maintainability.
 

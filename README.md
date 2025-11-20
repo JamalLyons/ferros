@@ -85,10 +85,7 @@ Once available, you'll be able to:
 cargo install ferros
 
 # Debug your Rust project
-cargo ferros run
-
-# Attach to a running process
-ferros attach <pid>
+cargo ferros launch <program> [args...]
 ```
 
 ### Requirements

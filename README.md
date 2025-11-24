@@ -20,7 +20,7 @@ Unlike traditional debuggers that retrofit C-style semantics onto Rust programs,
 
 ---
 
-## ✨ Mission
+## Mission
 
 To give Rust developers a **first-class, language-native debugging experience** — fast, intuitive, and designed for Rust's safety guarantees.
 
@@ -28,7 +28,7 @@ Ferros aims to become the Rust ecosystem's standard debugging platform, compleme
 
 ---
 
-## 🎯 What Makes Ferros Different?
+## What Makes Ferros Different?
 
 While existing Rust debugging solutions are either platform-limited or retrofitted from C/C++ debuggers, Ferros is built **from the ground up** for Rust developers.
 
@@ -47,7 +47,7 @@ While existing Rust debugging solutions are either platform-limited or retrofitt
 
 ---
 
-## 📊 Current Status
+## Current Status
 
 Ferros is currently in **active development** with core infrastructure in place.
 
@@ -55,7 +55,7 @@ Ferros is currently in **active development** with core infrastructure in place.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 Ferros is structured as a **workspace of multiple crates**, each with a specific responsibility:
 
@@ -74,7 +74,7 @@ ferros/
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 > **Note:** Ferros is currently in early development. Installation and usage instructions will be available in future releases.
 
@@ -101,7 +101,7 @@ cargo ferros launch <program> [args...]
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **[Architecture](./docs/architecture.md)** — Deep dive into Ferros' design and structure
 - **[Roadmap](./ROADMAP.md)** — Development milestones and planned features
@@ -109,7 +109,7 @@ cargo ferros launch <program> [args...]
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Ferros is built with ❤️ by the Rust community.
 
@@ -123,13 +123,13 @@ We welcome contributions! Ferros is built with ❤️ by the Rust community.
 
 ---
 
-## 📄 License
+## License
 
 Licensed under the [Apache License, Version 2.0](./LICENSE).
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Ferros draws inspiration from:
 - The Rust compiler's MIR representation

@@ -11,3 +11,5 @@ target/** linguist-vendored
 # Mark documentation as documentation
 *.md linguist-documentation
 
+# Auto detect text files and perform LF normalization
+* text=auto

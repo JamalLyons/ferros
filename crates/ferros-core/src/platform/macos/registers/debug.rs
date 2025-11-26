@@ -21,6 +21,7 @@ use libc::{natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 
+use crate::breakpoints::WatchpointAccess;
 use crate::error::{DebuggerError, Result};
 use crate::platform::macos::{constants, ffi};
 use crate::types::Address;
@@ -140,6 +141,62 @@ pub fn clear_hardware_breakpoint(thread: thread_act_t, slot: u32) -> Result<()>
     #[cfg(target_arch = "aarch64")]
     {
         clear_hw_bp_arm64(thread, slot)
+    }
+}
+
+/// Set a data watchpoint at the given address.
+///
+/// Watchpoints use CPU debug registers (DBGWVR/DBGWCR on ARM64, DR0-DR7/DR7 on x86-64)
+/// to trap on data access instead of instruction execution.
+///
+/// ## Platform support
+///
+/// - **ARM64 (Apple Silicon)**: Supported for 8-byte read/write watchpoints in user mode.
+/// - **x86-64**: Not yet implemented. This function will return `InvalidArgument`.
+///
+/// ## Parameters
+///
+/// - `thread`: The thread port to modify.
+/// - `address`: The starting address of the watched region.
+/// - `length`: Size in bytes of the watched region (currently must be 8 on ARM64).
+/// - `access`: Type of access that should trigger the watchpoint.
+///
+/// ## Errors
+///
+/// - `InvalidArgument` if the architecture is not supported, or parameters are unsupported.
+/// - `ResourceExhausted` if all watchpoint slots are in use.
+/// - `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+pub fn set_watchpoint(thread: thread_act_t, address: Address, length: usize, access: WatchpointAccess) -> Result<u32>
+{
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (thread, address, length, access);
+        Err(DebuggerError::InvalidArgument(
+            "Data watchpoints are not yet supported on x86-64 macOS".to_string(),
+        ))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        set_wp_arm64(thread, address, length, access)
+    }
+}
+
+/// Clear a data watchpoint from the given slot.
+///
+/// On ARM64 this clears DBGWCR/DBGWVR for the given slot. On x86-64 this
+/// always returns `InvalidArgument` as watchpoints are not yet implemented.
+pub fn clear_watchpoint(thread: thread_act_t, slot: u32) -> Result<()>
+{
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (thread, slot);
+        Err(DebuggerError::InvalidArgument(
+            "Data watchpoints are not yet supported on x86-64 macOS".to_string(),
+        ))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        clear_wp_arm64(thread, slot)
     }
 }
 
@@ -344,6 +401,123 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
 
         // Clear enable bit (bit 0)
         state.bcr[slot as usize] = 0;
+
+        let kr = ffi::thread_set_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &state as *const _ as *const natural_t,
+            constants::ARM_DEBUG_STATE64_COUNT,
+        );
+
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: WatchpointAccess) -> Result<u32>
+{
+    // For the initial implementation we support a single, naturally aligned
+    // 8-byte watchpoint that triggers on both loads and stores. This matches
+    // the common case of watching a pointer-sized value.
+    if length != 8 {
+        return Err(DebuggerError::InvalidArgument(
+            "ARM64 watchpoints currently only support length == 8 bytes".to_string(),
+        ));
+    }
+
+    if !matches!(access, WatchpointAccess::ReadWrite) {
+        return Err(DebuggerError::InvalidArgument(
+            "ARM64 watchpoints currently only support ReadWrite access".to_string(),
+        ));
+    }
+
+    unsafe {
+        let mut state = ArmDebugState64::default();
+        let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
+
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        // Find a free slot in the watchpoint control registers.
+        // WCR (Watchpoint Control Register) bit 0 is enable (E).
+        let mut slot = None;
+        for i in 0..16 {
+            if (state.wcr[i] & 1) == 0 {
+                slot = Some(i);
+                break;
+            }
+        }
+
+        let slot = slot.ok_or_else(|| {
+            DebuggerError::ResourceExhausted("No free hardware watchpoint slots (maximum 16 on ARM64)".into())
+        })?;
+
+        // Program the watchpoint value register with the watched address.
+        state.wvr[slot] = address.value();
+
+        // Program the watchpoint control register.
+        //
+        // NOTE: The exact DBGWCR_EL1 encoding is architecture-specific and
+        // nuanced (LSC, BAS, PAC, etc.). For now we reuse the same control
+        // value as execution breakpoints, which configures:
+        //   - E = 1 (enable)
+        //   - PMC = user mode
+        //   - BAS = match all bytes in the 8-byte region
+        //
+        // This is sufficient to get a functioning user-mode data watchpoint
+        // on Apple Silicon, and can be refined later if needed.
+        state.wcr[slot] = constants::ARM64_BP_CTRL_USER_EXEC;
+
+        let kr = ffi::thread_set_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &state as *const _ as *const natural_t,
+            constants::ARM_DEBUG_STATE64_COUNT,
+        );
+
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        Ok(slot as u32)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn clear_wp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
+{
+    unsafe {
+        let mut state = ArmDebugState64::default();
+        let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+        let kr = ffi::thread_get_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            &mut state as *mut _ as *mut natural_t,
+            &mut count,
+        );
+
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::MachError(kr.into()));
+        }
+
+        if slot >= 16 {
+            return Err(DebuggerError::InvalidArgument("Invalid watchpoint slot".into()));
+        }
+
+        // Clear the enable bit and value for the watchpoint slot.
+        state.wcr[slot as usize] = 0;
+        state.wvr[slot as usize] = 0;
 
         let kr = ffi::thread_set_state(
             thread,

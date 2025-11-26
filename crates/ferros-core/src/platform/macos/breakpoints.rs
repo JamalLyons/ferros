@@ -325,6 +325,69 @@ impl BreakpointManager
         Ok(store.insert(entry))
     }
 
+    /// Install a data watchpoint at the given address and length.
+    ///
+    /// This method uses CPU debug registers to break on data access to a memory
+    /// region instead of instruction execution. On macOS this is currently
+    /// implemented for ARM64 (Apple Silicon) only; x86-64 will return an error.
+    pub(crate) fn install_watchpoint<Ops: BreakpointOperations>(
+        ops: &mut Ops,
+        breakpoints: &Arc<Mutex<BreakpointStore>>,
+        address: Address,
+        length: usize,
+        access: crate::breakpoints::WatchpointAccess,
+    ) -> Result<BreakpointId>
+    {
+        ops.ensure_attached()?;
+
+        {
+            let store = breakpoints.lock().unwrap();
+            if store.id_for_kind(address, BreakpointKind::Watchpoint).is_some() {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "Watchpoint already exists at 0x{:016x}",
+                    address.value()
+                )));
+            }
+        }
+
+        // Install on all threads
+        let mut used_slot = None;
+
+        for &thread in ops.thread_ports() {
+            let slot = registers::set_watchpoint(thread, address, length, access)?;
+            if let Some(s) = used_slot {
+                if s != slot {
+                    tracing::warn!("Watchpoint slots inconsistent across threads: {} vs {}", s, slot);
+                }
+            } else {
+                used_slot = Some(slot);
+            }
+        }
+
+        let slot =
+            used_slot.ok_or_else(|| DebuggerError::AttachFailed("No threads available to set data watchpoint".into()))?;
+
+        let mut info = BreakpointInfo::new(BreakpointId::from_raw(0), address, BreakpointKind::Watchpoint);
+        info.state = BreakpointState::Resolved;
+        info.enabled = true;
+        info.resolved_at = Some(SystemTime::now());
+        info.watch_access = Some(access);
+        info.watch_length = Some(length);
+
+        let entry = BreakpointEntry {
+            info,
+            payload: BreakpointPayload::Watchpoint {
+                address,
+                length,
+                access,
+                slot,
+            },
+        };
+
+        let mut store = breakpoints.lock().unwrap();
+        Ok(store.insert(entry))
+    }
+
     /// Restore a software breakpoint by writing back the original instruction.
     ///
     /// This method replaces the trap instruction with the original instruction bytes
@@ -389,6 +452,22 @@ impl BreakpointManager
         Ok(())
     }
 
+    /// Remove a data watchpoint from all threads.
+    ///
+    /// This clears the watchpoint from the hardware watchpoint registers. The
+    /// operation is best-effort and logs warnings if individual threads fail.
+    pub(crate) fn remove_watchpoint<Ops: BreakpointOperations>(ops: &Ops, entry: &BreakpointEntry) -> Result<()>
+    {
+        if let BreakpointPayload::Watchpoint { slot, .. } = &entry.payload {
+            for &thread in ops.thread_ports() {
+                if let Err(e) = registers::clear_watchpoint(thread, *slot) {
+                    tracing::warn!("Failed to clear data watchpoint on thread {}: {}", thread, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Restore all breakpoints (remove software breakpoints, clear hardware breakpoints).
     ///
     /// This method removes all breakpoints from the process by:
@@ -419,17 +498,28 @@ impl BreakpointManager
         };
 
         for entry in entries {
-            if let BreakpointPayload::Software { .. } = entry.payload {
-                if let Err(err) = Self::restore_software_breakpoint(ops, &entry) {
-                    tracing::warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
+            match entry.payload {
+                BreakpointPayload::Software { .. } => {
+                    if let Err(err) = Self::restore_software_breakpoint(ops, &entry) {
+                        tracing::warn!("Failed to restore breakpoint 0x{:016x}: {err}", entry.info.address.value());
+                    }
                 }
-            } else if let BreakpointPayload::Hardware { .. } = entry.payload
-                && let Err(err) = Self::remove_hardware_breakpoint(ops, &entry)
-            {
-                tracing::warn!(
-                    "Failed to remove hardware breakpoint 0x{:016x}: {err}",
-                    entry.info.address.value()
-                );
+                BreakpointPayload::Hardware { .. } => {
+                    if let Err(err) = Self::remove_hardware_breakpoint(ops, &entry) {
+                        tracing::warn!(
+                            "Failed to remove hardware breakpoint 0x{:016x}: {err}",
+                            entry.info.address.value()
+                        );
+                    }
+                }
+                BreakpointPayload::Watchpoint { .. } => {
+                    if let Err(err) = Self::remove_watchpoint(ops, &entry) {
+                        tracing::warn!(
+                            "Failed to remove data watchpoint 0x{:016x}: {err}",
+                            entry.info.address.value()
+                        );
+                    }
+                }
             }
         }
     }
@@ -452,8 +542,6 @@ impl BreakpointManager
     /// - Installation fails for any reason
     ///
     /// ## Errors
-    ///
-    /// - `DebuggerError::InvalidArgument`: Watchpoints not supported, or installation failed
     pub(crate) fn add_breakpoint<Ops: BreakpointOperations>(
         ops: &mut Ops,
         breakpoints: &Arc<Mutex<BreakpointStore>>,
@@ -463,9 +551,9 @@ impl BreakpointManager
         match request {
             BreakpointRequest::Software { address } => Self::install_software_breakpoint(ops, breakpoints, address),
             BreakpointRequest::Hardware { address } => Self::install_hardware_breakpoint(ops, breakpoints, address),
-            BreakpointRequest::Watchpoint { .. } => Err(DebuggerError::InvalidArgument(
-                "Watchpoints are not yet supported on macOS".to_string(),
-            )),
+            BreakpointRequest::Watchpoint { address, length, access } => {
+                Self::install_watchpoint(ops, breakpoints, address, length, access)
+            }
         }
     }
 
@@ -508,7 +596,7 @@ impl BreakpointManager
             match entry.info.kind {
                 BreakpointKind::Software => Self::restore_software_breakpoint(ops, &entry)?,
                 BreakpointKind::Hardware => Self::remove_hardware_breakpoint(ops, &entry)?,
-                _ => {}
+                BreakpointKind::Watchpoint => Self::remove_watchpoint(ops, &entry)?,
             }
         }
         Ok(())
@@ -546,13 +634,13 @@ impl BreakpointManager
         id: BreakpointId,
     ) -> Result<()>
     {
-        let (kind, address) = {
+        let (kind, address, payload) = {
             let store = breakpoints.lock().unwrap();
             let entry = store.get(id).ok_or_else(|| DebuggerError::BreakpointIdNotFound(id.raw()))?;
             if entry.info.enabled {
                 return Ok(());
             }
-            (entry.info.kind, entry.info.address)
+            (entry.info.kind, entry.info.address, entry.payload.clone())
         };
 
         match kind {
@@ -587,7 +675,38 @@ impl BreakpointManager
                     }
                 }
             }
-            _ => return Err(DebuggerError::InvalidArgument("Watchpoints not supported".into())),
+            BreakpointKind::Watchpoint => {
+                if let BreakpointPayload::Watchpoint { length, access, .. } = payload {
+                    // Re-install on all threads
+                    let mut used_slot = None;
+                    for &thread in ops.thread_ports() {
+                        let slot = registers::set_watchpoint(thread, address, length, access)?;
+                        if let Some(s) = used_slot {
+                            if s != slot {
+                                tracing::warn!("Watchpoint slots inconsistent: {} vs {}", s, slot);
+                            }
+                        } else {
+                            used_slot = Some(slot);
+                        }
+                    }
+
+                    if let Some(new_slot) = used_slot {
+                        let mut store = breakpoints.lock().unwrap();
+                        if let Some(entry) = store.get_mut(id) {
+                            entry.payload = BreakpointPayload::Watchpoint {
+                                address,
+                                length,
+                                access,
+                                slot: new_slot,
+                            };
+                        }
+                    }
+                } else {
+                    return Err(DebuggerError::InvalidArgument(
+                        "Invalid payload for watchpoint breakpoint".to_string(),
+                    ));
+                }
+            }
         }
 
         let mut store = breakpoints.lock().unwrap();
@@ -662,7 +781,15 @@ impl BreakpointManager
                     }
                 }
             }
-            _ => {}
+            BreakpointKind::Watchpoint => {
+                if let BreakpointPayload::Watchpoint { slot, .. } = payload {
+                    for &thread in ops.thread_ports() {
+                        if let Err(e) = registers::clear_watchpoint(thread, slot) {
+                            tracing::warn!("Failed to clear data watchpoint: {}", e);
+                        }
+                    }
+                }
+            }
         }
 
         let mut store = breakpoints.lock().unwrap();

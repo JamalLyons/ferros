@@ -65,13 +65,13 @@ pub enum BreakpointRequest
     Software
     {
         /// The memory address where the breakpoint should be placed.
-        address: Address
+        address: Address,
     },
     /// Hardware execution breakpoint.
     Hardware
     {
         /// The memory address where the breakpoint should be placed.
-        address: Address
+        address: Address,
     },
     /// Watchpoint on a memory range.
     Watchpoint
@@ -153,7 +153,7 @@ pub enum BreakpointPayload
     Software
     {
         /// Original instruction bytes that were replaced by the trap instruction.
-        original_bytes: Vec<u8>
+        original_bytes: Vec<u8>,
     },
     /// Payload for hardware breakpoints.
     Hardware
@@ -161,15 +161,19 @@ pub enum BreakpointPayload
         /// The memory address configured in the debug register.
         address: Address,
         /// The debug register slot number used for this breakpoint.
-        slot: u32
+        slot: u32,
     },
     /// Payload for watchpoints.
     Watchpoint
     {
+        /// The starting memory address of the watched region.
+        address: Address,
         /// Length in bytes of the watched memory region.
         length: usize,
         /// Type of access that triggers this watchpoint.
-        access: WatchpointAccess
+        access: WatchpointAccess,
+        /// The debug register slot number used for this watchpoint (if applicable).
+        slot: u32,
     },
 }
 

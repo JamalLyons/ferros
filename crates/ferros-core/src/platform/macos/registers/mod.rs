@@ -34,6 +34,6 @@ pub mod debug;
 #[cfg(target_arch = "aarch64")]
 pub use arm64::{read_registers_arm64, write_registers_arm64};
 // Re-export debug register functions
-pub use debug::{clear_hardware_breakpoint, set_hardware_breakpoint};
+pub use debug::{clear_hardware_breakpoint, clear_watchpoint, set_hardware_breakpoint, set_watchpoint};
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{read_registers_x86_64, write_registers_x86_64};

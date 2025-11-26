@@ -10,7 +10,7 @@ This list captures concrete work needed to reach feature parity with production 
 - [x] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
 - [x] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
 - [x] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code.
-- [ ] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
+- [x] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
 - [x] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
 - [x] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
 - [x] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.

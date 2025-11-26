@@ -49,8 +49,11 @@ pub enum BreakpointKind
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WatchpointAccess
 {
+    /// Trigger on read access to the watched memory region.
     Read,
+    /// Trigger on write access to the watched memory region.
     Write,
+    /// Trigger on either read or write access to the watched memory region.
     ReadWrite,
 }
 
@@ -61,18 +64,23 @@ pub enum BreakpointRequest
     /// Software breakpoint at an address.
     Software
     {
+        /// The memory address where the breakpoint should be placed.
         address: Address
     },
     /// Hardware execution breakpoint.
     Hardware
     {
+        /// The memory address where the breakpoint should be placed.
         address: Address
     },
     /// Watchpoint on a memory range.
     Watchpoint
     {
+        /// The starting memory address of the watched region.
         address: Address,
+        /// The length in bytes of the memory region to watch.
         length: usize,
+        /// The type of memory access that should trigger the watchpoint.
         access: WatchpointAccess,
     },
 }
@@ -93,20 +101,32 @@ pub enum BreakpointState
 #[derive(Debug, Clone)]
 pub struct BreakpointInfo
 {
+    /// Unique identifier for this breakpoint.
     pub id: BreakpointId,
+    /// The memory address where the breakpoint is placed.
     pub address: Address,
+    /// The type of breakpoint (software, hardware, or watchpoint).
     pub kind: BreakpointKind,
+    /// Current lifecycle state of the breakpoint.
     pub state: BreakpointState,
+    /// Whether the breakpoint is currently enabled and will trigger.
     pub enabled: bool,
+    /// Number of times this breakpoint has been hit.
     pub hit_count: u64,
+    /// Timestamp when the breakpoint was first requested.
     pub requested_at: SystemTime,
+    /// Timestamp when the breakpoint was successfully installed, if resolved.
     pub resolved_at: Option<SystemTime>,
+    /// Access type for watchpoints (None for execution breakpoints).
     pub watch_access: Option<WatchpointAccess>,
+    /// Length in bytes for watchpoints (None for execution breakpoints).
     pub watch_length: Option<usize>,
 }
 
 impl BreakpointInfo
 {
+    /// Create a new breakpoint info with the given identifier, address, and kind.
+    /// The breakpoint starts in `Requested` state, disabled, with zero hit count.
     #[must_use]
     pub fn new(id: BreakpointId, address: Address, kind: BreakpointKind) -> Self
     {
@@ -129,17 +149,27 @@ impl BreakpointInfo
 #[derive(Debug, Clone)]
 pub enum BreakpointPayload
 {
+    /// Payload for software breakpoints.
     Software
     {
+        /// Original instruction bytes that were replaced by the trap instruction.
         original_bytes: Vec<u8>
     },
+    /// Payload for hardware breakpoints.
     Hardware
     {
-        address: Address, slot: u32
+        /// The memory address configured in the debug register.
+        address: Address,
+        /// The debug register slot number used for this breakpoint.
+        slot: u32
     },
+    /// Payload for watchpoints.
     Watchpoint
     {
-        length: usize, access: WatchpointAccess
+        /// Length in bytes of the watched memory region.
+        length: usize,
+        /// Type of access that triggers this watchpoint.
+        access: WatchpointAccess
     },
 }
 
@@ -147,7 +177,9 @@ pub enum BreakpointPayload
 #[derive(Debug, Clone)]
 pub struct BreakpointEntry
 {
+    /// Public information about the breakpoint.
     pub info: BreakpointInfo,
+    /// Internal payload used by the backend to restore state.
     pub payload: BreakpointPayload,
 }
 
@@ -165,6 +197,7 @@ pub struct BreakpointStore
 
 impl BreakpointStore
 {
+    /// Create a new empty breakpoint store.
     #[must_use]
     pub fn new() -> Self
     {

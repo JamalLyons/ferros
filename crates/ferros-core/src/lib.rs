@@ -27,6 +27,7 @@
 //! calls themselves must be `unsafe`.
 
 #![allow(unsafe_code)] // Required for low-level system APIs (Mach, ptrace, etc.)
+#![warn(missing_docs)]
 
 pub mod breakpoints;
 pub mod debugger;

@@ -194,19 +194,26 @@ pub fn init_logging_with_level(level: LogLevel, format: LogFormat) -> Result<(),
 /// The log file will be created in the user's home directory at `~/.ferros/YYYY-MM-DD-ferros-tui.log`
 /// or falls back to `/tmp/YYYY-MM-DD-ferros-tui.log` if home directory is not accessible.
 ///
+/// ## Arguments
+///
+/// * `level` - Optional log level. If `None`, uses `RUST_LOG` environment variable or defaults to `INFO`.
+///
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_utils::init_logging_for_tui;
+/// use ferros_utils::{LogLevel, init_logging_for_tui};
 ///
-/// init_logging_for_tui().expect("Failed to initialize logging for TUI");
-/// // Now all log messages go to file only, not interfering with TUI
+/// // Use default (INFO or RUST_LOG)
+/// init_logging_for_tui(None).expect("Failed to initialize logging for TUI");
+///
+/// // Or specify a level explicitly
+/// init_logging_for_tui(Some(LogLevel::Debug)).expect("Failed to initialize logging for TUI");
 /// ```
 ///
 /// ## Errors
 ///
 /// Returns an error if logging is already initialized or file creation fails.
-pub fn init_logging_for_tui() -> Result<PathBuf, LoggingError>
+pub fn init_logging_for_tui(level: Option<LogLevel>) -> Result<PathBuf, LoggingError>
 {
     // Determine log file path with date prefix
     let today = Utc::now().format("%Y-%m-%d");
@@ -219,7 +226,8 @@ pub fn init_logging_for_tui() -> Result<PathBuf, LoggingError>
         PathBuf::from("/tmp").join(format!("{today}-ferros-tui.log"))
     };
 
-    init_logging_file_only(log_file.clone(), LogFormat::Pretty, Level::INFO)?;
+    let explicit_level = level.map(Into::into);
+    init_logging_file_only(log_file.clone(), LogFormat::Pretty, explicit_level)?;
     Ok(log_file)
 }
 
@@ -319,11 +327,23 @@ fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), 
 /// Internal initialization function for file-only logging
 /// Used by TUI mode to prevent stdout interference
 #[allow(clippy::unnecessary_wraps)]
-fn init_logging_file_only(log_file: PathBuf, format: LogFormat, default_level: Level) -> Result<(), LoggingError>
+fn init_logging_file_only(log_file: PathBuf, format: LogFormat, explicit_level: Option<Level>) -> Result<(), LoggingError>
 {
     // Build environment filter
-    // RUST_LOG can override the default level with more specific filters
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level.to_string()));
+    // Priority:
+    // 1. If explicit_level is Some (from --log-level CLI flag), use it
+    // 2. If RUST_LOG is set, use it (allows module-specific filters like "ferros_core=debug")
+    // 3. Otherwise, use INFO as default
+    let env_filter = if let Some(level) = explicit_level {
+        // Explicit level from CLI takes precedence
+        EnvFilter::new(level.to_string())
+    } else if let Ok(rust_log) = env::var("RUST_LOG") {
+        // Use RUST_LOG (supports both simple levels and module-specific filters)
+        EnvFilter::try_new(&rust_log).unwrap_or_else(|_| EnvFilter::new(Level::INFO.to_string()))
+    } else {
+        // Default to INFO
+        EnvFilter::new(Level::INFO.to_string())
+    };
 
     match format {
         LogFormat::Pretty => {

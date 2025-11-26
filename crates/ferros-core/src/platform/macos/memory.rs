@@ -641,6 +641,19 @@ impl MemoryProtectionGuard
         let (aligned_addr, aligned_len) = aligned_range(addr, len);
         let original = region.protection as c_int;
 
+        // Check if the requested protection is allowed by the region's maximum protection
+        let requested_write = (protection & libc::VM_PROT_WRITE) != 0;
+        let max_allows_write = (region.max_protection & libc::VM_PROT_WRITE as u32) != 0;
+        
+        if requested_write && !max_allows_write {
+            return Err(DebuggerError::Io(Error::other(format!(
+                "Cannot make memory writable at 0x{:016x}: region maximum protection (0x{:x}) does not allow writes. \
+                 Maximum protection cannot be changed. Consider using hardware breakpoints instead.",
+                addr.value(),
+                region.max_protection
+            ))));
+        }
+
         change_protection(task, aligned_addr, aligned_len, protection)?;
 
         Ok(Self {
@@ -669,6 +682,7 @@ struct RegionInfo
     start: mach_vm_address_t,
     size: mach_vm_size_t,
     protection: u32,
+    max_protection: u32,
 }
 
 fn ensure_readable_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
@@ -754,6 +768,7 @@ fn region_for_address(task: mach_port_t, addr: Address) -> Result<Option<RegionI
                 start: target,
                 size,
                 protection: info.protection as u32,
+                max_protection: info.max_protection as u32,
             }));
         }
     }
@@ -824,17 +839,20 @@ fn region_name_from_heuristics(protection: c_int) -> Option<String>
 fn change_protection(task: mach_port_t, addr: mach_vm_address_t, len: mach_vm_size_t, protection: c_int) -> Result<()>
 {
     unsafe {
-        let result = mach_vm_protect(task as vm_map_t, addr, len, 1, protection);
-        if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(Error::other(format!(
-                "mach_vm_protect (set maximum) failed: {}",
-                result
-            ))));
-        }
-
+        // On macOS, we can only set current protection to what the maximum allows.
+        // We don't try to change maximum protection (set_maximum=1) because:
+        // 1. Maximum protection is set by the kernel and typically can't be changed
+        // 2. Code segments often have max_protection = READ|EXECUTE (no write)
+        // 3. If max doesn't allow writes, we can't make it writable
+        
+        // Just set current protection (set_maximum=0)
+        // This will fail if the requested protection exceeds the maximum, which is expected
         let result = mach_vm_protect(task as vm_map_t, addr, len, 0, protection);
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(Error::other(format!("mach_vm_protect failed: {}", result))));
+            return Err(DebuggerError::Io(Error::other(format!(
+                "mach_vm_protect failed: {} - requested protection may exceed region maximum",
+                result
+            ))));
         }
     }
 

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::fmt::Write;
 
 use ferros_core::events::{DebuggerEvent, format_stop_reason};
-use ferros_core::types::{Address, FrameId, StackFrame, StopReason, ThreadId};
+use ferros_core::types::{Address, FrameId, SourceLocation, StackFrame, StopReason, ThreadId};
 use ferros_core::{BreakpointId, BreakpointInfo, Debugger};
 use ratatui::widgets::TableState;
 
@@ -85,6 +85,8 @@ pub struct App
     pub breakpoints_state: TableState,
     /// Cached breakpoints list
     pub cached_breakpoints: Vec<BreakpointInfo>,
+    /// Cache of breakpoint addresses to source locations (for UI indicators)
+    pub breakpoint_locations: std::collections::HashMap<Address, Option<SourceLocation>>,
     /// Source code cache (file path -> lines)
     pub source_cache: std::collections::HashMap<String, Vec<String>>,
     /// Current source file being displayed
@@ -151,6 +153,8 @@ pub enum ViewMode
     Stack,
     /// Timeline/log panel
     Timeline,
+    /// Help view showing keyboard shortcuts and commands
+    Help,
 }
 
 /// Layout preset for different screen sizes
@@ -219,6 +223,7 @@ impl App
             stack_frames_state,
             breakpoints_state,
             cached_breakpoints: Vec::new(),
+            breakpoint_locations: std::collections::HashMap::new(),
             source_cache: std::collections::HashMap::new(),
             current_source_file: None,
             source_scroll: 0,
@@ -287,6 +292,15 @@ impl App
 
         self.error_message = None;
 
+        // Check for Ctrl+Q FIRST - this should always work to quit, regardless of mode
+        if matches!(key_event.code, KeyCode::Char('q' | 'Q'))
+            && key_event.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.error_message = Some("Quitting...".to_string());
+            self.should_quit = true;
+            return true;
+        }
+
         // Handle breakpoint editor input
         if self.breakpoint_editor.is_some() {
             return self.handle_breakpoint_editor_input(key_event);
@@ -299,14 +313,8 @@ impl App
 
         match key_event.code {
             KeyCode::Char('q' | 'Q') => {
-                if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.error_message = Some("Quitting...".to_string());
-                    self.should_quit = true;
-                    return true;
-                } else if !self.command_palette_active {
-                    // Only quit on 'q' if not in command palette
-                    self.error_message = Some("Press Ctrl+Q to quit".to_string());
-                }
+                // Regular 'q' without Ctrl - show help message
+                self.error_message = Some("Press Esc to quit".to_string());
             }
             KeyCode::Esc => {
                 if self.command_palette_active {
@@ -315,7 +323,10 @@ impl App
                 } else if self.breakpoint_editor.is_some() {
                     self.breakpoint_editor = None;
                 } else {
-                    self.error_message = Some("Press Ctrl+Q to quit".to_string());
+                    // Escape quits when not in any special mode
+                    self.error_message = Some("Quitting...".to_string());
+                    self.should_quit = true;
+                    return true;
                 }
             }
             KeyCode::Char('1') => {
@@ -343,6 +354,18 @@ impl App
             }
             KeyCode::Char('8') => {
                 self.view_mode = ViewMode::Timeline;
+            }
+            KeyCode::Char('9') => {
+                self.view_mode = ViewMode::Help;
+            }
+            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => {
+                // Toggle help view
+                if self.view_mode == ViewMode::Help {
+                    // Return to previous view (default to Overview)
+                    self.view_mode = ViewMode::Overview;
+                } else {
+                    self.view_mode = ViewMode::Help;
+                }
             }
             KeyCode::Char(':') => {
                 // Open command palette
@@ -461,8 +484,9 @@ impl App
             ViewMode::Stack => {
                 self.navigate_stack_up();
             }
-            ViewMode::Timeline | ViewMode::Overview => {
+            ViewMode::Timeline | ViewMode::Overview | ViewMode::Help => {
                 // Timeline auto-scrolls to bottom, no manual navigation needed
+                // Help view doesn't support navigation
             }
         }
     }
@@ -513,8 +537,9 @@ impl App
             ViewMode::Stack => {
                 self.navigate_stack_down();
             }
-            ViewMode::Timeline | ViewMode::Overview => {
+            ViewMode::Timeline | ViewMode::Overview | ViewMode::Help => {
                 // Timeline auto-scrolls to bottom, no manual navigation needed
+                // Help view doesn't support navigation
             }
         }
     }
@@ -546,8 +571,9 @@ impl App
             // Refresh breakpoints periodically
             self.refresh_breakpoints();
 
-            // Refresh stack trace if stopped and in stack view
-            if self.target_is_stopped && self.view_mode == ViewMode::Stack {
+            // Refresh stack trace if stopped (always, not just in stack view)
+            // This ensures symbols are loaded even if user isn't viewing stack
+            if self.target_is_stopped {
                 self.refresh_stack_trace();
             }
         }
@@ -664,6 +690,22 @@ impl App
     pub fn refresh_breakpoints(&mut self)
     {
         self.cached_breakpoints = self.debugger.breakpoints();
+        
+        // Resolve breakpoint addresses to source locations for UI indicators
+        // This allows us to show breakpoint markers in the source view
+        // We use the stack trace frames which already have symbolication
+        self.breakpoint_locations.clear();
+        if let Some(ref frames) = self.cached_stack_trace {
+            for bp in &self.cached_breakpoints {
+                if bp.enabled && bp.state == ferros_core::BreakpointState::Resolved {
+                    // Try to find a frame with matching PC to get source location
+                    let location = frames.iter()
+                        .find(|frame| frame.pc == bp.address)
+                        .and_then(|frame| frame.location.clone());
+                    self.breakpoint_locations.insert(bp.address, location);
+                }
+            }
+        }
     }
 
     /// Refresh the source view based on current frame
@@ -989,16 +1031,13 @@ impl App
                     }
                 }
             }
-            "continue" | "c" => {
-                if self.debugger.is_attached()
-                    && let Err(e) = self.debugger.resume()
-                {
-                    self.error_message = Some(format!("Failed to resume: {e}"));
+            "help" | "h" => {
+                // Toggle help view
+                if self.view_mode == ViewMode::Help {
+                    self.view_mode = ViewMode::Overview;
+                } else {
+                    self.view_mode = ViewMode::Help;
                 }
-            }
-            "step" | "s" => {
-                // Step command (placeholder - would need step implementation)
-                self.error_message = Some("Step command not yet implemented".to_string());
             }
             "frame" | "f" => {
                 if parts.len() > 1
@@ -1022,10 +1061,6 @@ impl App
                         self.refresh_stack_trace();
                     }
                 }
-            }
-            "help" | "h" => {
-                self.error_message =
-                    Some("Commands: break, delete, enable, disable, continue, step, frame, thread".to_string());
             }
             _ => {
                 self.error_message = Some(format!("Unknown command: {cmd}. Type 'help' for commands."));

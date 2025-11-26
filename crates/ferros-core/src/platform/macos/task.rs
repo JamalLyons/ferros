@@ -153,6 +153,11 @@ impl breakpoints::BreakpointOperations for MacOSDebugger
         }
         Ok(())
     }
+
+    fn task_port(&self) -> mach_port_t
+    {
+        self.task
+    }
 }
 
 impl threads::ThreadOperations for MacOSDebugger
@@ -813,23 +818,133 @@ impl Debugger for MacOSDebugger
 
         // Load images into symbol cache if not already loaded
         let regions = get_memory_regions(self.task)?;
-        
+
         // First, try to load the main executable explicitly
-        // Find the region containing the PC (which should be in the main executable)
+        // We need to find the __TEXT segment's load address, not just any region
         let exec_path = Self::get_executable_path(self.pid);
         if let Some(exec_path) = &exec_path {
+            use tracing::info;
+            info!("Attempting to load executable: {}", exec_path.display());
+
+            // First, parse the binary to get the __TEXT segment's expected virtual address
+            let text_vmaddr = Self::get_text_segment_vmaddr(exec_path);
+
             let pc_addr = regs.pc.value();
-            // Find the region containing the PC
-            if let Some(pc_region) = regions.iter().find(|r| {
-                r.start.value() <= pc_addr && pc_addr < r.end.value()
-            }) {
-                // Try loading the executable at this region's start address
+            info!("PC address: 0x{:x}", pc_addr);
+
+            if let Some(vmaddr) = text_vmaddr {
+                info!("Executable __TEXT segment vmaddr: 0x{:x}", vmaddr);
+            }
+
+            // Find the region containing the PC (this should be the __TEXT segment)
+            if let Some(pc_region) = regions.iter().find(|r| r.start.value() <= pc_addr && pc_addr < r.end.value()) {
+                info!(
+                    "PC region: 0x{:x} - 0x{:x}, perms: {}",
+                    pc_region.start.value(),
+                    pc_region.end.value(),
+                    pc_region.permissions
+                );
+
+                // Calculate the load address
+                // The BinaryImage expects load_address to be where __TEXT is loaded
+                // If we know the __TEXT vmaddr, we can calculate the slide
+                let load_address = if let Some(vmaddr) = text_vmaddr {
+                    // The slide is: runtime_load_address - file_vmaddr
+                    // We need to find where __TEXT is actually loaded
+                    // The PC region should contain the __TEXT segment
+                    // Calculate slide: if PC is at runtime_addr, and file expects vmaddr,
+                    // then the segment starts at: runtime_addr - (pc_offset_in_segment)
+                    // But we don't know the offset, so we'll try the region start
+                    // and let BinaryImage calculate the slide
+                    let calculated_load = pc_region.start.value();
+                    let slide = calculated_load as i64 - vmaddr as i64;
+                    info!(
+                        "Calculated load address: 0x{:x}, slide: 0x{:x} (from vmaddr 0x{:x})",
+                        calculated_load, slide, vmaddr
+                    );
+                    calculated_load
+                } else {
+                    // Fall back to PC region start
+                    info!("No vmaddr found, using PC region start: 0x{:x}", pc_region.start.value());
+                    pc_region.start.value()
+                };
+
                 let desc = ImageDescriptor {
                     path: exec_path.clone(),
-                    load_address: pc_region.start.value(),
+                    load_address,
                 };
-                let _ = self.symbol_cache.load_image(desc);
+                match self.symbol_cache.load_image(desc) {
+                    Ok(_) => {
+                        info!(
+                            "Successfully loaded executable: {} at address 0x{:x}",
+                            exec_path.display(),
+                            load_address
+                        );
+                    }
+                    Err(e) => {
+                        use tracing::warn;
+                        warn!(
+                            "Failed to load executable {} at 0x{:x}: {}",
+                            exec_path.display(),
+                            load_address,
+                            e
+                        );
+                        // Try loading at different addresses - maybe the PC region isn't the right one
+                        // Try all executable regions
+                        for region in &regions {
+                            if region.permissions.contains('x') && region.permissions.contains('r') {
+                                let desc = ImageDescriptor {
+                                    path: exec_path.clone(),
+                                    load_address: region.start.value(),
+                                };
+                                match self.symbol_cache.load_image(desc) {
+                                    Ok(_) => {
+                                        info!(
+                                            "Successfully loaded executable: {} at alternative address 0x{:x}",
+                                            exec_path.display(),
+                                            region.start.value()
+                                        );
+                                        break;
+                                    }
+                                    Err(e2) => {
+                                        use tracing::debug;
+                                        debug!("Failed to load at 0x{:x}: {}", region.start.value(), e2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                use tracing::warn;
+                warn!("Could not find memory region containing PC 0x{:x}", pc_addr);
+                // Try to load executable at any executable region
+                for region in &regions {
+                    if region.permissions.contains('x') && region.permissions.contains('r') {
+                        let desc = ImageDescriptor {
+                            path: exec_path.clone(),
+                            load_address: region.start.value(),
+                        };
+                        match self.symbol_cache.load_image(desc) {
+                            Ok(_) => {
+                                use tracing::info;
+                                info!(
+                                    "Successfully loaded executable: {} at address 0x{:x} (fallback)",
+                                    exec_path.display(),
+                                    region.start.value()
+                                );
+                                break;
+                            }
+                            Err(_) => {
+                                // Continue trying
+                            }
+                        }
+                    }
+                }
             }
+        } else {
+            use tracing::warn;
+            warn!("Could not get executable path for PID {}", self.pid.0);
         }
 
         // Load all other images (shared libraries and named regions)
@@ -1565,7 +1680,7 @@ impl MacOSDebugger
 
         // Ensure images are loaded (same logic as stack_trace)
         let regions = get_memory_regions(self.task)?;
-        
+
         // Load the main executable if we can find it
         let exec_path = Self::get_executable_path(self.pid);
         if let Some(exec_path) = &exec_path {
@@ -1614,5 +1729,34 @@ impl MacOSDebugger
             Ok(path) => Some(std::path::PathBuf::from(path)),
             Err(_) => None,
         }
+    }
+
+    /// Get the __TEXT segment's virtual address from a binary file
+    fn get_text_segment_vmaddr(path: &std::path::Path) -> Option<u64>
+    {
+        use std::fs;
+
+        use object::{Object, ObjectSegment};
+
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+
+        let file = match object::File::parse(&*bytes) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+
+        // Find the __TEXT segment
+        for segment in file.segments() {
+            if let Ok(Some(name)) = segment.name() {
+                if name == "__TEXT" || name == ".text" {
+                    return Some(segment.address());
+                }
+            }
+        }
+
+        None
     }
 }

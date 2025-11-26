@@ -1,4 +1,4 @@
-use std::process;
+use std::{env, process};
 
 use clap::{Parser, Subcommand};
 use ferros_core::debugger::create_debugger;
@@ -45,6 +45,8 @@ enum Commands
         /// Path to the executable to launch
         program: String,
         /// Arguments to pass to the program
+        /// Note: To set Ferros log level, use --log-level before the 'launch' subcommand:
+        ///   ferros --log-level debug launch <program>
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
         /// Use headless mode (no TUI, just print info and exit)
@@ -91,11 +93,27 @@ fn main()
     // Initialize logging with CLI flags or environment variables
     let _log_file_path = if is_tui_mode {
         // For TUI mode, use file-only logging to prevent stdout interference
-        match init_logging_for_tui() {
+        // If --log-level is provided, validate it
+        if let Some(level_str) = &cli.log_level {
+            if level_str.parse::<LogLevel>().is_err() {
+                eprintln!("Invalid log level: {}. Use: error, warn, info, debug, or trace", level_str);
+                process::exit(1);
+            }
+        }
+        // Parse log level from CLI if provided, otherwise use None (will use RUST_LOG or default to INFO)
+        let log_level = cli.log_level.as_ref().and_then(|s| s.parse::<LogLevel>().ok());
+        match init_logging_for_tui(log_level) {
             Ok(path) => {
                 // Log once to indicate where logs are being written
                 // Note: This will go to the log file since we're in TUI mode
                 info!("Logs are being written to: {}", path.display());
+                if let Some(level) = log_level {
+                    info!("Log level set to: {:?} (from --log-level flag)", level);
+                } else if env::var("RUST_LOG").is_ok() {
+                    info!("Log level from RUST_LOG environment variable");
+                } else {
+                    info!("Log level: INFO (default)");
+                }
                 Some(path)
             }
             Err(e) => {
@@ -180,6 +198,14 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
             Ok(())
         }
         Commands::Launch { program, args, headless } => {
+            // Check if --log-level was accidentally passed as a program argument
+            if args.iter().any(|arg| arg == "--log-level" || arg.starts_with("--log-level=")) {
+                eprintln!("Warning: --log-level flag detected in program arguments.");
+                eprintln!("  The --log-level flag must come BEFORE the 'launch' subcommand.");
+                eprintln!("  Correct usage: ferros --log-level debug launch <program>");
+                eprintln!("  Your command: ferros launch <program> --log-level debug (incorrect)");
+            }
+
             info!("Launching program: {} with args: {:?}", program, args);
             if !headless {
                 info!("Note: For best debugging experience, ensure your program was built with debug symbols");

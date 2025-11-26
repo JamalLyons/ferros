@@ -508,8 +508,8 @@ pub fn draw_source_view(frame: &mut Frame, area: Rect, app: &mut App)
 /// Draw source code with breakpoint gutter
 fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
 {
-    // Get current PC to highlight
-    let current_pc = if app.debugger.is_attached() && app.target_is_stopped {
+    // Get current PC to highlight (may be used for future features)
+    let _current_pc = if app.debugger.is_attached() && app.target_is_stopped {
         app.debugger.read_registers().ok().map(|r| r.pc)
     } else {
         None
@@ -544,14 +544,11 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
                 let line_num = i + 1;
                 let line_num_str = format!("{line_num:4} ");
 
-                // Check for breakpoint at this address (simplified - would need symbol resolution)
-                // For now, we'll show breakpoints based on the current PC if it matches
-                let has_breakpoint = current_pc.is_some_and(|_pc| {
-                    // Check if any breakpoint is near this line (simplified check)
-                    app.cached_breakpoints.iter().any(|bp| {
-                        // This is a simplified check - in reality we'd need to resolve
-                        // line numbers to addresses via DWARF
-                        bp.enabled && bp.state == ferros_core::BreakpointState::Resolved
+                // Check for breakpoint at this line by matching source location
+                let line_u32 = u32::try_from(line_num).unwrap_or(u32::MAX);
+                let has_breakpoint = app.breakpoint_locations.iter().any(|(_addr, location_opt)| {
+                    location_opt.as_ref().is_some_and(|location| {
+                        location.file == *file && location.line == Some(line_u32)
                     })
                 });
 
@@ -868,4 +865,104 @@ pub fn draw_timeline(frame: &mut Frame, area: Rect, app: &App)
         .wrap(ratatui::widgets::Wrap { trim: true });
 
     frame.render_widget(timeline, area);
+}
+
+/// Draw the help page
+pub fn draw_help(frame: &mut Frame, area: Rect, _app: &App)
+{
+    let mut lines = Vec::new();
+
+    // Title
+    lines.push(Line::from(vec![
+        Span::styled("Ferros Debugger - Help", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(""));
+
+    // Navigation Section
+    lines.push(Line::from(vec![
+        Span::styled("VIEW NAVIGATION (Number Keys)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  Press number keys to switch between views:"));
+    lines.push(Line::from("  1 - Overview: Debugger status and process information"));
+    lines.push(Line::from("  2 - Registers: CPU registers (PC, SP, FP, general registers)"));
+    lines.push(Line::from("  3 - Threads: All threads in the process"));
+    lines.push(Line::from("  4 - Memory Regions: Memory map of the process"));
+    lines.push(Line::from("  5 - Output: Process stdout/stderr"));
+    lines.push(Line::from("  6 - Source: Source code view with breakpoints"));
+    lines.push(Line::from("  7 - Stack: Call stack and frame details"));
+    lines.push(Line::from("  8 - Timeline: Event log of debugger operations"));
+    lines.push(Line::from("  9 - Help: This help page"));
+    lines.push(Line::from(""));
+
+    // Navigation within views
+    lines.push(Line::from(vec![
+        Span::styled("WITHIN-VIEW NAVIGATION", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  ↑/↓ - Navigate up/down in current view (registers, threads, stack, etc.)"));
+    lines.push(Line::from("  n - Next frame (in stack view)"));
+    lines.push(Line::from("  p - Previous frame (in stack view)"));
+    lines.push(Line::from(""));
+
+    // Program Control
+    lines.push(Line::from(vec![
+        Span::styled("PROGRAM CONTROL", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  s - Suspend: Stop the process execution"));
+    lines.push(Line::from("  r - Resume: Continue execution from current position"));
+    lines.push(Line::from("  Note: Process must be stopped to inspect registers, stack, or source"));
+    lines.push(Line::from(""));
+
+    // Breakpoints
+    lines.push(Line::from(vec![
+        Span::styled("BREAKPOINTS", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  b - Toggle breakpoint at current PC (when stopped)"));
+    lines.push(Line::from("  B - Open breakpoint editor to add breakpoints manually"));
+    lines.push(Line::from(""));
+
+    // Command Palette
+    lines.push(Line::from(vec![
+        Span::styled("COMMAND PALETTE (:)", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  Press ':' to open the command palette"));
+    lines.push(Line::from("  Commands for breakpoint management:"));
+    lines.push(Line::from("    break <address>  or  b <address>  - Add breakpoint at address (hex: 0x1000)"));
+    lines.push(Line::from("    delete <id>      or  d <id>       - Remove breakpoint by ID"));
+    lines.push(Line::from("    enable <id>      or  e <id>       - Enable a disabled breakpoint"));
+    lines.push(Line::from("    disable <id>                        - Disable a breakpoint"));
+    lines.push(Line::from("  Commands for navigation:"));
+    lines.push(Line::from("    frame <index>    or  f <index>    - Jump to specific stack frame"));
+    lines.push(Line::from("    thread <id>      or  t <id>       - Switch active thread"));
+    lines.push(Line::from("  Other commands:"));
+    lines.push(Line::from("    help             or  h            - Show this help"));
+    lines.push(Line::from("  Use ↑/↓ in command palette to navigate command history"));
+    lines.push(Line::from(""));
+
+    // Other Shortcuts
+    lines.push(Line::from(vec![
+        Span::styled("OTHER SHORTCUTS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  ? or h - Toggle help page"));
+    lines.push(Line::from("  l - Cycle layout presets (Compact/Standard/Widescreen)"));
+    lines.push(Line::from("  Esc - Quit debugger (or close command palette/breakpoint editor)"));
+    lines.push(Line::from("  Ctrl+Q - Force quit"));
+    lines.push(Line::from(""));
+
+    // Tips
+    lines.push(Line::from(vec![
+        Span::styled("TIPS", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  • Use number keys (1-9) for quick view switching"));
+    lines.push(Line::from("  • Suspend the process (s) before inspecting state"));
+    lines.push(Line::from("  • In Stack view, select a frame to load its source code"));
+    lines.push(Line::from("  • Breakpoints are shown with ● in the source view"));
+    lines.push(Line::from("  • Timeline view shows chronological log of all events"));
+    lines.push(Line::from("  • For best debugging, build programs with debug symbols"));
+
+    let help_widget = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .style(Style::default().fg(Color::White))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    frame.render_widget(help_widget, area);
 }

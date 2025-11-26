@@ -284,9 +284,39 @@ impl BinaryImage
         let slide = desc.load_address as i64 - text_vmaddr as i64;
 
         let mut sections = HashMap::new();
+        let mut debug_info_size = 0;
+        let mut debug_line_size = 0;
         for (canonical, aliases) in DWARF_SECTIONS {
             let data = load_section_bytes(&file, aliases)?;
+            if *canonical == ".debug_info" {
+                debug_info_size = data.len();
+            }
+            if *canonical == ".debug_line" {
+                debug_line_size = data.len();
+            }
+            if !data.is_empty() {
+                use tracing::debug;
+                debug!("Loaded DWARF section {} ({} bytes)", canonical, data.len());
+            }
             sections.insert(*canonical, data);
+        }
+        
+        if debug_info_size == 0 || debug_line_size == 0 {
+            use tracing::warn;
+            warn!(
+                "Binary {} missing critical DWARF sections: .debug_info={} bytes, .debug_line={} bytes. Build with debug symbols!",
+                desc.path.display(),
+                debug_info_size,
+                debug_line_size
+            );
+        } else {
+            use tracing::info;
+            info!(
+                "Binary {} has DWARF debug information (.debug_info: {} bytes, .debug_line: {} bytes)",
+                desc.path.display(),
+                debug_info_size,
+                debug_line_size
+            );
         }
 
         let eh_frame = load_section_blob(&file, &[".eh_frame", "__eh_frame"])?;
@@ -606,14 +636,34 @@ impl BinaryImage
     /// ```
     pub fn symbolicate(&self, address: Address) -> Option<Symbolication>
     {
-        let file_addr = self.file_address(address)?;
-        let ctx = self.symbol_context().ok()?;
+        let file_addr = match self.file_address(address) {
+            Some(addr) => addr,
+            None => {
+                use tracing::debug;
+                debug!("Address 0x{:x} not in image {}", address.value(), self.path.display());
+                return None;
+            }
+        };
+        
+        let ctx = match self.symbol_context() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                use tracing::debug;
+                debug!("Failed to get symbol context for {}: {}", self.path.display(), e);
+                return None;
+            }
+        };
+        
         let mut frames = Vec::new();
 
         let lookup = ctx.find_frames(file_addr);
         let mut frame_iter = match lookup.skip_all_loads() {
             Ok(iter) => iter,
-            Err(_) => return None,
+            Err(e) => {
+                use tracing::debug;
+                debug!("Failed to find frames for 0x{:x} in {}: {:?}", file_addr, self.path.display(), e);
+                return None;
+            }
         };
 
         while let Ok(Some(frame)) = frame_iter.next() {
@@ -632,10 +682,15 @@ impl BinaryImage
 
             if let Some(symbol) = symbol_name {
                 frames.push(SymbolFrame { symbol, location });
+            } else {
+                use tracing::debug;
+                debug!("Frame at 0x{:x} has no symbol name", file_addr);
             }
         }
 
         if frames.is_empty() {
+            use tracing::debug;
+            debug!("No frames found for address 0x{:x} in {}", file_addr, self.path.display());
             return None;
         }
 

@@ -137,6 +137,10 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 
         while depth < max_frames as u32 && cursor.pc != Address::ZERO {
             let symbolication = self.symbols.symbolicate(cursor.pc);
+            if symbolication.is_none() {
+                use tracing::debug;
+                debug!("No symbolication for address 0x{:x}", cursor.pc.value());
+            }
             append_logical_frames(&mut frames, thread, depth, &cursor, &symbolication, status, return_address);
 
             if frames.len() >= max_frames {

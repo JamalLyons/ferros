@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use libc::thread_act_t;
+use libc::{mach_port_t, thread_act_t};
 
 use crate::breakpoints::{
     BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
@@ -96,6 +96,16 @@ pub(crate) trait BreakpointOperations
     ///
     /// - `DebuggerError::AttachFailed`: Debugger is not attached to a process
     fn ensure_attached(&self) -> Result<()>;
+
+    /// Get the Mach task port for the target process.
+    ///
+    /// This is needed for operations that require direct access to the Mach task,
+    /// such as changing memory protection for breakpoint installation.
+    ///
+    /// ## Returns
+    ///
+    /// The Mach task port (`mach_port_t`) for the target process.
+    fn task_port(&self) -> mach_port_t;
 }
 
 /// Breakpoint management functions for macOS debugger.
@@ -222,7 +232,35 @@ impl BreakpointManager
             )));
         }
 
-        let written = ops.write_memory(address, &trap)?;
+        // Try to write directly first - vm_write() may work on read-only segments
+        // with debugger permissions, even without changing protection
+        let write_result = ops.write_memory(address, &trap);
+
+        let written = match write_result {
+            Ok(written) => written,
+            Err(_) => {
+                // If direct write fails, try making memory writable first
+                // The guard will automatically restore protection when dropped
+                use crate::platform::macos::memory::MemoryProtectionGuard;
+                let guard_result = MemoryProtectionGuard::make_writable(ops.task_port(), address, trap.len());
+
+                let _guard = match guard_result {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        // If we can't make it writable, suggest using hardware breakpoints
+                        return Err(DebuggerError::InvalidArgument(format!(
+                            "Cannot install software breakpoint at 0x{:016x}: region does not allow writes. Try using a \
+                             hardware breakpoint instead. Error: {}",
+                            address.value(),
+                            e
+                        )));
+                    }
+                };
+
+                // Try writing again after changing protection
+                ops.write_memory(address, &trap)?
+            }
+        };
         if written != trap.len() {
             return Err(DebuggerError::InvalidArgument(format!(
                 "Failed to write breakpoint trap at 0x{:016x}",

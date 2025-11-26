@@ -51,7 +51,7 @@ While existing Rust debugging solutions are either platform-limited or retrofitt
 
 Ferros is currently in **active development** with core infrastructure in place.
 
-📖 **See [ROADMAP.md](./ROADMAP.md) for detailed development milestones and progress tracking.**
+**See [ROADMAP.md](./ROADMAP.md) for detailed development milestones and progress tracking.**
 
 ---
 
@@ -113,19 +113,13 @@ cargo ferros launch <program> [args...]
 
 We welcome contributions! Ferros is built with ❤️ by the Rust community.
 
-📖 **Getting Started:** Check out [CONTRIBUTING.md](./CONTRIBUTING.md) for:
-- Development setup instructions
-- Code style guidelines
-- Testing requirements
-- How to submit pull requests
-
-**Looking for your first contribution?** Check out issues labeled [`good first issue`](https://github.com/jamallyons/ferros/labels/good%20first%20issue)!
+Check out [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ---
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](./LICENSE).
+Licensed under the [Apache License](./LICENSE).
 
 ---
 

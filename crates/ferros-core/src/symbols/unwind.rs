@@ -137,9 +137,17 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 
         while depth < max_frames as u32 && cursor.pc != Address::ZERO {
             let symbolication = self.symbols.symbolicate(cursor.pc);
+            // Only log if we have an image for this address but still can't symbolicate it
+            // (this indicates a real problem, not just a missing system library)
             if symbolication.is_none() {
-                use tracing::debug;
-                debug!("No symbolication for address 0x{:x}", cursor.pc.value());
+                if self.symbols.image_for_address(cursor.pc).is_some() {
+                    use tracing::debug;
+                    debug!(
+                        "No symbolication for address 0x{:x} (image loaded but symbolication failed)",
+                        cursor.pc.value()
+                    );
+                }
+                // Otherwise, it's expected - address is in a system library we haven't loaded
             }
             append_logical_frames(&mut frames, thread, depth, &cursor, &symbolication, status, return_address);
 

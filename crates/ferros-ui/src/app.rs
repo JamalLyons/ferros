@@ -55,6 +55,10 @@ pub struct App
     pub selected_thread_index: usize,
     /// Error message to display (if any)
     pub error_message: Option<String>,
+    /// Success/info message to display (if any) - cleared after a short time
+    pub info_message: Option<String>,
+    /// Timestamp when info message was set (for auto-clearing)
+    pub info_message_time: Option<std::time::Instant>,
     /// Process output buffer (for displaying in TUI)
     pub process_output: VecDeque<ProcessOutputLine>,
     /// Number of lines scrolled back from the end of the output buffer
@@ -208,6 +212,8 @@ impl App
             memory_regions_state,
             selected_thread_index: 0,
             error_message: None,
+            info_message: None,
+            info_message_time: None,
             process_output: VecDeque::new(),
             output_scrollback: 0,
             last_thread_refresh: std::time::Instant::now(),
@@ -293,9 +299,7 @@ impl App
         self.error_message = None;
 
         // Check for Ctrl+Q FIRST - this should always work to quit, regardless of mode
-        if matches!(key_event.code, KeyCode::Char('q' | 'Q'))
-            && key_event.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key_event.code, KeyCode::Char('q' | 'Q')) && key_event.modifiers.contains(KeyModifiers::CONTROL) {
             self.error_message = Some("Quitting...".to_string());
             self.should_quit = true;
             return true;
@@ -390,18 +394,22 @@ impl App
                 if self.debugger.is_attached() {
                     if let Err(e) = self.debugger.suspend() {
                         self.error_message = Some(format!("Failed to suspend: {e}"));
+                        self.info_message = None;
                     }
                 } else {
                     self.error_message = Some("Not attached to a process".to_string());
+                    self.info_message = None;
                 }
             }
             KeyCode::Char('r') => {
                 if self.debugger.is_attached() {
                     if let Err(e) = self.debugger.resume() {
                         self.error_message = Some(format!("Failed to resume: {e}"));
+                        self.info_message = None;
                     }
                 } else {
                     self.error_message = Some("Not attached to a process".to_string());
+                    self.info_message = None;
                 }
             }
             KeyCode::Char('n') => {
@@ -577,6 +585,14 @@ impl App
                 self.refresh_stack_trace();
             }
         }
+
+        // Auto-clear info messages after 3 seconds
+        if let Some(time) = self.info_message_time {
+            if time.elapsed().as_secs() >= 3 {
+                self.info_message = None;
+                self.info_message_time = None;
+            }
+        }
     }
 
     /// Consume an asynchronous debugger event from the core backend.
@@ -690,7 +706,7 @@ impl App
     pub fn refresh_breakpoints(&mut self)
     {
         self.cached_breakpoints = self.debugger.breakpoints();
-        
+
         // Resolve breakpoint addresses to source locations for UI indicators
         // This allows us to show breakpoint markers in the source view
         // We use the stack trace frames which already have symbolication
@@ -699,7 +715,8 @@ impl App
             for bp in &self.cached_breakpoints {
                 if bp.enabled && bp.state == ferros_core::BreakpointState::Resolved {
                     // Try to find a frame with matching PC to get source location
-                    let location = frames.iter()
+                    let location = frames
+                        .iter()
                         .find(|frame| frame.pc == bp.address)
                         .and_then(|frame| frame.location.clone());
                     self.breakpoint_locations.insert(bp.address, location);
@@ -768,12 +785,21 @@ impl App
     fn toggle_breakpoint_at_address(&mut self, address: Address)
     {
         // Check if breakpoint already exists
-        if let Some(bp) = self.cached_breakpoints.iter().find(|bp| bp.address == address) {
+        let existing_bp = self.cached_breakpoints.iter().find(|bp| bp.address == address).cloned();
+
+        if let Some(bp) = existing_bp {
             // Toggle existing breakpoint
+            let was_enabled = bp.enabled;
             if let Err(e) = self.debugger.toggle_breakpoint(bp.id) {
                 self.error_message = Some(format!("Failed to toggle breakpoint: {e}"));
+                self.info_message = None;
             } else {
                 self.refresh_breakpoints();
+                let action = if was_enabled { "Disabled" } else { "Enabled" };
+                let message = format!("{} breakpoint #{} at {}", action, bp.id.raw(), address);
+                self.info_message = Some(message.clone());
+                self.info_message_time = Some(std::time::Instant::now());
+                self.error_message = None;
                 self.add_timeline_entry(TimelineEntryKind::BreakpointHit, format!("Toggled breakpoint at {address}"));
             }
         } else {
@@ -783,9 +809,24 @@ impl App
                 .add_breakpoint(ferros_core::BreakpointRequest::Software { address })
             {
                 self.error_message = Some(format!("Failed to add breakpoint: {e}"));
+                self.info_message = None;
             } else {
                 self.refresh_breakpoints();
-                self.add_timeline_entry(TimelineEntryKind::BreakpointHit, format!("Added breakpoint at {address}"));
+                // Find the newly created breakpoint to show its type and ID
+                let new_bp = self.cached_breakpoints.iter().find(|bp| bp.address == address).cloned();
+
+                if let Some(bp) = new_bp {
+                    let kind_str = match bp.kind {
+                        ferros_core::BreakpointKind::Software => "software",
+                        ferros_core::BreakpointKind::Hardware => "hardware",
+                        ferros_core::BreakpointKind::Watchpoint => "watchpoint",
+                    };
+                    let message = format!("Added {} breakpoint #{} at {}", kind_str, bp.id.raw(), address);
+                    self.info_message = Some(message.clone());
+                    self.info_message_time = Some(std::time::Instant::now());
+                    self.error_message = None;
+                    self.add_timeline_entry(TimelineEntryKind::BreakpointHit, message);
+                }
             }
         }
     }

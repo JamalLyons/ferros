@@ -12,9 +12,9 @@ use crate::app::{App, ViewMode};
 pub fn draw(frame: &mut Frame, app: &mut App)
 {
     // Use boxed slice to avoid large stack array warning
-    // Make footer taller if there's an error message to display
-    let footer_height = if app.error_message.is_some() {
-        5 // Extra space for wrapped error messages
+    // Make footer taller if there's an error or info message to display
+    let footer_height = if app.error_message.is_some() || app.info_message.is_some() {
+        5 // Extra space for wrapped messages
     } else {
         3
     };
@@ -100,7 +100,43 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App)
 
     let mut footer_lines = vec![Line::from(help_text)];
 
-    if let Some(ref error) = app.error_message {
+    // Show info message (success) in green, or error message in red
+    if let Some(ref info) = app.info_message {
+        // Split long info messages into multiple lines to avoid truncation
+        let max_width = area.width.saturating_sub(4); // Account for borders
+        let info_text = format!("✓ {}", info);
+        
+        // Break info into chunks that fit the width
+        let mut info_lines = Vec::new();
+        let mut current_line = String::new();
+        
+        for word in info_text.split_whitespace() {
+            let test_line = if current_line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{} {}", current_line, word)
+            };
+            
+            if test_line.len() as u16 <= max_width {
+                current_line = test_line;
+            } else {
+                if !current_line.is_empty() {
+                    info_lines.push(Line::from(vec![
+                        Span::styled(current_line, Style::default().fg(Color::Green))
+                    ]));
+                }
+                current_line = word.to_string();
+            }
+        }
+        
+        if !current_line.is_empty() {
+            info_lines.push(Line::from(vec![
+                Span::styled(current_line, Style::default().fg(Color::Green))
+            ]));
+        }
+        
+        footer_lines.extend(info_lines);
+    } else if let Some(ref error) = app.error_message {
         // Split long error messages into multiple lines to avoid truncation
         let max_width = area.width.saturating_sub(4); // Account for borders
         let error_text = format!("Error: {error}");

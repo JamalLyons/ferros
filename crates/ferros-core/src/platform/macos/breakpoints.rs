@@ -244,21 +244,28 @@ impl BreakpointManager
                 use crate::platform::macos::memory::MemoryProtectionGuard;
                 let guard_result = MemoryProtectionGuard::make_writable(ops.task_port(), address, trap.len());
 
-                let _guard = match guard_result {
-                    Ok(guard) => Some(guard),
-                    Err(e) => {
-                        // If we can't make it writable, suggest using hardware breakpoints
-                        return Err(DebuggerError::InvalidArgument(format!(
-                            "Cannot install software breakpoint at 0x{:016x}: region does not allow writes. Try using a \
-                             hardware breakpoint instead. Error: {}",
-                            address.value(),
-                            e
-                        )));
+                match guard_result {
+                    Ok(guard) => {
+                        // Try writing again after changing protection
+                        match ops.write_memory(address, &trap) {
+                            Ok(written) => {
+                                // Success! Keep guard alive until end of function
+                                let _guard = guard;
+                                written
+                            }
+                            Err(_) => {
+                                // Protection change succeeded but write still failed
+                                // Guard will be dropped here, then fall back to hardware breakpoint
+                                drop(guard);
+                                return Self::try_hardware_fallback(ops, breakpoints, address);
+                            }
+                        }
                     }
-                };
-
-                // Try writing again after changing protection
-                ops.write_memory(address, &trap)?
+                    Err(_) => {
+                        // Can't make memory writable - automatically fall back to hardware breakpoint
+                        return Self::try_hardware_fallback(ops, breakpoints, address);
+                    }
+                }
             }
         };
         if written != trap.len() {
@@ -282,6 +289,32 @@ impl BreakpointManager
 
         let mut store = breakpoints.lock().unwrap();
         Ok(store.insert(entry))
+    }
+
+    /// Helper function to try hardware breakpoint fallback when software breakpoint fails
+    fn try_hardware_fallback<Ops: BreakpointOperations>(
+        ops: &mut Ops,
+        breakpoints: &Arc<Mutex<BreakpointStore>>,
+        address: Address,
+    ) -> Result<BreakpointId>
+    {
+        // Check if hardware breakpoint already exists at this address
+        {
+            let store = breakpoints.lock().unwrap();
+            if store.id_for_kind(address, BreakpointKind::Hardware).is_some() {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "Breakpoint already exists at 0x{:016x}",
+                    address.value()
+                )));
+            }
+        }
+
+        // Try hardware breakpoint instead
+        tracing::debug!(
+            "Software breakpoint failed at 0x{:016x}, automatically falling back to hardware breakpoint",
+            address.value()
+        );
+        Self::install_hardware_breakpoint(ops, breakpoints, address)
     }
 
     /// Install a hardware breakpoint at the given address.

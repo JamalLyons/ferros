@@ -31,7 +31,7 @@ This list captures concrete work needed to reach feature parity with production 
 
 ## ferros-ui (TUI)
 
-- [ ] **Command palette / mini-console:** Embed a small command line so users can run CLI commands without leaving the TUI (LLDB’s `command` window, Delve’s REPL).
+- [x] **Command palette / mini-console:** Embed a small command line so users can run CLI commands without leaving the TUI (LLDB’s `command` window, Delve’s REPL).
 - [ ] **Source + breakpoint view:** Render source/machine code next to the PC with breakpoint gutter, hit counts, and enable/disable toggles.
 - [ ] **Call stack + frame locals:** Add panes for stack frames, local variables, arguments, captures, and watch expressions with Rust-aware formatting.
 - [ ] **Thread/task explorer:** Display thread states, async tasks/futures, and allow activation/switching directly inside the TUI.

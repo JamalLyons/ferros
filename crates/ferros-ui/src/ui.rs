@@ -47,12 +47,28 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App)
 /// Draw the main content area
 fn draw_main_content(frame: &mut Frame, area: Rect, app: &mut App)
 {
+    // Draw command palette overlay if active
+    if app.command_palette_active {
+        crate::widgets::draw_command_palette(frame, area, app);
+        return;
+    }
+
+    // Draw breakpoint editor overlay if active
+    if app.breakpoint_editor.is_some() {
+        crate::widgets::draw_breakpoint_editor(frame, area, app);
+        return;
+    }
+
+    // Draw main content based on view mode and layout
     match app.view_mode {
         ViewMode::Overview => crate::widgets::draw_overview(frame, area, app),
         ViewMode::Registers => crate::widgets::draw_registers(frame, area, app),
         ViewMode::Threads => crate::widgets::draw_threads(frame, area, app),
         ViewMode::MemoryRegions => crate::widgets::draw_memory_regions(frame, area, app),
         ViewMode::Output => crate::widgets::draw_output(frame, area, app),
+        ViewMode::Source => crate::widgets::draw_source_view(frame, area, app),
+        ViewMode::Stack => crate::widgets::draw_stack_view(frame, area, app),
+        ViewMode::Timeline => crate::widgets::draw_timeline(frame, area, app),
     }
 }
 
@@ -61,12 +77,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App)
 {
     let help_text = match app.view_mode {
         ViewMode::Overview => {
-            "1: Overview | 2: Registers | 3: Threads | 4: Memory | 5: Output | s: Suspend | r: Resume | q: Quit"
+            "1:Overview 2:Regs 3:Threads 4:Memory 5:Output 6:Source 7:Stack 8:Timeline | :Cmd | s:Suspend r:Resume \
+             b:Breakpoint B:EditBP l:Layout Ctrl+Q:Quit"
         }
         ViewMode::Registers | ViewMode::Threads | ViewMode::MemoryRegions => {
-            "↑/↓: Navigate | 1-5: Switch View | s: Suspend | r: Resume | q: Quit"
+            "↑/↓:Navigate | 1-8:Switch View | :Cmd | s:Suspend r:Resume b:Breakpoint | Ctrl+Q:Quit"
         }
-        ViewMode::Output => "↑/↓: Scroll | 1-5: Switch View | s: Suspend | r: Resume | q: Quit",
+        ViewMode::Output => "↑/↓:Scroll | 1-8:Switch View | :Cmd | s:Suspend r:Resume | Ctrl+Q:Quit",
+        ViewMode::Source => "↑/↓:Scroll | 1-8:Switch View | :Cmd | b:ToggleBP | Ctrl+Q:Quit",
+        ViewMode::Stack => "↑/↓/n/p:Navigate | 1-8:Switch View | :Cmd | f:Frame | Ctrl+Q:Quit",
+        ViewMode::Timeline => "↑/↓:Scroll | 1-8:Switch View | :Cmd | Ctrl+Q:Quit",
     };
 
     let mut footer_content = vec![Span::raw(help_text)];

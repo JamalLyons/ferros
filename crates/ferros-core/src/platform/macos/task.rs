@@ -813,11 +813,37 @@ impl Debugger for MacOSDebugger
 
         // Load images into symbol cache if not already loaded
         let regions = get_memory_regions(self.task)?;
+        
+        // First, try to load the main executable explicitly
+        // Find the region containing the PC (which should be in the main executable)
+        let exec_path = Self::get_executable_path(self.pid);
+        if let Some(exec_path) = &exec_path {
+            let pc_addr = regs.pc.value();
+            // Find the region containing the PC
+            if let Some(pc_region) = regions.iter().find(|r| {
+                r.start.value() <= pc_addr && pc_addr < r.end.value()
+            }) {
+                // Try loading the executable at this region's start address
+                let desc = ImageDescriptor {
+                    path: exec_path.clone(),
+                    load_address: pc_region.start.value(),
+                };
+                let _ = self.symbol_cache.load_image(desc);
+            }
+        }
+
+        // Load all other images (shared libraries and named regions)
         for region in regions {
             if let Some(name) = &region.name
                 && name.starts_with('/')
                 && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
             {
+                // Skip if this is the main executable (we already loaded it above)
+                if let Some(ref exec_path) = exec_path {
+                    if name == exec_path.to_str().unwrap_or("") {
+                        continue;
+                    }
+                }
                 let desc = ImageDescriptor {
                     path: std::path::PathBuf::from(name),
                     load_address: region.start.value(),
@@ -1537,13 +1563,38 @@ impl MacOSDebugger
     {
         self.ensure_attached()?;
 
-        // Ensure images are loaded
+        // Ensure images are loaded (same logic as stack_trace)
         let regions = get_memory_regions(self.task)?;
+        
+        // Load the main executable if we can find it
+        let exec_path = Self::get_executable_path(self.pid);
+        if let Some(exec_path) = &exec_path {
+            // Find a code region to use as load address
+            for region in &regions {
+                if region.permissions.contains('x') && region.permissions.contains('r') {
+                    let desc = crate::symbols::ImageDescriptor {
+                        path: exec_path.clone(),
+                        load_address: region.start.value(),
+                    };
+                    if self.symbol_cache.load_image(desc).is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Load all other images
         for region in regions {
             if let Some(name) = &region.name
                 && name.starts_with('/')
                 && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
             {
+                // Skip if this is the main executable
+                if let Some(ref exec_path) = exec_path {
+                    if name == exec_path.to_str().unwrap_or("") {
+                        continue;
+                    }
+                }
                 let desc = crate::symbols::ImageDescriptor {
                     path: std::path::PathBuf::from(name),
                     load_address: region.start.value(),
@@ -1553,5 +1604,15 @@ impl MacOSDebugger
         }
 
         Ok(self.symbol_cache.symbolicate(address))
+    }
+
+    /// Get the executable path for a process using libproc
+    fn get_executable_path(pid: ProcessId) -> Option<std::path::PathBuf>
+    {
+        use libproc::libproc::proc_pid::pidpath;
+        match pidpath(pid.0 as i32) {
+            Ok(path) => Some(std::path::PathBuf::from(path)),
+            Err(_) => None,
+        }
     }
 }

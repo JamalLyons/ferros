@@ -419,3 +419,453 @@ fn format_process_output_line(entry: &ProcessOutputLine) -> Line<'_>
         Span::raw(entry.text.clone()),
     ])
 }
+
+/// Draw the command palette
+pub fn draw_command_palette(frame: &mut Frame, area: Rect, app: &App)
+{
+    let center_y = area.height / 2;
+    let center_x = area.width / 2;
+    let width = area.width.min(80);
+    let height = 3;
+
+    let palette_area = Rect {
+        x: center_x.saturating_sub(width / 2),
+        y: center_y.saturating_sub(height / 2),
+        width,
+        height,
+    };
+
+    let input_text = format!(":{}", app.command_input);
+    let input = Paragraph::new(input_text.as_str())
+        .block(Block::default().borders(Borders::ALL).title("Command"))
+        .style(Style::default().fg(Color::Yellow));
+
+    frame.render_widget(input, palette_area);
+
+    // Set cursor position for input
+    let cursor_offset = app.command_input.len().min(width as usize - 2);
+    let cursor_offset = u16::try_from(cursor_offset).unwrap_or(u16::MAX);
+    frame.set_cursor_position((palette_area.x + 1 + cursor_offset, palette_area.y + 1));
+}
+
+/// Draw the breakpoint editor
+pub fn draw_breakpoint_editor(frame: &mut Frame, area: Rect, app: &App)
+{
+    let center_y = area.height / 2;
+    let center_x = area.width / 2;
+    let width = area.width.min(60);
+    let height = 8;
+
+    let editor_area = Rect {
+        x: center_x.saturating_sub(width / 2),
+        y: center_y.saturating_sub(height / 2),
+        width,
+        height,
+    };
+
+    if let Some(ref editor) = app.breakpoint_editor {
+        let lines = vec![
+            Line::from("Breakpoint Editor"),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Address: "),
+                Span::styled(&editor.address_input, Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::raw("Kind: "),
+                Span::styled(&editor.kind_input, Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(""),
+            Line::from("Press Enter to apply, Esc to cancel"),
+        ];
+
+        let editor_widget = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Breakpoint Editor"))
+            .style(Style::default().fg(Color::White));
+
+        frame.render_widget(editor_widget, editor_area);
+    }
+}
+
+/// Draw the source code view with breakpoints
+pub fn draw_source_view(frame: &mut Frame, area: Rect, app: &mut App)
+{
+    // Split into source (left) and breakpoints (right) if widescreen
+    let constraints: Box<[Constraint]> = match app.layout_preset {
+        crate::app::LayoutPreset::Compact | crate::app::LayoutPreset::Standard => Box::new([Constraint::Percentage(100)]),
+        crate::app::LayoutPreset::Widescreen => Box::new([Constraint::Percentage(70), Constraint::Percentage(30)]),
+    };
+
+    let chunks = Layout::horizontal(constraints).split(area);
+
+    draw_source_code(frame, chunks[0], app);
+
+    if chunks.len() > 1 {
+        draw_breakpoints_list(frame, chunks[1], app);
+    }
+}
+
+/// Draw source code with breakpoint gutter
+fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
+{
+    // Get current PC to highlight
+    let current_pc = if app.debugger.is_attached() && app.target_is_stopped {
+        app.debugger.read_registers().ok().map(|r| r.pc)
+    } else {
+        None
+    };
+
+    // Get source file from selected frame in stack view, or fall back to first frame
+    let source_file = if app.current_source_file.is_none() {
+        if let Some(ref frames) = app.cached_stack_trace {
+            let selected_idx = app.stack_frames_state.selected().unwrap_or(0);
+            if let Some(frame) = frames.get(selected_idx) {
+                frame.location.as_ref().map(|loc| loc.file.clone())
+            } else if let Some(frame) = frames.first() {
+                frame.location.as_ref().map(|loc| loc.file.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        app.current_source_file.clone()
+    };
+
+    if let Some(ref file) = source_file {
+        if let Some(lines) = app.source_cache.get(file) {
+            let viewport_height = area.height.saturating_sub(2) as usize;
+            let start_line = app.source_scroll.min(lines.len().saturating_sub(1));
+            let end_line = (start_line + viewport_height).min(lines.len());
+
+            let mut source_lines = Vec::new();
+            for (i, line) in lines.iter().enumerate().skip(start_line).take(end_line - start_line) {
+                let line_num = i + 1;
+                let line_num_str = format!("{line_num:4} ");
+
+                // Check for breakpoint at this address (simplified - would need symbol resolution)
+                // For now, we'll show breakpoints based on the current PC if it matches
+                let has_breakpoint = current_pc.is_some_and(|_pc| {
+                    // Check if any breakpoint is near this line (simplified check)
+                    app.cached_breakpoints.iter().any(|bp| {
+                        // This is a simplified check - in reality we'd need to resolve
+                        // line numbers to addresses via DWARF
+                        bp.enabled && bp.state == ferros_core::BreakpointState::Resolved
+                    })
+                });
+
+                // Check if this is the current line (use selected frame from stack view)
+                let is_current = if let Some(ref frames) = app.cached_stack_trace {
+                    let selected_idx = app.stack_frames_state.selected().unwrap_or(0);
+                    if let Some(frame) = frames.get(selected_idx)
+                        && let Some(ref location) = frame.location
+                    {
+                        let line_u32 = u32::try_from(line_num).unwrap_or(u32::MAX);
+                        location.file == *file && location.line == Some(line_u32)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let mut spans = vec![Span::styled(line_num_str, Style::default().fg(Color::DarkGray))];
+
+                if has_breakpoint {
+                    spans.push(Span::styled("● ", Style::default().fg(Color::Red)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+
+                let line_style = if is_current {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                spans.push(Span::styled(line.clone(), line_style));
+                source_lines.push(Line::from(spans));
+            }
+
+            let source_widget = Paragraph::new(source_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("Source: {}", file.split('/').next_back().unwrap_or(file))),
+                )
+                .style(Style::default().fg(Color::White))
+                .wrap(ratatui::widgets::Wrap { trim: false });
+
+            frame.render_widget(source_widget, area);
+        } else {
+            let error = Paragraph::new("No source code available")
+                .block(Block::default().borders(Borders::ALL).title("Source"))
+                .style(Style::default().fg(Color::Red));
+            frame.render_widget(error, area);
+        }
+    } else {
+        let error = Paragraph::new("No source file loaded. Select a frame in the stack view.")
+            .block(Block::default().borders(Borders::ALL).title("Source"))
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(error, area);
+    }
+}
+
+/// Draw breakpoints list
+fn draw_breakpoints_list(frame: &mut Frame, area: Rect, app: &mut App)
+{
+    let rows: Vec<Row> = app
+        .cached_breakpoints
+        .iter()
+        .map(|bp| {
+            let state_str = if bp.enabled {
+                if bp.state == ferros_core::BreakpointState::Resolved {
+                    "●"
+                } else {
+                    "○"
+                }
+            } else {
+                "-"
+            };
+
+            let kind_str = match bp.kind {
+                ferros_core::BreakpointKind::Software => "SW",
+                ferros_core::BreakpointKind::Hardware => "HW",
+                ferros_core::BreakpointKind::Watchpoint => "WP",
+            };
+
+            Row::new(vec![
+                Cell::from(format!("{}", bp.id.raw())),
+                Cell::from(state_str),
+                Cell::from(kind_str),
+                Cell::from(format!("{}", bp.address)),
+                Cell::from(format!("{}", bp.hit_count)),
+            ])
+        })
+        .collect();
+
+    let constraints: Box<[Constraint]> = vec![
+        Constraint::Length(5),
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(18),
+        Constraint::Length(5),
+    ]
+    .into_boxed_slice();
+
+    let table = Table::new(rows, constraints)
+        .block(Block::default().borders(Borders::ALL).title("Breakpoints"))
+        .header(Row::new(vec![
+            Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("E").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("K").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Address").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Hits").style(Style::default().add_modifier(Modifier::BOLD)),
+        ]))
+        .row_highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.breakpoints_state);
+}
+
+/// Draw the call stack and frame locals view
+pub fn draw_stack_view(frame: &mut Frame, area: Rect, app: &mut App)
+{
+    // Split area into stack frames (left) and frame info (right)
+    let constraints: Box<[Constraint]> = match app.layout_preset {
+        crate::app::LayoutPreset::Compact => Box::new([Constraint::Percentage(100)]),
+        crate::app::LayoutPreset::Standard => Box::new([Constraint::Percentage(50), Constraint::Percentage(50)]),
+        crate::app::LayoutPreset::Widescreen => Box::new([Constraint::Percentage(40), Constraint::Percentage(60)]),
+    };
+
+    let chunks = Layout::horizontal(constraints).split(area);
+
+    // Draw stack frames on the left
+    draw_stack_frames(frame, chunks[0], app);
+
+    // Draw frame details on the right (if space available)
+    if chunks.len() > 1 {
+        draw_frame_details(frame, chunks[1], app);
+    }
+}
+
+/// Draw the stack frames list
+fn draw_stack_frames(frame: &mut Frame, area: Rect, app: &mut App)
+{
+    let frames = app.cached_stack_trace.as_deref().unwrap_or(&[]);
+
+    if frames.is_empty() {
+        let error = Paragraph::new("No stack trace available. Process may be running.")
+            .block(Block::default().borders(Borders::ALL).title("Call Stack"))
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(error, area);
+        return;
+    }
+
+    let rows: Vec<Row> = frames
+        .iter()
+        .map(|frame| {
+            let prefix = if frame.kind.is_inlined() { "↪ " } else { "  " };
+            let symbol_name = frame
+                .symbol
+                .as_ref()
+                .map_or("<unknown>", ferros_core::SymbolName::display_name);
+            let location_str = frame.location.as_ref().map_or_else(
+                || format!("{}", frame.pc),
+                |loc| {
+                    if let Some(line) = loc.line {
+                        format!("{}:{}", loc.file.split('/').next_back().unwrap_or(&loc.file), line)
+                    } else {
+                        loc.file.split('/').next_back().unwrap_or(&loc.file).to_string()
+                    }
+                },
+            );
+
+            Row::new(vec![
+                Cell::from(format!("{prefix}#{}", frame.index)),
+                Cell::from(symbol_name),
+                Cell::from(location_str),
+            ])
+        })
+        .collect();
+
+    let constraints: Box<[Constraint]> = Box::new([Constraint::Length(5), Constraint::Min(20), Constraint::Min(20)]);
+
+    let table = Table::new(rows, constraints)
+        .block(Block::default().borders(Borders::ALL).title("Call Stack"))
+        .header(Row::new(vec![
+            Cell::from("Frame").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Function").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Location").style(Style::default().add_modifier(Modifier::BOLD)),
+        ]))
+        .row_highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(table, area, &mut app.stack_frames_state);
+}
+
+/// Draw frame details (locals, registers, etc.)
+fn draw_frame_details(frame: &mut Frame, area: Rect, app: &App)
+{
+    let selected_idx = app.stack_frames_state.selected().unwrap_or(0);
+    let selected_frame = app.cached_stack_trace.as_ref().and_then(|frames| frames.get(selected_idx));
+
+    if let Some(selected_frame) = selected_frame {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Frame #", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}", selected_frame.index)),
+            ]),
+            Line::from(""),
+        ];
+
+        if let Some(ref symbol) = selected_frame.symbol {
+            lines.push(Line::from(vec![
+                Span::styled("Function: ", Style::default().fg(Color::Yellow)),
+                Span::raw(symbol.display_name()),
+            ]));
+        }
+
+        if let Some(ref location) = selected_frame.location {
+            lines.push(Line::from(vec![
+                Span::styled("File: ", Style::default().fg(Color::Yellow)),
+                Span::raw(location.file.clone()),
+            ]));
+            if let Some(line) = location.line {
+                lines.push(Line::from(vec![
+                    Span::styled("Line: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("{line}")),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("PC: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", selected_frame.pc)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("SP: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}", selected_frame.sp)),
+        ]));
+        if selected_frame.fp.value() != 0 {
+            lines.push(Line::from(vec![
+                Span::styled("FP: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{}", selected_frame.fp)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:?}", selected_frame.status)),
+        ]));
+
+        let details = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Frame Details"))
+            .style(Style::default().fg(Color::White));
+
+        frame.render_widget(details, area);
+    } else {
+        let error_widget = Paragraph::new("No frame selected")
+            .block(Block::default().borders(Borders::ALL).title("Frame Details"))
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(error_widget, area);
+    }
+}
+
+/// Draw the timeline/log panel
+pub fn draw_timeline(frame: &mut Frame, area: Rect, app: &App)
+{
+    let viewport_height = area.height.saturating_sub(2) as usize;
+    let mut timeline_lines = Vec::new();
+
+    if app.timeline_log.is_empty() {
+        timeline_lines.push(Line::from("No timeline events yet."));
+    } else {
+        let start_idx = app.timeline_log.len().saturating_sub(viewport_height);
+        for entry in app.timeline_log.iter().skip(start_idx) {
+            let elapsed = entry.timestamp.elapsed();
+            let time_str = format!("{:6.2}s", elapsed.as_secs_f64());
+
+            let kind_color = match entry.kind {
+                crate::app::TimelineEntryKind::Resume => Color::Green,
+                crate::app::TimelineEntryKind::BreakpointHit => Color::Yellow,
+                crate::app::TimelineEntryKind::Signal => Color::Magenta,
+                crate::app::TimelineEntryKind::Output => Color::Cyan,
+                crate::app::TimelineEntryKind::Stop | crate::app::TimelineEntryKind::Error => Color::Red,
+            };
+
+            let kind_str = match entry.kind {
+                crate::app::TimelineEntryKind::Stop => "STOP",
+                crate::app::TimelineEntryKind::Resume => "RESUME",
+                crate::app::TimelineEntryKind::BreakpointHit => "BP",
+                crate::app::TimelineEntryKind::Signal => "SIG",
+                crate::app::TimelineEntryKind::Output => "OUT",
+                crate::app::TimelineEntryKind::Error => "ERR",
+            };
+
+            timeline_lines.push(Line::from(vec![
+                Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("[{kind_str}]"),
+                    Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::raw(entry.message.clone()),
+            ]));
+        }
+    }
+
+    let timeline = Paragraph::new(timeline_lines)
+        .block(Block::default().borders(Borders::ALL).title("Timeline"))
+        .style(Style::default().fg(Color::White))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    frame.render_widget(timeline, area);
+}

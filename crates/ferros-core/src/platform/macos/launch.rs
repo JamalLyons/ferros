@@ -16,6 +16,7 @@
 //!
 //! - [posix_spawn(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::ptr;
@@ -43,6 +44,55 @@ pub(crate) struct LaunchManager;
 
 impl LaunchManager
 {
+    /// Build an environment with debug-friendly flags enabled.
+    ///
+    /// This function creates an environment that includes:
+    /// - All current environment variables
+    /// - Debug flags for Rust programs (RUST_BACKTRACE, etc.)
+    /// - Other helpful debugging environment variables
+    ///
+    /// Returns a vector of CStrings suitable for passing to posix_spawn.
+    fn build_debug_environment() -> Result<Vec<CString>>
+    {
+        use std::env;
+
+        use tracing::debug;
+
+        debug!("Building debug environment");
+
+        // Start with current environment
+        let mut env_vars: HashMap<String, String> = env::vars().collect();
+
+        // Set Rust debug flags (these are helpful for debugging Rust programs)
+        // RUST_BACKTRACE=1 enables backtraces on panic
+        // Only set if not already set by user
+        if env::var("RUST_BACKTRACE").is_err() {
+            env_vars.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+        }
+
+        // For C/C++ programs, these can be helpful too
+        // MallocStackLogging helps with memory debugging on macOS
+        if env::var("MallocStackLogging").is_err() {
+            env_vars.insert("MallocStackLogging".to_string(), "1".to_string());
+        }
+
+        // Convert to CString array (format: "KEY=VALUE\0")
+        let mut env_cstrings = Vec::new();
+        for (key, value) in env_vars {
+            let env_entry = format!("{key}={value}");
+            match CString::new(env_entry) {
+                Ok(cstr) => env_cstrings.push(cstr),
+                Err(e) => {
+                    debug!("Skipping invalid environment variable: {e}");
+                    // Skip invalid entries rather than failing
+                }
+            }
+        }
+
+        debug!("Built environment with {} variables", env_cstrings.len());
+        Ok(env_cstrings)
+    }
+
     /// Create a pipe pair for process output redirection.
     ///
     /// Creates a pipe and sets the `FD_CLOEXEC` flag on both file descriptors
@@ -135,6 +185,7 @@ impl LaunchManager
         use tracing::{debug, info, trace};
 
         info!("Launching process: {} with args: {:?}", program, args);
+        info!("Debug environment enabled: RUST_BACKTRACE=1, MallocStackLogging=1");
         debug!("Validating launch parameters");
 
         // Validate inputs
@@ -276,8 +327,15 @@ impl LaunchManager
                 }
             }
 
+            trace!("Building debug environment");
+            // Build environment with debug flags
+            let env_cstrings = Self::build_debug_environment()?;
+            let mut env_ptrs: Vec<*const libc::c_char> = env_cstrings.iter().map(|s| s.as_ptr()).collect();
+            // Add null terminator for the environment array
+            env_ptrs.push(ptr::null());
+
             trace!("Calling posix_spawn");
-            // Spawn the process
+            // Spawn the process with debug environment
             let mut pid: libc::pid_t = 0;
             let spawn_result = ffi::posix_spawn(
                 &mut pid,
@@ -289,7 +347,7 @@ impl LaunchManager
                 },
                 &attr, // Use attributes with START_SUSPENDED flag
                 argv.as_ptr(),
-                ptr::null(), // Use current environment
+                env_ptrs.as_ptr(), // Use debug environment
             );
 
             if file_actions_initialized {

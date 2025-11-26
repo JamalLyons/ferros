@@ -181,6 +181,11 @@ async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
         }
         Commands::Launch { program, args, headless } => {
             info!("Launching program: {} with args: {:?}", program, args);
+            if !headless {
+                info!("Note: For best debugging experience, ensure your program was built with debug symbols");
+                info!("  Rust: Use 'cargo build' (debug mode) or 'cargo build --release' with debug=true");
+                info!("  C/C++: Compile with -g flag");
+            }
             let mut debugger = create_debugger()?;
 
             if !headless {

@@ -5,25 +5,17 @@ edition = "2024"
 description = "Low-level debugging primitives and process control for Ferros."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-readme = "README.md"
-keywords = ["debugger", "rust", "debugging", "ptrace"]
+# readme = "README.md"
+keywords = ["debugger", "debugging", "ptrace"]
 categories = ["development-tools"]
 
 [dependencies]
-addr2line = "0.25.1"
-gimli = "=0.32.3"
-object = { version = "0.38.0", features = ["read", "macho"] }
-once_cell = "1.19"
-rustc-demangle = "0.1"
-smallvec = "1.13"
-libc = "0.2.177"
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
-# macOS-specific Mach API bindings
 [target.'cfg(target_os = "macos")'.dependencies]
-libproc = "0.14"
-mach2 = "0.6.0"
 
 [build-dependencies]
 rustc_version = "0.4"
+
+[lints]
+workspace = true

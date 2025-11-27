@@ -7,17 +7,11 @@ license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
 homepage = "https://github.com/jamallyons/ferros"
 documentation = "https://docs.rs/ferros"
-readme = "./README.md"
-keywords = ["debugger", "rust", "mir", "debugging"]
+# readme = "./README.md"
+keywords = ["debugger", "mir", "debugging"]
 categories = ["development-tools"]
 
 [dependencies]
-clap = { version = "4.5.51", features = ["derive"] }
-tokio = { workspace = true }
 
 ferros-core = { path = "../ferros-core" }
-ferros-ui = { path = "../ferros-ui" }
 ferros-utils = { path = "../ferros-utils" }
-
-[dev-dependencies]
-ctrlc = "3.4"

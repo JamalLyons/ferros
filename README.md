@@ -85,7 +85,7 @@ Once available, you'll be able to:
 cargo install ferros
 
 # Debug your Rust project
-cargo ferros launch <program> [args...]
+cargo ferros [ferros args...] launch <program> [program args...]
 ```
 
 ### Requirements

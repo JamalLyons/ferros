@@ -5,8 +5,8 @@ edition = "2024"
 description = "MIR integration, introspection, and analysis for Ferros."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-readme = "README.md"
-keywords = ["debugger", "rust", "mir", "compiler"]
+# readme = "README.md"
+keywords = ["debugger", "mir", "compiler"]
 categories = ["development-tools"]
 
 [dependencies]

@@ -17,12 +17,6 @@ use thiserror::Error;
 /// - `KERN_INVALID_ARGUMENT` (4): Invalid argument
 /// - `KERN_FAILURE` (14): General failure (often means process not found)
 ///
-/// ## Why convert to an enum?
-///
-/// - **Type safety**: Can match on specific error types
-/// - **Better error messages**: Descriptive strings instead of numbers
-/// - **Error chaining**: Can convert to `DebuggerError` automatically
-///
 /// ## References
 ///
 /// - [kern_return_t documentation](https://developer.apple.com/documentation/kernel/kern_return_t)

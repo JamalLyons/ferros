@@ -1,10 +1,9 @@
 //! # Error Types
 //!
-//! Error handling for the debugger.
+//! General error handling for the debugger.
 //!
 //! We use `thiserror` to automatically generate `Error` trait implementations
-//! and nice error messages. This makes error handling ergonomic while still
-//! giving us full control over error types.
+//! and nice error messages.
 
 use thiserror::Error;
 
@@ -13,13 +12,6 @@ use thiserror::Error;
 /// This enum represents all the ways a debugger operation can fail.
 /// Each variant corresponds to a specific error condition that can occur
 /// when interacting with processes.
-///
-/// ## Why use an enum instead of String?
-///
-/// - **Type safety**: The compiler ensures we handle all error cases
-/// - **Pattern matching**: Can match on specific error types
-/// - **Better error messages**: Each variant can have a custom message
-/// - **Error chaining**: Can convert from platform-specific errors (like MachError)
 ///
 /// ## Error Categories
 ///
@@ -31,7 +23,7 @@ use thiserror::Error;
 /// 6. **Platform errors**: MachError (macOS-specific)
 /// 7. **I/O errors**: Io (for file operations, etc.)
 #[derive(Error, Debug)]
-pub enum DebuggerError
+pub enum FerrosError
 {
     /// The process with the given PID doesn't exist or has exited
     ///
@@ -47,10 +39,6 @@ pub enum DebuggerError
     /// On macOS, this typically means:
     /// - `task_for_pid()` returned `KERN_PROTECTION_FAILURE`
     /// - You need to run with `sudo` or grant debugging entitlements
-    ///
-    /// On Linux, this means:
-    /// - `ptrace(PTRACE_ATTACH)` failed with EPERM
-    /// - You need to be root or the process owner
     ///
     /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger)
     #[error("Permission denied: {0}")]
@@ -128,28 +116,6 @@ pub enum DebuggerError
     ///
     /// Remove some existing breakpoints/watchpoints before adding new ones, or
     /// use software breakpoints which don't have hardware limits.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use ferros_core::Debugger;
-    /// use ferros_core::breakpoints::BreakpointRequest;
-    /// use ferros_core::error::DebuggerError;
-    /// use ferros_core::types::Address;
-    ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
-    /// # let address = Address::from(0x1000);
-    /// let breakpoint_id = match debugger.add_breakpoint(BreakpointRequest::Hardware { address }) {
-    ///     Err(DebuggerError::ResourceExhausted(msg)) => {
-    ///         println!("Hardware breakpoint limit reached: {}", msg);
-    ///         // Try software breakpoint instead
-    ///         debugger.add_breakpoint(BreakpointRequest::Software { address })?
-    ///     }
-    ///     Ok(id) => id,
-    ///     Err(e) => return Err(e),
-    /// };
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
-    /// ```
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
 
@@ -177,19 +143,13 @@ pub enum DebuggerError
     /// - The thread has exited
     /// - The thread state structure doesn't match what we expect
     /// - The architecture is different than expected
-    ///
-    /// ## Context
-    ///
-    /// - `operation`: Description of what operation was being performed (e.g., "read ARM64 registers")
-    /// - `thread_id`: Optional thread ID if the operation was thread-specific
-    /// - `details`: Additional error details from the underlying system call
     #[error("Failed to read registers: {operation}")]
     ReadRegistersFailed
     {
         /// Description of the operation that failed
         operation: String,
         /// Thread ID if the operation was thread-specific
-        thread_id: Option<crate::types::ThreadId>,
+        thread_id: Option<crate::types::process::ThreadId>,
         /// Additional error details
         details: String,
     },
@@ -216,20 +176,11 @@ pub enum DebuggerError
 
 /// Convenience type alias for `Result<T, DebuggerError>`
 ///
-/// This makes error handling more ergonomic. Instead of writing:
 /// ```rust
-/// use ferros_core::error::DebuggerError;
-/// fn foo() -> std::result::Result<(), DebuggerError>
+/// use ferros_core::error::FerrosResult;
+/// fn foo() -> FerrosResult<()>
 /// {
 ///     Ok(())
 /// }
 /// ```
-/// We can write:
-/// ```rust
-/// use ferros_core::error::Result;
-/// fn foo() -> Result<()>
-/// {
-///     Ok(())
-/// }
-/// ```
-pub type Result<T> = std::result::Result<T, DebuggerError>;
+pub type FerrosResult<T> = std::result::Result<T, FerrosError>;

@@ -22,16 +22,6 @@ use std::ops::{Add, Sub};
 ///
 /// - **macOS/Linux**: Typically 48-bit virtual addresses (can be extended to 57-bit)
 /// - **Windows**: 48-bit virtual addresses
-///
-/// ## Example
-///
-/// ```rust
-/// use ferros_core::types::Address;
-///
-/// let addr = Address::from(0x1000);
-/// let next_addr = addr + 0x100; // Add offset
-/// assert_eq!(next_addr.value(), 0x1100);
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address(u64);
 
@@ -46,14 +36,6 @@ impl Address
     /// Create a new address from a `u64` value
     ///
     /// This is equivalent to `Address::from(value)` but can be used in const contexts.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Address;
-    ///
-    /// const STACK_BASE: Address = Address::new(0x7fff00000000);
-    /// ```
     pub const fn new(value: u64) -> Self
     {
         Address(value)
@@ -63,15 +45,6 @@ impl Address
     ///
     /// This returns the underlying address value. Use this when you need to pass
     /// the address to platform-specific APIs that expect a `u64`.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Address;
-    ///
-    /// let addr = Address::from(0x1000);
-    /// assert_eq!(addr.value(), 0x1000);
-    /// ```
     pub const fn value(self) -> u64
     {
         self.0
@@ -80,16 +53,6 @@ impl Address
     /// Add an offset to this address, checking for overflow
     ///
     /// Returns `Some(new_address)` if the addition doesn't overflow, or `None` if it does.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Address;
-    ///
-    /// let addr = Address::from(0x1000);
-    /// assert_eq!(addr.checked_add(0x100), Some(Address::from(0x1100)));
-    /// assert_eq!(addr.checked_add(u64::MAX), None); // Overflow
-    /// ```
     pub fn checked_add(self, offset: u64) -> Option<Self>
     {
         self.0.checked_add(offset).map(Address)
@@ -98,16 +61,6 @@ impl Address
     /// Subtract an offset from this address, checking for underflow
     ///
     /// Returns `Some(new_address)` if the subtraction doesn't underflow, or `None` if it does.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Address;
-    ///
-    /// let addr = Address::from(0x1000);
-    /// assert_eq!(addr.checked_sub(0x100), Some(Address::from(0xf00)));
-    /// assert_eq!(addr.checked_sub(u64::MAX), None); // Underflow
-    /// ```
     pub fn checked_sub(self, offset: u64) -> Option<Self>
     {
         self.0.checked_sub(offset).map(Address)
@@ -116,16 +69,6 @@ impl Address
     /// Add an offset to this address, saturating at the maximum value
     ///
     /// If the addition would overflow, returns `Address::new(u64::MAX)` instead.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Address;
-    ///
-    /// let addr = Address::from(0x1000);
-    /// assert_eq!(addr.saturating_add(0x100), Address::from(0x1100));
-    /// assert_eq!(addr.saturating_add(u64::MAX), Address::new(u64::MAX)); // Saturates
-    /// ```
     pub fn saturating_add(self, offset: u64) -> Self
     {
         Address(self.0.saturating_add(offset))

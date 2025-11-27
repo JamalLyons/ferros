@@ -3,7 +3,7 @@
 //! Shared utilities, logging, config, and helpers for Ferros.
 //!
 //! This crate provides common functionality used across the Ferros workspace,
-//! including production-ready logging infrastructure built on `tracing`.
+//! including a logging infrastructure built on `tracing`.
 
 pub mod logging;
 

@@ -89,17 +89,4 @@
 //! - [posix_spawn documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
 //! - [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
 
-pub mod breakpoints;
-pub mod constants;
 pub mod error;
-pub mod exception;
-pub mod ffi;
-pub mod guards;
-pub mod launch;
-pub mod memory;
-pub mod registers;
-pub mod task;
-pub mod threads;
-pub mod types;
-
-pub use task::MacOSDebugger;

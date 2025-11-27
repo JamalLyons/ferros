@@ -1,12 +1,12 @@
 [package]
 name = "ferros-protocol"
 version = "0.0.0"
-edition = "2024"  
+edition = "2024"
 description = "Communication layer between Ferros debugger and frontend."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-readme = "README.md"
-keywords = ["debugger", "rust", "protocol", "communication"]
+# readme = "README.md"
+keywords = ["debugger", "protocol", "communication"]
 categories = ["development-tools"]
 
 [dependencies]

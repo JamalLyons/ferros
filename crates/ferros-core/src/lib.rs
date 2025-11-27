@@ -5,14 +5,14 @@
 //! This crate provides the foundational debugging capabilities, including:
 //! - Process attachment and control
 //! - Register inspection and manipulation
-//! - Memory reading/writing (future)
-//! - Breakpoint management (future)
+//! - Memory reading/writing
+//! - Breakpoint management
 //!
 //! ## Platform Support
 //!
 //! - **macOS**: Uses Mach APIs (`task_for_pid`, `thread_get_state`, etc.)
-//! - **Linux**: Will use `ptrace` (future)
-//! - **Windows**: Will use Windows Debug API (future)
+//! - **Linux**: TBA
+//! - **Windows** TBA
 //!
 //! ## Why unsafe code is needed
 //!
@@ -26,27 +26,16 @@
 //! We wrap these unsafe calls in safe abstractions, but the underlying system
 //! calls themselves must be `unsafe`.
 
-#![allow(unsafe_code)] // Required for low-level system APIs (Mach, ptrace, etc.)
-#![warn(missing_docs)]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/master/assets/ferros-logo-transparent.png"
+)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/master/assets/ferros-logo-transparent.png"
+)]
+#![allow(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
-pub mod breakpoints;
-pub mod debugger;
 pub mod error;
-pub mod events;
 pub mod platform;
-pub mod symbols;
+pub mod prelude;
 pub mod types;
-
-pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
-pub use debugger::Debugger;
-// Re-export commonly used types
-pub use error::{DebuggerError, Result};
-pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};
-#[cfg(target_os = "macos")]
-pub use platform::macos::MacOSDebugger;
-pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
-pub use types::{
-    Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,
-    RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName, ThreadId,
-    VectorRegisterValue,
-};

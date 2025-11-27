@@ -2,34 +2,13 @@
 
 use std::fmt;
 
-use super::Address;
+use crate::types::address::Address;
 
 /// Process identifier (PID)
 ///
 /// A PID is a unique number assigned to each running process by the operating
 /// system. On Unix-like systems (macOS, Linux), PIDs are typically 32-bit
 /// unsigned integers.
-///
-/// ## Why wrap it in a struct?
-///
-/// Using a newtype pattern (`struct ProcessId(u32)`) instead of a raw `u32`
-/// provides:
-/// - **Type safety**: Prevents accidentally passing a random number where a PID is expected
-/// - **Self-documenting code**: Makes it clear what the value represents
-/// - **Future extensibility**: Can add methods or validation later
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::platform::macos::MacOSDebugger;
-/// use ferros_core::types::ProcessId;
-///
-/// let pid = ProcessId::from(12345);
-/// let mut debugger = MacOSDebugger::new()?;
-/// debugger.attach(pid)?;
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId(pub u32);
 
@@ -60,21 +39,6 @@ impl From<ProcessId> for u32
 ///
 /// We store it as a `u64` to provide a platform-agnostic interface. Platform-specific
 /// implementations convert between their native types and `ThreadId`.
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::types::ThreadId;
-///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let threads = debugger.threads()?;
-/// if let Some(thread) = threads.first() {
-///     debugger.set_active_thread(*thread)?;
-/// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadId(pub u64);
 
@@ -88,15 +52,6 @@ impl ThreadId
     /// - **macOS**: Mach thread port value
     /// - **Linux**: Thread ID (TID)
     /// - **Windows**: Thread handle or thread ID
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::ThreadId;
-    ///
-    /// let thread = ThreadId::from(12345);
-    /// assert_eq!(thread.raw(), 12345);
-    /// ```
     pub fn raw(&self) -> u64
     {
         self.0
@@ -130,25 +85,6 @@ impl From<u64> for ThreadId
 /// - **macOS**: Uses `task_suspend()`/`task_resume()` for suspension
 /// - **Linux**: Uses `ptrace(PTRACE_CONT)`/`ptrace(PTRACE_STOP)` for control
 /// - **Windows**: Uses `SuspendThread()`/`ResumeThread()` for thread control
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::types::StopReason;
-///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// match debugger.stop_reason() {
-///     StopReason::Running => println!("Process is running"),
-///     StopReason::Suspended => println!("Process is suspended"),
-///     StopReason::Signal(sig) => println!("Stopped by signal: {}", sig),
-///     StopReason::Breakpoint(addr) => println!("Hit breakpoint at 0x{:x}", addr),
-///     StopReason::Exited(code) => println!("Process exited with code: {}", code),
-///     StopReason::Unknown => println!("Stopped for unknown reason"),
-/// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason
 {
@@ -197,26 +133,6 @@ pub enum StopReason
 /// Memory region IDs are stable within a single enumeration session, but may
 /// change if the process's memory layout changes (e.g., after `malloc()` or `mmap()`).
 /// You should refresh the memory region list if you need up-to-date information.
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::types::MemoryRegionId;
-///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let regions = debugger.get_memory_regions()?;
-/// for region in regions {
-///     println!(
-///         "Region {}: {}-{}",
-///         region.id.value(),
-///         region.start,
-///         region.end
-///     );
-/// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryRegionId(pub usize);
 
@@ -226,15 +142,6 @@ impl MemoryRegionId
     ///
     /// This returns the underlying ID value. Use this when you need to compare
     /// or store the ID as a number.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::MemoryRegionId;
-    ///
-    /// let id = MemoryRegionId(42);
-    /// assert_eq!(id.value(), 42);
-    /// ```
     pub fn value(self) -> usize
     {
         self.0
@@ -247,30 +154,6 @@ impl MemoryRegionId
 /// such as the stack, heap, or code segments. Each region has a start
 /// address, end address, and permission flags that determine what
 /// operations are allowed on that memory.
-///
-/// ## Examples
-///
-/// ```
-/// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-///
-/// // A readable and executable code segment
-/// let code_segment = MemoryRegion::new(
-///     MemoryRegionId(0),
-///     Address::from(0x1000),
-///     Address::from(0x2000),
-///     "rx".to_string(),
-///     Some("/usr/bin/example".to_string()),
-/// );
-///
-/// // A readable and writable heap region
-/// let heap = MemoryRegion::new(
-///     MemoryRegionId(1),
-///     Address::from(0x2000),
-///     Address::from(0x3000),
-///     "rw".to_string(),
-///     Some("[heap]".to_string()),
-/// );
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRegion
 {
@@ -338,21 +221,6 @@ impl MemoryRegion
     ///
     /// Returns `end - start`, or 0 if `end <= start` (using saturating subtraction
     /// to prevent underflow).
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-    ///
-    /// let region = MemoryRegion::new(
-    ///     MemoryRegionId(0),
-    ///     Address::from(0x1000),
-    ///     Address::from(0x2000),
-    ///     "rwx".to_string(),
-    ///     None,
-    /// );
-    /// assert_eq!(region.size(), 0x1000); // 4096 bytes
-    /// ```
     pub fn size(&self) -> u64
     {
         self.end.value().saturating_sub(self.start.value())
@@ -361,21 +229,6 @@ impl MemoryRegion
     /// Check if the region is readable
     ///
     /// Returns `true` if the permissions string contains `'r'`.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-    ///
-    /// let region = MemoryRegion::new(
-    ///     MemoryRegionId(0),
-    ///     Address::from(0x1000),
-    ///     Address::from(0x2000),
-    ///     "r-x".to_string(),
-    ///     None,
-    /// );
-    /// assert!(region.is_readable());
-    /// ```
     pub fn is_readable(&self) -> bool
     {
         self.permissions.contains('r')
@@ -384,21 +237,6 @@ impl MemoryRegion
     /// Check if the region is writable
     ///
     /// Returns `true` if the permissions string contains `'w'`.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-    ///
-    /// let region = MemoryRegion::new(
-    ///     MemoryRegionId(0),
-    ///     Address::from(0x1000),
-    ///     Address::from(0x2000),
-    ///     "rw-".to_string(),
-    ///     None,
-    /// );
-    /// assert!(region.is_writable());
-    /// ```
     pub fn is_writable(&self) -> bool
     {
         self.permissions.contains('w')
@@ -407,21 +245,6 @@ impl MemoryRegion
     /// Check if the region is executable
     ///
     /// Returns `true` if the permissions string contains `'x'`.
-    ///
-    /// ## Example
-    ///
-    /// ```
-    /// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-    ///
-    /// let region = MemoryRegion::new(
-    ///     MemoryRegionId(0),
-    ///     Address::from(0x1000),
-    ///     Address::from(0x2000),
-    ///     "r-x".to_string(),
-    ///     None,
-    /// );
-    /// assert!(region.is_executable());
-    /// ```
     pub fn is_executable(&self) -> bool
     {
         self.permissions.contains('x')
@@ -431,25 +254,6 @@ impl MemoryRegion
     ///
     /// Returns `true` if the address is greater than or equal to `start` and
     /// less than `end` (i.e., within the region's address range).
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
-    ///
-    /// let region = MemoryRegion::new(
-    ///     MemoryRegionId(0),
-    ///     Address::from(0x1000),
-    ///     Address::from(0x2000),
-    ///     "rwx".to_string(),
-    ///     None,
-    /// );
-    ///
-    /// assert!(region.contains(Address::from(0x1000))); // Start (inclusive)
-    /// assert!(region.contains(Address::from(0x1500))); // Middle
-    /// assert!(!region.contains(Address::from(0x2000))); // End (exclusive)
-    /// assert!(!region.contains(Address::from(0x500))); // Before start
-    /// ```
     pub fn contains(&self, address: Address) -> bool
     {
         address >= self.start && address < self.end
@@ -473,22 +277,6 @@ impl MemoryRegion
 /// The architecture is typically detected when attaching to a process. On macOS,
 /// we use the architecture of the currently running debugger binary as a hint,
 /// but the actual architecture may differ if debugging a cross-architecture process.
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::types::Architecture;
-///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// match debugger.architecture() {
-///     Architecture::Arm64 => println!("Debugging ARM64 process"),
-///     Architecture::X86_64 => println!("Debugging x86-64 process"),
-///     Architecture::Unknown(name) => println!("Unknown architecture: {}", name),
-/// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Architecture
 {
@@ -522,16 +310,6 @@ impl Architecture
     /// This uses Rust's `#[cfg(target_arch = "...")]` to determine the architecture
     /// at compile time. It's useful as a default when creating a debugger instance,
     /// though the actual target process may have a different architecture.
-    ///
-    /// ## Example
-    ///
-    /// ```rust
-    /// use ferros_core::types::Architecture;
-    ///
-    /// let arch = Architecture::current();
-    /// // On Apple Silicon: Architecture::Arm64
-    /// // On Intel Mac: Architecture::X86_64
-    /// ```
     pub const fn current() -> Self
     {
         #[cfg(target_arch = "aarch64")]

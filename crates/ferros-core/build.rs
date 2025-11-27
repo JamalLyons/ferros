@@ -9,8 +9,8 @@
 //!
 //! - **Rust**: Edition 2021 (Rust 1.56.0 or newer)
 //! - **macOS**: 10.9+ (Mavericks) for Intel, 11.0+ (Big Sur) for Apple Silicon
-//! - **Linux**: TBD (ptrace support)
-//! - **Windows**: TBD (WinDbg API support)
+//! - **Linux**: TBD
+//! - **Windows**: TBD
 
 fn main()
 {

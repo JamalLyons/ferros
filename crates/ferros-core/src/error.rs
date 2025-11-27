@@ -149,7 +149,7 @@ pub enum FerrosError
         /// Description of the operation that failed
         operation: String,
         /// Thread ID if the operation was thread-specific
-        thread_id: Option<crate::types::ThreadId>,
+        thread_id: Option<crate::types::process::ThreadId>,
         /// Additional error details
         details: String,
     },

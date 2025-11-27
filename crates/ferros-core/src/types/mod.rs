@@ -8,7 +8,3 @@
 
 pub mod address;
 pub mod process;
-
-// Re-export all public types
-pub use address::Address;
-pub use process::ThreadId;

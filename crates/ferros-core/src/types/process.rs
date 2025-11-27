@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::types::Address;
+use crate::types::address::Address;
 
 /// Process identifier (PID)
 ///

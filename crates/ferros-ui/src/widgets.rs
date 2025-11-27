@@ -515,8 +515,8 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
         None
     };
 
-    // Get source file from selected frame in stack view, or fall back to first frame
-    let source_file = if app.current_source_file.is_none() {
+    // Get source file - prefer current_source_file, otherwise try to find from frames
+    let source_file = app.current_source_file.clone().or_else(|| {
         if let Some(ref frames) = app.cached_stack_trace {
             let selected_idx = app.stack_frames_state.selected().unwrap_or(0);
             if let Some(frame) = frames.get(selected_idx) {
@@ -529,9 +529,7 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
         } else {
             None
         }
-    } else {
-        app.current_source_file.clone()
-    };
+    });
 
     if let Some(ref file) = source_file {
         if let Some(lines) = app.source_cache.get(file) {
@@ -566,6 +564,11 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
                 } else {
                     false
                 };
+                
+                // Check if this line is selected (for setting breakpoints)
+                let is_selected = app.source_selected_line
+                    .map(|selected| selected == i)
+                    .unwrap_or(false);
 
                 let mut spans = vec![Span::styled(line_num_str, Style::default().fg(Color::DarkGray))];
 
@@ -580,6 +583,10 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
                         .bg(Color::DarkGray)
+                } else if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -605,9 +612,32 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
             frame.render_widget(error, area);
         }
     } else {
-        let error = Paragraph::new("No source file loaded. Select a frame in the stack view.")
+        // Provide helpful error message based on why source isn't loaded
+        let error_msg = if !app.debugger.is_attached() {
+            "Not attached to a process. Launch or attach to a process first."
+        } else if !app.target_is_stopped {
+            "Process is running. Suspend the process (press 's') or wait for a breakpoint to view source."
+        } else if app.cached_stack_trace.is_none() {
+            "No stack trace available. The process may not have debug symbols."
+        } else if app.cached_stack_trace.as_ref().is_some_and(|frames| frames.is_empty()) {
+            "Stack trace is empty. No frames available."
+        } else {
+            // Check if we have frames but they don't have source locations
+            let has_frames_without_source = app.cached_stack_trace.as_ref().is_some_and(|frames| {
+                frames.iter().all(|f| f.location.is_none())
+            });
+            
+            if has_frames_without_source {
+                "Stack frames exist but none have source location information.\nThis usually means:\n  • Program wasn't built with debug symbols\n  • Source files aren't available at the paths in DWARF\n\nTry building with: cargo build --example test_target"
+            } else {
+                "No source file available for current frame. Try:\n  1. Navigate to Stack view (press '7')\n  2. Select a frame with source info (↑/↓)\n  3. Return to Source view (press '6')"
+            }
+        };
+        
+        let error = Paragraph::new(error_msg)
             .block(Block::default().borders(Borders::ALL).title("Source"))
-            .style(Style::default().fg(Color::Yellow));
+            .style(Style::default().fg(Color::Yellow))
+            .wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(error, area);
     }
 }
@@ -780,6 +810,23 @@ fn draw_frame_details(frame: &mut Frame, area: Rect, app: &App)
             }
         }
 
+        // Display function parameters if available
+        if !selected_frame.parameters.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Parameters: ", Style::default().fg(Color::Yellow)),
+            ]));
+            for param in &selected_frame.parameters {
+                let param_str = match (&param.name, &param.type_name) {
+                    (Some(name), Some(ty)) => format!("  {}: {}", name, ty),
+                    (Some(name), None) => format!("  {}", name),
+                    (None, Some(ty)) => format!("  <unnamed>: {}", ty),
+                    (None, None) => "  <unknown>".to_string(),
+                };
+                lines.push(Line::from(Span::raw(param_str)));
+            }
+        }
+
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("PC: ", Style::default().fg(Color::Yellow)),
@@ -916,7 +963,10 @@ pub fn draw_help(frame: &mut Frame, area: Rect, _app: &App)
     lines.push(Line::from(vec![
         Span::styled("BREAKPOINTS", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
     ]));
-    lines.push(Line::from("  b - Toggle breakpoint at current PC (when stopped)"));
+    lines.push(Line::from("  b - Toggle breakpoint:"));
+    lines.push(Line::from("      • In Source view: at selected/current line"));
+    lines.push(Line::from("      • In Stack view: at selected frame's PC"));
+    lines.push(Line::from("      • Other views: at current PC"));
     lines.push(Line::from("  B - Open breakpoint editor to add breakpoints manually"));
     lines.push(Line::from(""));
 
@@ -955,7 +1005,16 @@ pub fn draw_help(frame: &mut Frame, area: Rect, _app: &App)
     lines.push(Line::from("  • Use number keys (1-9) for quick view switching"));
     lines.push(Line::from("  • Suspend the process (s) before inspecting state"));
     lines.push(Line::from("  • In Stack view, select a frame to load its source code"));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Source View (6):", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from("  • Source code loads automatically when process is stopped"));
+    lines.push(Line::from("  • Navigate to Stack view (7) and select a frame to change source"));
+    lines.push(Line::from("  • Use ↑/↓ to scroll, 'b' to toggle breakpoint at selected line"));
+    lines.push(Line::from("  • Current execution line is highlighted in yellow"));
     lines.push(Line::from("  • Breakpoints are shown with ● in the source view"));
+    lines.push(Line::from(""));
     lines.push(Line::from("  • Timeline view shows chronological log of all events"));
     lines.push(Line::from("  • For best debugging, build programs with debug symbols"));
 

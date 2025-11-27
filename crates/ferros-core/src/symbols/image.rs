@@ -39,7 +39,7 @@ use super::demangle::make_symbol_name;
 use super::extractor::{TypeExtractor, TypeSummary};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
-use crate::types::{Address, Architecture, SourceLocation};
+use crate::types::{Address, Architecture, FunctionParameter, SourceLocation};
 
 /// Describes a binary image mapped in the debuggee's address space.
 ///
@@ -672,8 +672,8 @@ impl BinaryImage
                 .as_ref()
                 .and_then(|func| func.raw_name().ok())
                 .map(|raw| make_symbol_name(raw.to_string()));
-            let location = frame.location.and_then(|loc| {
-                loc.file.map(|file| SourceLocation {
+            let location = frame.location.as_ref().and_then(|loc| {
+                loc.file.as_ref().map(|file| SourceLocation {
                     file: file.to_string(),
                     line: loc.line,
                     column: loc.column,
@@ -681,7 +681,13 @@ impl BinaryImage
             });
 
             if let Some(symbol) = symbol_name {
-                frames.push(SymbolFrame { symbol, location });
+                // Extract function parameters from DWARF
+                let parameters = self.extract_function_parameters(file_addr, &frame);
+                frames.push(SymbolFrame {
+                    symbol,
+                    location,
+                    parameters,
+                });
             } else {
                 use tracing::debug;
                 debug!("Frame at 0x{:x} has no symbol name", file_addr);
@@ -698,6 +704,23 @@ impl BinaryImage
             image_id: self.id,
             frames,
         })
+    }
+
+    /// Extract function parameters from DWARF for a given address and frame.
+    ///
+    /// This method walks the DWARF DIEs to find function parameters.
+    fn extract_function_parameters(
+        &self,
+        file_addr: u64,
+        _frame: &addr2line::Frame<OwnedReader>,
+    ) -> Vec<FunctionParameter>
+    {
+        // TODO: Implement full DWARF parameter extraction
+        // For now, return empty vector as parameter extraction from DWARF
+        // requires walking the DIE tree and finding DW_TAG_formal_parameter entries
+        // This is a placeholder that can be enhanced later
+        let _ = file_addr;
+        Vec::new()
     }
 
     /// Describe a type by name using DWARF type information.

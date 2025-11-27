@@ -3,7 +3,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use super::symbols::{SourceLocation, SymbolName};
+use super::symbols::{FunctionParameter, SourceLocation, SymbolName};
 use super::{Address, ThreadId};
 
 /// Stable identifier for a logical stack frame.
@@ -337,6 +337,11 @@ pub struct StackFrame
     /// Contains the source file, line number, and column if debug information
     /// is available. May be `None` if source information is not available.
     pub location: Option<SourceLocation>,
+    /// Function parameters (if available from DWARF).
+    ///
+    /// Contains the function's parameters with their names and types if debug
+    /// information is available. May be empty if parameter information is not available.
+    pub parameters: Vec<FunctionParameter>,
     /// Reliability indicator for this frame's unwind data.
     ///
     /// Indicates how reliable the frame's data is based on the unwinding method

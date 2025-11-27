@@ -2,6 +2,41 @@
 
 use std::fmt;
 
+/// Function parameter information extracted from DWARF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParameter
+{
+    /// Parameter name (if available in DWARF).
+    pub name: Option<String>,
+    /// Parameter type name (if available).
+    pub type_name: Option<String>,
+    /// Location where the parameter is stored (register, memory offset, etc.).
+    pub location: Option<String>,
+}
+
+impl FunctionParameter
+{
+    /// Create a new function parameter with just a name.
+    pub fn new(name: impl Into<String>) -> Self
+    {
+        Self {
+            name: Some(name.into()),
+            type_name: None,
+            location: None,
+        }
+    }
+
+    /// Create a function parameter with name and type.
+    pub fn with_type(name: impl Into<String>, type_name: impl Into<String>) -> Self
+    {
+        Self {
+            name: Some(name.into()),
+            type_name: Some(type_name.into()),
+            location: None,
+        }
+    }
+}
+
 /// Programming language associated with a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolLanguage

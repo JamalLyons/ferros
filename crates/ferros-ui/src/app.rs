@@ -97,6 +97,8 @@ pub struct App
     pub current_source_file: Option<String>,
     /// Source view scroll position (line number)
     pub source_scroll: usize,
+    /// Source view selected line (for setting breakpoints)
+    pub source_selected_line: Option<usize>,
     /// Timeline log entries (chronological events)
     pub timeline_log: VecDeque<TimelineEntry>,
     /// Current layout preset
@@ -233,6 +235,7 @@ impl App
             source_cache: std::collections::HashMap::new(),
             current_source_file: None,
             source_scroll: 0,
+            source_selected_line: None,
             timeline_log: VecDeque::new(),
             layout_preset: LayoutPreset::Standard,
             breakpoint_editor: None,
@@ -350,6 +353,10 @@ impl App
             }
             KeyCode::Char('6') => {
                 self.view_mode = ViewMode::Source;
+                // Ensure we have a stack trace before trying to load source
+                if self.debugger.is_attached() && self.target_is_stopped {
+                    self.refresh_stack_trace();
+                }
                 self.refresh_source_view();
             }
             KeyCode::Char('7') => {
@@ -377,13 +384,66 @@ impl App
                 self.command_input.clear();
             }
             KeyCode::Char('b') => {
-                // Toggle breakpoint at current PC
-                if self.debugger.is_attached()
-                    && self.target_is_stopped
-                    && let Ok(regs) = self.debugger.read_registers()
-                {
-                    let pc = regs.pc;
-                    self.toggle_breakpoint_at_address(pc);
+                // Toggle breakpoint - use context-aware address selection
+                if self.debugger.is_attached() && self.target_is_stopped {
+                    let address = match self.view_mode {
+                        ViewMode::Source => {
+                            // In source view, try to use the selected line or current line
+                            if let Some(ref file) = self.current_source_file {
+                                let line_num = self.source_selected_line
+                                    .or_else(|| {
+                                        // Use current frame's line if no line selected
+                                        let selected_idx = self.stack_frames_state.selected().unwrap_or(0);
+                                        self.cached_stack_trace
+                                            .as_ref()
+                                            .and_then(|frames| frames.get(selected_idx))
+                                            .and_then(|frame| frame.location.as_ref())
+                                            .and_then(|loc| {
+                                                if loc.file == *file {
+                                                    loc.line.map(|l| l as usize)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                    });
+                                
+                                if let Some(line) = line_num {
+                                    // Try to find address for this source line
+                                    self.find_address_for_source_line(file, line)
+                                } else {
+                                    // Fallback to selected frame's PC
+                                    let selected_idx = self.stack_frames_state.selected().unwrap_or(0);
+                                    self.cached_stack_trace
+                                        .as_ref()
+                                        .and_then(|frames| frames.get(selected_idx))
+                                        .map(|frame| frame.pc)
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        ViewMode::Stack => {
+                            // Use the selected frame's PC
+                            let selected_idx = self.stack_frames_state.selected().unwrap_or(0);
+                            self.cached_stack_trace
+                                .as_ref()
+                                .and_then(|frames| frames.get(selected_idx))
+                                .map(|frame| frame.pc)
+                        }
+                        _ => {
+                            // For other views, use current PC
+                            self.debugger.read_registers().ok().map(|regs| regs.pc)
+                        }
+                    };
+                    
+                    if let Some(addr) = address {
+                        self.toggle_breakpoint_at_address(addr);
+                    } else {
+                        // Fallback to current PC if context lookup failed
+                        if let Ok(regs) = self.debugger.read_registers() {
+                            self.toggle_breakpoint_at_address(regs.pc);
+                        }
+                    }
                 }
             }
             KeyCode::Char('B') => {
@@ -487,7 +547,13 @@ impl App
                 self.scroll_output_up();
             }
             ViewMode::Source => {
-                self.source_scroll += 1;
+                if self.source_scroll > 0 {
+                    self.source_scroll -= 1;
+                }
+                // Update selected line when scrolling
+                if let Some(ref _file) = self.current_source_file {
+                    self.source_selected_line = Some(self.source_scroll);
+                }
             }
             ViewMode::Stack => {
                 self.navigate_stack_up();
@@ -538,8 +604,22 @@ impl App
                 self.scroll_output_down();
             }
             ViewMode::Source => {
-                if self.source_scroll > 0 {
-                    self.source_scroll -= 1;
+                // Check if we can scroll further
+                if let Some(ref file) = self.current_source_file {
+                    if let Some(lines) = self.source_cache.get(file) {
+                        let max_scroll = lines.len().saturating_sub(1);
+                        if self.source_scroll < max_scroll {
+                            self.source_scroll += 1;
+                        }
+                    } else {
+                        self.source_scroll += 1;
+                    }
+                } else {
+                    self.source_scroll += 1;
+                }
+                // Update selected line when scrolling
+                if let Some(ref _file) = self.current_source_file {
+                    self.source_selected_line = Some(self.source_scroll);
                 }
             }
             ViewMode::Stack => {
@@ -709,18 +789,20 @@ impl App
 
         // Resolve breakpoint addresses to source locations for UI indicators
         // This allows us to show breakpoint markers in the source view
-        // We use the stack trace frames which already have symbolication
+        // Use stack trace frames which already have symbolication
         self.breakpoint_locations.clear();
-        if let Some(ref frames) = self.cached_stack_trace {
-            for bp in &self.cached_breakpoints {
-                if bp.enabled && bp.state == ferros_core::BreakpointState::Resolved {
-                    // Try to find a frame with matching PC to get source location
-                    let location = frames
-                        .iter()
-                        .find(|frame| frame.pc == bp.address)
-                        .and_then(|frame| frame.location.clone());
-                    self.breakpoint_locations.insert(bp.address, location);
-                }
+        for bp in &self.cached_breakpoints {
+            if bp.enabled && bp.state == ferros_core::BreakpointState::Resolved {
+                // Try to find source location from stack trace frames
+                let location = self.cached_stack_trace
+                    .as_ref()
+                    .and_then(|frames| {
+                        frames
+                            .iter()
+                            .find(|frame| frame.pc == bp.address)
+                            .and_then(|frame| frame.location.clone())
+                    });
+                self.breakpoint_locations.insert(bp.address, location);
             }
         }
     }
@@ -730,20 +812,128 @@ impl App
     {
         // Use the selected frame from stack view, or fall back to first frame
         let selected_idx = self.stack_frames_state.selected().unwrap_or(0);
-        if let Some(ref frames) = self.cached_stack_trace
-            && let Some(frame) = frames.get(selected_idx)
+        
+        // Try to find a frame with source location (start from selected, then try all frames)
+        let frame_with_source = if let Some(ref frames) = self.cached_stack_trace {
+            // First try the selected frame
+            frames.get(selected_idx)
+                .and_then(|f| f.location.as_ref().map(|_| f))
+                // If that doesn't work, try the first frame
+                .or_else(|| frames.first().and_then(|f| f.location.as_ref().map(|_| f)))
+                // If that doesn't work, search all frames for one with source
+                .or_else(|| {
+                    frames.iter().find(|f| f.location.is_some())
+                })
+        } else {
+            None
+        };
+        
+        if let Some(frame) = frame_with_source
             && let Some(ref location) = frame.location
         {
-            if !self.source_cache.contains_key(&location.file) {
+            let file_path = &location.file;
+            
+            // Try multiple path resolution strategies
+            let resolved_path = if std::path::Path::new(file_path).exists() {
+                // Path exists as-is
+                Some(file_path.clone())
+            } else if file_path.starts_with('/') {
+                // Absolute path that doesn't exist - try to find it relative to workspace
+                // This handles cases where DWARF has absolute paths from build machine
+                let workspace_root = std::env::current_dir().ok();
+                let mut found_path = None;
+                if let Some(root) = workspace_root {
+                    let path = std::path::Path::new(file_path);
+                    
+                    // Strategy 1: Try to find the file by matching the workspace name in the path
+                    // e.g., if DWARF has /some/absolute/path/ferros/crates/ferros/examples/test_target.rs
+                    // and workspace is /Users/.../ferros, try to extract the relative part
+                    let path_str = path.to_string_lossy();
+                    if let Some(workspace_name) = root.file_name().and_then(|n| n.to_str()) {
+                        // Try to find the workspace name in the absolute path
+                        if let Some(pos) = path_str.find(workspace_name) {
+                            // Extract everything after the workspace name
+                            let relative_part = &path_str[pos + workspace_name.len()..];
+                            let test_path = root.join(relative_part.trim_start_matches('/'));
+                            if test_path.exists() {
+                                if let Some(str_path) = test_path.to_str() {
+                                    found_path = Some(str_path.to_string());
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Strategy 2: If that didn't work, try searching by filename in common locations
+                    if found_path.is_none() {
+                        if let Some(file_name) = path.file_name() {
+                            let search_paths = vec![
+                                root.join(file_name),
+                                root.join("crates").join(file_name),
+                                root.join("target").join("debug").join(file_name),
+                            ];
+                            
+                            for search_path in search_paths {
+                                if search_path.exists() {
+                                    if let Some(str_path) = search_path.to_str() {
+                                        found_path = Some(str_path.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                found_path
+            } else {
+                // Relative path - try resolving from current directory
+                let current_dir = std::env::current_dir().ok();
+                if let Some(dir) = current_dir {
+                    let resolved = dir.join(file_path);
+                    if resolved.exists() {
+                        resolved.to_str().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            
+            let path_to_load = resolved_path.as_ref().unwrap_or(file_path);
+            
+            if !self.source_cache.contains_key(path_to_load) {
                 // Try to load the source file
-                if let Ok(content) = std::fs::read_to_string(&location.file) {
-                    let lines: Vec<String> = content.lines().map(str::to_string).collect();
-                    self.source_cache.insert(location.file.clone(), lines);
+                match std::fs::read_to_string(path_to_load) {
+                    Ok(content) => {
+                        let lines: Vec<String> = content.lines().map(str::to_string).collect();
+                        self.source_cache.insert(path_to_load.clone(), lines);
+                        // Also cache under original path for lookup
+                        if path_to_load != file_path {
+                            if let Some(cached_lines) = self.source_cache.get(path_to_load) {
+                                self.source_cache.insert(file_path.clone(), cached_lines.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Store error info for display - show both original and attempted paths
+                        let error_detail = if resolved_path.is_some() && path_to_load != file_path {
+                            format!("DWARF path: {}\nTried: {}\nError: {}\n\nTip: Source paths in DWARF may be absolute paths from build machine.", file_path, path_to_load, e)
+                        } else {
+                            format!("Path: {}\nError: {}\n\nTip: Check if the file exists at this path.", path_to_load, e)
+                        };
+                        self.error_message = Some(format!("Failed to load source file:\n{}", error_detail));
+                        self.info_message = None;
+                    }
                 }
             }
-            self.current_source_file = Some(location.file.clone());
+            
+            // Use resolved path if available, otherwise original
+            let display_path = resolved_path.as_ref().unwrap_or(file_path);
+            self.current_source_file = Some(display_path.clone());
             if let Some(line) = location.line {
-                self.source_scroll = (line as usize).saturating_sub(10).max(0);
+                let line_usize = line as usize;
+                self.source_scroll = line_usize.saturating_sub(10).max(0);
+                self.source_selected_line = Some(line_usize.saturating_sub(1)); // Line numbers are 1-based, array is 0-based
             }
         }
     }
@@ -779,6 +969,26 @@ impl App
                 self.refresh_source_view();
             }
         }
+    }
+
+    /// Find address for a given source file and line number.
+    /// This searches through known addresses to find one that matches the source location.
+    fn find_address_for_source_line(&self, file: &str, line: usize) -> Option<Address>
+    {
+        // First, try to find in cached stack trace frames
+        if let Some(ref frames) = self.cached_stack_trace {
+            for frame in frames {
+                if let Some(ref location) = frame.location {
+                    if location.file == file && location.line == Some(line as u32) {
+                        return Some(frame.pc);
+                    }
+                }
+            }
+        }
+        
+        // If not found in frames, we could iterate through breakpoints or use symbolication
+        // For now, return None and let the caller fall back to frame PC
+        None
     }
 
     /// Toggle breakpoint at the given address

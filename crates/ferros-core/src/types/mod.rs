@@ -17,4 +17,4 @@ pub use address::Address;
 pub use process::{Architecture, MemoryRegion, MemoryRegionId, ProcessId, StopReason, ThreadId};
 pub use registers::{Arm64Register, FloatingPointState, RegisterId, Registers, VectorRegisterValue, X86_64Register};
 pub use stack::{FrameId, FrameKind, FrameStatus, StackFrame};
-pub use symbols::{SourceLocation, SymbolLanguage, SymbolName};
+pub use symbols::{FunctionParameter, SourceLocation, SymbolLanguage, SymbolName};

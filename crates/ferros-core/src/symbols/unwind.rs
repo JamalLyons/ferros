@@ -523,7 +523,15 @@ fn append_logical_frames(
 )
 {
     if let Some(symbols) = symbolication {
-        for (inline_depth, SymbolFrame { symbol, location }) in symbols.frames.iter().enumerate() {
+        for (
+            inline_depth,
+            SymbolFrame {
+                symbol,
+                location,
+                parameters,
+            },
+        ) in symbols.frames.iter().enumerate()
+        {
             let inline_id = FrameId::new(thread, depth, inline_depth as u8, regs.pc, regs.sp);
             frames.push(StackFrame {
                 id: inline_id,
@@ -539,17 +547,18 @@ fn append_logical_frames(
                 return_address,
                 symbol: Some(symbol.clone()),
                 location: location.clone(),
+                parameters: parameters.clone(),
                 status,
             });
         }
     }
 
     let physical_id = FrameId::new(thread, depth, 0, regs.pc, regs.sp);
-    let (symbol, location) = symbolication
+    let (symbol, location, parameters) = symbolication
         .as_ref()
         .and_then(|sym| sym.frames.first())
-        .map(|frame| (Some(frame.symbol.clone()), frame.location.clone()))
-        .unwrap_or((None, None));
+        .map(|frame| (Some(frame.symbol.clone()), frame.location.clone(), frame.parameters.clone()))
+        .unwrap_or((None, None, Vec::new()));
 
     frames.push(StackFrame {
         id: physical_id,
@@ -562,6 +571,7 @@ fn append_logical_frames(
         return_address,
         symbol,
         location,
+        parameters,
         status,
     });
 }

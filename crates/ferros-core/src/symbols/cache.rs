@@ -47,7 +47,7 @@ use std::sync::Arc;
 use super::extractor::TypeSummary;
 use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use crate::error::{DebuggerError, Result};
-use crate::types::{Address, SourceLocation, SymbolName};
+use crate::types::{Address, FunctionParameter, SourceLocation, SymbolName};
 
 /// Cached symbol metadata for a given address.
 ///
@@ -73,6 +73,8 @@ pub struct SymbolFrame
     pub symbol: SymbolName,
     /// Source location (file, line, column) if available
     pub location: Option<SourceLocation>,
+    /// Function parameters (if available from DWARF)
+    pub parameters: Vec<FunctionParameter>,
 }
 
 /// Cache for binary images and their DWARF metadata.

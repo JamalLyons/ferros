@@ -10,10 +10,8 @@ resolver = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-# missing_docs = "warn"
 unused = { level = "warn", priority = -1 }
-# Warn about Rust 2024 incompatible patterns
-rust_2024_incompatible_pat = "warn"
+rust_2024_incompatible_pat = "deny"
 
 # Clippy lints
 [workspace.lints.clippy]

@@ -9,7 +9,7 @@ use crate::types::address::Address;
 /// A PID is a unique number assigned to each running process by the operating
 /// system. On Unix-like systems (macOS, Linux), PIDs are typically 32-bit
 /// unsigned integers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub struct ProcessId(pub u32);
 
 impl From<u32> for ProcessId
@@ -39,7 +39,7 @@ impl From<ProcessId> for u32
 ///
 /// We store it as a `u64` to provide a platform-agnostic interface. Platform-specific
 /// implementations convert between their native types and `ThreadId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub struct ThreadId(pub u64);
 
 impl ThreadId
@@ -76,7 +76,6 @@ impl From<u64> for ThreadId
 ///
 /// - `Running` → `Suspended`: Process was explicitly suspended via `suspend()`
 /// - `Running` → `Signal(n)`: Process received a signal (e.g., SIGSTOP, SIGINT)
-/// - `Running` → `Breakpoint(addr)`: Process hit a breakpoint at `addr`
 /// - `Running` → `Exited(code)`: Process exited with exit code `code`
 /// - `Suspended` → `Running`: Process was resumed via `resume()`
 ///
@@ -85,7 +84,7 @@ impl From<u64> for ThreadId
 /// - **macOS**: Uses `task_suspend()`/`task_resume()` for suspension
 /// - **Linux**: Uses `ptrace(PTRACE_CONT)`/`ptrace(PTRACE_STOP)` for control
 /// - **Windows**: Uses `SuspendThread()`/`ResumeThread()` for thread control
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum StopReason
 {
     /// Process is currently running (not stopped)
@@ -103,13 +102,10 @@ pub enum StopReason
     /// - `SIGTSTP` (20): Terminal stop signal
     /// - `SIGINT` (2): Interrupt signal (Ctrl+C)
     ///
-    /// See: [signal(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/signal.3.html)
+    /// macOS: [signal(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/signal.3.html)
+    /// Linux: [signal(7) man page](https://man7.org/linux/man-pages/man7/signal.7.html)
+    /// Windows: n/a
     Signal(i32),
-    /// Hit a breakpoint at the provided address
-    ///
-    /// The `u64` value is the memory address where the breakpoint was hit.
-    /// This is set when the process executes an instruction at a breakpoint location.
-    Breakpoint(u64),
     /// Process exited with status code
     ///
     /// The `i32` value is the exit code (0 typically means success, non-zero means error).
@@ -133,7 +129,7 @@ pub enum StopReason
 /// Memory region IDs are stable within a single enumeration session, but may
 /// change if the process's memory layout changes (e.g., after `malloc()` or `mmap()`).
 /// You should refresh the memory region list if you need up-to-date information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub struct MemoryRegionId(pub usize);
 
 impl MemoryRegionId
@@ -154,7 +150,7 @@ impl MemoryRegionId
 /// such as the stack, heap, or code segments. Each region has a start
 /// address, end address, and permission flags that determine what
 /// operations are allowed on that memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct MemoryRegion
 {
     /// Stable identifier for the region.
@@ -277,7 +273,7 @@ impl MemoryRegion
 /// The architecture is typically detected when attaching to a process. On macOS,
 /// we use the architecture of the currently running debugger binary as a hint,
 /// but the actual architecture may differ if debugging a cross-architecture process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub enum Architecture
 {
     /// 64-bit ARM (Apple Silicon)

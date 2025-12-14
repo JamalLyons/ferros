@@ -1,6 +1,6 @@
 //! Build script for ferros-core
 //!
-//! This script checks system requirements before compilation:
+//! This script validates system requirements before compilation:
 //! - Minimum Rust version (Edition 2021 = Rust 1.56.0+)
 //! - Platform-specific requirements (macOS version, etc.)
 //! - Architecture support
@@ -12,81 +12,110 @@
 //! - **Linux**: TBD
 //! - **Windows**: TBD
 
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Minimum required Rust version (Edition 2021)
+const MIN_RUST_VERSION: &str = "1.56.0";
+
+/// Minimum macOS version for Intel (x86_64)
+/// mach_vm_region() was introduced in macOS 10.5, but we require 10.9+
+/// as that's when 64-bit support became standard
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Only used when target_arch = "x86_64"
+const MIN_MACOS_VERSION_INTEL: (u32, u32, u32) = (10, 9, 0);
+
+/// Minimum macOS version for Apple Silicon (ARM64)
+/// Apple Silicon requires macOS 11.0+ (Big Sur)
+#[cfg(target_os = "macos")]
+const MIN_MACOS_VERSION_ARM64: (u32, u32, u32) = (11, 0, 0);
+
 fn main()
 {
-    // Check minimum Rust version
-    // Edition 2021 requires Rust 1.56.0
-    // Note: We use nightly Rust, but the minimum stable version for edition 2021 is 1.56.0
-    if let Ok(rustc_version) = rustc_version::version() {
-        let min_rust_version = rustc_version::Version::parse("1.56.0").unwrap();
+    check_rust_version();
+    check_platform_requirements();
+}
 
-        if rustc_version < min_rust_version {
-            panic!(
-                "ferros-core requires Rust {} or newer (Edition 2021), found {}",
-                min_rust_version, rustc_version
-            );
+/// Verifies that the Rust compiler meets the minimum version requirement.
+fn check_rust_version()
+{
+    match rustc_version::version() {
+        Ok(version) => {
+            let min_version = rustc_version::Version::parse(MIN_RUST_VERSION).expect("invalid MIN_RUST_VERSION constant");
+
+            if version < min_version {
+                panic!(
+                    "ferros-core requires Rust {} or newer (Edition 2021), found {}",
+                    min_version, version
+                );
+            }
         }
-    } else {
-        // If we can't get version (e.g., in some build environments), just warn
-        println!("cargo:warning=could not verify Rust version");
+        Err(_) => {
+            // If we can't get version (e.g., in some build environments), just warn
+            // This allows builds to proceed in cross-compilation scenarios
+            println!("cargo:warning=could not verify Rust version");
+        }
     }
+}
 
-    // Platform-specific checks
+/// Orchestrates platform-specific requirement checks.
+fn check_platform_requirements()
+{
     #[cfg(target_os = "macos")]
     check_macos_requirements();
-
-    #[cfg(target_arch = "aarch64")]
-    #[cfg(target_os = "macos")]
-    check_macos_arm64_requirements();
 }
 
 #[cfg(target_os = "macos")]
+/// Validates macOS version requirements based on architecture.
 fn check_macos_requirements()
 {
-    // Check macOS version
-    // mach_vm_region() was introduced in macOS 10.5 (Leopard)
-    // However, for practical purposes, we require macOS 10.9+ (Mavericks)
-    // as that's when 64-bit support became standard
-    let min_macos_version = (10, 9, 0);
+    let Some(version) = get_macos_version() else {
+        // If we can't detect macOS version, warn but don't fail
+        // (might be cross-compiling or in a non-standard build environment)
+        println!("cargo:warning=could not detect macOS version");
+        return;
+    };
 
-    match get_macos_version() {
-        Some(version) if version < min_macos_version => {
+    // Check architecture-specific requirements
+    #[cfg(target_arch = "aarch64")]
+    {
+        if version < MIN_MACOS_VERSION_ARM64 {
             panic!(
-                "ferros-core requires macOS {}.{}.{} or newer, found {}.{}.{}",
-                min_macos_version.0, min_macos_version.1, min_macos_version.2, version.0, version.1, version.2
+                "ferros-core on Apple Silicon requires macOS {}.{}.{} or newer (Big Sur+), found {}.{}.{}",
+                MIN_MACOS_VERSION_ARM64.0,
+                MIN_MACOS_VERSION_ARM64.1,
+                MIN_MACOS_VERSION_ARM64.2,
+                version.0,
+                version.1,
+                version.2
             );
         }
-        None => {
-            // If we can't detect macOS version, warn but don't fail
-            // (might be cross-compiling)
-            println!("cargo:warning=could not detect macOS version");
-        }
-        _ => {} // Version is OK
     }
-}
 
-#[cfg(target_arch = "aarch64")]
-#[cfg(target_os = "macos")]
-fn check_macos_arm64_requirements()
-{
-    // Apple Silicon (ARM64) requires macOS 11.0+ (Big Sur)
-    let min_macos_version = (11, 0, 0);
-
-    if let Some(version) = get_macos_version()
-        && version < min_macos_version
+    #[cfg(target_arch = "x86_64")]
     {
-        panic!(
-            "ferros-core on Apple Silicon requires macOS {}.{}.{} or newer (Big Sur+), found {}.{}.{}",
-            min_macos_version.0, min_macos_version.1, min_macos_version.2, version.0, version.1, version.2
-        );
+        if version < MIN_MACOS_VERSION_INTEL {
+            panic!(
+                "ferros-core requires macOS {}.{}.{} or newer, found {}.{}.{}",
+                MIN_MACOS_VERSION_INTEL.0,
+                MIN_MACOS_VERSION_INTEL.1,
+                MIN_MACOS_VERSION_INTEL.2,
+                version.0,
+                version.1,
+                version.2
+            );
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
+/// Attempts to detect the current macOS version.
+///
+/// Returns `None` if version detection fails (e.g., cross-compiling or
+/// non-standard build environment).
 fn get_macos_version() -> Option<(u32, u32, u32)>
 {
-    // Try to get macOS version from environment or system
-    // This is a best-effort check - may not work in all build environments
     use std::process::Command;
 
     let output = Command::new("sw_vers").arg("-productVersion").output().ok()?;

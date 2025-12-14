@@ -16,11 +16,10 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 ## Code Style & Formatting
 
 ### Formatting Rules
-- Always run `cargo fmt --all` before committing
-- Follow the project's `rustfmt.toml`
+- Always run `just fmt` before committing
 
 ### Linting Rules
-- Always run `cargo clippy --all -- -D warnings` before committing
+- Always run `just lint` before committing
 
 ## Workspace Configuration
 
@@ -61,6 +60,8 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 - Document all public functions, types, and modules with Rustdoc comments (`///`)
 - Use `# Errors` sections to document error conditions
 - Use `# Panics` sections if functions can panic
+- When documenting platoform code, try to include references to the man pages for the system calls you are using. Make sure the url is valid and accessible.
+- When documenting code types that mask C types, explain what the type does as if it actually acts as the underlying C type.
 
 ### Code Comments
 - Use `//` for inline comments
@@ -113,7 +114,6 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 ### Type Safety
 - Prefer strong types over primitives (e.g., `struct ProcessId(u32)` over `u32`)
 - Use newtype patterns for domain concepts
-- Leverage Rust's type system for compile-time guarantees
 
 ### Code Organization
 - Keep modules focused and cohesive
@@ -126,10 +126,9 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Use `PascalCase` for types and traits
 - Use `SCREAMING_SNAKE_CASE` for constants
 - Use descriptive names that convey intent
-- Avoid abbreviations unless widely understood
+- Avoid abbreviations
 
 ### Resource Management
-- Use RAII patterns for resource cleanup
 - Implement `Drop` for custom resource types
 - Use `std::sync::Arc` for shared ownership
 - Prefer direct lifetime syntax over cloning when possible

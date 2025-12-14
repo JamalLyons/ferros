@@ -9,12 +9,6 @@ use std::ops::{Add, Sub};
 /// addresses. It prevents accidentally mixing addresses with other `u64` values
 /// (like sizes, counts, or other numeric types).
 ///
-/// ## Why use a newtype?
-///
-/// - **Type safety**: Prevents accidentally passing a size where an address is expected
-/// - **Self-documenting**: Makes it clear that a value represents a memory address
-/// - **Future extensibility**: Can add address validation or methods later
-///
 /// ## Address Space
 ///
 /// On 64-bit systems, addresses are 64-bit values. However, not all 64-bit values

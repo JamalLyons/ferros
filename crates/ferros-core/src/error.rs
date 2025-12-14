@@ -7,6 +7,8 @@
 
 use thiserror::Error;
 
+use crate::types::process::ThreadId;
+
 /// Main error type for debugger operations
 ///
 /// This enum represents all the ways a debugger operation can fail.
@@ -149,7 +151,7 @@ pub enum FerrosError
         /// Description of the operation that failed
         operation: String,
         /// Thread ID if the operation was thread-specific
-        thread_id: Option<crate::types::process::ThreadId>,
+        thread_id: Option<ThreadId>,
         /// Additional error details
         details: String,
     },

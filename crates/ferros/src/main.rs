@@ -5,7 +5,7 @@ use ferros_core::prelude::*;
 use ferros_utils::{LogFormat, LogLevel, LoggingError, init_logging, init_logging_with_level};
 
 use crate::cli::Cli;
-use crate::commands::{Commands, run_attach_command};
+use crate::commands::run_command;
 
 mod cli;
 mod commands;
@@ -18,7 +18,9 @@ fn main() -> FerrosResult<()>
     // Initialize logging based on CLI options
     init_logging_from_cli(&cli).map_err(|e| FerrosError::InvalidArgument(format!("Failed to initialize logging: {}", e)))?;
 
-    run_command(cli)?;
+    // Run the appropriate command based on the CLI input
+    run_command(cli.command)?;
+
     Ok(())
 }
 
@@ -56,15 +58,4 @@ fn init_logging_from_cli(cli: &Cli) -> Result<(), LoggingError>
     }
 
     Ok(())
-}
-
-fn run_command(cli: Cli) -> FerrosResult<()>
-{
-    match cli.command {
-        Commands::Attach { pid } => {
-            run_attach_command(pid)?;
-            Ok(())
-        }
-        _ => Err(FerrosError::InvalidArgument("Invalid command".to_string())),
-    }
 }

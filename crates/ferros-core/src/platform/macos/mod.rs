@@ -55,8 +55,10 @@
 //! - [posix_spawn documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
 //! - [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
 
+use std::ffi::CString;
+
 use ferros_utils::debug;
-use libc::{c_int, mach_port_t, thread_act_t};
+use libc::{c_int, mach_port_t, pid_t, thread_act_t};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::task::task_threads;
 use mach2::traps::mach_task_self;
@@ -148,11 +150,85 @@ impl Drop for MacOSDebugger
 
 impl crate::debugger::FerrosDebugger for MacOSDebugger
 {
-    fn launch(&mut self, _program: &str, _args: &[&str]) -> FerrosResult<crate::types::process::ProcessId>
+    fn launch(&mut self, program: &str, args: &[&str]) -> FerrosResult<crate::types::process::ProcessId>
     {
-        Err(crate::error::FerrosError::AttachFailed(
-            "launch() not yet implemented".to_string(),
-        ))
+        // Cannot launch if already attached
+        if self.task_port.is_some() {
+            return Err(FerrosError::AttachFailed(
+                "Already attached to a process. Call detach() first.".to_string(),
+            ));
+        }
+
+        // Build argv: program path followed by args, null-terminated
+        let mut argv_cstrings = Vec::with_capacity(args.len() + 1);
+        argv_cstrings
+            .push(CString::new(program).map_err(|e| FerrosError::InvalidArgument(format!("Invalid program path: {}", e)))?);
+        for arg in args {
+            argv_cstrings
+                .push(CString::new(*arg).map_err(|e| FerrosError::InvalidArgument(format!("Invalid argument: {}", e)))?);
+        }
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv_cstrings.iter().map(|s| s.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+
+        // Initialize spawn attributes
+        let mut attr: libc::posix_spawnattr_t = unsafe { std::mem::zeroed() };
+        let init_result = unsafe { ffi::posix_spawnattr_init(&mut attr as *mut _) };
+        if init_result != 0 {
+            return Err(FerrosError::AttachFailed(format!(
+                "posix_spawnattr_init failed with errno {}",
+                init_result
+            )));
+        }
+
+        // Ensure we destroy the attr even on early returns
+        struct AttrGuard(libc::posix_spawnattr_t);
+        impl Drop for AttrGuard
+        {
+            fn drop(&mut self)
+            {
+                unsafe {
+                    let _ = ffi::posix_spawnattr_destroy(&mut self.0 as *mut _);
+                }
+            }
+        }
+        let mut attr_guard = AttrGuard(attr);
+
+        // Start the process suspended so the debugger controls initial execution
+        let flag_result = unsafe {
+            ffi::posix_spawnattr_setflags(&mut attr_guard.0 as *mut _, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED)
+        };
+        if flag_result != 0 {
+            return Err(FerrosError::AttachFailed(format!(
+                "posix_spawnattr_setflags failed with errno {}",
+                flag_result
+            )));
+        }
+
+        // Spawn the process
+        let mut child_pid: pid_t = 0;
+        let spawn_result = unsafe {
+            ffi::posix_spawn(
+                &mut child_pid as *mut _,
+                argv_cstrings[0].as_ptr(),
+                std::ptr::null(),
+                &attr_guard.0 as *const _,
+                argv_ptrs.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+
+        if spawn_result != 0 {
+            return Err(FerrosError::AttachFailed(format!(
+                "posix_spawn failed with errno {}",
+                spawn_result
+            )));
+        }
+
+        // Attach to the newly spawned (suspended) process
+        let pid_value = child_pid as u32;
+        self.attach(ProcessId::from(pid_value))?;
+
+        Ok(ProcessId::from(pid_value))
     }
 
     fn attach(&mut self, pid: ProcessId) -> FerrosResult<()>

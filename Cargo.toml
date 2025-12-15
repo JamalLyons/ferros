@@ -28,3 +28,4 @@ undocumented_unsafe_blocks = "deny"
 # Workspace dependencies
 [workspace.dependencies]
 thiserror = "2.0.17"
+libc = "0.2.178"

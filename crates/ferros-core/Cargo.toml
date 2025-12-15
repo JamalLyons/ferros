@@ -10,7 +10,7 @@ keywords = ["debugger", "debugging", "ptrace"]
 categories = ["development-tools"]
 
 [dependencies]
-libc = "0.2.177"
+libc = { workspace = true }
 thiserror = { workspace = true }
 ferros-utils = { path = "../ferros-utils" }
 

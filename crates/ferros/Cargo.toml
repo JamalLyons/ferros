@@ -16,3 +16,6 @@ clap = { version = "4.5.51", features = ["derive"] }
 
 ferros-core = { path = "../ferros-core" }
 ferros-utils = { path = "../ferros-utils" }
+libc = { workspace = true }
+log = "0.4.29"
+rustyline = "17.0.2"

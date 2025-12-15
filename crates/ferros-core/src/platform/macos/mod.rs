@@ -82,12 +82,12 @@ pub mod ffi;
 #[derive(Debug)]
 pub struct MacOSDebugger
 {
-    /// Mach task port for the attached process
+    /// Mach task port for the attached process.
     ///
     /// This is `None` when not attached to any process. When attached,
     /// this contains the task port obtained from `task_for_pid()`.
     pub task_port: Option<mach_port_t>,
-    /// Process ID of the attached process
+    /// Process ID of the attached process.
     ///
     /// This is `None` when not attached to any process. When attached,
     /// this contains the PID that was used to obtain the task port.
@@ -391,6 +391,8 @@ impl crate::debugger::FerrosDebugger for MacOSDebugger
         }
         self.threads.clear();
         self.current_thread = None;
+        self.task_port = None;
+        self.pid = None;
 
         // Clean up the task port
         if let Some(task_port) = self.task_port.take() {

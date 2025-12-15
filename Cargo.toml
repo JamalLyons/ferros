@@ -5,6 +5,7 @@ members = [
     "crates/ferros-mir",
     "crates/ferros-protocol",
     "crates/ferros-utils",
+    "crates/ferros-config",
 ]
 resolver = "2"
 

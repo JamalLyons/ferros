@@ -16,4 +16,4 @@ EXAMPLE_BIN="$PROJECT_ROOT/target/debug/examples/simple_test"
 
 # Launch the example under Ferros (launch starts it suspended, Ferros owns its lifetime)
 echo "Launching simple_test under Ferros..."
-sudo cargo run --package ferros -- --log-level debug launch "$EXAMPLE_BIN"
+sudo FERROS_CONFIG="$PROJECT_ROOT/.config/ferros/config.toml" cargo run --package ferros "$EXAMPLE_BIN"

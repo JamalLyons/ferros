@@ -29,6 +29,14 @@ pub fn run_command(command: Commands) -> FerrosResult<()>
 
             Ok(())
         }
+        // `External` should be resolved into a concrete `Attach` or `Launch`
+        // command by `resolve_command` in `main.rs` and never reach here.
+        // If it does, treat it as a programmer error and surface a clear message.
+        Commands::External(args) => Err(FerrosError::InvalidArgument(format!(
+            "Unresolved external command '{:?}'. This is a bug in ferros; please file an issue including the CLI \
+             invocation.",
+            args
+        ))),
     }
 }
 

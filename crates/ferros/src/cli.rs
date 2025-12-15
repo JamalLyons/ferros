@@ -41,4 +41,21 @@ pub enum Commands
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Fallback for invocations without an explicit subcommand.
+    ///
+    /// This allows calling `ferros <target>` and using the configuration
+    /// value `debugger.default_attach_mode` to determine whether to treat
+    /// the target as a PID (`attach`) or an executable path (`launch`).
+    ///
+    /// Examples:
+    /// - With `default_attach_mode = "launch"`:
+    ///     `ferros ./target/debug/my_program arg1 arg2`
+    /// - With `default_attach_mode = "attach"`:
+    ///     `ferros 12345`
+    ///
+    /// The concrete behavior is resolved in `main` before dispatching
+    /// to `run_command`.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }

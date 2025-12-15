@@ -1,0 +1,7 @@
+[debugger]
+# Log level used by Ferros.
+# One of: "error", "warn", "info", "debug", "trace"
+log_level = "debug"
+
+# Reserved for future use: default attach mode (e.g. "attach", "launch").
+default_attach_mode = "launch"

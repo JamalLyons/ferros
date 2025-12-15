@@ -35,7 +35,7 @@ impl Repl
         // Disable rustyline debug logs by setting log crate's max level to INFO
         // Rustyline uses the log crate internally, so we filter it at the log level
         // This prevents DEBUG and TRACE logs from rustyline from appearing
-        let _ = log::set_max_level(LevelFilter::Info);
+        log::set_max_level(LevelFilter::Info);
 
         let mut rl =
             DefaultEditor::new().map_err(|e| FerrosError::InvalidArgument(format!("Failed to initialize REPL: {}", e)))?;
@@ -109,10 +109,8 @@ impl Repl
         // Save history
         if let Err(e) = rl.save_history(&history_path) {
             eprintln!("Warning: Failed to save history: {}", e);
-        } else {
-            if is_running_as_root() {
-                fix_file_permissions(&history_path);
-            }
+        } else if is_running_as_root() {
+            fix_file_permissions(&history_path);
         }
 
         // If we launched the process, ensure it is terminated when the REPL exits.
@@ -155,28 +153,28 @@ fn fix_file_permissions(path: &PathBuf)
         use std::os::unix::fs::PermissionsExt;
 
         // Get the real user's UID from SUDO_UID environment variable
-        if let Ok(sudo_uid_str) = std::env::var("SUDO_UID") {
-            if let Ok(uid) = sudo_uid_str.parse::<u32>() {
-                // Get the real user's GID from SUDO_GID
-                let gid = std::env::var("SUDO_GID")
-                    .ok()
-                    .and_then(|g| g.parse::<u32>().ok())
-                    .unwrap_or(uid); // Fallback to UID if GID not available
+        if let Ok(sudo_uid_str) = std::env::var("SUDO_UID")
+            && let Ok(uid) = sudo_uid_str.parse::<u32>()
+        {
+            // Get the real user's GID from SUDO_GID
+            let gid = std::env::var("SUDO_GID")
+                .ok()
+                .and_then(|g| g.parse::<u32>().ok())
+                .unwrap_or(uid); // Fallback to UID if GID not available
 
-                // Convert path to C string
-                let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok();
-                if let Some(path_cstr) = path_cstr {
-                    // Change ownership to the real user
-                    unsafe {
-                        let _ = libc::chown(path_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
-                    }
+            // Convert path to C string
+            let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).ok();
+            if let Some(path_cstr) = path_cstr {
+                // Change ownership to the real user
+                unsafe {
+                    let _ = libc::chown(path_cstr.as_ptr(), uid as libc::uid_t, gid as libc::gid_t);
                 }
+            }
 
-                // Set permissions to 644 (rw-r--r--)
-                if let Ok(mut perms) = std::fs::metadata(path).map(|m| m.permissions()) {
-                    perms.set_mode(0o644);
-                    let _ = std::fs::set_permissions(path, perms);
-                }
+            // Set permissions to 644 (rw-r--r--)
+            if let Ok(mut perms) = std::fs::metadata(path).map(|m| m.permissions()) {
+                perms.set_mode(0o644);
+                let _ = std::fs::set_permissions(path, perms);
             }
         }
     }

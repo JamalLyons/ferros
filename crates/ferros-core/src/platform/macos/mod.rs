@@ -56,13 +56,13 @@
 //! - [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
 
 use ferros_utils::debug;
-use libc::{c_int, mach_port_t};
+use libc::{c_int, mach_port_t, thread_act_t};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::task::task_threads;
 use mach2::traps::mach_task_self;
 
 use crate::error::{FerrosError, FerrosResult};
-use crate::types::process::ProcessId;
+use crate::types::process::{Architecture, ProcessId};
 
 pub mod error;
 pub mod ffi;
@@ -90,6 +90,12 @@ pub struct MacOSDebugger
     /// This is `None` when not attached to any process. When attached,
     /// this contains the PID that was used to obtain the task port.
     pub pid: Option<u32>,
+    /// Architecture metadata.
+    pub architecture: Architecture,
+    /// Cached thread ports for the target task.
+    pub threads: Vec<thread_act_t>,
+    /// Active thread used for register operations.
+    pub current_thread: Option<thread_act_t>,
 }
 
 impl MacOSDebugger
@@ -107,6 +113,9 @@ impl MacOSDebugger
         Ok(Self {
             task_port: None,
             pid: None,
+            architecture: Architecture::current(),
+            threads: Vec::new(),
+            current_thread: None,
         })
     }
 }
@@ -115,9 +124,20 @@ impl Drop for MacOSDebugger
 {
     fn drop(&mut self)
     {
+        let self_task = unsafe { mach_task_self() };
+
+        // Clean up thread ports
+        for thread_port in &self.threads {
+            let result = unsafe { ffi::mach_port_deallocate(self_task, *thread_port) };
+            if result != KERN_SUCCESS {
+                debug!("Failed to deallocate thread port in Drop: {}", result);
+            }
+        }
+        self.threads.clear();
+        self.current_thread = None;
+
         // Clean up the task port if we're still attached
         if let Some(task_port) = self.task_port {
-            let self_task = unsafe { mach_task_self() };
             let result = unsafe { ffi::mach_port_deallocate(self_task, task_port) };
             if result != KERN_SUCCESS {
                 debug!("Failed to deallocate task port in Drop: {}", result);
@@ -179,10 +199,44 @@ impl crate::debugger::FerrosDebugger for MacOSDebugger
                         mach_error
                     )));
                 }
-                error::MachError::ProcessNotFound => {
-                    // Even though we checked above, the process might have exited
-                    // between the check and the attach call
+                error::MachError::Failure => {
+                    // KERN_FAILURE can mean either process not found OR permission denied.
+                    // Since we already verified the process exists above, this is likely
+                    // a permission issue. However, the process might have exited between
+                    // the check and the attach call, so we verify again.
+                    let still_exists = unsafe { libc::kill(pid_value as libc::pid_t, 0) == 0 };
+                    if still_exists {
+                        // Process still exists, so this is a permission issue
+                        return Err(FerrosError::PermissionDenied(format!(
+                            "task_for_pid() failed: {}. Process exists but access denied. Need sudo or debugging \
+                             entitlements.",
+                            mach_error
+                        )));
+                    } else {
+                        // Process exited between check and attach
+                        return Err(FerrosError::ProcessNotFound(pid_value));
+                    }
+                }
+                error::MachError::InvalidTask => {
+                    return Err(FerrosError::AttachFailed(format!(
+                        "task_for_pid() failed: {}. Invalid task port.",
+                        mach_error
+                    )));
+                }
+                error::MachError::InvalidRight => {
+                    return Err(FerrosError::AttachFailed(format!(
+                        "task_for_pid() failed: {}. Invalid port right.",
+                        mach_error
+                    )));
+                }
+                error::MachError::Terminated => {
                     return Err(FerrosError::ProcessNotFound(pid_value));
+                }
+                error::MachError::InvalidAddress
+                | error::MachError::NoSpace
+                | error::MachError::ResourceShortage
+                | error::MachError::NotSupported => {
+                    return Err(FerrosError::AttachFailed(format!("task_for_pid() failed: {}", mach_error)));
                 }
                 error::MachError::Unknown(code) => {
                     return Err(FerrosError::AttachFailed(format!(
@@ -212,7 +266,18 @@ impl crate::debugger::FerrosDebugger for MacOSDebugger
             )));
         }
 
-        // Deallocate the thread list (task_threads allocates memory that must be freed)
+        // Copy thread ports from the array into our Vec before deallocating the memory
+        let mut threads = Vec::new();
+        if !thread_list.is_null() && thread_count > 0 {
+            let thread_slice = unsafe { std::slice::from_raw_parts(thread_list, thread_count as usize) };
+            threads.extend_from_slice(thread_slice);
+        }
+
+        // Set the current thread to the first thread (if any)
+        let current_thread = threads.first().copied();
+
+        // Deallocate the thread list memory (task_threads allocates memory that must be freed)
+        // Note: We've copied the thread ports, so we can safely deallocate the array memory
         if !thread_list.is_null() && thread_count > 0 {
             unsafe {
                 let vm_result = ffi::vm_deallocate(
@@ -226,9 +291,11 @@ impl crate::debugger::FerrosDebugger for MacOSDebugger
             }
         }
 
-        // Store the task port and PID
+        // Store the task port, PID, threads, and current thread
         self.task_port = Some(task_port);
         self.pid = Some(pid_value);
+        self.threads = threads;
+        self.current_thread = current_thread;
 
         debug!("Successfully attached to process {} (task port: {})", pid_value, task_port);
         Ok(())
@@ -236,8 +303,21 @@ impl crate::debugger::FerrosDebugger for MacOSDebugger
 
     fn detach(&mut self) -> FerrosResult<()>
     {
+        let self_task = unsafe { mach_task_self() };
+
+        // Clean up thread ports
+        for thread_port in &self.threads {
+            let result = unsafe { ffi::mach_port_deallocate(self_task, *thread_port) };
+            if result != KERN_SUCCESS {
+                debug!("Failed to deallocate thread port in detach: {}", result);
+                // Continue cleaning up other resources even if one fails
+            }
+        }
+        self.threads.clear();
+        self.current_thread = None;
+
+        // Clean up the task port
         if let Some(task_port) = self.task_port.take() {
-            let self_task = unsafe { mach_task_self() };
             let result = unsafe { ffi::mach_port_deallocate(self_task, task_port) };
             if result != KERN_SUCCESS {
                 return Err(FerrosError::AttachFailed(format!(

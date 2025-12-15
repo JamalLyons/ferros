@@ -5,13 +5,14 @@ edition = "2024"
 description = "Low-level debugging primitives and process control for Ferros."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-# readme = "README.md"
+readme = "README.md"
 keywords = ["debugger", "debugging", "ptrace"]
 categories = ["development-tools"]
 
 [dependencies]
 libc = "0.2.177"
 thiserror = { workspace = true }
+ferros-utils = { path = "../ferros-utils" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6.0"

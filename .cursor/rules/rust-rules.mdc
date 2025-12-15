@@ -9,7 +9,7 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 - `ferros`: Command-line interface
 - `ferros-core`: Low-level debugging primitives and process control
 - `ferros-mir`: MIR integration, introspection, and analysis
-- `ferros-ui`: Optional GUI for visualization
+- `ferros-ui`: Optional TUI for visualization
 - `ferros-protocol`: Communication layer between debugger and frontend
 - `ferros-utils`: Shared utilities, logging, config, and helpers
 

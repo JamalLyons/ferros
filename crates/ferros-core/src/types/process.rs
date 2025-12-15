@@ -273,7 +273,7 @@ impl MemoryRegion
 /// The architecture is typically detected when attaching to a process. On macOS,
 /// we use the architecture of the currently running debugger binary as a hint,
 /// but the actual architecture may differ if debugging a cross-architecture process.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Architecture
 {
     /// 64-bit ARM (Apple Silicon)

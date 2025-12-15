@@ -8,3 +8,4 @@
 
 pub mod address;
 pub mod process;
+pub mod registers;

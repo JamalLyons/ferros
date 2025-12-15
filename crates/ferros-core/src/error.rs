@@ -174,6 +174,18 @@ pub enum FerrosError
     /// This is a standard Rust `std::io::Error` converted to our error type.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Platform not supported
+    ///
+    /// This error occurs when the platform is not supported by the current implementation.
+    #[error("Platform not supported: {platform}: {message}")]
+    PlatformNotSupported
+    {
+        /// The platform that is not supported
+        platform: String,
+        /// The message describing why the platform is not supported
+        message: String,
+    },
 }
 
 /// Convenience type alias for `Result<T, DebuggerError>`

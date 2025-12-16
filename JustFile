@@ -1,3 +1,5 @@
+#!/usr/bin/env -S just --justfile
+
 # Justfile for Ferros development
 # Run `just setup` to get started
 
@@ -6,7 +8,7 @@ default:
     @just --list
 
 # Setup development environment for new contributors
-setup: check-prerequisites install-rust install-nightly verify-setup run-setup-tests
+setup: check-prerequisites install-rust install-nightly verify-setup test
     @echo ""
     @echo "🎉 Setup complete! You're ready to contribute to Ferros."
     @echo ""
@@ -15,12 +17,6 @@ setup: check-prerequisites install-rust install-nightly verify-setup run-setup-t
     @echo "  • Run 'just lint' to check code quality"
     @echo "  • Run 'just test' to run tests"
     @echo "  • Read CONTRIBUTING.md for guidelines"
-
-# Run tests as part of setup
-run-setup-tests:
-    @echo ""
-    @echo "🧪 Running tests..."
-    @cargo test --workspace --all-features
 
 # Check if prerequisites are installed
 check-prerequisites:
@@ -67,23 +63,23 @@ verify-setup:
     @echo "Verifying Rust installation..."
     @rustc --version || { echo "  ❌ rustc not found"; exit 1; }
     @echo "  ✓ rustc: $(rustc --version | cut -d' ' -f2)"
-    
+
     @echo "Verifying cargo..."
     @cargo --version || { echo "  ❌ cargo not found"; exit 1; }
     @echo "  ✓ cargo: $(cargo --version | cut -d' ' -f2)"
-    
+
     @echo "Verifying nightly toolchain..."
     @rustup toolchain list | grep -q nightly || { echo "  ❌ nightly toolchain not found"; exit 1; }
     @echo "  ✓ nightly toolchain installed"
-    
+
     @echo "Verifying rustfmt..."
     @cargo fmt --version >/dev/null 2>&1 || { echo "  ❌ rustfmt not found"; exit 1; }
     @echo "  ✓ rustfmt: $(cargo fmt --version | cut -d' ' -f2)"
-    
+
     @echo "Verifying clippy..."
     @cargo clippy --version >/dev/null 2>&1 || { echo "  ⚠ clippy not found (optional)"; exit 0; }
     @echo "  ✓ clippy: $(cargo clippy --version | cut -d' ' -f2)"
-    
+
     @echo "Verifying cargo-workspaces..."
     @cargo ws --version >/dev/null 2>&1 || { echo "  ⚠ cargo-ws not found (optional)"; exit 0; }
     @echo "  ✓ cargo-ws: $(cargo ws --version | cut -d' ' -f2)"
@@ -261,32 +257,3 @@ website-preview:
         echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
         exit 1; \
     fi
-
-# macOS-specific commands
-
-# Sign debugger binary with entitlements (macOS only)
-# Usage: just sign-debugger [BINARY_PATH]
-# Example: just sign-debugger target/debug/ferros
-sign-debugger BINARY_PATH="target/debug/ferros":
-    @echo "🔐 Signing debugger binary with entitlements..."
-    @if [ ! -f "{{BINARY_PATH}}" ]; then \
-        echo "❌ Binary not found: {{BINARY_PATH}}"; \
-        echo "   Build it first with: cargo build"; \
-        exit 1; \
-    fi
-    @if [ ! -f "crates/ferros-core/ferros.entitlements" ]; then \
-        echo "❌ Entitlements file not found: crates/ferros-core/ferros.entitlements"; \
-        exit 1; \
-    fi
-    @codesign --entitlements crates/ferros-core/ferros.entitlements --force --sign - "{{BINARY_PATH}}" || { \
-        echo "❌ Failed to sign binary. Make sure you have a code signing certificate."; \
-        echo "   Create one with: Keychain Access > Certificate Assistant > Create a Certificate"; \
-        exit 1; \
-    }
-    @echo "✅ Binary signed successfully: {{BINARY_PATH}}"
-
-# Build and sign debugger binary (macOS only)
-build-sign:
-    @echo "🔨 Building and signing debugger..."
-    @just build
-    @just sign-debugger target/debug/ferros

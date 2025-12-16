@@ -27,12 +27,9 @@
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 //! - [Mach System Calls](https://developer.apple.com/documentation/kernel)
 
-// Allow doc comments in extern blocks - they're useful for developers even if rustdoc doesn't generate docs
-#![allow(unused_doc_comments)]
-
 use libc::{
-    c_int, kern_return_t, mach_msg_type_number_t, mach_port_t, natural_t, thread_act_t, vm_address_t, vm_map_t, vm_offset_t,
-    vm_size_t,
+    c_int, kern_return_t, mach_msg_type_number_t, mach_port_t, mach_vm_address_t, mach_vm_size_t, natural_t, thread_act_t,
+    vm_address_t, vm_map_t, vm_offset_t, vm_size_t,
 };
 
 /// Structure for vm_region_basic_info
@@ -54,6 +51,7 @@ use libc::{
 /// - `behavior`: Memory behavior hints (e.g., caching strategy)
 /// - `user_wired_count`: Number of times the region is wired in user space
 #[repr(C)]
+#[derive(Debug)]
 pub struct VmRegionBasicInfoData
 {
     /// Current protection flags (VM_PROT_READ, VM_PROT_WRITE, VM_PROT_EXECUTE)
@@ -79,18 +77,10 @@ pub struct VmRegionBasicInfoData
 // These functions deal with Mach tasks (processes) and obtaining access to them.
 #[link(name = "c", kind = "dylib")]
 unsafe extern "C" {
-    // Get a Mach port to a process by PID
+    /// Get a Mach port to a process by PID
     ///
     /// This function obtains a Mach task port for the process with the given PID.
     /// The task port allows you to control and inspect the process.
-    ///
-    /// ## Security
-    ///
-    /// This function requires special permissions:
-    /// - Running as root (sudo)
-    /// - Debugging entitlements (`com.apple.security.cs.debugger`)
-    ///
-    /// Without these permissions, the function will return `KERN_PROTECTION_FAILURE`.
     ///
     /// ## Parameters
     ///
@@ -104,13 +94,6 @@ unsafe extern "C" {
     /// - `KERN_PROTECTION_FAILURE` if permissions denied
     /// - `KERN_INVALID_ARGUMENT` if PID is invalid
     /// - `KERN_FAILURE` if process not found
-    ///
-    /// ## Safety
-    ///
-    /// This function is unsafe because:
-    /// - It can access any process if you have permissions
-    /// - The returned task port must be used carefully
-    /// - Invalid PIDs can cause errors
     ///
     /// ## Documentation
     ///
@@ -352,12 +335,6 @@ unsafe extern "C" {
     /// This function writes memory to the target process's address space.
     /// The data is copied from the current process's address space.
     ///
-    /// ## ⚠️ Warning
-    ///
-    /// Writing to memory can crash the target process or cause undefined behavior.
-    /// Only write to writable memory regions (e.g., stack, heap).
-    /// Writing to code segments may corrupt the program.
-    ///
     /// ## Parameters
     ///
     /// - `target_task`: Task port (from `task_for_pid()`)
@@ -444,8 +421,8 @@ unsafe extern "C" {
     /// See: [mach_vm_region(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_region/)
     pub fn mach_vm_region(
         target_task: vm_map_t,
-        address: *mut u64, // mach_vm_address_t
-        size: *mut u64,    // mach_vm_size_t
+        address: *mut mach_vm_address_t,
+        size: *mut mach_vm_size_t,
         flavor: c_int,
         info: *mut VmRegionBasicInfoData,
         info_count: *mut mach_msg_type_number_t,

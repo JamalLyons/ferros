@@ -1,414 +1,143 @@
-use std::{env, process};
+use std::str::FromStr;
 
-use clap::{Parser, Subcommand};
-use ferros_core::debugger::create_debugger;
-use ferros_core::types::ProcessId;
-use ferros_core::{Debugger, Result as DebuggerResult};
-use ferros_utils::{LogFormat, LogLevel, debug, info, init_logging, init_logging_for_tui, init_logging_with_level};
+use clap::Parser;
+use ferros_config::{Config, ConfigSource};
+use ferros_core::prelude::*;
+use ferros_utils::{LogFormat, LogLevel, LoggingError, init_logging, init_logging_with_level};
 
-/// A Rust-native debugger with hybrid MIR and system-level introspection.
-#[derive(Parser, Debug)]
-#[command(name = "ferros")]
-#[command(version)]
-#[command(about = "A Rust-native debugger with hybrid MIR and system-level introspection", long_about = None)]
-struct Cli
-{
-    /// Set the log level (error, warn, info, debug, trace)
-    /// Overrides RUST_LOG environment variable
-    #[arg(long, value_name = "LEVEL")]
-    log_level: Option<String>,
+use crate::cli::Cli;
+use crate::commands::run_command;
 
-    /// Set the log format (pretty, json)
-    /// Overrides FERROS_LOG_FORMAT environment variable
-    #[arg(long, value_name = "FORMAT")]
-    log_format: Option<String>,
+mod cli;
+mod commands;
+mod repl;
 
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands
-{
-    /// Attach to a running process by PID
-    Attach
-    {
-        /// Process ID (PID) to attach to
-        pid: u32,
-        /// Use headless mode (no TUI, just print info and exit)
-        #[arg(long, default_value_t = false)]
-        headless: bool,
-    },
-    /// Launch a new process under debugger control
-    Launch
-    {
-        /// Path to the executable to launch
-        program: String,
-        /// Arguments to pass to the program
-        /// Note: To set Ferros log level, use --log-level before the 'launch' subcommand:
-        ///   ferros --log-level debug launch <program>
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-        /// Use headless mode (no TUI, just print info and exit)
-        #[arg(long, default_value_t = false)]
-        headless: bool,
-    },
-    /// Display CPU registers from the attached process
-    Registers,
-    /// Read memory from the attached process
-    Memory
-    {
-        /// Memory address to read from (hex format: 0x1000 or decimal)
-        address: String,
-        /// Number of bytes to read (default: 16)
-        #[arg(short, long, default_value_t = 16)]
-        length: usize,
-    },
-    /// List memory regions in the attached process
-    Regions,
-    /// List all threads in the attached process
-    Threads,
-    /// Suspend execution of the attached process
-    Suspend,
-    /// Resume execution of the attached process
-    Resume,
-    /// Detach from the attached process
-    Detach,
-    /// Show debugger information (architecture, status, etc.)
-    Info,
-    /// Change directory to the log directory for easy log viewing
-    FindLogs,
-}
-
-fn main()
+fn main() -> FerrosResult<()>
 {
     let cli = Cli::parse();
 
-    // Check if we're running in TUI mode (non-headless attach/launch)
-    let is_tui_mode = matches!(
-        cli.command,
-        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. }
-    );
+    // Load configuration (may create default global config on first run)
+    let (config, source) =
+        Config::load().map_err(|e| FerrosError::InvalidArgument(format!("Failed to load config: {e}")))?;
 
-    // Initialize logging with CLI flags or environment variables
-    let _log_file_path = if is_tui_mode {
-        // For TUI mode, use file-only logging to prevent stdout interference
-        // If --log-level is provided, validate it
-        if let Some(level_str) = &cli.log_level {
-            if level_str.parse::<LogLevel>().is_err() {
-                eprintln!("Invalid log level: {}. Use: error, warn, info, debug, or trace", level_str);
-                process::exit(1);
-            }
-        }
-        // Parse log level from CLI if provided, otherwise use None (will use RUST_LOG or default to INFO)
-        let log_level = cli.log_level.as_ref().and_then(|s| s.parse::<LogLevel>().ok());
-        match init_logging_for_tui(log_level) {
-            Ok(path) => {
-                // Log once to indicate where logs are being written
-                // Note: This will go to the log file since we're in TUI mode
-                info!("Logs are being written to: {}", path.display());
-                if let Some(level) = log_level {
-                    info!("Log level set to: {:?} (from --log-level flag)", level);
-                } else if env::var("RUST_LOG").is_ok() {
-                    info!("Log level from RUST_LOG environment variable");
-                } else {
-                    info!("Log level: INFO (default)");
-                }
-                Some(path)
-            }
-            Err(e) => {
-                eprintln!("Failed to initialize logging: {}", e);
-                process::exit(1);
-            }
-        }
-    } else if let Some(level_str) = &cli.log_level {
-        // Parse log level from CLI
-        let level = level_str.parse::<LogLevel>().unwrap_or_else(|_| {
-            eprintln!("Invalid log level: {}. Use: error, warn, info, debug, or trace", level_str);
-            process::exit(1);
-        });
+    // Initialize logging based on configuration and CLI options
+    init_logging_from_cli(&cli, &config, source)
+        .map_err(|e| FerrosError::InvalidArgument(format!("Failed to initialize logging: {}", e)))?;
 
-        // Parse log format from CLI or default to pretty
-        let format = cli
-            .log_format
-            .as_ref()
-            .and_then(|f| f.parse::<LogFormat>().ok())
-            .unwrap_or(LogFormat::Pretty);
+    // Resolve the effective command, supporting both explicit subcommands
+    // and configuration-driven defaults for bare invocations.
+    let command = resolve_command(cli.command, &config)?;
 
-        if let Err(e) = init_logging_with_level(level, format) {
-            eprintln!("Failed to initialize logging: {}", e);
-            process::exit(1);
-        }
-        None
-    } else {
-        // Use environment variables or defaults
-        if let Err(e) = init_logging() {
-            eprintln!("Failed to initialize logging: {}", e);
-            process::exit(1);
-        }
-        None
+    // Run the appropriate command based on the resolved input
+    run_command(command)?;
+
+    Ok(())
+}
+
+/// Initialize logging based on configuration and CLI options
+///
+/// Priority order:
+/// 1. CLI `--log-level` and `--log-format` (if provided, override everything)
+/// 2. CLI `--log-format` only (uses RUST_LOG env var or INFO default for level)
+/// 3. Environment variables (RUST_LOG, FERROS_LOG_FORMAT)
+///
+/// If `--log-level` or `--log-format` are provided, they override environment variables.
+/// Otherwise, falls back to `init_logging()` which reads from environment variables.
+fn init_logging_from_cli(cli: &Cli, config: &Config, _source: ConfigSource) -> Result<(), LoggingError>
+{
+    // Parse log level in priority order:
+    // 1. CLI flag
+    // 2. Config file
+    // 3. Environment (handled by init_logging)
+    let cli_log_level = cli.log_level.as_deref().and_then(|s| LogLevel::from_str(s).ok());
+
+    let config_log_level = match config.debugger.log_level {
+        ferros_config::LogLevel::Error => Some(LogLevel::Error),
+        ferros_config::LogLevel::Warn => Some(LogLevel::Warn),
+        ferros_config::LogLevel::Info => Some(LogLevel::Info),
+        ferros_config::LogLevel::Debug => Some(LogLevel::Debug),
+        ferros_config::LogLevel::Trace => Some(LogLevel::Trace),
     };
 
-    // Check if we need async runtime for TUI (default mode, unless --headless is used)
-    let needs_async = matches!(
-        cli.command,
-        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. }
-    );
+    let log_level = cli_log_level.or(config_log_level);
 
-    // Handle find-logs command early (before async runtime)
-    if matches!(cli.command, Commands::FindLogs) {
-        let log_dir = if let Ok(home) = std::env::var("HOME") {
-            std::path::PathBuf::from(home).join(".ferros")
-        } else {
-            std::path::PathBuf::from("/tmp")
-        };
+    // Parse log format if provided, otherwise default to pretty
+    let log_format = cli
+        .log_format
+        .as_deref()
+        .and_then(|s| LogFormat::from_str(s).ok())
+        .unwrap_or(LogFormat::Pretty);
 
-        println!("{}", log_dir.display());
-        return;
-    }
-
-    if needs_async {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        if let Err(e) = rt.block_on(run_command_async(cli)) {
-            eprintln!("Error: {}", e);
-            process::exit(1);
-        }
-    } else if let Err(e) = run_command(cli) {
-        eprintln!("Error: {}", e);
-        process::exit(1);
-    }
-}
-
-async fn run_command_async(cli: Cli) -> Result<(), Box<dyn std::error::Error>>
-{
-    match cli.command {
-        Commands::Attach { pid, headless } => {
-            info!("Attaching to process {}", pid);
-            let mut debugger = create_debugger()?;
-            debugger.attach(ProcessId::from(pid))?;
-            info!("Successfully attached to process {}", pid);
-
-            if headless {
-                print_debugger_info(&*debugger)?;
-                // In headless mode, detach after showing info
-                debugger.detach()?;
-            } else {
-                ferros_ui::run_tui(debugger, Some(pid), false).await?;
-            }
-            Ok(())
-        }
-        Commands::Launch { program, args, headless } => {
-            // Check if --log-level was accidentally passed as a program argument
-            if args.iter().any(|arg| arg == "--log-level" || arg.starts_with("--log-level=")) {
-                eprintln!("Warning: --log-level flag detected in program arguments.");
-                eprintln!("  The --log-level flag must come BEFORE the 'launch' subcommand.");
-                eprintln!("  Correct usage: ferros --log-level debug launch <program>");
-                eprintln!("  Your command: ferros launch <program> --log-level debug (incorrect)");
-            }
-
-            info!("Launching program: {} with args: {:?}", program, args);
-            if !headless {
-                info!("Note: For best debugging experience, ensure your program was built with debug symbols");
-                info!("  Rust: Use 'cargo build' (debug mode) or 'cargo build --release' with debug=true");
-                info!("  C/C++: Compile with -g flag");
-            }
-            let mut debugger = create_debugger()?;
-
-            if !headless {
-                debugger.set_capture_process_output(true);
-            }
-
-            // Convert relative path to absolute path for posix_spawn
-            let program_path = std::path::Path::new(&program);
-            let absolute_program = if program_path.is_absolute() {
-                program.clone()
-            } else {
-                std::env::current_dir()?
-                    .join(program_path)
-                    .canonicalize()?
-                    .to_string_lossy()
-                    .to_string()
-            };
-
-            // The launch method requires at least one argument (typically the program name)
-            // If no args provided, use the program name itself
-            let args_refs: Vec<&str> = if args.is_empty() {
-                vec![&absolute_program]
-            } else {
-                args.iter().map(|s| s.as_str()).collect()
-            };
-
-            let pid = debugger.launch(&absolute_program, &args_refs)?;
-
-            // Process starts suspended, resume it so it runs normally
-            debugger.resume()?;
-
-            if headless {
-                print_debugger_info(&*debugger)?;
-                // In headless mode, detach after showing info
-                debugger.detach()?;
-            } else {
-                println!("Running Ferros TUI");
-                ferros_ui::run_tui(debugger, Some(pid.0), true).await?;
-            }
-            Ok(())
-        }
-        _ => {
-            // Non-async commands should not reach here
-            Err("TUI mode only available for attach/launch commands".into())
-        }
-    }
-}
-
-fn run_command(cli: Cli) -> DebuggerResult<()>
-{
-    match cli.command {
-        Commands::Attach { pid, headless: true } => {
-            info!("Attaching to process {}", pid);
-            let mut debugger = create_debugger()?;
-            debugger.attach(ProcessId::from(pid))?;
-            info!("Successfully attached to process {}", pid);
-            print_debugger_info(&*debugger)?;
-            // Detach after showing info in headless mode
-            debugger.detach()?;
-            Ok(())
-        }
-        Commands::Launch {
-            program,
-            args,
-            headless: true,
-        } => {
-            info!("Launching program: {} with args: {:?}", program, args);
-            let mut debugger = create_debugger()?;
-
-            // Convert relative path to absolute path for posix_spawn
-            let program_path = std::path::Path::new(&program);
-            let absolute_program = if program_path.is_absolute() {
-                program.clone()
-            } else {
-                std::env::current_dir()?
-                    .join(program_path)
-                    .canonicalize()?
-                    .to_string_lossy()
-                    .to_string()
-            };
-
-            // If no args provided, use the program name itself
-            let args_refs: Vec<&str> = if args.is_empty() {
-                vec![&absolute_program]
-            } else {
-                args.iter().map(|s| s.as_str()).collect()
-            };
-
-            let pid = debugger.launch(&absolute_program, &args_refs)?;
-            info!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
-
-            // Process starts suspended, resume it so it runs normally
-            debugger.resume()?;
-            info!("Process resumed and running");
-
-            print_debugger_info(&*debugger)?;
-            // Detach after showing info in headless mode
-            debugger.detach()?;
-            Ok(())
-        }
-        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. } => {
-            // These should be handled by run_command_async
-            Err(ferros_core::error::DebuggerError::InvalidArgument(
-                "TUI mode requires async runtime".to_string(),
-            ))
-        }
-        Commands::Registers => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Memory { address: _, length: _ } => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Regions => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Threads => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Suspend => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Resume => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Detach => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::Info => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
-        Commands::FindLogs => {
-            // This should be handled in main() before reaching here
-            unreachable!("FindLogs should be handled in main()")
-        }
-    }
-}
-
-fn print_debugger_info(debugger: &dyn Debugger) -> DebuggerResult<()>
-{
-    info!("Debugger Information:");
-    info!("  Architecture: {}", debugger.architecture());
-    info!("  Attached: {}", debugger.is_attached());
-    info!("  Stopped: {}", debugger.is_stopped());
-    debug!("  Stop Reason: {:?}", debugger.stop_reason());
-
-    if debugger.is_attached() {
-        if let Ok(threads) = debugger.threads() {
-            info!("  Threads: {}", threads.len());
-            if let Some(active) = debugger.active_thread() {
-                debug!("  Active Thread: {}", active.raw());
-            }
-        }
-
-        if let Ok(regions) = debugger.get_memory_regions() {
-            info!("  Memory Regions: {}", regions.len());
-        }
+    // If log level is explicitly provided, use it with the format
+    if let Some(level) = log_level {
+        init_logging_with_level(level, log_format)?;
+    } else if cli.log_format.is_some() {
+        // Format is explicitly set but level isn't - use INFO as default
+        // (User can still use RUST_LOG env var for more granular control)
+        init_logging_with_level(LogLevel::Info, log_format)?;
+    } else {
+        // No CLI overrides, use environment variables (RUST_LOG, FERROS_LOG_FORMAT)
+        init_logging()?;
     }
 
     Ok(())
+}
+
+/// Resolve the effective CLI command, supporting:
+///
+/// - Explicit subcommands: `attach`, `launch`
+/// - Bare invocation using configuration fallback:
+///   - With `debugger.default_attach_mode = "launch"`:
+///     `ferros ./target/debug/my_program arg1 arg2`
+///   - With `debugger.default_attach_mode = "attach"`:
+///     `ferros 12345`
+fn resolve_command(command: crate::cli::Commands, config: &Config) -> FerrosResult<crate::cli::Commands>
+{
+    use crate::cli::Commands;
+
+    match command {
+        // Explicit subcommands are passed through unchanged.
+        Commands::Attach { .. } | Commands::Launch { .. } => Ok(command),
+
+        // External subcommands are interpreted according to configuration.
+        Commands::External(args) => {
+            if args.is_empty() {
+                return Err(FerrosError::InvalidArgument(
+                    "No target program or PID provided. Specify a subcommand or a target.".to_string(),
+                ));
+            }
+
+            let mode = config
+                .debugger
+                .default_attach_mode
+                .as_deref()
+                .unwrap_or("launch")
+                .to_lowercase();
+
+            match mode.as_str() {
+                "launch" => {
+                    let program = args[0].clone();
+                    let launch_args = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+
+                    Ok(Commands::Launch {
+                        program,
+                        args: launch_args,
+                    })
+                }
+                "attach" => {
+                    let pid_str = &args[0];
+                    let pid = pid_str.parse::<u32>().map_err(|_| {
+                        FerrosError::InvalidArgument(format!(
+                            "Invalid PID '{pid_str}' for attach mode. Expected a positive integer."
+                        ))
+                    })?;
+
+                    Ok(Commands::Attach { pid })
+                }
+                other => Err(FerrosError::InvalidArgument(format!(
+                    "Invalid debugger.default_attach_mode '{other}'. Expected 'launch' or 'attach'."
+                ))),
+            }
+        }
+    }
 }

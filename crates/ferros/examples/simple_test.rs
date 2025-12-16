@@ -5,45 +5,32 @@
 
 fn main()
 {
+    let pid = std::process::id();
     println!("Simple Test Target Program Starting...");
-    println!("PID: {}", std::process::id());
+    println!("PID: {}", pid);
     println!("This program will run until interrupted");
 
-    let mut counter = 0u64;
-    let mut sum = 0i64;
+    // Write PID to file for easy attachment
+    // Try multiple possible paths depending on where the example is run from
+    let pid_paths = [
+        "crates/ferros/examples/pid.txt", // From workspace root
+        "examples/pid.txt",               // From crate root
+        "./pid.txt",                      // Current directory
+    ];
 
-    loop {
-        counter += 1;
-        sum = add_to_sum(counter, sum);
-
-        if counter.is_multiple_of(50) {
-            println!("Iteration: {}, Sum: {}", counter, sum);
-        }
-
-        // Simulate some work
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // Allocate some memory
-        if counter.is_multiple_of(25) {
-            let _data = vec![counter; 100];
-            let _message = format!("Allocated at iteration {}", counter);
+    let mut written = false;
+    for pid_file in &pid_paths {
+        if let Ok(()) = std::fs::write(pid_file, pid.to_string()) {
+            written = true;
+            break;
         }
     }
-}
 
-fn add_to_sum(value: u64, current_sum: i64) -> i64
-{
-    let result = if value.is_multiple_of(2) {
-        current_sum + (value as i64)
-    } else {
-        current_sum - (value as i64)
-    };
-
-    // Nested call
-    clamp_result(result)
-}
-
-fn clamp_result(value: i64) -> i64
-{
-    value.clamp(-1000, 1000)
+    if !written {
+        eprintln!("Warning: Failed to write PID to any expected location");
+    }
+    loop {
+        // Simulate some work
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
 }

@@ -88,9 +88,9 @@ fn init_logging_from_cli(cli: &Cli, config: &Config, _source: ConfigSource) -> R
 /// - Explicit subcommands: `attach`, `launch`
 /// - Bare invocation using configuration fallback:
 ///   - With `debugger.default_attach_mode = "launch"`:
-///       `ferros ./target/debug/my_program arg1 arg2`
+///     `ferros ./target/debug/my_program arg1 arg2`
 ///   - With `debugger.default_attach_mode = "attach"`:
-///       `ferros 12345`
+///     `ferros 12345`
 fn resolve_command(command: crate::cli::Commands, config: &Config) -> FerrosResult<crate::cli::Commands>
 {
     use crate::cli::Commands;

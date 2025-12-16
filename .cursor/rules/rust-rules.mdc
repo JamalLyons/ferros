@@ -16,10 +16,7 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 ## Code Style & Formatting
 
 ### Formatting Rules
-- Always run `just fmt` before committing
-
-### Linting Rules
-- Always run `just lint` before committing
+- Always run `just check` after making changes to code.
 
 ## Workspace Configuration
 

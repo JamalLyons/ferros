@@ -50,9 +50,9 @@ pub enum Commands
     ///
     /// Examples:
     /// - With `default_attach_mode = "launch"`:
-    ///     `ferros ./target/debug/my_program arg1 arg2`
+    ///   `ferros ./target/debug/my_program arg1 arg2`
     /// - With `default_attach_mode = "attach"`:
-    ///     `ferros 12345`
+    ///   `ferros 12345`
     ///
     /// The concrete behavior is resolved in `main` before dispatching
     /// to `run_command`.

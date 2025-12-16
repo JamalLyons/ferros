@@ -46,7 +46,7 @@ impl Default for DebuggerConfig
 /// Log level used for Ferros logging.
 ///
 /// This is intentionally close to the log levels supported by `ferros-utils`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel
 {
@@ -55,17 +55,10 @@ pub enum LogLevel
     /// Warning-level logging.
     Warn,
     /// Informational logging (default).
+    #[default]
     Info,
     /// Debug-level logging.
     Debug,
     /// Trace-level logging.
     Trace,
-}
-
-impl Default for LogLevel
-{
-    fn default() -> Self
-    {
-        LogLevel::Info
-    }
 }

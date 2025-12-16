@@ -14,8 +14,8 @@ mod config;
 mod error;
 mod paths;
 
-use std::fs;
 use std::path::Path;
+use std::{fs, io};
 
 pub use crate::config::{Config, DebuggerConfig, LogLevel};
 pub use crate::error::{ConfigError, Result};
@@ -55,16 +55,22 @@ impl Config
 
         // 2. Local config in current directory
         let local_path = paths::local_config_path()?;
-        if local_path.is_file() {
-            let config = Self::load_from(&local_path)?;
-            return Ok((config, ConfigSource::Local));
+        match Self::load_from(&local_path) {
+            Ok(config) => return Ok((config, ConfigSource::Local)),
+            Err(error::ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                // No local config; continue to global lookup.
+            }
+            Err(e) => return Err(e),
         }
 
         // 3. Global config in $HOME/.config/ferros/config.toml
         let global_path = paths::global_config_path()?;
-        if global_path.is_file() {
-            let config = Self::load_from(&global_path)?;
-            return Ok((config, ConfigSource::Global));
+        match Self::load_from(&global_path) {
+            Ok(config) => return Ok((config, ConfigSource::Global)),
+            Err(error::ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                // No global config; we'll create one with defaults below.
+            }
+            Err(e) => return Err(e),
         }
 
         // No config found anywhere; write defaults to global path

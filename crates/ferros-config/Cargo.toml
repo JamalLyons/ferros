@@ -6,6 +6,9 @@ license = "Apache-2.0"
 authors = ["Ferros Contributors"]
 description = "Configuration loading and management for the Ferros debugger."
 repository = "https://github.com/jamallyons/ferros"
+readme = "README.md"
+keywords = ["debugger", "rust", "configuration", "ferros"]
+categories = ["development-tools", "development-tools::debugging"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

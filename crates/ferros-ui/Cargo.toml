@@ -11,7 +11,7 @@ categories = ["development-tools"]
 publish = false
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29.0"
 ferros-core = { path = "../ferros-core" }
 ferros-utils = { path = "../ferros-utils" }

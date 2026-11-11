@@ -287,6 +287,7 @@ pub enum FrameStatus
 ///     return_address: Some(Address::from(0x2000)),
 ///     symbol: None,
 ///     location: None,
+///     parameters: Vec::new(),
 ///     status: FrameStatus::Complete,
 /// };
 /// ```
@@ -378,6 +379,7 @@ impl StackFrame
     ///     return_address: None,
     ///     symbol: None,
     ///     location: None,
+    ///     parameters: Vec::new(),
     ///     status: ferros_core::types::FrameStatus::Complete,
     /// };
     ///

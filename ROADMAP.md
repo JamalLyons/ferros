@@ -1,19 +1,24 @@
 # Ferros Debugger Roadmap
 
-_Last updated: 2025-11-19_
+_Last updated: 2026-11-11_
+
+**Status:** nothing below is ticked because no item is covered by a test yet. Items are only ticked once a test exercises them. Several of these have code in `ferros-core` that is untested and unverified. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26).
+
+**Verified today (manually, not by tests):** the workspace builds; a binary ad-hoc signed with `crates/ferros-core/ferros.entitlements` can launch a program suspended on macOS, obtain its task port, read thread and memory-region counts, resume, and detach without `sudo`.
+
 
 This list captures concrete work needed to reach feature parity with production debuggers such as LLDB, GDB, Delve, and rr, with a focus on complete Rust language support. Items are grouped by subsystem to clarify ownership.
 
 ## ferros-core (debugger engine)
 
-- [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
-- [x] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
-- [x] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
-- [x] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code.
-- [x] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
-- [x] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
-- [x] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
-- [x] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
+- [ ] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
+- [ ] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
+- [ ] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
+- [ ] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code.
+- [ ] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
+- [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
+- [ ] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
+- [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
 - [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping.
 - [ ] **Remote/recording support:** Define a `ferros-protocol` transport (TCP/Unix socket) plus optional record/replay support (rr-style) so sessions can be remote or deterministic.
 - [ ] **Cross-platform parity:** Implement `LinuxDebugger` (ptrace + /proc) and `WindowsDebugger` (DbgHelp/DbgEng) so the `Debugger` factory stops erroring on non-macOS hosts and we can debug on the same platforms that LLDB/GDB support by default.
@@ -31,9 +36,11 @@ This list captures concrete work needed to reach feature parity with production 
 
 ## ferros-ui (TUI)
 
-- [x] **Command palette / mini-console:** Embed a small command line so users can run CLI commands without leaving the TUI (LLDB’s `command` window, Delve’s REPL).
+_`ferros-ui` is currently excluded from the workspace while the interactive front end is rebuilt; `ferros launch`/`attach` behave as `--headless`._
+
+- [ ] **Command palette / mini-console:** Embed a small command line so users can run CLI commands without leaving the TUI (LLDB’s `command` window, Delve’s REPL).
 - [ ] **Source + breakpoint view:** Render source/machine code next to the PC with breakpoint gutter, hit counts, and enable/disable toggles.
-- [x] **Call stack + frame locals:** Add panes for stack frames, local variables, arguments, captures, and watch expressions with Rust-aware formatting.
+- [ ] **Call stack + frame locals:** Add panes for stack frames, local variables, arguments, captures, and watch expressions with Rust-aware formatting.
 - [ ] **Thread/task explorer:** Display thread states, async tasks/futures, and allow activation/switching directly inside the TUI.
 - [ ] **Rust value pretty-printing:** Plug into the planned DWARF/MIR layer to render enums/structs/options succinctly, matching LLDB’s Rust pretty-printers.
 - [ ] **Breakpoint/watchpoint editors:** Provide dialogs or popovers to set addresses, symbolic names, conditional expressions, and logpoints.

@@ -1,13 +1,14 @@
 //! Build script for ferros-core
 //!
 //! This script checks system requirements before compilation:
-//! - Minimum Rust version (Edition 2021 = Rust 1.56.0+)
+//! - Minimum Rust version (Edition 2024 = Rust 1.85.0+)
 //! - Platform-specific requirements (macOS version, etc.)
 //! - Architecture support
 //!
 //! ## Requirements
 //!
-//! - **Rust**: Edition 2021 (Rust 1.56.0 or newer)
+//! - **Rust**: Edition 2024 (Rust 1.85.0 or newer); the workspace pins the nightly
+//!   toolchain via `rust-toolchain.toml`
 //! - **macOS**: 10.9+ (Mavericks) for Intel, 11.0+ (Big Sur) for Apple Silicon
 //! - **Linux**: TBD (ptrace support)
 //! - **Windows**: TBD (WinDbg API support)
@@ -15,14 +16,13 @@
 fn main()
 {
     // Check minimum Rust version
-    // Edition 2021 requires Rust 1.56.0
-    // Note: We use nightly Rust, but the minimum stable version for edition 2021 is 1.56.0
+    // Edition 2024 requires Rust 1.85.0. The workspace uses nightly (see rust-toolchain.toml).
     if let Ok(rustc_version) = rustc_version::version() {
-        let min_rust_version = rustc_version::Version::parse("1.56.0").unwrap();
+        let min_rust_version = rustc_version::Version::parse("1.85.0").unwrap();
 
         if rustc_version < min_rust_version {
             panic!(
-                "ferros-core requires Rust {} or newer (Edition 2021), found {}",
+                "ferros-core requires Rust {} or newer (Edition 2024), found {}",
                 min_rust_version, rustc_version
             );
         }

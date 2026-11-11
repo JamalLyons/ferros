@@ -33,7 +33,7 @@ fn main()
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let worker = thread::spawn(move || {
-        worker_thread(running_clone);
+        worker_thread(&running_clone);
     });
 
     // Main loop with function calls
@@ -45,13 +45,13 @@ fn main()
         accumulator = process_value(counter, accumulator);
 
         if counter.is_multiple_of(100) {
-            println!("Counter: {}, Accumulator: {}", counter, accumulator);
+            println!("Counter: {counter}, Accumulator: {accumulator}");
         }
 
         // Allocate some memory periodically
         if counter.is_multiple_of(50) {
             let _vec = vec![0u8; 1024];
-            let _string = format!("Allocated memory at iteration {}", counter);
+            let _string = format!("Allocated memory at iteration {counter}");
             // Memory is dropped here
         }
 
@@ -63,16 +63,16 @@ fn main()
     worker.join().expect("Worker thread panicked");
 
     println!("Test Target Program Exiting...");
-    println!("Final counter: {}, Final accumulator: {}", counter, accumulator);
+    println!("Final counter: {counter}, Final accumulator: {accumulator}");
 }
 
 /// Process a value and return updated accumulator
 fn process_value(value: u64, acc: i64) -> i64
 {
     let result = if value.is_multiple_of(2) {
-        acc + (value as i64)
+        acc + value.cast_signed()
     } else {
-        acc - (value as i64)
+        acc - value.cast_signed()
     };
 
     // Nested function call
@@ -92,7 +92,7 @@ fn validate_result(result: i64) -> i64
 }
 
 /// Worker thread that does some computation
-fn worker_thread(running: Arc<AtomicBool>)
+fn worker_thread(running: &AtomicBool)
 {
     let mut local_counter = 0u32;
 
@@ -105,7 +105,7 @@ fn worker_thread(running: Arc<AtomicBool>)
         thread::sleep(Duration::from_millis(200));
     }
 
-    println!("Worker thread exiting, processed {} iterations", local_counter);
+    println!("Worker thread exiting, processed {local_counter} iterations");
 }
 
 /// Calculate Fibonacci number (inefficient recursive version for testing)

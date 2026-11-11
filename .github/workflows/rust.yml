@@ -10,6 +10,7 @@ on:
       - '.github/workflows/rust.yml'
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
+      - 'JustFile'
   pull_request:
     branches: [ "master" ]
     paths:
@@ -19,18 +20,28 @@ on:
       - '.github/workflows/rust.yml'
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
+      - 'JustFile'
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  build-linux:
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v5
     - name: Build
-      run: cargo build --verbose --lib --bins
-    - name: Run tests
-      run: cargo test --verbose --lib --bins
+      run: cargo build --workspace --verbose
+
+  macos:
+    runs-on: macos-15
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install just
+      run: brew install just
+    - name: Format check
+      run: just fmt-check
+    - name: Lint
+      run: just lint
+    - name: Test
+      run: just test

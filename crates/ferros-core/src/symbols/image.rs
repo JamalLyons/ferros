@@ -300,11 +300,12 @@ impl BinaryImage
             }
             sections.insert(*canonical, data);
         }
-        
+
         if debug_info_size == 0 || debug_line_size == 0 {
             use tracing::warn;
             warn!(
-                "Binary {} missing critical DWARF sections: .debug_info={} bytes, .debug_line={} bytes. Build with debug symbols!",
+                "Binary {} missing critical DWARF sections: .debug_info={} bytes, .debug_line={} bytes. Build with debug \
+                 symbols!",
                 desc.path.display(),
                 debug_info_size,
                 debug_line_size
@@ -644,7 +645,7 @@ impl BinaryImage
                 return None;
             }
         };
-        
+
         let ctx = match self.symbol_context() {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -653,7 +654,7 @@ impl BinaryImage
                 return None;
             }
         };
-        
+
         let mut frames = Vec::new();
 
         let lookup = ctx.find_frames(file_addr);
@@ -661,7 +662,12 @@ impl BinaryImage
             Ok(iter) => iter,
             Err(e) => {
                 use tracing::debug;
-                debug!("Failed to find frames for 0x{:x} in {}: {:?}", file_addr, self.path.display(), e);
+                debug!(
+                    "Failed to find frames for 0x{:x} in {}: {:?}",
+                    file_addr,
+                    self.path.display(),
+                    e
+                );
                 return None;
             }
         };
@@ -709,11 +715,7 @@ impl BinaryImage
     /// Extract function parameters from DWARF for a given address and frame.
     ///
     /// This method walks the DWARF DIEs to find function parameters.
-    fn extract_function_parameters(
-        &self,
-        file_addr: u64,
-        _frame: &addr2line::Frame<OwnedReader>,
-    ) -> Vec<FunctionParameter>
+    fn extract_function_parameters(&self, file_addr: u64, _frame: &addr2line::Frame<OwnedReader>) -> Vec<FunctionParameter>
     {
         // TODO: Implement full DWARF parameter extraction
         // For now, return empty vector as parameter extraction from DWARF

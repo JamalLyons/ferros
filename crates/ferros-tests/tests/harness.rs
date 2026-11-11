@@ -2,7 +2,7 @@
 #![cfg(target_os = "macos")]
 
 use std::panic::{self, AssertUnwindSafe};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -156,26 +156,40 @@ fn drop_after_detach_kills_debuggee()
     });
 }
 
+/// Ends a directly spawned process even when an assertion fails first.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop
+{
+    fn drop(&mut self)
+    {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The orphan left by a failed launch is found and killed by its identifying argument.
 #[test]
 fn kill_tagged_kills_orphan_by_argument()
 {
     let tag = format!("{TEST_ID_ARG_PREFIX}orphan-check-{}", std::process::id());
-    let mut child = Command::new(fixture!("loop_counter").path())
-        .args(["3000", &tag])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn loop_counter");
+    let mut child = KillOnDrop(
+        Command::new(fixture!("loop_counter").path())
+            .args(["3000", &tag])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn loop_counter"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while harness::tagged_pids(&tag).is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
     let killed = harness::kill_tagged(&tag);
-    assert_eq!(killed, vec![child.id()]);
-    let status = child.wait().expect("wait for loop_counter");
+    assert_eq!(killed, vec![child.0.id()]);
+    let status = child.0.wait().expect("wait for loop_counter");
     assert!(!status.success(), "loop_counter should have been killed");
     assert_eq!(harness::tagged_pids(&tag), Vec::<u32>::new());
 }

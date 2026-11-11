@@ -64,6 +64,11 @@ pub const DEBUGGER_ENTITLEMENT: &str = "com.apple.security.cs.debugger";
 /// How long cleanup waits for a killed process to disappear before giving up.
 const KILL_SETTLE: Duration = Duration::from_secs(2);
 
+/// After a launch stalled, how often and for how long its watchdog keeps looking for the
+/// half-launched process while `Debugger::launch` has still not returned.
+const STALL_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+const STALL_SWEEP_LIMIT: Duration = Duration::from_secs(30);
+
 /// Runs a test body under the [`DEFAULT_TIMEOUT`] deadline.
 ///
 /// See [`run_with_timeout`].
@@ -132,13 +137,7 @@ where
     match outcome {
         Outcome::Finished(Ok(())) => {}
         Outcome::Finished(Err(payload)) => panic::resume_unwind(payload),
-        Outcome::LaunchStalled => panic!(
-            "{}",
-            permission_guidance(&format!(
-                "Debugger::launch did not return within {LAUNCH_DEADLINE:?}; the system is probably waiting on an \
-                 authorization dialog for task_for_pid"
-            ))
-        ),
+        Outcome::LaunchStalled => panic!("{}", launch_stalled_guidance()),
         Outcome::TimedOut => {
             panic!("ferros-tests: test timed out after {timeout:?}; killed its debuggee processes {killed:?}")
         }
@@ -285,19 +284,21 @@ impl TestContext
             pid: None,
         });
 
-        // Watchdog: if launch has not returned by the deadline, tell the controller, which
-        // kills the tagged process and fails the test. Dropping `launch_done` disarms it.
-        let (launch_done, launch_wait) = mpsc::channel::<()>();
+        // Watchdog: if launch has not returned by the deadline, it tells the controller (which
+        // fails the test) and kills the half-launched process by its tag.
         let events = self.events.clone();
-        let _ = thread::Builder::new()
-            .name("ferros-launch-watchdog".to_owned())
-            .spawn(move || {
-                if launch_wait.recv_timeout(LAUNCH_DEADLINE) == Err(RecvTimeoutError::Timeout) {
-                    let _ = events.send(Event::LaunchStalled);
-                }
-            });
+        let watchdog = LaunchWatchdog::arm(tag.clone(), LAUNCH_DEADLINE, move || {
+            let _ = events.send(Event::LaunchStalled);
+        });
         let launched = debugger.launch(program, &command_line);
-        drop(launch_done);
+        if watchdog.disarm() {
+            // The launch outlived its deadline and the test is being failed for it. Whatever
+            // launch returned in the end, leave no process and report the same reason.
+            kill_debuggee(launched.as_ref().ok().map(|pid| pid.0), &tag);
+            self.shared.forget(&tag);
+            drop(debugger);
+            panic!("{}", launch_stalled_guidance());
+        }
 
         let pid = match launched {
             Ok(pid) => pid,
@@ -330,6 +331,80 @@ impl TestContext
             fixture.name()
         );
         Ok(guard)
+    }
+}
+
+/// State of one [`LaunchWatchdog`], decided under a lock so that "the launch returned" and
+/// "the launch stalled" can never both win.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchState
+{
+    Armed,
+    Disarmed,
+    Stalled,
+}
+
+/// Watches a single `Debugger::launch` call.
+///
+/// If the call has not returned when `deadline` passes, the watchdog declares the launch
+/// stalled, calls `on_stall`, and kills every process carrying `tag`. It does the killing
+/// itself, and repeats it until the launch call returns, because nobody else may be left to
+/// do it: the test's controller may already have finished its own cleanup (its deadline can
+/// pass while a launch is in flight, before the child process exists).
+struct LaunchWatchdog
+{
+    state: Arc<Mutex<WatchState>>,
+    launch_returned: Sender<()>,
+}
+
+impl LaunchWatchdog
+{
+    fn arm<F>(tag: String, deadline: Duration, on_stall: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(WatchState::Armed));
+        let (launch_returned, wait) = mpsc::channel::<()>();
+        let shared_state = Arc::clone(&state);
+        let _ = thread::Builder::new()
+            .name("ferros-launch-watchdog".to_owned())
+            .spawn(move || {
+                if wait.recv_timeout(deadline) != Err(RecvTimeoutError::Timeout) {
+                    return;
+                }
+                {
+                    let mut state = shared_state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if *state != WatchState::Armed {
+                        return;
+                    }
+                    *state = WatchState::Stalled;
+                }
+                on_stall();
+                let give_up = Instant::now() + STALL_SWEEP_LIMIT;
+                loop {
+                    kill_debuggee(None, &tag);
+                    let launch_still_blocked = wait.recv_timeout(STALL_SWEEP_INTERVAL) == Err(RecvTimeoutError::Timeout);
+                    if !launch_still_blocked || Instant::now() >= give_up {
+                        break;
+                    }
+                }
+            });
+        Self { state, launch_returned }
+    }
+
+    /// Call when the launch has returned. Returns `true` when the watchdog had already
+    /// declared the launch stalled.
+    fn disarm(self) -> bool
+    {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let stalled = *state == WatchState::Stalled;
+        if !stalled {
+            *state = WatchState::Disarmed;
+        }
+        drop(state);
+        // Dropping `launch_returned` wakes the watchdog thread and ends its sweep.
+        drop(self.launch_returned);
+        stalled
     }
 }
 
@@ -592,31 +667,67 @@ fn unique_tag() -> String
 }
 
 /// Builds the failure message for a denied (or stalled) `task_for_pid`.
+///
+/// `detail` is the engine's error text; only its first line is kept, because the rest advises
+/// `sudo`, which tests must not use.
 fn permission_guidance(detail: &str) -> String
 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<test executable>"));
-    let mut message = format!(
-        "ferros-tests: cannot debug the fixture process: task_for_pid was denied.\n\nThe test executable lacks the \
-         `{DEBUGGER_ENTITLEMENT}` entitlement.\nRun the integration tests with `just test-integration`: on arm64 macOS the \
-         cargo runner (scripts/cargo-test-runner.sh, configured in .cargo/config.toml) signs the test executable before \
-         running it. Make sure FERROS_TEST_UNSIGNED is not set.\nTo sign it manually, from the repository root:\n  \
-         codesign --entitlements crates/ferros-core/ferros.entitlements --force --sign - {}\nIf the executable is signed \
-         and still denied, check `DevToolsSecurity -status` (developer mode must be enabled).\n",
+    let signing_step = format!(
+        "Signing step: run the integration tests with `just test-integration`. On arm64 macOS the cargo runner \
+         (scripts/cargo-test-runner.sh, configured in .cargo/config.toml) signs the test executable before running it; \
+         make sure FERROS_TEST_UNSIGNED is not set.\nTo sign it manually, from the repository root:\n  codesign \
+         --entitlements crates/ferros-core/ferros.entitlements --force --sign - {}\n",
         exe.display()
     );
-    let _ = match executable_has_debugger_entitlement() {
-        Some(true) => writeln!(message, "Preflight: the test executable does carry the entitlement."),
-        Some(false) => writeln!(message, "Preflight: the test executable does NOT carry the entitlement."),
-        None => writeln!(message, "Preflight: could not inspect the test executable's entitlements."),
-    };
-    let _ = write!(message, "Detail: {detail}");
+    let authorization_step = "Authorization step: check `DevToolsSecurity -status` (developer mode must be enabled) and \
+                              that macOS is not waiting on a \"Developer Tools Access\" dialog. A machine with nobody at \
+                              the screen cannot answer that dialog: see the setup step of the integration job in \
+                              .github/workflows/rust.yml.\n";
+
+    let mut message = String::from("ferros-tests: cannot debug the fixture process: task_for_pid was denied.\n\n");
+    match executable_has_debugger_entitlement() {
+        Some(false) => {
+            let _ = writeln!(
+                message,
+                "The test executable lacks the `{DEBUGGER_ENTITLEMENT}` entitlement (it was not signed)."
+            );
+            message.push_str(&signing_step);
+        }
+        Some(true) => {
+            let _ = writeln!(
+                message,
+                "The test executable is signed with the `{DEBUGGER_ENTITLEMENT}` entitlement, so signing is not the \
+                 problem."
+            );
+            message.push_str(authorization_step);
+        }
+        None => {
+            let _ = writeln!(
+                message,
+                "Could not inspect the test executable's entitlements; it needs `{DEBUGGER_ENTITLEMENT}`."
+            );
+            message.push_str(&signing_step);
+            message.push_str(authorization_step);
+        }
+    }
+    let _ = write!(message, "Detail: {}", detail.lines().next().unwrap_or_default());
     message
+}
+
+/// Failure message for a `Debugger::launch` call that outlived [`LAUNCH_DEADLINE`].
+fn launch_stalled_guidance() -> String
+{
+    permission_guidance(&format!(
+        "Debugger::launch did not return within {LAUNCH_DEADLINE:?}; the system is probably waiting on an authorization \
+         dialog for task_for_pid"
+    ))
 }
 
 /// Checks (once per test binary) whether the running test executable carries the debugger
 /// entitlement. Returns `None` when `codesign` cannot be run.
 ///
-/// This only enriches the failure message; it never blocks a launch, so a root run or an
+/// This only shapes the failure message; it never blocks a launch, so a root run or an
 /// unexpected `codesign` output format cannot break a working setup.
 fn executable_has_debugger_entitlement() -> Option<bool>
 {
@@ -632,4 +743,94 @@ fn executable_has_debugger_entitlement() -> Option<bool>
             .ok()?;
         Some(String::from_utf8_lossy(&output.stdout).contains(DEBUGGER_ENTITLEMENT))
     })
+}
+
+#[cfg(test)]
+mod tests
+{
+    use std::process::Child;
+
+    use super::*;
+
+    /// Ends the helper process even when an assertion fails first.
+    struct KillOnDrop(Child);
+
+    impl Drop for KillOnDrop
+    {
+        fn drop(&mut self)
+        {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A long-running stand-in for a half-launched fixture: `yes` repeats its argument forever.
+    fn spawn_tagged(tag: &str) -> KillOnDrop
+    {
+        let child = Command::new("/usr/bin/yes")
+            .arg(tag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /usr/bin/yes");
+        KillOnDrop(child)
+    }
+
+    #[test]
+    fn stalled_launch_watchdog_reports_and_kills_the_tagged_process()
+    {
+        let tag = unique_tag();
+        let mut child = spawn_tagged(&tag);
+        let (stalled_tx, stalled_rx) = mpsc::channel();
+
+        let watchdog = LaunchWatchdog::arm(tag.clone(), Duration::from_millis(200), move || {
+            let _ = stalled_tx.send(());
+        });
+
+        stalled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watchdog never reported the stall");
+        // No controller is involved here: the watchdog itself must end the process.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("try_wait") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the watchdog did not kill the tagged process");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!status.success(), "the tagged process should have been killed, got {status}");
+        assert!(watchdog.disarm(), "disarm() must report that the launch stalled");
+        assert_eq!(tagged_pids(&tag), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn disarmed_watchdog_stays_quiet()
+    {
+        let tag = unique_tag();
+        let mut child = spawn_tagged(&tag);
+        let (stalled_tx, stalled_rx) = mpsc::channel();
+
+        let watchdog = LaunchWatchdog::arm(tag.clone(), Duration::from_millis(300), move || {
+            let _ = stalled_tx.send(());
+        });
+        assert!(!watchdog.disarm(), "disarm() before the deadline must not report a stall");
+
+        thread::sleep(Duration::from_millis(600));
+        assert!(stalled_rx.try_recv().is_err(), "a disarmed watchdog reported a stall");
+        assert!(
+            child.0.try_wait().expect("try_wait").is_none(),
+            "a disarmed watchdog killed the process"
+        );
+    }
+
+    #[test]
+    fn permission_guidance_keeps_only_the_first_detail_line()
+    {
+        let message = permission_guidance("task_for_pid() failed with KERN_FAILURE\n\nQuick fix: Run with sudo:\n  sudo x");
+        assert!(message.contains("Detail: task_for_pid() failed with KERN_FAILURE"));
+        assert!(!message.contains("sudo x"), "engine sudo advice leaked into: {message}");
+        assert!(message.contains(DEBUGGER_ENTITLEMENT));
+    }
 }

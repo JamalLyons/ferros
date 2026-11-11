@@ -77,6 +77,7 @@ If a test fails with "task_for_pid was denied":
 ```sh
 DevToolsSecurity -status
 ```
+- If the detail says `Debugger::launch did not return within 5s`: macOS is waiting for a "Developer Tools Access" authorization. In a desktop session, approve the dialog once. On a machine with nobody at the screen (CI), the dialog cannot be answered; the `integration-macos` job in `.github/workflows/rust.yml` shows the machine setup step that removes it. The harness kills the half-launched fixture either way.
 
 Two environment switches are available for diagnostic and harness verification:
 - `FERROS_TEST_UNSIGNED=1`: the runner re-signs the test executable without the entitlement to verify the permission-failure path.

@@ -17,7 +17,7 @@ fn main()
         sum = add_to_sum(counter, sum);
 
         if counter.is_multiple_of(50) {
-            println!("Iteration: {}, Sum: {}", counter, sum);
+            println!("Iteration: {counter}, Sum: {sum}");
         }
 
         // Simulate some work
@@ -26,7 +26,7 @@ fn main()
         // Allocate some memory
         if counter.is_multiple_of(25) {
             let _data = vec![counter; 100];
-            let _message = format!("Allocated at iteration {}", counter);
+            let _message = format!("Allocated at iteration {counter}");
         }
     }
 }
@@ -34,9 +34,9 @@ fn main()
 fn add_to_sum(value: u64, current_sum: i64) -> i64
 {
     let result = if value.is_multiple_of(2) {
-        current_sum + (value as i64)
+        current_sum + value.cast_signed()
     } else {
-        current_sum - (value as i64)
+        current_sum - value.cast_signed()
     };
 
     // Nested call

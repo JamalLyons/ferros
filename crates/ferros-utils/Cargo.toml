@@ -20,4 +20,4 @@ chrono = "0.4.42"
 [lints.clippy]
 # Allow multiple crate versions (needed for tracing-appender which uses thiserror 1.0)
 # Use priority 0 to override the default deny from -D warnings
-multiple-crate-versions = { level = "allow", priority = 0 }
+multiple_crate_versions = { level = "allow", priority = 0 }

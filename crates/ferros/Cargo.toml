@@ -5,7 +5,6 @@ edition = "2024"
 description = "A Rust-native debugger with hybrid MIR and system-level introspection."
 license = "Apache-2.0"
 repository = "https://github.com/jamallyons/ferros"
-homepage = "https://github.com/jamallyons/ferros"
 documentation = "https://docs.rs/ferros"
 readme = "./README.md"
 keywords = ["debugger", "rust", "mir", "debugging"]
@@ -13,11 +12,12 @@ categories = ["development-tools"]
 
 [dependencies]
 clap = { version = "4.5.51", features = ["derive"] }
-tokio = { workspace = true }
 
 ferros-core = { path = "../ferros-core" }
-ferros-ui = { path = "../ferros-ui" }
 ferros-utils = { path = "../ferros-utils" }
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 ctrlc = "3.4"

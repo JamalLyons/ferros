@@ -644,7 +644,7 @@ impl MemoryProtectionGuard
         // Check if the requested protection is allowed by the region's maximum protection
         let requested_write = (protection & libc::VM_PROT_WRITE) != 0;
         let max_allows_write = (region.max_protection & libc::VM_PROT_WRITE as u32) != 0;
-        
+
         if requested_write && !max_allows_write {
             return Err(DebuggerError::Io(Error::other(format!(
                 "Cannot make memory writable at 0x{:016x}: region maximum protection (0x{:x}) does not allow writes. \
@@ -844,7 +844,7 @@ fn change_protection(task: mach_port_t, addr: mach_vm_address_t, len: mach_vm_si
         // 1. Maximum protection is set by the kernel and typically can't be changed
         // 2. Code segments often have max_protection = READ|EXECUTE (no write)
         // 3. If max doesn't allow writes, we can't make it writable
-        
+
         // Just set current protection (set_maximum=0)
         // This will fail if the requested protection exceeds the maximum, which is expected
         let result = mach_vm_protect(task as vm_map_t, addr, len, 0, protection);

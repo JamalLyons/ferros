@@ -326,13 +326,7 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
 
         // Find a free slot
         // BCR (Breakpoint Control Register) bit 0 is enable (E)
-        let mut slot = None;
-        for i in 0..16 {
-            if (state.bcr[i] & 1) == 0 {
-                slot = Some(i);
-                break;
-            }
-        }
+        let slot = state.bcr.iter().take(16).position(|reg| (reg & 1) == 0);
 
         let slot = slot.ok_or_else(|| {
             DebuggerError::ResourceExhausted("No free hardware breakpoint slots (maximum 16 on ARM64)".into())
@@ -451,13 +445,7 @@ fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: W
 
         // Find a free slot in the watchpoint control registers.
         // WCR (Watchpoint Control Register) bit 0 is enable (E).
-        let mut slot = None;
-        for i in 0..16 {
-            if (state.wcr[i] & 1) == 0 {
-                slot = Some(i);
-                break;
-            }
-        }
+        let slot = state.wcr.iter().take(16).position(|reg| (reg & 1) == 0);
 
         let slot = slot.ok_or_else(|| {
             DebuggerError::ResourceExhausted("No free hardware watchpoint slots (maximum 16 on ARM64)".into())

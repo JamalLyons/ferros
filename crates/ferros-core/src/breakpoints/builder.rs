@@ -30,8 +30,8 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 ///
 /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
-///     .with_hit_count(5)  // Break after 5 hits
-///     .with_condition(|regs| regs.pc.value() > 0x2000)  // Only break if PC > 0x2000
+///     .with_hit_count(5) // Break after 5 hits
+///     .with_condition(|regs| regs.pc.value() > 0x2000) // Only break if PC > 0x2000
 ///     .install(&mut debugger)?;
 /// # Ok::<(), ferros_core::error::DebuggerError>(())
 /// ```

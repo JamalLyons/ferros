@@ -139,15 +139,13 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             let symbolication = self.symbols.symbolicate(cursor.pc);
             // Only log if we have an image for this address but still can't symbolicate it
             // (this indicates a real problem, not just a missing system library)
-            if symbolication.is_none() {
-                if self.symbols.image_for_address(cursor.pc).is_some() {
-                    use tracing::debug;
-                    debug!(
-                        "No symbolication for address 0x{:x} (image loaded but symbolication failed)",
-                        cursor.pc.value()
-                    );
-                }
-                // Otherwise, it's expected - address is in a system library we haven't loaded
+            // Otherwise, it's expected - address is in a system library we haven't loaded
+            if symbolication.is_none() && self.symbols.image_for_address(cursor.pc).is_some() {
+                use tracing::debug;
+                debug!(
+                    "No symbolication for address 0x{:x} (image loaded but symbolication failed)",
+                    cursor.pc.value()
+                );
             }
             append_logical_frames(&mut frames, thread, depth, &cursor, &symbolication, status, return_address);
 

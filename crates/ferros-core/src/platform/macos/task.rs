@@ -954,10 +954,10 @@ impl Debugger for MacOSDebugger
                 && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
             {
                 // Skip if this is the main executable (we already loaded it above)
-                if let Some(ref exec_path) = exec_path {
-                    if name == exec_path.to_str().unwrap_or("") {
-                        continue;
-                    }
+                if let Some(ref exec_path) = exec_path
+                    && name == exec_path.to_str().unwrap_or("")
+                {
+                    continue;
                 }
                 let desc = ImageDescriptor {
                     path: std::path::PathBuf::from(name),
@@ -1705,10 +1705,10 @@ impl MacOSDebugger
                 && (name.ends_with(".dylib") || name.ends_with(".so") || !name.contains('['))
             {
                 // Skip if this is the main executable
-                if let Some(ref exec_path) = exec_path {
-                    if name == exec_path.to_str().unwrap_or("") {
-                        continue;
-                    }
+                if let Some(ref exec_path) = exec_path
+                    && name == exec_path.to_str().unwrap_or("")
+                {
+                    continue;
                 }
                 let desc = crate::symbols::ImageDescriptor {
                     path: std::path::PathBuf::from(name),
@@ -1750,10 +1750,10 @@ impl MacOSDebugger
 
         // Find the __TEXT segment
         for segment in file.segments() {
-            if let Ok(Some(name)) = segment.name() {
-                if name == "__TEXT" || name == ".text" {
-                    return Some(segment.address());
-                }
+            if let Ok(Some(name)) = segment.name()
+                && (name == "__TEXT" || name == ".text")
+            {
+                return Some(segment.address());
             }
         }
 

@@ -27,3 +27,15 @@ mach2 = "0.6.0"
 
 [build-dependencies]
 rustc_version = "0.4"
+
+# ferros-core calls Mach APIs through raw FFI, so it needs `unsafe`, which the
+# workspace lints forbid. Mirror the workspace lints minus `unsafe_code = "forbid"`
+# and minus clippy pedantic (to avoid churn in ferros-core; revisit later).
+[lints.rust]
+unused = { level = "warn", priority = -1 }
+rust_2024_incompatible_pat = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -2 }
+nursery = { level = "allow", priority = -1 }
+multiple_crate_versions = { level = "allow", priority = -1 }

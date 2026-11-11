@@ -28,30 +28,22 @@ Ferros aims to become the Rust ecosystem's standard debugging platform, compleme
 
 ---
 
-## What Makes Ferros Different?
+## Goals
 
-While existing Rust debugging solutions are either platform-limited or retrofitted from C/C++ debuggers, Ferros is built **from the ground up** for Rust developers.
-
-| Solution | Limitations |
-|----------|-------------|
-| **BugStalker** | Linux-only, no macOS or Windows support |
-| **GDB/LLDB** | C/C++ semantics, doesn't understand Rust's ownership model |
-| **CodeLLDB** | Generic debugger extension, no Rust-specific features |
-
-**Ferros brings:**
-- ✅ **Cross-Platform First**: macOS support now, with Linux and Windows planned
-- ✅ **Rust-Native Understanding**: Built to understand ownership, lifetimes, borrows, and MIR
-- ✅ **MIR-Level Debugging**: Debug at the compiler's intermediate representation
-- ✅ **Hybrid Architecture**: Combines symbolic debugging and interpreted execution
-- ✅ **Modern Design**: Designed for Rust's safety guarantees from day one
+Ferros aims to be a Rust-aware debugger: ownership, lifetimes, and MIR-level understanding, starting on macOS with Linux and Windows planned. These are goals, not current features.
 
 ---
 
 ## Current Status
 
-Ferros is currently in **active development** with core infrastructure in place.
+Ferros is **early and experimental**. What is verified today:
 
-**See [ROADMAP.md](./ROADMAP.md) for detailed development milestones and progress tracking.**
+- The workspace builds.
+- On macOS, a binary ad-hoc signed with [`crates/ferros-core/ferros.entitlements`](./crates/ferros-core/ferros.entitlements) can launch a program suspended, obtain its task port, read thread and memory-region counts, resume it, and detach, without `sudo`.
+
+Nothing else is covered by tests yet. Other code in `ferros-core` (breakpoints, stack unwinding, symbols, and so on) exists but is unverified, so it is not claimed here. The interactive TUI is being rebuilt: `ferros launch` and `attach` currently behave exactly like `--headless` (print info and exit).
+
+The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for the item list (none ticked until a test covers it).
 
 ---
 
@@ -65,7 +57,7 @@ ferros/
 │   ├── ferros/          # Command-line interface
 │   ├── ferros-core/     # Low-level debugging primitives & process control
 │   ├── ferros-mir/      # MIR integration & analysis
-│   ├── ferros-ui/       # Optional TUI/GUI for visualization
+│   ├── ferros-ui/       # TUI (excluded from the workspace while being rebuilt)
 │   ├── ferros-protocol/ # Communication layer
 │   └── ferros-utils/    # Shared utilities & helpers
 ```
@@ -76,28 +68,20 @@ ferros/
 
 ## Quick Start
 
-> **Note:** Ferros is currently in early development. Installation and usage instructions will be available in future releases.
-
-Once available, you'll be able to:
+Not published to crates.io yet. Build from source:
 
 ```bash
-# Install via cargo
-cargo install ferros
-
-# Debug your Rust project
-cargo ferros launch <program> [args...]
+cargo build --workspace
+cargo run -p ferros -- launch --headless <program> [args...]
 ```
 
 ### Requirements
 
-- **Rust**: Edition 2021 (Rust 1.56.0 or newer)
-- **macOS**: 10.9+ (Mavericks) for Intel Macs, 11.0+ (Big Sur) for Apple Silicon
-- **Linux**: Planned (ptrace support)
-- **Windows**: Planned (WinDbg API support)
+- **Rust**: Edition 2024; the nightly toolchain is selected automatically by [`rust-toolchain.toml`](./rust-toolchain.toml)
+- **macOS** (Apple Silicon is what CI and development use): the only supported platform today
+- **Linux / Windows**: not implemented
 
-> **Note**: On macOS, debugging other processes requires either:
-> - Running with `sudo`, or
-> - Granting debugging entitlements (`com.apple.security.cs.debugger`)
+> **Note**: On macOS, debugging other processes needs the binary to be code-signed with the debugger entitlement. Ad-hoc signing with `crates/ferros-core/ferros.entitlements` is the verified path.
 
 ---
 

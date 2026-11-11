@@ -1,6 +1,6 @@
 [toolchain]
 channel = "nightly"
-components = ["rustfmt"]
+components = ["rustfmt", "clippy"]
 # Use nightly for formatting to enable unstable rustfmt features
 # This allows rustfmt to use unstable features like:
 # - format_code_in_doc_comments

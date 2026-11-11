@@ -11,7 +11,7 @@ keywords = ["debugger", "rust", "testing", "fixtures"]
 categories = ["development-tools"]
 
 [dependencies]
-ferros-core = { path = "../ferros-core" }
+ferros-core = { path = "../ferros-core", features = ["test-util"] }
 
 # Fixture programs. `test = false`: they have no unit tests, so cargo should not build
 # and run an empty test harness for each one.

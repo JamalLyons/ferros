@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["debugger", "rust", "debugging", "ptrace"]
 categories = ["development-tools"]
 
+[features]
+# Enables `backend::mock` (an in-memory, scripted `Backend`) for tests in dependent crates.
+test-util = []
+
 [dependencies]
 addr2line = "0.25.1"
 gimli = "=0.32.3"

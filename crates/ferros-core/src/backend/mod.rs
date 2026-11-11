@@ -58,10 +58,18 @@
 //!
 //! Hardware breakpoints and watchpoints, and asynchronous APIs, are not part of this
 //! interface yet.
+//!
+//! ## Testing without a process
+//!
+//! `mock::MockBackend` is a scripted, in-memory backend for unit-testing engine code on
+//! any machine. It is compiled for this crate's tests, and for other crates when they
+//! enable the `test-util` feature of `ferros-core`.
 
 #![forbid(unsafe_code)]
 
 mod error;
+#[cfg(any(test, feature = "test-util"))]
+pub mod mock;
 mod types;
 
 use std::time::Duration;
@@ -120,6 +128,8 @@ pub trait Backend: Send
     /// Release the target, which keeps running afterwards; the backend returns to
     /// *NoProcess*.
     ///
+    /// Stop events still queued for [`wait`](Self::wait) are discarded.
+    ///
     /// # Preconditions
     ///
     /// The target is *Stopped*. The engine must already have removed every trap it wrote,
@@ -134,7 +144,8 @@ pub trait Backend: Send
 
     /// Terminate and reap the target; the backend returns to *NoProcess*.
     ///
-    /// No terminal [`StopEvent`] is reported for a kill.
+    /// No terminal [`StopEvent`] is reported for a kill, and stop events still queued for
+    /// [`wait`](Self::wait) are discarded.
     ///
     /// # Preconditions
     ///
@@ -194,7 +205,8 @@ pub trait Backend: Send
     /// Ask a running target to stop; returns immediately.
     ///
     /// The stop is reported by a later [`wait`](Self::wait) as
-    /// [`StopEvent::Interrupted`], or as another event if one raced it. Returns `Ok(())`
+    /// [`StopEvent::Interrupted`], or as another event if one raced it. The event names a
+    /// thread only if the OS attributes the stop to one. Returns `Ok(())`
     /// without doing anything if the target is already stopped.
     ///
     /// # Preconditions

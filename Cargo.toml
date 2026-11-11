@@ -4,10 +4,16 @@ members = [
     "crates/ferros-core",
     "crates/ferros-mir",
     "crates/ferros-protocol",
+    "crates/ferros-tests",
     "crates/ferros-utils",
 ]
 exclude = ["crates/ferros-ui"]
 resolver = "2"
+
+[profile.dev.package.ferros-tests]
+opt-level = 0
+debug = "full"
+split-debuginfo = "packed"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

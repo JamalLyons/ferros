@@ -13,6 +13,11 @@ categories = ["development-tools"]
 [dependencies]
 ferros-core = { path = "../ferros-core" }
 
+# Only the tests need the scripted mock backend. Keeping the feature here leaves it out
+# of ordinary workspace builds, so the `ferros` binary is not built with the mock.
+[dev-dependencies]
+ferros-core = { path = "../ferros-core", features = ["test-util"] }
+
 # Fixture programs. `test = false`: they have no unit tests, so cargo should not build
 # and run an empty test harness for each one.
 [[bin]]

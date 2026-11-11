@@ -82,3 +82,11 @@ fn resume_runs_hello()
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+
+## Tests without a real process
+
+`tests/backend_mock.rs` is the one test file that launches no process and does not use the
+harness. It drives `ferros_core::backend::mock::MockBackend`, an in-memory, scripted backend
+enabled through the `test-util` feature, to prove the portable `Backend` trait and the mock work
+from outside `ferros-core`. With nothing to launch it needs no entitlement, no fixtures and no
+`#![cfg(target_os = "macos")]` gate.

@@ -14,6 +14,13 @@
 //! - **Linux**: Will use `ptrace` (future)
 //! - **Windows**: Will use Windows Debug API (future)
 //!
+//! ## Backend boundary
+//!
+//! [`backend::Backend`] is the portable interface every operating system implements:
+//! process control, register and memory access, and stop reporting (mechanism only).
+//! [`arch::Arch`] holds CPU knowledge (trap bytes, pc/sp/fp/link register, pointer
+//! authentication) independent of the OS. Neither module contains OS-specific code.
+//!
 //! ## Why unsafe code is needed
 //!
 //! This crate requires `unsafe` code because we're calling low-level system APIs
@@ -29,6 +36,8 @@
 #![allow(unsafe_code)] // Required for low-level system APIs (Mach, ptrace, etc.)
 #![warn(missing_docs)]
 
+pub mod arch;
+pub mod backend;
 pub mod breakpoints;
 pub mod debugger;
 pub mod error;
@@ -37,6 +46,8 @@ pub mod platform;
 pub mod symbols;
 pub mod types;
 
+pub use arch::Arch;
+pub use backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
 pub use debugger::Debugger;
 // Re-export commonly used types

@@ -34,12 +34,13 @@ pub enum StopEvent
 
     /// A signal is about to be delivered to the target, which is stopped.
     ///
-    /// The engine decides whether to pass it on through
-    /// [`ResumeRequest::signal`] in the next [`Backend::resume`](super::Backend::resume).
+    /// The backend holds the signal back instead of delivering it. The engine decides
+    /// whether the program sees it: see [`ResumeRequest::signals`].
     Signal
     {
-        /// Thread the signal is directed at, if the OS reports one.
-        thread: Option<ThreadId>,
+        /// Thread that will receive the signal. For a signal sent to the whole process
+        /// this is the thread the OS picked to take it.
+        thread: ThreadId,
         /// Signal number.
         signal: i32,
     },
@@ -83,8 +84,8 @@ impl StopEvent
     pub fn thread(&self) -> Option<ThreadId>
     {
         match self {
-            Self::Breakpoint { thread, .. } | Self::SingleStep { thread } => Some(*thread),
-            Self::Signal { thread, .. } | Self::Interrupted { thread } | Self::Other { thread, .. } => *thread,
+            Self::Breakpoint { thread, .. } | Self::SingleStep { thread } | Self::Signal { thread, .. } => Some(*thread),
+            Self::Interrupted { thread } | Self::Other { thread, .. } => *thread,
             Self::Exited { .. } | Self::Killed { .. } => None,
         }
     }
@@ -285,10 +286,20 @@ pub struct ResumeRequest
     pub default_action: ThreadAction,
     /// Per-thread overrides; when a thread appears more than once, the last entry wins.
     pub thread_actions: Vec<(ThreadId, ThreadAction)>,
-    /// Signal to deliver on resume to the thread that reported the last
-    /// [`StopEvent::Signal`] (process-wide if that stop named no thread).
-    /// `None` suppresses the pending signal.
-    pub signal: Option<i32>,
+    /// Signals to pass on, each to one thread; when a thread appears more than once,
+    /// the last entry wins.
+    ///
+    /// A signal reported by [`StopEvent::Signal`] is held by the backend. It reaches the
+    /// program only if the resume that next lets its thread run (`Continue` or `Step`)
+    /// names it here. If that resume does not name it, the signal is discarded. While
+    /// the thread stays `Suspend`ed the signal stays held, so the engine can step
+    /// another thread first and pass the signal on later.
+    ///
+    /// Naming a thread whose action is `Suspend` is an error
+    /// ([`BackendError::Unsupported`](super::BackendError::Unsupported)). A backend may
+    /// also return `Unsupported` for a signal it is not holding for that thread, if the
+    /// OS cannot inject new signals.
+    pub signals: Vec<(ThreadId, i32)>,
 }
 
 impl ResumeRequest
@@ -300,7 +311,7 @@ impl ResumeRequest
         Self {
             default_action: action,
             thread_actions: Vec::new(),
-            signal: None,
+            signals: Vec::new(),
         }
     }
 
@@ -326,12 +337,23 @@ impl ResumeRequest
         self
     }
 
-    /// Deliver `signal` on resume.
+    /// Pass `signal` on to `thread` when it resumes; see [`signals`](Self::signals).
     #[must_use]
-    pub fn with_signal(mut self, signal: i32) -> Self
+    pub fn with_signal(mut self, thread: ThreadId, signal: i32) -> Self
     {
-        self.signal = Some(signal);
+        self.signals.push((thread, signal));
         self
+    }
+
+    /// The signal `thread` receives under this request, if any (last entry wins).
+    #[must_use]
+    pub fn signal_for(&self, thread: ThreadId) -> Option<i32>
+    {
+        self.signals
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == thread)
+            .map(|(_, signal)| *signal)
     }
 
     /// Action `thread` performs: the last matching override, else the default.

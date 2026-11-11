@@ -4,6 +4,9 @@ use super::Arch;
 use crate::backend::{BackendError, BackendResult};
 use crate::types::{Address, Architecture, Registers};
 
+/// Index of the frame pointer X29 in [`Registers::general`].
+const FRAME_POINTER_INDEX: usize = 29;
+
 /// Index of the link register X30 in [`Registers::general`].
 const LINK_REGISTER_INDEX: usize = 30;
 
@@ -108,9 +111,14 @@ impl Arch for Arm64
         registers.fp
     }
 
+    /// `Registers` holds x29 twice, as `fp` and as `general[29]`; both are updated so
+    /// they never disagree.
     fn set_fp(&self, registers: &mut Registers, value: Address)
     {
         registers.fp = value;
+        if let Some(slot) = registers.general.get_mut(FRAME_POINTER_INDEX) {
+            *slot = value.value();
+        }
     }
 
     fn link_register(&self, registers: &Registers) -> Option<Address>
@@ -185,6 +193,7 @@ mod tests
         assert_eq!(arch.link_register(&regs), Some(Address::new(0x4000)));
         assert_eq!(regs.pc, Address::new(0x1000));
         assert_eq!(regs.general[30], 0x4000);
+        assert_eq!(regs.general[29], 0x3000, "set_fp keeps general[29] in step with fp");
     }
 
     #[test]

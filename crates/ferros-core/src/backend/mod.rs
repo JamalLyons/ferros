@@ -26,7 +26,8 @@
 //! | Call                                                           | NoProcess | Stopped | Running |
 //! |----------------------------------------------------------------|-----------|---------|---------|
 //! | `launch`, `attach`                                             | yes       | no      | no      |
-//! | `resume`, `detach`                                             | no        | yes     | no      |
+//! | `resume`                                                       | no        | yes (+) | no      |
+//! | `detach`                                                       | no        | yes     | no      |
 //! | `threads`, registers, memory, `memory_regions`, `images`      | no        | yes     | no      |
 //! | `wait`                                                         | no        | yes (*) | yes     |
 //! | `interrupt`                                                    | no        | yes (no-op) | yes |
@@ -34,16 +35,45 @@
 //! | `architecture`                                                 | yes       | yes     | yes     |
 //!
 //! (*) see [`Backend::wait`] for draining queued events and its behaviour with nothing pending.
+//! (+) only once every queued event has been drained with [`Backend::wait`].
 //!
-//! An illegal call returns [`BackendError::InvalidState`] and leaves the state unchanged.
+//! An illegal call returns [`BackendError::InvalidState`].
+//!
+//! ## Errors never change the state
+//!
+//! The state changes only when `launch`, `attach`, `resume`, `detach` or `kill` returns
+//! `Ok`, or when `wait` returns an event. A call that returns an error, whichever
+//! variant, leaves the backend in the state it was in:
+//!
+//! - `resume` is all or nothing. If the OS fails part-way, the backend stops the threads
+//!   it had already resumed before returning the error, and the target is still *Stopped*.
+//! - If the process dies on its own (for example it is killed from outside while
+//!   stopped), calls may start failing with [`BackendError::NotFound`] or
+//!   [`BackendError::Os`], but the backend stays in its current state until the engine
+//!   collects the terminal event with `wait` or calls `kill`.
+//! - `kill` on a process that is already dead succeeds and discards the terminal event.
+//!
+//! ## A stop ends the resume before it
+//!
+//! When `wait` reports a stop, every request of the preceding `resume` is finished. A
+//! `Step` that did not complete (the thread took a signal instead, or another thread
+//! stopped first) is cancelled, and an `interrupt` that lost a race against another event
+//! is consumed. No `SingleStep` or `Interrupted` event belonging to an earlier resume is
+//! ever reported after a later `resume`; the engine asks again if it still wants one.
+//!
+//! ## Thread identity
+//!
+//! A [`ThreadId`] names the same thread for as long as that thread lives, across stops
+//! and resumes. An id may be reused only after its thread has exited.
 //!
 //! ## Threading
 //!
 //! A backend is owned by one engine thread at a time. It is [`Send`] so it can be moved
 //! to that thread, but not required to be [`Sync`]. Some operating systems (Linux
-//! `ptrace`) only accept requests from the thread that attached, so the engine must issue
-//! every call after `launch`/`attach` from a single thread. To interrupt the target on
-//! behalf of another thread (a UI, a Ctrl-C handler), the engine thread polls
+//! `ptrace`) only accept requests from the thread that launched or attached, so the
+//! engine must issue every call from `launch`/`attach` onwards, including that call
+//! itself, on one thread, and move the backend to that thread beforehand. To interrupt
+//! the target on behalf of another thread (a UI, a Ctrl-C handler), the engine thread polls
 //! [`Backend::wait`] with a finite timeout and calls [`Backend::interrupt`] between polls.
 //!
 //! ## Breakpoints belong to the engine
@@ -128,7 +158,8 @@ pub trait Backend: Send
     /// Release the target, which keeps running afterwards; the backend returns to
     /// *NoProcess*.
     ///
-    /// Stop events still queued for [`wait`](Self::wait) are discarded.
+    /// Stop events still queued for [`wait`](Self::wait) are discarded, and so are
+    /// signals the backend is holding (see [`ResumeRequest::signals`]).
     ///
     /// # Preconditions
     ///
@@ -138,14 +169,16 @@ pub trait Backend: Send
     /// # Errors
     ///
     /// - [`BackendError::InvalidState`] with no process, or while the target is running.
-    /// - [`BackendError::NotFound`] if the process has already exited.
+    /// - [`BackendError::NotFound`] if the process has already died; the backend stays
+    ///   *Stopped* until `wait` returns the terminal event or `kill` is called.
     /// - [`BackendError::Os`] if the OS refuses to detach.
     fn detach(&mut self) -> BackendResult<()>;
 
     /// Terminate and reap the target; the backend returns to *NoProcess*.
     ///
     /// No terminal [`StopEvent`] is reported for a kill, and stop events still queued for
-    /// [`wait`](Self::wait) are discarded.
+    /// [`wait`](Self::wait) are discarded. Killing a process that has already died
+    /// succeeds.
     ///
     /// # Preconditions
     ///
@@ -197,9 +230,11 @@ pub trait Backend: Send
     /// - [`BackendError::InvalidState`] with no process, while running, or while stop
     ///   events are still pending.
     /// - [`BackendError::NotFound`] if a thread named in `request` does not exist.
-    /// - [`BackendError::Unsupported`] if the combination of thread actions or the signal
-    ///   cannot be expressed on this OS.
-    /// - [`BackendError::Os`] if the OS fails to resume a thread.
+    /// - [`BackendError::Unsupported`] if the combination of thread actions cannot be
+    ///   expressed on this OS, a signal is named for a thread whose action is `Suspend`,
+    ///   or a signal cannot be delivered (see [`ResumeRequest::signals`]).
+    /// - [`BackendError::Os`] if the OS fails to resume a thread; the target is left
+    ///   *Stopped*.
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>;
 
     /// Ask a running target to stop; returns immediately.
@@ -250,6 +285,8 @@ pub trait Backend: Send
     ///
     /// The target is *Stopped*; `thread` belongs to it; `registers` has the target's
     /// architecture and layout (normally obtained from [`read_registers`](Self::read_registers)).
+    /// Where `Registers` holds a value twice (arm64 keeps x29 in both `fp` and
+    /// `general[29]`), the named field (`pc`, `sp`, `fp`) is the one written.
     ///
     /// # Errors
     ///
@@ -467,10 +504,12 @@ mod tests
         let request = ResumeRequest::continue_all()
             .with_thread(ThreadId(2), ThreadAction::Step)
             .with_thread(ThreadId(2), ThreadAction::Suspend)
-            .with_signal(2);
+            .with_signal(ThreadId(2), 2)
+            .with_signal(ThreadId(2), 11);
         assert_eq!(request.action_for(ThreadId(1)), ThreadAction::Continue);
         assert_eq!(request.action_for(ThreadId(2)), ThreadAction::Suspend);
-        assert_eq!(request.signal, Some(2));
+        assert_eq!(request.signal_for(ThreadId(2)), Some(11));
+        assert_eq!(request.signal_for(ThreadId(1)), None);
         assert_eq!(
             ResumeRequest::all(ThreadAction::Suspend).action_for(ThreadId(9)),
             ThreadAction::Suspend
@@ -484,7 +523,7 @@ mod tests
         assert_eq!(request.action_for(ThreadId(7)), ThreadAction::Step);
         assert_eq!(request.action_for(ThreadId(8)), ThreadAction::Suspend);
         assert_eq!(request.default_action, ThreadAction::Suspend);
-        assert_eq!(request.signal, None);
+        assert!(request.signals.is_empty());
     }
 
     #[test]
@@ -501,22 +540,7 @@ mod tests
                 false,
             ),
             (StopEvent::SingleStep { thread: t }, Some(t), false),
-            (
-                StopEvent::Signal {
-                    thread: Some(t),
-                    signal: 11,
-                },
-                Some(t),
-                false,
-            ),
-            (
-                StopEvent::Signal {
-                    thread: None,
-                    signal: 11,
-                },
-                None,
-                false,
-            ),
+            (StopEvent::Signal { thread: t, signal: 11 }, Some(t), false),
             (StopEvent::Interrupted { thread: Some(t) }, Some(t), false),
             (StopEvent::Interrupted { thread: None }, None, false),
             (

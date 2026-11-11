@@ -59,6 +59,8 @@ Every engine change lands with an integration test in `crates/ferros-tests` that
 ## Writing an integration test
 Create a dedicated test file per area in `crates/ferros-tests/tests/`, gated with `#![cfg(target_os = "macos")]`. Run every test body inside `harness::run(|t| { ... })`. Resolve fixture binaries using the `fixture!("name")` macro, and look up breakpoint locations using source markers via `fixture.marker_line("<name>")`. Never hard-code line numbers or `target/...` paths. See `crates/ferros-tests/README.md` for the full example and API overview.
 
+The one exception is `tests/backend_mock.rs`: it drives the in-memory `MockBackend` instead of a real process, so it uses neither the macOS gate nor the harness.
+
 ## Leaked processes
 A suspended fixture keeps inherited pipes open and can hang the next command. After any integration run, verify that no orphaned fixture processes remain:
 ```sh

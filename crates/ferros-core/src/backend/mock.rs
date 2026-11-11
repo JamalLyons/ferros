@@ -2,7 +2,8 @@
 //!
 //! [`MockBackend`] pretends to be one debugged process: it has a memory map, threads
 //! with registers, loaded images, and a *script* of the stops the "process" will make.
-//! It follows the state machine and error contract documented on [`Backend`] strictly,
+//! It follows the state machine and error contract documented on [`Backend`] strictly
+//! (the one deliberate difference is that `wait` never blocks, see below),
 //! so engine code (breakpoints, stepping) can be unit-tested on any machine without a
 //! real process.
 //!
@@ -62,7 +63,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use super::{Backend, BackendError, BackendResult, LaunchSpec, LoadedImage, ResumeRequest, StopEvent};
+use super::{Backend, BackendError, BackendResult, LaunchSpec, LoadedImage, ResumeRequest, StopEvent, ThreadAction};
 use crate::types::{Address, Architecture, MemoryRegion, MemoryRegionId, ProcessId, Registers, ThreadId};
 
 /// Arm64 register set with every register zero and the 31 general registers (x0-x30)
@@ -416,8 +417,10 @@ fn segments(memory: &BTreeMap<u64, Region>, address: Address, len: usize) -> Bac
 
 fn read_bytes(memory: &BTreeMap<u64, Region>, address: Address, len: usize) -> BackendResult<Vec<u8>>
 {
+    // Validate the range before allocating: a bogus `len` must be an error, not a panic.
+    let pieces = segments(memory, address, len)?;
     let mut out = Vec::with_capacity(len);
-    for (start, offset, take) in segments(memory, address, len)? {
+    for (start, offset, take) in pieces {
         out.extend_from_slice(&memory[&start].bytes[offset..offset + take]);
     }
     Ok(out)
@@ -816,6 +819,17 @@ impl Backend for MockBackend
         {
             return Err(unknown_thread(*thread));
         }
+        for (thread, signal) in &request.signals {
+            if !inner.threads.contains_key(&thread.0) {
+                return Err(unknown_thread(*thread));
+            }
+            if request.action_for(*thread) == ThreadAction::Suspend {
+                return Err(BackendError::Unsupported(format!(
+                    "resume: signal {signal} is named for thread {}, which stays suspended",
+                    thread.0
+                )));
+            }
+        }
         if let Some(stops) = inner.script.front() {
             for expected in stops.iter().filter_map(|stop| stop.expected_resume.as_ref()) {
                 if expected != request {
@@ -939,7 +953,6 @@ mod tests
 {
     use super::*;
     use crate::arch;
-    use crate::backend::ThreadAction;
 
     const T1: ThreadId = ThreadId(1);
     const CODE: u64 = 0x1000;
@@ -1382,5 +1395,135 @@ mod tests
         .expect("backend failed");
         assert_eq!(mock.state(), MockState::NoProcess);
         assert_eq!(mock.calls().len(), 3);
+    }
+
+    /// A signal on one thread is held while another thread steps past a breakpoint, then
+    /// passed on when its own thread resumes.
+    #[test]
+    fn signal_is_held_across_a_step_and_passed_per_thread()
+    {
+        let t2 = ThreadId(2);
+        let mut mock = process().with_thread(t2, regs_at(CODE));
+        mock.script_simultaneous([
+            MockStop::new(StopEvent::Breakpoint {
+                thread: T1,
+                pc: Address::new(BP),
+            }),
+            MockStop::new(StopEvent::Signal { thread: t2, signal: 30 }),
+        ]);
+        mock.script(MockStop::new(StopEvent::SingleStep { thread: T1 }).expect_resume(ResumeRequest::step(T1)));
+        let pass_on = ResumeRequest::continue_all().with_signal(t2, 30);
+        mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(pass_on.clone()));
+
+        mock.launch(&spec()).expect("launch");
+        mock.resume(&ResumeRequest::continue_all()).expect("resume");
+        assert_eq!(
+            mock.wait(None),
+            Ok(Some(StopEvent::Breakpoint {
+                thread: T1,
+                pc: Address::new(BP)
+            }))
+        );
+        assert_eq!(
+            mock.wait(Some(Duration::ZERO)),
+            Ok(Some(StopEvent::Signal { thread: t2, signal: 30 }))
+        );
+
+        // A signal cannot be named for a thread that stays suspended, or for an unknown one.
+        assert!(matches!(
+            mock.resume(&ResumeRequest::step(T1).with_signal(t2, 30)),
+            Err(BackendError::Unsupported(_))
+        ));
+        assert!(matches!(
+            mock.resume(&ResumeRequest::continue_all().with_signal(ThreadId(9), 30)),
+            Err(BackendError::NotFound(_))
+        ));
+        assert_eq!(mock.state(), MockState::Stopped);
+
+        mock.resume(&ResumeRequest::step(T1)).expect("step with the signal held");
+        assert_eq!(mock.wait(None), Ok(Some(StopEvent::SingleStep { thread: T1 })));
+        // Continuing without the signal is not what the script expects.
+        assert!(is_invalid_state(&mock.resume(&ResumeRequest::continue_all())));
+        mock.resume(&pass_on).expect("continue, passing the signal on");
+        assert_eq!(mock.wait(None), Ok(Some(StopEvent::Exited { code: 0 })));
+    }
+
+    #[test]
+    fn detach_discards_pending_events()
+    {
+        let mut mock = process();
+        mock.script_simultaneous([
+            MockStop::new(StopEvent::Interrupted { thread: Some(T1) }),
+            MockStop::new(StopEvent::Other {
+                thread: None,
+                reason: "second".into(),
+            }),
+        ]);
+        mock.launch(&spec()).expect("launch");
+        mock.resume(&ResumeRequest::continue_all()).expect("resume");
+        mock.wait(None).expect("first event");
+        assert_eq!(mock.pending_len(), 1);
+        mock.detach().expect("detach");
+        assert_eq!(mock.state(), MockState::NoProcess);
+        assert_eq!(mock.pending_len(), 0);
+
+        mock.launch(&spec()).expect("relaunch");
+        assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(None));
+    }
+
+    #[test]
+    fn script_effects_apply_together_or_not_at_all()
+    {
+        let t2 = ThreadId(2);
+        let mut replacement = regs_at(0x2000);
+        replacement.general[5] = 55;
+        let mut mock = process().with_thread(t2, regs_at(CODE));
+        mock.script(
+            MockStop::new(StopEvent::Other {
+                thread: Some(T1),
+                reason: "effects".into(),
+            })
+            .set_registers(T1, replacement.clone())
+            .remove_thread(t2)
+            .write_memory(Address::new(CODE + 32), vec![1, 2, 3]),
+        );
+        // The first effect is fine, the second names a thread that does not exist.
+        mock.script(
+            MockStop::new(StopEvent::Interrupted { thread: None })
+                .set_pc(T1, Address::new(0x3000))
+                .remove_thread(ThreadId(9)),
+        );
+
+        mock.launch(&spec()).expect("launch");
+        mock.resume(&ResumeRequest::continue_all()).expect("resume");
+        mock.wait(None).expect("stop with effects");
+        assert_eq!(mock.peek_threads(), vec![T1]);
+        assert_eq!(
+            mock.peek_registers(T1).map(MockRegisters),
+            Some(MockRegisters(replacement.clone()))
+        );
+        assert_eq!(mock.peek_memory(Address::new(CODE + 32), 4), Ok(vec![1, 2, 3, 0xAA]));
+
+        mock.resume(&ResumeRequest::continue_all()).expect("resume");
+        assert!(is_invalid_state(&mock.wait(None)));
+        // Nothing of the failed group was applied, and the stop is still queued.
+        assert_eq!(mock.peek_registers(T1).map(MockRegisters), Some(MockRegisters(replacement)));
+        assert_eq!(mock.state(), MockState::Running);
+        assert_eq!(mock.script_len(), 1);
+    }
+
+    #[test]
+    fn absurd_read_length_is_an_error_not_a_panic()
+    {
+        let mut mock = process();
+        mock.launch(&spec()).expect("launch");
+        assert!(matches!(
+            mock.read_memory(Address::new(CODE), usize::MAX),
+            Err(BackendError::NotFound(_))
+        ));
+        assert!(matches!(
+            mock.peek_memory(Address::new(CODE), usize::MAX),
+            Err(BackendError::NotFound(_))
+        ));
     }
 }

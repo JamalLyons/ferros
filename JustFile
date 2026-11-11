@@ -16,11 +16,11 @@ setup: check-prerequisites install-rust install-nightly verify-setup run-setup-t
     @echo "  • Run 'just test' to run tests"
     @echo "  • Read CONTRIBUTING.md for guidelines"
 
-# Run tests as part of setup
+# Run tests as part of setup (unit tests only, see `test`)
 run-setup-tests:
     @echo ""
     @echo "🧪 Running tests..."
-    @cargo test --workspace --all-features
+    @cargo test --workspace --exclude ferros-tests --all-features
 
 # Check if prerequisites are installed
 check-prerequisites:
@@ -108,10 +108,18 @@ lint-fix:
     @echo "🔧 Running clippy with auto-fix..."
     @cargo clippy --all --all-targets --fix --allow-dirty --allow-staged
 
-# Run all tests
+# Run unit tests (excludes ferros-tests, so they never need debugging permission)
 test:
     @echo "🧪 Running tests..."
-    @cargo test --workspace --all-features
+    @cargo test --workspace --exclude ferros-tests --all-features
+
+# Run the integration tests in crates/ferros-tests. They launch real fixture
+# processes under the debugger. On arm64 macOS the cargo runner
+# (scripts/cargo-test-runner.sh, see .cargo/config.toml) signs the test binary
+# with the debugger entitlement first, so no sudo is needed.
+test-integration:
+    @echo "🧪 Running integration tests..."
+    @cargo test -p ferros-tests
 
 # Run tests for a specific crate (usage: just test-crate ferros-core)
 test-crate CRATE:

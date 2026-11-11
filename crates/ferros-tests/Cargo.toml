@@ -1,0 +1,44 @@
+[package]
+name = "ferros-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Integration test fixtures and test harness for Ferros."
+license = "Apache-2.0"
+repository = "https://github.com/jamallyons/ferros"
+readme = "README.md"
+keywords = ["debugger", "rust", "testing", "fixtures"]
+categories = ["development-tools"]
+
+[dependencies]
+ferros-core = { path = "../ferros-core" }
+
+# Fixture programs. `test = false`: they have no unit tests, so cargo should not build
+# and run an empty test harness for each one.
+[[bin]]
+name = "ferros-fixture-hello"
+path = "fixtures/hello.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-exit_code"
+path = "fixtures/exit_code.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-loop_counter"
+path = "fixtures/loop_counter.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-nested_calls"
+path = "fixtures/nested_calls.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-threads"
+path = "fixtures/threads.rs"
+test = false
+
+[lints]
+workspace = true

@@ -11,6 +11,9 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'JustFile'
+      - '.cargo/**'
+      - 'scripts/**'
+      - '**/*.entitlements'
   pull_request:
     branches: [ "master" ]
     paths:
@@ -21,6 +24,9 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'JustFile'
+      - '.cargo/**'
+      - 'scripts/**'
+      - '**/*.entitlements'
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,3 +51,39 @@ jobs:
       run: just lint
     - name: Test
       run: just test
+
+  integration-macos:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install just
+      run: brew install just
+    - name: Debugging permission status
+      run: |
+        DevToolsSecurity -status || true
+        id -Gn || true
+        sw_vers -productVersion || true
+        uname -m || true
+        security authorizationdb read system.privilege.taskport 2>/dev/null | grep -A1 -E '<key>(class|group|rule|authenticate-user)</key>' || true
+    # The hosted runner has developer mode enabled and its user is in _developer, yet a signed
+    # debugger still blocks in task_for_pid there: macOS waits for a "Developer Tools Access"
+    # authorization that nobody can give on a machine without a person at the screen. This
+    # machine setup removes that prompt. The tests themselves still run as the normal runner
+    # user, without sudo.
+    - name: Allow task_for_pid without a dialog (runner setup)
+      run: sudo security authorizationdb write system.privilege.taskport allow
+    - name: Integration tests
+      run: just test-integration
+    - name: Authorization log
+      if: always()
+      run: |
+        log show --last 3m --style compact --predicate 'process == "taskgated" OR process == "taskgated-helper" OR process == "authd" OR process == "SecurityAgent"' | tail -n 40 || true
+    - name: No fixture process left behind
+      if: always()
+      run: |
+        if leaked=$(pgrep -fl ferros-fixture-); then
+          echo "Found leaked fixture processes:" >&2
+          printf '%s\n' "$leaked" >&2
+          exit 1
+        fi

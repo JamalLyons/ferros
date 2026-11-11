@@ -374,6 +374,13 @@ name = "ferros-protocol"
 version = "0.0.0"
 
 [[package]]
+name = "ferros-tests"
+version = "0.0.0"
+dependencies = [
+ "ferros-core",
+]
+
+[[package]]
 name = "ferros-utils"
 version = "0.0.0"
 dependencies = [

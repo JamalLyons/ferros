@@ -11,6 +11,9 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'JustFile'
+      - '.cargo/**'
+      - 'scripts/**'
+      - '**/*.entitlements'
   pull_request:
     branches: [ "master" ]
     paths:
@@ -21,6 +24,9 @@ on:
       - 'rust-toolchain.toml'
       - 'rustfmt.toml'
       - 'JustFile'
+      - '.cargo/**'
+      - 'scripts/**'
+      - '**/*.entitlements'
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,3 +51,27 @@ jobs:
       run: just lint
     - name: Test
       run: just test
+
+  integration-macos:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v5
+    - name: Install just
+      run: brew install just
+    - name: Debugging permission status
+      run: |
+        DevToolsSecurity -status || true
+        id -Gn || true
+        sw_vers -productVersion || true
+        uname -m || true
+    - name: Integration tests
+      run: just test-integration
+    - name: No fixture process left behind
+      if: always()
+      run: |
+        if leaked=$(pgrep -fl ferros-fixture-); then
+          echo "Found leaked fixture processes:" >&2
+          printf '%s\n' "$leaked" >&2
+          exit 1
+        fi

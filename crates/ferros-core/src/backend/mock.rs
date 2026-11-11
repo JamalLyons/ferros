@@ -651,6 +651,23 @@ impl MockBackend
         }
     }
 
+    /// Simulate the process dying on its own (for example killed from outside) while it
+    /// is *Stopped*: `event` is queued as a pending terminal event, as the contract
+    /// requires of a real backend. The next `wait` returns it and the mock goes to
+    /// *NoProcess*; until then `resume` is refused.
+    ///
+    /// # Panics
+    ///
+    /// If `event` is not terminal or the mock is not *Stopped* (to script a death while
+    /// running, enqueue a terminal [`MockStop`] instead).
+    pub fn die(&self, event: StopEvent)
+    {
+        let mut inner = self.lock();
+        assert!(event.is_terminal(), "die: {event:?} is not a terminal event");
+        assert_eq!(inner.state, MockState::Stopped, "die: the mock is not stopped");
+        inner.pending.push_back(event);
+    }
+
     /// Make the next call of `kind` fail with `error`, after it is recorded and before
     /// anything else happens (the state does not change). Several failures can be queued;
     /// each is used once.
@@ -888,8 +905,13 @@ impl Backend for MockBackend
                 inner.architecture
             )));
         }
+        let is_arm64 = inner.architecture == Architecture::Arm64;
         let slot = inner.threads.get_mut(&thread.0).ok_or_else(|| unknown_thread(thread))?;
         *slot = registers.clone();
+        // The contract says the named field wins where arm64 holds x29 twice.
+        if is_arm64 && let Some(x29) = slot.general.get_mut(29) {
+            *x29 = slot.fp.value();
+        }
         Ok(())
     }
 
@@ -1397,10 +1419,11 @@ mod tests
         assert_eq!(mock.calls().len(), 3);
     }
 
-    /// A signal on one thread is held while another thread steps past a breakpoint, then
-    /// passed on when its own thread resumes.
+    /// The engine steps one thread while another has a signal, then names that signal for
+    /// its own thread. The mock does not model held signals; it validates the request and
+    /// matches it against the script's expectation.
     #[test]
-    fn signal_is_held_across_a_step_and_passed_per_thread()
+    fn signal_requests_are_validated_per_thread()
     {
         let t2 = ThreadId(2);
         let mut mock = process().with_thread(t2, regs_at(CODE));
@@ -1525,5 +1548,38 @@ mod tests
             mock.peek_memory(Address::new(CODE), usize::MAX),
             Err(BackendError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn death_while_stopped_is_a_pending_terminal_event()
+    {
+        let mut mock = process();
+        mock.launch(&spec()).expect("launch");
+        mock.die(StopEvent::Killed { signal: 9 });
+        assert_eq!(mock.state(), MockState::Stopped);
+        assert!(is_invalid_state(&mock.resume(&ResumeRequest::continue_all())));
+        assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(Some(StopEvent::Killed { signal: 9 })));
+        assert_eq!(mock.state(), MockState::NoProcess);
+
+        // `kill` is the other way out, and discards the terminal event.
+        mock.launch(&spec()).expect("relaunch");
+        mock.die(StopEvent::Exited { code: 1 });
+        mock.kill().expect("kill a dead process");
+        assert_eq!(mock.state(), MockState::NoProcess);
+        assert_eq!(mock.pending_len(), 0);
+    }
+
+    #[test]
+    fn write_registers_keeps_arm64_x29_in_step_with_fp()
+    {
+        let mut mock = process();
+        mock.launch(&spec()).expect("launch");
+        let mut registers = mock.read_registers(T1).expect("read");
+        registers.fp = Address::new(0x7FF0);
+        registers.general[29] = 1;
+        mock.write_registers(T1, &registers).expect("write");
+        let stored = mock.read_registers(T1).expect("read back");
+        assert_eq!(stored.fp, Address::new(0x7FF0));
+        assert_eq!(stored.general[29], 0x7FF0);
     }
 }

@@ -270,6 +270,9 @@ pub enum ThreadAction
     /// Run freely.
     Continue,
     /// Execute exactly one instruction, then stop with [`StopEvent::SingleStep`].
+    ///
+    /// If a signal is passed to the thread in the same resume, the one instruction is the
+    /// first instruction of the program's signal handler.
     Step,
     /// Stay suspended.
     Suspend,

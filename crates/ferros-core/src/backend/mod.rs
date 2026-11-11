@@ -47,10 +47,14 @@
 //!
 //! - `resume` is all or nothing. If the OS fails part-way, the backend stops the threads
 //!   it had already resumed before returning the error, and the target is still *Stopped*.
-//! - If the process dies on its own (for example it is killed from outside while
-//!   stopped), calls may start failing with [`BackendError::NotFound`] or
-//!   [`BackendError::Os`], but the backend stays in its current state until the engine
-//!   collects the terminal event with `wait` or calls `kill`.
+//!   If one of those threads produced a stop in the meantime, that event is queued for
+//!   `wait` rather than lost.
+//! - If the process dies on its own while *Stopped* (for example it is killed from
+//!   outside), calls may start failing with [`BackendError::NotFound`] or
+//!   [`BackendError::Os`], but the backend stays *Stopped*. The backend queues the
+//!   terminal event as a pending event, so the next `wait` returns it and moves the
+//!   backend to *NoProcess*; until then `resume` fails because an event is pending. The
+//!   engine can also call `kill` instead.
 //! - `kill` on a process that is already dead succeeds and discards the terminal event.
 //!
 //! ## A stop ends the resume before it
@@ -204,7 +208,9 @@ pub trait Backend: Send
     /// to drain them; `Ok(None)` then means none is pending.
     ///
     /// While the target is *Stopped* with nothing pending, a finite timeout returns
-    /// `Ok(None)` after at most that timeout (possibly immediately).
+    /// `Ok(None)` after at most that timeout (possibly immediately). A process that died
+    /// while *Stopped* counts as a pending terminal event: `wait` checks for it and
+    /// returns it.
     ///
     /// # Preconditions
     ///

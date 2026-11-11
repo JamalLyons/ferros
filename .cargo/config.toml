@@ -1,0 +1,10 @@
+# On arm64 macOS every executable cargo runs (`cargo test`, `cargo run`, doctests)
+# goes through this runner. It ad-hoc signs the executable with the debugger
+# entitlement so the integration tests in crates/ferros-tests can debug their
+# fixture processes without sudo. See the script for the FERROS_TEST_UNSIGNED switch.
+#
+# A relative path containing a slash is resolved against the directory that
+# contains this `.cargo` directory (the repository root), so the runner works
+# no matter which subdirectory cargo is invoked from.
+[target.aarch64-apple-darwin]
+runner = "scripts/cargo-test-runner.sh"

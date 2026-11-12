@@ -7,7 +7,7 @@
 #      declare `#![forbid(unsafe_code)]`.
 #   3. crates/ferros-core/Cargo.toml must not name an OS crate.
 #   4. The CLI (crates/ferros/src) may name `ferros_macos` only in its factory
-#      module, platform.rs.
+#      module, platform.rs, and its manifest may not rename that dependency.
 #
 # Every offending line is printed as `file:line: rule: text` on stderr and the
 # exit status is 1. The rules match crates/ferros-tests/tests/platform_boundary.rs.
@@ -36,8 +36,7 @@ awk '
     {
         code = $0
         sub(/^[[:space:]]*/, "", code)
-        if (substr(code, 1, 2) != "//" &&
-            (index($0, "unsafe {") || index($0, "unsafe fn") || index($0, "unsafe impl") || index($0, "unsafe extern"))) {
+        if (substr(code, 1, 2) != "//" && code ~ /(^|[^A-Za-z0-9_])unsafe([[:space:]]*\{|[[:space:]]+(fn|impl|extern)|[[:space:]]*$)/) {
             printf "%s:%d: ferros-core must not contain unsafe code: %s\n", FILENAME, FNR, $0
             bad = 1
         }
@@ -79,6 +78,17 @@ if [ -n "$cli_sources" ]; then
         END { exit bad }
     ' $cli_sources >&2 || failed=1
 fi
+
+# A renamed dependency (`x = { package = "ferros-macos" }`) would hide the crate name
+# from the check above, so the CLI manifest must not rename it.
+awk '
+    /^[[:space:]]*#/ { next }
+    /package[[:space:]]*=[[:space:]]*"ferros-macos"/ {
+        printf "%s:%d: the CLI must not rename the ferros-macos dependency: %s\n", FILENAME, FNR, $0
+        bad = 1
+    }
+    END { exit bad }
+' crates/ferros/Cargo.toml >&2 || failed=1
 
 if [ "$failed" -ne 0 ]; then
     echo "check-boundary: the platform boundary is broken (see the lines above)" >&2

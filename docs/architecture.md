@@ -287,7 +287,7 @@ ferros-ui/src/
 
 The `App` struct in [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs) manages the application state:
 
-- **Session**: A `Session` drives its backend
+- **Debugger instance**: the parked TUI still holds the old `Debugger` trait object; it has not been ported to `Session` and is excluded from the workspace
 - **View modes**: Overview, Registers, Threads, Memory Regions, Output
 - **Table states**: For navigating registers, threads, memory regions
 - **Process output**: Captured stdout/stderr from launched processes

@@ -36,8 +36,9 @@ impl Session
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, [`DebuggerError::Backend`] with
     /// [`BackendError::Unsupported`] for hardware breakpoints, watchpoints, or an
-    /// architecture without trap support, or the backend's error from reading or writing
-    /// memory (the table is then unchanged).
+    /// architecture without trap support, [`DebuggerError::InvalidArgument`] if the trap
+    /// would overlap another breakpoint's trap, or the backend's error from reading or
+    /// writing memory (the table is then unchanged).
     pub fn add_breakpoint(&mut self, request: BreakpointRequest) -> Result<BreakpointId>
     {
         self.require_stopped()?;
@@ -55,6 +56,20 @@ impl Session
         }
 
         let trap = self.arch()?.trap_instruction();
+        // A trap that overlaps another breakpoint's trap would save trap bytes as its
+        // "original" bytes and corrupt the instruction when both are removed.
+        let trap_len = trap.len() as u64;
+        if let Some(other) =
+            self.breakpoints.list().into_iter().find(|info| {
+                info.kind == BreakpointKind::Software && info.address.value().abs_diff(address.value()) < trap_len
+            })
+        {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "a breakpoint at 0x{:016x} would overlap the breakpoint at 0x{:016x}",
+                address.value(),
+                other.address.value()
+            )));
+        }
         let original = self.backend.read_memory(address, trap.len())?;
         if original.len() != trap.len() {
             return Err(DebuggerError::InvalidArgument(format!(

@@ -699,7 +699,8 @@ fn stack_trace_reads_memory_through_the_backend_and_skips_bad_images()
         len: 8
     }));
 
-    // The image that failed to load is not tried again.
+    // Symbolication still works after an image failed to load: the backend is asked for
+    // its image list and nothing else.
     let _ = mock.take_calls();
     session.symbolicate(Address::new(CODE)).expect("symbolicate");
     assert_eq!(mock.take_calls(), [MockCall::Images]);
@@ -810,4 +811,70 @@ fn read_memory_hides_trap_bytes()
     let mut session = launched(&mock);
     session.add_breakpoint(software(BP)).expect("add");
     assert_eq!(session.read_memory(Address::new(BP), 4).expect("read"), original(BP));
+}
+
+#[test]
+fn dropping_a_stopped_session_restores_every_trap()
+{
+    let mock = process();
+    let mut session = launched(&mock);
+    session.add_breakpoint(software(BP)).expect("add");
+    let disabled = session.add_breakpoint(software(BP2)).expect("add second");
+    session.disable_breakpoint(disabled).expect("disable");
+    assert_eq!(mock.peek_memory(Address::new(BP), 4).expect("peek"), TRAP);
+
+    drop(session);
+    assert_eq!(mock.peek_memory(Address::new(BP), 4).expect("peek"), original(BP));
+    assert_eq!(mock.peek_memory(Address::new(BP2), 4).expect("peek"), original(BP2));
+}
+
+#[test]
+fn overlapping_breakpoint_is_refused_before_any_backend_call()
+{
+    let mock = process();
+    let mut session = launched(&mock);
+    session.add_breakpoint(software(BP)).expect("add");
+    let _ = mock.take_calls();
+
+    for address in [BP + 1, BP + 3, BP - 1, BP - 3] {
+        assert!(
+            matches!(
+                session.add_breakpoint(software(address)),
+                Err(DebuggerError::InvalidArgument(_))
+            ),
+            "a trap at 0x{address:x} overlaps the one at 0x{BP:x}"
+        );
+    }
+    assert!(mock.take_calls().is_empty(), "an overlapping breakpoint reached the backend");
+    assert_eq!(session.breakpoints().len(), 1);
+
+    // The neighbouring instruction does not overlap.
+    session.add_breakpoint(software(BP + 4)).expect("add at the next instruction");
+    drop(session);
+    assert_eq!(
+        mock.peek_memory(Address::new(BP), 8).expect("peek"),
+        [original(BP), original(BP + 4)].concat()
+    );
+}
+
+#[test]
+fn failed_thread_listing_after_a_stop_does_not_keep_a_dead_thread_selected()
+{
+    let mock = process();
+    let mut session = launched(&mock);
+    session.select_thread(T2).expect("select T2");
+    mock.script(MockStop::new(StopEvent::Interrupted { thread: None }).remove_thread(T2));
+    session.resume().expect("resume");
+    mock.fail_next(
+        MockCallKind::Threads,
+        BackendError::Os {
+            code: 5,
+            message: "threads".into(),
+        },
+    );
+    session.wait(Some(Duration::ZERO)).expect("wait").expect("an event");
+    assert_eq!(session.selected_thread(), None, "T2 exited but is still selected");
+
+    assert_eq!(session.threads().expect("threads"), vec![T1]);
+    assert_eq!(session.selected_thread(), Some(T1));
 }

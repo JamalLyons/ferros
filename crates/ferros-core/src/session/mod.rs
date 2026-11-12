@@ -47,6 +47,11 @@
 //!   [`SessionState::Exited`]: the pid, thread list and selection are cleared and the
 //!   breakpoint table is emptied (the process memory that held the traps is gone).
 //!
+//! Dropping a session while the process is stopped restores the original bytes of every
+//! inserted trap first (best effort), so a process the backend releases on drop is not
+//! left with traps nobody handles. Call [`Session::detach`] to release a process
+//! deliberately and see errors.
+//!
 //! ## Known gaps
 //!
 //! These are deliberate for now and are fixed by later tasks:
@@ -55,6 +60,8 @@
 //!   not step over the trap, so the thread hits the same trap again.
 //! - T07 (issue #33): [`Session::read_memory`] returns memory as it is, including the
 //!   trap bytes of inserted breakpoints.
+//! - T07 (issue #33): [`Session::write_memory`] over an inserted trap bypasses the
+//!   breakpoint table (the saved original bytes are not updated).
 //! - T06 (issue #32) and T07 (issue #33): `Session` has no `interrupt`, `kill` or
 //!   `step_instruction` yet.
 
@@ -123,6 +130,23 @@ impl std::fmt::Debug for Session
             .field("last_stop", &self.last_stop)
             .field("breakpoints", &self.breakpoints)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Session
+{
+    /// Restore the original bytes of every inserted trap while the process is stopped.
+    ///
+    /// The backend decides what happens to the process itself when it is dropped (the
+    /// macOS backend kills a process it launched and releases one it attached to). A
+    /// released process must not keep trap instructions it has no debugger for, and
+    /// only the session knows where they are. Failures are ignored: this is best
+    /// effort, and nothing can be restored while the process is running.
+    fn drop(&mut self)
+    {
+        if self.state == SessionState::Stopped {
+            let _ = self.restore_all_traps();
+        }
     }
 }
 
@@ -224,11 +248,17 @@ impl Session
     ///
     /// `preferred` (the thread a stop event names) is selected if it exists. Otherwise
     /// the current selection is kept if it still exists, else the first thread is
-    /// selected. If the backend cannot list threads, the previous list is kept.
+    /// selected. If the backend cannot list threads, the old list cannot be trusted (a
+    /// thread in it may have exited): only `preferred` is kept, so a dead thread is never
+    /// left selected. The next successful [`threads`](Self::threads) call repairs the list.
     fn sync_threads(&mut self, preferred: Option<ThreadId>)
     {
-        if let Ok(threads) = self.backend.threads() {
-            self.threads = threads;
+        match self.backend.threads() {
+            Ok(threads) => self.threads = threads,
+            Err(error) => {
+                tracing::debug!("could not list threads after a stop: {error}");
+                self.threads = preferred.into_iter().collect();
+            }
         }
         self.fix_selection(preferred);
     }

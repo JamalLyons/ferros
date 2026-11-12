@@ -596,7 +596,8 @@ impl Registers
         }
     }
 
-    pub(crate) fn set_architecture(&mut self, architecture: Architecture)
+    /// Sets the architecture these registers belong to.
+    pub fn set_architecture(&mut self, architecture: Architecture)
     {
         self.architecture = architecture;
     }

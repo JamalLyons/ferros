@@ -136,8 +136,8 @@ pub enum DebuggerError
     /// use ferros_core::breakpoints::BreakpointRequest;
     /// use ferros_core::error::DebuggerError;
     /// use ferros_core::types::Address;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # let address = Address::from(0x1000);
     /// let breakpoint_id = match debugger.add_breakpoint(BreakpointRequest::Hardware { address }) {
     ///     Err(DebuggerError::ResourceExhausted(msg)) => {
@@ -148,7 +148,8 @@ pub enum DebuggerError
     ///     Ok(id) => id,
     ///     Err(e) => return Err(e),
     /// };
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),

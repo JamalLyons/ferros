@@ -40,11 +40,12 @@ To debug processes on macOS, you have two options:
 ## Usage
 
 ```rust
-use ferros_core::platform::macos::MacOSDebugger;
 use ferros_core::Debugger;
 
+// The debugger implementation comes from a platform crate.
+let debugger: &mut dyn Debugger = /* platform debugger */;
+
 // Launch a process under debugger control (recommended)
-let mut debugger = MacOSDebugger::new()?;
 debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
 // Process is now suspended and ready for debugging
 

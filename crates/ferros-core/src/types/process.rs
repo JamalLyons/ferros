@@ -22,13 +22,13 @@ use super::Address;
 ///
 /// ```rust,no_run
 /// use ferros_core::Debugger;
-/// use ferros_core::platform::macos::MacOSDebugger;
 /// use ferros_core::types::ProcessId;
+/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
 ///
 /// let pid = ProcessId::from(12345);
-/// let mut debugger = MacOSDebugger::new()?;
 /// debugger.attach(pid)?;
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId(pub u32);
@@ -66,14 +66,15 @@ impl From<ProcessId> for u32
 /// ```rust,no_run
 /// use ferros_core::Debugger;
 /// use ferros_core::types::ThreadId;
+/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
 ///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
 /// let threads = debugger.threads()?;
 /// if let Some(thread) = threads.first() {
 ///     debugger.set_active_thread(*thread)?;
 /// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadId(pub u64);
@@ -136,8 +137,8 @@ impl From<u64> for ThreadId
 /// ```rust,no_run
 /// use ferros_core::Debugger;
 /// use ferros_core::types::StopReason;
+/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
 ///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
 /// match debugger.stop_reason() {
 ///     StopReason::Running => println!("Process is running"),
@@ -147,7 +148,8 @@ impl From<u64> for ThreadId
 ///     StopReason::Exited(code) => println!("Process exited with code: {}", code),
 ///     StopReason::Unknown => println!("Stopped for unknown reason"),
 /// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason
@@ -203,8 +205,8 @@ pub enum StopReason
 /// ```rust,no_run
 /// use ferros_core::Debugger;
 /// use ferros_core::types::MemoryRegionId;
+/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
 ///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
 /// let regions = debugger.get_memory_regions()?;
 /// for region in regions {
@@ -215,7 +217,8 @@ pub enum StopReason
 ///         region.end
 ///     );
 /// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoryRegionId(pub usize);
@@ -479,15 +482,16 @@ impl MemoryRegion
 /// ```rust,no_run
 /// use ferros_core::Debugger;
 /// use ferros_core::types::Architecture;
+/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
 ///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
 /// match debugger.architecture() {
 ///     Architecture::Arm64 => println!("Debugging ARM64 process"),
 ///     Architecture::X86_64 => println!("Debugging x86-64 process"),
 ///     Architecture::Unknown(name) => println!("Unknown architecture: {}", name),
 /// }
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Architecture

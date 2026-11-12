@@ -155,14 +155,20 @@ impl LaunchManager
         if spec.program.as_os_str().is_empty() {
             return Err(DebuggerError::InvalidArgument("Program path cannot be empty".to_string()));
         }
-        if !spec.program.exists() {
+        // A relative path is resolved here, against the debugger's directory: with
+        // `spec.cwd` set, posix_spawn would otherwise resolve it in the child after the
+        // chdir action, against a different directory than the existence check.
+        let program = std::path::absolute(&spec.program)?;
+        if !program.exists() {
             return Err(DebuggerError::Io(Error::new(
                 ErrorKind::NotFound,
                 format!("Program '{}' does not exist", spec.program.display()),
             )));
         }
 
+        // argv[0] stays as the caller wrote it; the spawn path is the absolute one.
         let program_cstr = c_string(spec.program.as_os_str().as_bytes(), "program path")?;
+        let spawn_path_cstr = c_string(program.as_os_str().as_bytes(), "program path")?;
 
         // argv[0] is the program itself; spec.args excludes it.
         let mut arg_cstrs = vec![program_cstr.clone()];
@@ -216,7 +222,7 @@ impl LaunchManager
             let mut pid: libc::pid_t = 0;
             let spawn_result = ffi::posix_spawn(
                 &mut pid,
-                program_cstr.as_ptr(),
+                spawn_path_cstr.as_ptr(),
                 &actions.0,
                 &attr.0, // Attributes with the START_SUSPENDED flag
                 argv.as_ptr(),

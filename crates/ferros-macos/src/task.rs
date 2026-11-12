@@ -545,8 +545,15 @@ impl MacOSBackend
     /// is resumed. Queued stop events are discarded.
     fn stop_exception_handler(&mut self)
     {
+        // If the loop holds an exception it is waiting for a command: let it reply, answer
+        // the exceptions still queued on the port and exit before the port is destroyed.
+        // Otherwise it is blocked receiving, and destroying the port is what wakes it.
+        let holds_exception = lock_shared(&self.exception_state).pending_exception;
         if let Some(tx) = self.exception_commands.take() {
             let _ = tx.send(ExceptionLoopCommand::Shutdown);
+        }
+        if holds_exception && let Some(handle) = self.exception_thread.take() {
+            let _ = handle.join();
         }
 
         if self.exception_port != MACH_PORT_NULL {
@@ -778,10 +785,13 @@ impl Backend for MacOSBackend
         let kr = unsafe { task_suspend(self.task) };
         if kr != KERN_SUCCESS {
             self.stop_exception_handler();
+            self.release_suspends();
             self.release_ports();
             return Err(mach_error(kr, "task_suspend failed"));
         }
-        lock_shared(&self.exception_state).suspends = 1;
+        // Add, do not assign: the exception loop is already running and may have counted
+        // a suspend of its own for an exception raised before this one took effect.
+        lock_shared(&self.exception_state).suspends += 1;
         self.launched = false;
         self.state = BackendState::Stopped;
         Ok(())
@@ -889,15 +899,19 @@ impl Backend for MacOSBackend
 
         self.require_stopped("resume")?;
         self.check_resume_request(request)?;
-        if let Some(event) = self.try_next_event() {
-            self.peeked = Some(event);
-            return Err(BackendError::InvalidState(
-                "resume is not allowed while stop events are pending; drain them with wait".to_string(),
-            ));
-        }
-
+        // The exception loop queues a stop event under this lock, together with its
+        // suspend and the held-exception flag. Checking the queue under the same lock
+        // means a stop is either fully visible here (and the resume is refused) or has
+        // not happened yet.
+        let shared_state = Arc::clone(&self.exception_state);
         let (count, pending) = {
-            let mut shared = lock_shared(&self.exception_state);
+            let mut shared = lock_shared(&shared_state);
+            if let Some(event) = self.try_next_event() {
+                self.peeked = Some(event);
+                return Err(BackendError::InvalidState(
+                    "resume is not allowed while stop events are pending; drain them with wait".to_string(),
+                ));
+            }
             (std::mem::take(&mut shared.suspends), shared.pending_exception)
         };
         let restore = |backend: &Self, count: u32| lock_shared(&backend.exception_state).suspends += count;
@@ -953,14 +967,19 @@ impl Backend for MacOSBackend
             BackendState::Running => {
                 {
                     let mut shared = lock_shared(&self.exception_state);
+                    // An exception stop is already queued for `wait`: the interrupt lost
+                    // the race and is consumed, as the contract requires.
+                    if shared.pending_exception {
+                        return Ok(());
+                    }
                     let kr = unsafe { task_suspend(self.task) };
                     if kr != KERN_SUCCESS {
                         return Err(mach_error(kr, "task_suspend failed"));
                     }
                     shared.suspends += 1;
-                }
-                if let Some(tx) = &self.events_tx {
-                    let _ = tx.send(StopEvent::Interrupted { thread: None });
+                    if let Some(tx) = &self.events_tx {
+                        let _ = tx.send(StopEvent::Interrupted { thread: None });
+                    }
                 }
                 Ok(())
             }

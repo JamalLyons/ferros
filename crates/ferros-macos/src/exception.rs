@@ -44,8 +44,8 @@ use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
 use mach2::message::{
     MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_RCV_LARGE, MACH_RCV_MSG,
-    MACH_SEND_MSG, mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_size_t,
-    mach_msg_type_number_t,
+    MACH_RCV_TIMEOUT, MACH_SEND_MSG, mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_port_descriptor_t,
+    mach_msg_size_t, mach_msg_type_number_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;
@@ -251,19 +251,8 @@ pub(crate) fn run_exception_loop(
         let codes = [code[0], code[1]];
         let exception_type = message.exception;
 
-        {
-            // Stop every thread before reporting, under the lock so a concurrent resume
-            // sees either none or all of this stop.
-            let mut state = lock_shared(&shared);
-            let kr = unsafe { task_suspend(task) };
-            if kr == KERN_SUCCESS {
-                state.suspends += 1;
-            } else {
-                error!("task_suspend failed while handling a Mach exception: {kr}");
-            }
-            state.pending_exception = true;
-        }
-
+        // The faulting thread is blocked in the kernel until the reply, so its registers
+        // can be read before the task is suspended.
         let pc = if exception_type == EXC_BREAKPOINT as exception_type_t {
             match crate::task::read_registers_for_port(architecture, thread_port) {
                 Ok(registers) => Some(registers.pc.value()),
@@ -277,8 +266,21 @@ pub(crate) fn run_exception_loop(
         };
 
         let event = stop_event_from_exception(exception_type, ThreadId::from(u64::from(thread_port)), pc, codes);
-        if let Err(err) = events.send(event) {
-            warn!("Failed to send stop event from Mach loop: {err}");
+        {
+            // Stop every thread, mark the exception as held and queue the event in one
+            // step under the lock, so a concurrent resume or interrupt sees either none
+            // or all of this stop.
+            let mut state = lock_shared(&shared);
+            let kr = unsafe { task_suspend(task) };
+            if kr == KERN_SUCCESS {
+                state.suspends += 1;
+            } else {
+                error!("task_suspend failed while handling a Mach exception: {kr}");
+            }
+            state.pending_exception = true;
+            if let Err(err) = events.send(event) {
+                warn!("Failed to send stop event from Mach loop: {err}");
+            }
         }
 
         let command = commands.recv();
@@ -296,7 +298,43 @@ pub(crate) fn run_exception_loop(
                     break;
                 }
             }
-            Ok(ExceptionLoopCommand::Shutdown) | Err(_) => break,
+            Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
+                reply_to_queued_exceptions(exception_port);
+                break;
+            }
+        }
+    }
+}
+
+/// Reply to every exception message still queued on `exception_port`, without blocking.
+///
+/// The loop holds one exception at a time; other threads that raised an exception in
+/// the meantime wait in the port's queue. On shutdown they must be answered too:
+/// destroying the port with a message queued makes the kernel treat the exception as
+/// unhandled, which would kill a target that a detach is supposed to leave running.
+#[cfg(target_os = "macos")]
+fn reply_to_queued_exceptions(exception_port: mach_port_t)
+{
+    loop {
+        let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
+        let kr = unsafe {
+            mach_msg(
+                buffer.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0,
+                std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t,
+                exception_port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        if kr != MACH_MSG_SUCCESS {
+            break;
+        }
+        // SAFETY: mach_msg succeeded, so the buffer starts with a complete header.
+        let header = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const mach_msg_header_t) };
+        if let Err(err) = send_exception_reply(&header) {
+            error!("Failed to reply to a queued Mach exception: {err}");
         }
     }
 }

@@ -1,10 +1,10 @@
 //! Debugger event types and helpers.
 //!
-//! Higher layers (CLI, TUI, future protocol clients) consume these events to
-//! react to asynchronous target state changes without polling `is_stopped()` /
-//! `stop_reason()`. Platform backends publish events whenever the kernel
-//! delivers an exception (Mach) or a wait result (`waitpid`, Windows debug
-//! loop, etc.).
+//! Higher layers (CLI, TUI, future protocol clients) can use these events to
+//! describe target state changes. No backend publishes them at the moment: a
+//! [`Session`](crate::session::Session) reports stops synchronously through
+//! [`Session::wait`](crate::session::Session::wait) as
+//! [`StopEvent`](crate::backend::StopEvent)s.
 
 use std::sync::mpsc;
 

@@ -2,8 +2,9 @@
 //!
 //! Thread enumeration and management for macOS debugger.
 //!
-//! This module handles thread enumeration, active thread selection, and
-//! per-thread suspend/resume operations using Mach APIs.
+//! This module handles thread enumeration and per-thread suspend/resume
+//! operations using Mach APIs. Thread selection belongs to the portable engine
+//! ([`ferros_core::Session`]), not to the backend.
 //!
 //! ## Mach APIs Used
 //!
@@ -32,28 +33,6 @@ use mach2::task::task_threads;
 use mach2::traps::mach_task_self;
 
 use crate::ffi;
-
-/// Trait for thread operations that require access to debugger internals.
-pub(crate) trait ThreadOperations
-{
-    /// Get the task port.
-    fn task_port(&self) -> libc::mach_port_t;
-
-    /// Get the list of thread ports (mutable).
-    fn thread_ports_mut(&mut self) -> &mut Vec<thread_act_t>;
-
-    /// Get the list of thread ports (immutable).
-    fn thread_ports(&self) -> &[thread_act_t];
-
-    /// Get the current active thread port.
-    fn current_thread(&self) -> Option<thread_act_t>;
-
-    /// Set the current active thread port.
-    fn set_current_thread(&mut self, thread: Option<thread_act_t>);
-
-    /// Get the process ID (for error messages).
-    fn pid(&self) -> u32;
-}
 
 /// Thread management functions for macOS debugger.
 pub(crate) struct ThreadManager;
@@ -92,11 +71,12 @@ impl ThreadManager
         }
     }
 
-    /// Refresh the thread list from the operating system.
+    /// Enumerate the threads of `task` from the operating system.
     ///
-    /// This is an internal helper method that updates the cached thread list by
-    /// calling `task_threads()` to get the current set of threads in the target
-    /// process. It also updates the active thread if the current one no longer exists.
+    /// Returns the current set of thread ports. The ports in `previous` (the list
+    /// returned by the last call, if any) are deallocated after the new list has been
+    /// obtained, never before: a thread that still exists keeps its port name, so a
+    /// [`ThreadId`] names the same thread across stops.
     ///
     /// ## Mach API: task_threads()
     ///
@@ -112,103 +92,36 @@ impl ThreadManager
     ///
     /// See: [task_threads documentation](https://developer.apple.com/documentation/kernel/1537751-task_threads/)
     ///
-    /// ## Implementation Notes
-    ///
-    /// - Deallocates old thread ports before getting new ones to prevent port leaks
-    /// - Updates the active thread to the first thread if the current one no longer exists
-    ///
-    /// ## Mach APIs Used
-    ///
-    /// - **task_threads()**: Enumerates all threads in the task
-    /// - **mach_port_deallocate()**: Releases old thread ports
-    ///
     /// ## Errors
     ///
-    /// Returns `AttachFailed` if `task_threads()` fails or no threads found.
-    ///
-    /// ## See Also
-    ///
-    /// - [task_threads(3) man page](https://developer.apple.com/documentation/kernel/1402149-task_threads/)
-    pub(crate) fn refresh_thread_list<Ops: ThreadOperations>(ops: &mut Ops) -> Result<()>
+    /// Returns `DebuggerError::Os` with the `kern_return_t` if `task_threads()` fails;
+    /// `previous` is then left untouched.
+    pub(crate) fn refresh_thread_list(task: libc::mach_port_t, previous: &[thread_act_t]) -> Result<Vec<thread_act_t>>
     {
         unsafe {
-            // Deallocate old thread ports before getting new ones to prevent port leaks
-            for thread in ops.thread_ports() {
+            let mut threads: *mut thread_act_t = std::ptr::null_mut();
+            let mut thread_count: mach_msg_type_number_t = 0;
+            let result = task_threads(task, &mut threads, &mut thread_count);
+            if result != KERN_SUCCESS {
+                return Err(DebuggerError::Os {
+                    code: i64::from(result),
+                    message: format!("Failed to enumerate threads: {result}"),
+                });
+            }
+
+            let list = if threads.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(threads, thread_count as usize).to_vec()
+            };
+            Self::deallocate_threads_array(threads, thread_count);
+
+            // Release the previous rights only now, so names of live threads stay stable.
+            for thread in previous {
                 let _ = ffi::mach_port_deallocate(mach_task_self(), *thread);
             }
 
-            let mut threads: *mut thread_act_t = std::ptr::null_mut();
-            let mut thread_count: mach_msg_type_number_t = 0;
-            let result = task_threads(ops.task_port(), &mut threads, &mut thread_count);
-            if result != KERN_SUCCESS {
-                return Err(DebuggerError::AttachFailed(format!(
-                    "Failed to enumerate threads: {}",
-                    result
-                )));
-            }
-
-            let slice = std::slice::from_raw_parts(threads, thread_count as usize);
-            *ops.thread_ports_mut() = slice.to_vec();
-            Self::deallocate_threads_array(threads, thread_count);
-
-            // Update active thread - use first thread if current one no longer exists
-            if let Some(current) = ops.current_thread() {
-                if !ops.thread_ports().contains(&current) {
-                    ops.set_current_thread(ops.thread_ports().first().copied());
-                }
-            } else {
-                ops.set_current_thread(ops.thread_ports().first().copied());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Get the active thread port.
-    pub(crate) fn active_thread_port<Ops: ThreadOperations>(ops: &Ops) -> Result<thread_act_t>
-    {
-        ops.current_thread()
-            .ok_or_else(|| DebuggerError::InvalidArgument("No active thread selected".to_string()))
-    }
-
-    /// Get the thread port for a given ThreadId.
-    pub(crate) fn thread_port_for_id<Ops: ThreadOperations>(ops: &Ops, thread: ThreadId) -> Result<thread_act_t>
-    {
-        let port = thread.raw() as thread_act_t;
-        if ops.thread_ports().contains(&port) {
-            Ok(port)
-        } else {
-            Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}. Call refresh_threads() to update the thread list.",
-                thread.raw(),
-                ops.pid()
-            )))
-        }
-    }
-
-    /// Set the active thread using a Mach thread port.
-    ///
-    /// This is an internal helper method that sets the active thread using a raw
-    /// `thread_act_t` (Mach thread port). It validates that the thread belongs
-    /// to the current process before setting it as active.
-    ///
-    /// ## Parameters
-    ///
-    /// - `port`: The Mach thread port (`thread_act_t`) to make active
-    ///
-    /// ## Errors
-    ///
-    /// Returns `InvalidArgument` if the thread port is not in the current thread list.
-    pub(crate) fn set_active_thread_by_port<Ops: ThreadOperations>(ops: &mut Ops, port: thread_act_t) -> Result<()>
-    {
-        if ops.thread_ports().contains(&port) {
-            ops.set_current_thread(Some(port));
-            Ok(())
-        } else {
-            Err(DebuggerError::InvalidArgument(format!(
-                "Thread {port} is not part of process {}",
-                ops.pid()
-            )))
+            Ok(list)
         }
     }
 
@@ -234,14 +147,13 @@ impl ThreadManager
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
     /// - `SuspendFailed`: `thread_suspend()` failed
-    pub(crate) fn suspend_thread<Ops: ThreadOperations>(ops: &Ops, thread_id: ThreadId) -> Result<()>
+    pub(crate) fn suspend_thread(threads: &[thread_act_t], thread_id: ThreadId) -> Result<()>
     {
         let thread_port = thread_id.raw() as thread_act_t;
-        if !ops.thread_ports().contains(&thread_port) {
+        if !threads.contains(&thread_port) {
             return Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}",
-                thread_id.raw(),
-                ops.pid()
+                "Thread {} is not part of the target process",
+                thread_id.raw()
             )));
         }
 
@@ -281,14 +193,13 @@ impl ThreadManager
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
     /// - `ResumeFailed`: `thread_resume()` failed
-    pub(crate) fn resume_thread<Ops: ThreadOperations>(ops: &Ops, thread_id: ThreadId) -> Result<()>
+    pub(crate) fn resume_thread(threads: &[thread_act_t], thread_id: ThreadId) -> Result<()>
     {
         let thread_port = thread_id.raw() as thread_act_t;
-        if !ops.thread_ports().contains(&thread_port) {
+        if !threads.contains(&thread_port) {
             return Err(DebuggerError::InvalidArgument(format!(
-                "Thread {} is not part of process {}",
-                thread_id.raw(),
-                ops.pid()
+                "Thread {} is not part of the target process",
+                thread_id.raw()
             )));
         }
 

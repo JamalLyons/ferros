@@ -1,15 +1,17 @@
 //! Harness for integration tests that debug real fixture processes (macOS only).
 //!
 //! Every integration test body runs under [`run`] (or [`run_with_timeout`]), which gives it a
-//! [`TestContext`]. The context launches fixtures under a fresh debugger and returns a
-//! [`Debuggee`] guard that owns the debugger and kills the debuggee when dropped.
+//! [`TestContext`]. The context launches fixtures under a fresh [`Session`] (driving a
+//! `ferros_macos::MacOSBackend`) and returns a [`Debuggee`] guard that owns the session and
+//! kills the debuggee when dropped.
 //!
 //! ```ignore
+//! use ferros_core::SessionState;
 //! use ferros_tests::{fixture, harness};
 //!
 //! harness::run(|t| {
 //!     let mut d = t.launch(&fixture!("hello"));
-//!     assert!(d.is_stopped());
+//!     assert_eq!(d.state(), SessionState::Stopped);
 //!     d.resume().expect("resume");
 //!     assert!(d.wait_for_stdout("hello from ferros fixture", std::time::Duration::from_secs(10)));
 //! });
@@ -20,21 +22,22 @@
 //! - **No leaked processes.** Each launch appends a unique `--ferros-test-id=...` argument to
 //!   the fixture's argv. Dropping the [`Debuggee`] (normal return or unwinding) kills the
 //!   process by pid and by that argument; a failed launch kills any process left behind by
-//!   the argument; a timeout kills every process the test launched.
+//!   the argument; a timeout kills every process the test launched. The per-launch directory
+//!   that captures a debuggee's output is removed on the same paths.
 //! - **Hard deadline.** The body runs on a worker thread. If it does not finish in time the
 //!   test fails with a "timed out" message after its debuggees are killed. Only that test's
 //!   processes are touched, so tests can run in parallel.
-//! - **Fast permission failures.** If `task_for_pid` is denied, or `Debugger::launch` does not
+//! - **Fast permission failures.** If `task_for_pid` is denied, or `Session::launch` does not
 //!   return within [`LAUNCH_DEADLINE`] (for example because the system is waiting on an
 //!   authorization dialog), the test fails with guidance on signing the test executable.
 //! - **Panics stay panics.** A panic in the body reaches libtest with its original payload.
 
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -42,14 +45,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferros_core::{Debugger, DebuggerError, ProcessId};
+use ferros_core::backend::StdioSpec;
+use ferros_core::{DebuggerError, LaunchSpec, ProcessId, Session};
 
 use crate::Fixture;
 
 /// Deadline applied by [`run`] to a whole test body.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long [`TestContext::launch`] waits for `Debugger::launch` to return before it treats
+/// How long [`TestContext::launch`] waits for `Session::launch` to return before it treats
 /// the launch as blocked on a permission prompt and fails the test.
 pub const LAUNCH_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -64,7 +68,7 @@ pub const DEBUGGER_ENTITLEMENT: &str = "com.apple.security.cs.debugger";
 const KILL_SETTLE: Duration = Duration::from_secs(2);
 
 /// After a launch stalled, how often and for how long its watchdog keeps looking for the
-/// half-launched process while `Debugger::launch` has still not returned.
+/// half-launched process while `Session::launch` has still not returned.
 const STALL_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 const STALL_SWEEP_LIMIT: Duration = Duration::from_secs(30);
 
@@ -156,11 +160,13 @@ enum Outcome
     TimedOut,
 }
 
-/// A process launched by one test: its identifying argument and, once known, its pid.
+/// A process launched by one test: its identifying argument, once known its pid, and the
+/// directory capturing its output.
 struct Tracked
 {
     tag: String,
     pid: Option<u32>,
+    capture_dir: PathBuf,
 }
 
 /// State shared between a test's worker thread, its guards and the controlling thread.
@@ -191,13 +197,18 @@ impl Shared
         self.tracked().retain(|entry| entry.tag != tag);
     }
 
-    /// Kills every process still tracked and returns the pids that were targeted.
+    /// Kills every process still tracked, removes its capture directory, and returns the
+    /// pids that were targeted.
+    ///
+    /// After a timeout the abandoned worker thread may never drop its [`Debuggee`], so the
+    /// controller removes the capture directories itself.
     fn kill_all(&self) -> Vec<u32>
     {
         let entries = std::mem::take(&mut *self.tracked());
         let mut killed = Vec::new();
         for entry in entries {
             killed.extend(kill_debuggee(entry.pid, &entry.tag));
+            let _ = fs::remove_dir_all(&entry.capture_dir);
         }
         killed
     }
@@ -223,11 +234,13 @@ impl TestContext
         self.launch_with_args(fixture, &[])
     }
 
-    /// Launches `fixture` under a new debugger, suspended at entry, with `args` as its
+    /// Launches `fixture` under a new [`Session`], suspended at entry, with `args` as its
     /// arguments (followed by the harness's identifying argument).
     ///
-    /// The debuggee's stdout and stderr are captured (they never reach the test's output) and
-    /// are available through [`Debuggee::stdout`] and [`Debuggee::stderr`].
+    /// The debuggee's stdout and stderr go to two files in a temporary directory the
+    /// harness creates for this launch (they never reach the test's output); their contents
+    /// are available through [`Debuggee::stdout`] and [`Debuggee::stderr`]. Its stdin is
+    /// the null device.
     ///
     /// # Panics
     ///
@@ -250,7 +263,8 @@ impl TestContext
     ///
     /// # Errors
     ///
-    /// Returns the error from `MacOSDebugger::new` or `Debugger::launch`.
+    /// Returns the error from `MacOSBackend::new` or `Session::launch`, or an I/O error
+    /// when the capture directory cannot be created.
     ///
     /// # Panics
     ///
@@ -265,22 +279,21 @@ impl TestContext
             fixture.name()
         );
 
-        let program = fixture
-            .path()
-            .to_str()
-            .unwrap_or_else(|| panic!("fixture path is not UTF-8: {}", fixture.path().display()));
         let tag = unique_tag();
-        let mut command_line = Vec::with_capacity(args.len() + 2);
-        command_line.push(program);
-        command_line.extend_from_slice(args);
-        command_line.push(&tag);
+        let capture = CaptureDir::create(&tag)?;
+        let spec = LaunchSpec::new(fixture.path())
+            .args(args.iter().copied())
+            .arg(tag.as_str())
+            .stdin(StdioSpec::Null)
+            .stdout(StdioSpec::Path(capture.stdout_path()))
+            .stderr(StdioSpec::Path(capture.stderr_path()));
 
-        let mut debugger: Box<dyn Debugger> = Box::new(ferros_macos::MacOSDebugger::new()?);
-        debugger.set_capture_process_output(true);
+        let mut session = Session::new(Box::new(ferros_macos::MacOSBackend::new()?));
 
         self.shared.tracked().push(Tracked {
             tag: tag.clone(),
             pid: None,
+            capture_dir: capture.path.clone(),
         });
 
         // Watchdog: if launch has not returned by the deadline, it tells the controller (which
@@ -289,13 +302,13 @@ impl TestContext
         let watchdog = LaunchWatchdog::arm(tag.clone(), LAUNCH_DEADLINE, move || {
             let _ = events.send(Event::LaunchStalled);
         });
-        let launched = debugger.launch(program, &command_line);
+        let launched = session.launch(&spec);
         if watchdog.disarm() {
             // The launch outlived its deadline and the test is being failed for it. Whatever
             // launch returned in the end, leave no process and report the same reason.
             kill_debuggee(launched.as_ref().ok().map(|pid| pid.0), &tag);
             self.shared.forget(&tag);
-            drop(debugger);
+            drop(session);
             panic!("{}", launch_stalled_guidance());
         }
 
@@ -303,23 +316,24 @@ impl TestContext
             Ok(pid) => pid,
             Err(err) => {
                 // A failed launch can leave a suspended child behind (task_for_pid denied
-                // after posix_spawn). Kill it by its argument before releasing the debugger.
+                // after posix_spawn). Kill it by its argument before releasing the session.
                 kill_debuggee(None, &tag);
                 self.shared.forget(&tag);
-                drop(debugger);
+                drop(session);
                 return Err(err);
             }
         };
         self.shared.set_pid(&tag, pid.0);
 
-        let stdout = OutputBuffer::spawn_reader(debugger.take_process_stdout());
-        let stderr = OutputBuffer::spawn_reader(debugger.take_process_stderr());
+        let stdout = OutputBuffer::spawn_reader(capture.stdout_path());
+        let stderr = OutputBuffer::spawn_reader(capture.stderr_path());
         let guard = Debuggee {
-            debugger,
+            session,
             pid,
             tag,
             stdout,
             stderr,
+            capture,
             shared: Arc::clone(&self.shared),
         };
 
@@ -343,7 +357,7 @@ enum WatchState
     Stalled,
 }
 
-/// Watches a single `Debugger::launch` call.
+/// Watches a single `Session::launch` call.
 ///
 /// If the call has not returned when `deadline` passes, the watchdog declares the launch
 /// stalled, calls `on_stall`, and kills every process carrying `tag`. It does the killing
@@ -407,20 +421,21 @@ impl LaunchWatchdog
     }
 }
 
-/// A launched fixture process together with the debugger attached to it.
+/// A launched fixture process together with the [`Session`] debugging it.
 ///
-/// Dereferences to `dyn Debugger`, so debugger methods can be called directly
+/// Dereferences to [`Session`], so session methods can be called directly
 /// (`debuggee.read_registers()`). Dropping it kills the process (`kill -9` by pid and by its
-/// identifying argument) and then drops the debugger; this is safe whether the process is
-/// suspended at entry, running, already exited, or detached. Drop never panics and waits at
-/// most about two seconds.
+/// identifying argument), stops the output readers, removes the capture directory, and then
+/// drops the session; this is safe whether the process is suspended at entry, running,
+/// already exited, or detached. Drop never panics and waits at most about two seconds.
 pub struct Debuggee
 {
-    debugger: Box<dyn Debugger>,
+    session: Session,
     pid: ProcessId,
     tag: String,
     stdout: OutputBuffer,
     stderr: OutputBuffer,
+    capture: CaptureDir,
     shared: Arc<Shared>,
 }
 
@@ -440,18 +455,18 @@ impl Debuggee
         &self.tag
     }
 
-    /// The debugger attached to this process.
+    /// The session debugging this process.
     #[must_use]
-    pub fn debugger(&self) -> &dyn Debugger
+    pub fn session(&self) -> &Session
     {
-        &*self.debugger
+        &self.session
     }
 
-    /// Mutable access to the debugger attached to this process.
+    /// Mutable access to the session debugging this process.
     #[must_use]
-    pub fn debugger_mut(&mut self) -> &mut dyn Debugger
+    pub fn session_mut(&mut self) -> &mut Session
     {
-        &mut *self.debugger
+        &mut self.session
     }
 
     /// Everything the debuggee wrote to stdout so far (lossy UTF-8).
@@ -489,11 +504,11 @@ impl Debuggee
 
 impl Deref for Debuggee
 {
-    type Target = dyn Debugger;
+    type Target = Session;
 
     fn deref(&self) -> &Self::Target
     {
-        &*self.debugger
+        &self.session
     }
 }
 
@@ -501,7 +516,7 @@ impl DerefMut for Debuggee
 {
     fn deref_mut(&mut self) -> &mut Self::Target
     {
-        &mut *self.debugger
+        &mut self.session
     }
 }
 
@@ -509,43 +524,137 @@ impl Drop for Debuggee
 {
     fn drop(&mut self)
     {
-        // Kill before the debugger is dropped (fields drop after this function): neither
-        // detach nor dropping the debugger ends a launched process, and a process left
-        // suspended at entry would otherwise survive forever.
+        // Kill before the session is dropped (fields drop after this function): a detached
+        // process keeps running, and a process left suspended at entry would otherwise
+        // survive forever.
         kill_debuggee(Some(self.pid.0), &self.tag);
         self.shared.forget(&self.tag);
+        self.stdout.stop();
+        self.stderr.stop();
+        self.capture.remove();
     }
 }
 
-/// Captured output of a debuggee, filled by a background reader thread until EOF.
+/// Per-launch temporary directory holding the debuggee's stdout and stderr files.
+struct CaptureDir
+{
+    path: PathBuf,
+}
+
+impl CaptureDir
+{
+    /// Creates a fresh directory under the system temporary directory, named after `tag`,
+    /// with two empty files for stdout and stderr.
+    fn create(tag: &str) -> Result<Self, DebuggerError>
+    {
+        let name = tag.trim_start_matches("--").replace('=', "-");
+        let path = std::env::temp_dir().join(format!("ferros-tests-{name}"));
+        fs::create_dir_all(&path)?;
+        let dir = Self { path };
+        File::create(dir.stdout_path())?;
+        File::create(dir.stderr_path())?;
+        Ok(dir)
+    }
+
+    fn stdout_path(&self) -> PathBuf
+    {
+        self.path.join("stdout")
+    }
+
+    fn stderr_path(&self) -> PathBuf
+    {
+        self.path.join("stderr")
+    }
+
+    fn remove(&self)
+    {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Drop for CaptureDir
+{
+    fn drop(&mut self)
+    {
+        // Covers the failed-launch paths, where no `Debuggee` is built.
+        self.remove();
+    }
+}
+
+/// How often an output reader looks for new data after reaching the end of its file.
+const TAIL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Captured output of a debuggee, filled by a background thread that tails a file.
 struct OutputBuffer
 {
     bytes: Arc<Mutex<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl OutputBuffer
 {
-    fn spawn_reader(file: Option<File>) -> Self
+    /// Starts a thread that follows the file at `path` (as `tail -f` would) until
+    /// [`OutputBuffer::stop`] is called.
+    fn spawn_reader(path: PathBuf) -> Self
     {
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        if let Some(mut file) = file {
-            let sink = Arc::clone(&bytes);
-            // The reader ends at EOF, which arrives once the debuggee is gone.
-            let _ = thread::Builder::new().name("ferros-output-reader".to_owned()).spawn(move || {
-                let mut chunk = vec![0_u8; 4096];
-                while let Ok(read @ 1..) = file.read(&mut chunk) {
-                    sink.lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .extend_from_slice(&chunk[..read]);
-                }
-            });
-        }
-        Self { bytes }
+        let stop = Arc::new(AtomicBool::new(false));
+        let sink = Arc::clone(&bytes);
+        let stop_flag = Arc::clone(&stop);
+        let reader = thread::Builder::new()
+            .name("ferros-output-reader".to_owned())
+            .spawn(move || tail_file(&path, &sink, &stop_flag))
+            .ok();
+        Self { bytes, stop, reader }
     }
 
     fn snapshot(&self) -> String
     {
         String::from_utf8_lossy(&self.bytes.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+    }
+
+    /// Stops the reader thread and waits for it (at most one [`TAIL_INTERVAL`] plus a read).
+    fn stop(&mut self)
+    {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for OutputBuffer
+{
+    fn drop(&mut self)
+    {
+        self.stop();
+    }
+}
+
+/// Appends everything written to `path` to `sink` until `stop` is set, then reads once more.
+fn tail_file(path: &Path, sink: &Mutex<Vec<u8>>, stop: &AtomicBool)
+{
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    let mut chunk = vec![0_u8; 4096];
+    loop {
+        // Read the flag before draining, so data written before `stop` is never missed.
+        let stopping = stop.load(Ordering::SeqCst);
+        loop {
+            match file.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => sink
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..read]),
+            }
+        }
+        if stopping {
+            return;
+        }
+        thread::sleep(TAIL_INTERVAL);
     }
 }
 
@@ -726,11 +835,11 @@ fn permission_guidance(detail: &str) -> String
     message
 }
 
-/// Failure message for a `Debugger::launch` call that outlived [`LAUNCH_DEADLINE`].
+/// Failure message for a `Session::launch` call that outlived [`LAUNCH_DEADLINE`].
 fn launch_stalled_guidance() -> String
 {
     permission_guidance(&format!(
-        "Debugger::launch did not return within {LAUNCH_DEADLINE:?}; the system is probably waiting on an authorization \
+        "Session::launch did not return within {LAUNCH_DEADLINE:?}; the system is probably waiting on an authorization \
          dialog for task_for_pid"
     ))
 }

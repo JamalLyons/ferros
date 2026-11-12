@@ -5,17 +5,18 @@
 //! This crate provides the foundational debugging capabilities, including:
 //! - Process attachment and control
 //! - Register inspection and manipulation
-//! - Memory reading/writing (future)
-//! - Breakpoint management (future)
+//! - Memory reading and writing
+//! - Software breakpoint management
 //!
 //! ## Platform Support
 //!
 //! ferros-core holds no OS-specific code and no `unsafe`: it does not depend on any
-//! operating-system API. It defines the portable interfaces ([`Debugger`],
-//! [`backend::Backend`]) and the OS-independent pieces (types, symbols, breakpoints
-//! bookkeeping, CPU knowledge). Each operating system is implemented in its own crate:
+//! operating-system API. It defines the portable interface ([`backend::Backend`]), the
+//! portable engine ([`session::Session`]) and the OS-independent pieces (types, symbols,
+//! breakpoint bookkeeping, CPU knowledge). Each operating system is implemented in its
+//! own crate:
 //!
-//! - **macOS**: the `ferros-macos` crate (`MacOSDebugger`, using Mach APIs)
+//! - **macOS**: the `ferros-macos` crate (`MacOSBackend`, using Mach APIs)
 //! - **Linux**: Will use `ptrace` (future)
 //! - **Windows**: Will use Windows Debug API (future)
 //!
@@ -38,7 +39,6 @@
 pub mod arch;
 pub mod backend;
 pub mod breakpoints;
-pub mod debugger;
 pub mod error;
 pub mod events;
 pub mod session;
@@ -48,7 +48,6 @@ pub mod types;
 pub use arch::Arch;
 pub use backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
-pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
 pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};

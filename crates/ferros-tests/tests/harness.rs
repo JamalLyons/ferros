@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferros_core::SessionState;
 use ferros_tests::fixture;
 use ferros_tests::harness::{self, TEST_ID_ARG_PREFIX};
 
@@ -90,7 +91,7 @@ fn drop_while_suspended_at_entry_kills_debuggee()
 {
     harness::run(|t| {
         let d = t.launch_with_args(&fixture!("loop_counter"), &["3000"]);
-        assert!(d.is_stopped());
+        assert_eq!(d.state(), SessionState::Stopped);
         let (pid, tag) = (d.pid().0, d.tag().to_owned());
         let started = Instant::now();
         drop(d);

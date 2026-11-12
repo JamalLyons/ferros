@@ -1,4 +1,4 @@
-//! # RAII Guards for macOS Debugger Operations
+//! # RAII Guards for macOS Debugging Operations
 //!
 //! This module provides RAII guards that automatically restore state when dropped.
 //! These guards ensure that operations like suspending threads or disabling breakpoints
@@ -12,20 +12,19 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use ferros_core::Debugger;
-//! use ferros_core::types::ThreadId;
-//! use ferros_macos::MacOSDebugger;
+//! use ferros_core::Session;
+//! use ferros_macos::MacOSBackend;
 //! use ferros_macos::guards::ThreadSuspendGuard;
 //!
-//! # let mut debugger = MacOSDebugger::new()?;
-//! # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-//! let threads = debugger.threads()?;
+//! # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+//! # session.attach(ferros_core::types::ProcessId::from(12345))?;
+//! let threads = session.threads()?;
 //! if let Some(thread_id) = threads.first() {
-//!     // Get the thread port (internal API, simplified for example)
-//!     let thread_port = thread_id.raw() as u32; // In real code, use debugger's internal method
+//!     // On macOS a ThreadId is the Mach thread port name.
+//!     let thread_port = thread_id.raw() as u32;
 //!     let _guard = ThreadSuspendGuard::new(thread_port)?;
 //!     // Thread is suspended, safe to inspect
-//!     let regs = debugger.read_registers_for(*thread_id)?;
+//!     let regs = session.read_registers_for(*thread_id)?;
 //!     // Guard automatically resumes thread when dropped
 //! }
 //! # Ok::<(), ferros_core::error::DebuggerError>(())
@@ -46,20 +45,19 @@ use crate::ffi;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::types::ThreadId;
-/// use ferros_macos::MacOSDebugger;
+/// use ferros_core::Session;
+/// use ferros_macos::MacOSBackend;
 /// use ferros_macos::guards::ThreadSuspendGuard;
 ///
-/// # let mut debugger = MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let threads = debugger.threads()?;
+/// # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+/// # session.attach(ferros_core::types::ProcessId::from(12345))?;
+/// let threads = session.threads()?;
 /// if let Some(thread_id) = threads.first() {
-///     // Get the thread port (internal API, simplified for example)
-///     let thread_port = thread_id.raw() as u32; // In real code, use debugger's internal method
+///     // On macOS a ThreadId is the Mach thread port name.
+///     let thread_port = thread_id.raw() as u32;
 ///     let _guard = ThreadSuspendGuard::new(thread_port)?;
 ///     // Thread is suspended, safe to inspect
-///     let regs = debugger.read_registers_for(*thread_id)?;
+///     let regs = session.read_registers_for(*thread_id)?;
 ///     // Guard automatically resumes thread when dropped
 /// }
 /// # Ok::<(), ferros_core::error::DebuggerError>(())
@@ -145,30 +143,30 @@ impl Drop for ThreadSuspendGuard
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::breakpoints::BreakpointRequest;
 /// use ferros_core::types::Address;
-/// use ferros_macos::MacOSDebugger;
+/// use ferros_macos::MacOSBackend;
 /// use ferros_macos::guards::BreakpointRestoreGuard;
 ///
-/// # let mut debugger = MacOSDebugger::new()?;
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let bp_id = debugger.add_breakpoint(BreakpointRequest::Software {
+/// # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+/// # session.attach(ferros_core::types::ProcessId::from(12345))?;
+/// let bp_id = session.add_breakpoint(BreakpointRequest::Software {
 ///     address: Address::from(0x1000),
 /// })?;
 /// {
-///     let _guard = BreakpointRestoreGuard::new(&mut debugger, bp_id)?;
+///     let _guard = BreakpointRestoreGuard::new(&mut session, bp_id)?;
 ///     // Breakpoint is disabled, code can execute without hitting it
-///     // Note: Can't call debugger methods while guard holds mutable reference
+///     // Note: Can't call session methods while guard holds mutable reference
 ///     // Guard automatically re-enables breakpoint when dropped
 /// }
-/// // Now safe to use debugger again
-/// debugger.resume()?;
+/// // Now safe to use the session again
+/// session.resume()?;
 /// # Ok::<(), ferros_core::error::DebuggerError>(())
 /// ```
 pub struct BreakpointRestoreGuard<'a>
 {
-    debugger: &'a mut dyn ferros_core::debugger::Debugger,
+    session: &'a mut ferros_core::Session,
     breakpoint_id: BreakpointId,
     was_enabled: bool,
     active: bool,
@@ -184,15 +182,15 @@ impl<'a> BreakpointRestoreGuard<'a>
     ///
     /// - `BreakpointIdNotFound`: Breakpoint doesn't exist
     /// - `InvalidArgument`: Failed to disable the breakpoint
-    pub fn new(debugger: &'a mut dyn ferros_core::debugger::Debugger, breakpoint_id: BreakpointId) -> Result<Self>
+    pub fn new(session: &'a mut ferros_core::Session, breakpoint_id: BreakpointId) -> Result<Self>
     {
-        let was_enabled = debugger.breakpoint_info(breakpoint_id)?.enabled;
+        let was_enabled = session.breakpoint_info(breakpoint_id)?.enabled;
         if was_enabled {
-            debugger.disable_breakpoint(breakpoint_id)?;
+            session.disable_breakpoint(breakpoint_id)?;
         }
 
         Ok(Self {
-            debugger,
+            session,
             breakpoint_id,
             was_enabled,
             active: true,
@@ -206,7 +204,7 @@ impl<'a> BreakpointRestoreGuard<'a>
     pub fn restore(mut self) -> Result<()>
     {
         if self.active && self.was_enabled {
-            self.debugger.enable_breakpoint(self.breakpoint_id)?;
+            self.session.enable_breakpoint(self.breakpoint_id)?;
             self.active = false;
         }
         Ok(())
@@ -219,7 +217,7 @@ impl<'a> Drop for BreakpointRestoreGuard<'a>
     {
         if self.active && self.was_enabled {
             // Best effort restore - ignore errors
-            let _ = self.debugger.enable_breakpoint(self.breakpoint_id);
+            let _ = self.session.enable_breakpoint(self.breakpoint_id);
         }
     }
 }

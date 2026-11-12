@@ -565,6 +565,24 @@ unsafe extern "C" {
     ///
     /// See: [posix_spawnattr_setflags(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawnattr_setflags.3.html)
     pub fn posix_spawnattr_setflags(attrp: *mut libc::posix_spawnattr_t, flags: libc::c_short) -> libc::c_int;
+
+    /// Add a "change directory" action to a spawn file-actions object (macOS 10.15+)
+    ///
+    /// The spawned process changes its working directory to `path` before it executes
+    /// the program. Not exported by the `libc` crate.
+    ///
+    /// ## Returns
+    ///
+    /// - `0` on success
+    /// - Non-zero errno value on failure
+    ///
+    /// ## Safety
+    ///
+    /// `file_actions` must be initialized and `path` must be a valid C string.
+    pub fn posix_spawn_file_actions_addchdir_np(
+        file_actions: *mut libc::posix_spawn_file_actions_t,
+        path: *const libc::c_char,
+    ) -> libc::c_int;
 }
 
 /// Spawn flags for posix_spawn

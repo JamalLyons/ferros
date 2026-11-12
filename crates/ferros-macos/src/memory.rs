@@ -577,6 +577,10 @@ pub fn find_pattern(
     Ok(None)
 }
 
+/// `VM_PROT_COPY` from `<mach/vm_prot.h>` (not exported by the `libc` crate): make a
+/// private copy of the pages so that protection beyond the maximum can be set.
+const VM_PROT_COPY: c_int = 0x10;
+
 /// Guard that temporarily changes the protection of a memory range and restores it on drop.
 ///
 /// This RAII guard uses `mach_vm_protect()` to temporarily change memory protection
@@ -605,24 +609,33 @@ pub struct MemoryProtectionGuard
 
 impl MemoryProtectionGuard
 {
-    /// Make the specified range writable (and readable/executable) until the guard is dropped.
+    /// Make the specified range writable until the guard is dropped.
     ///
-    /// Sets protection to `VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE`.
+    /// Sets protection to `VM_PROT_READ | VM_PROT_WRITE` when the region's maximum
+    /// protection allows writes (the range is not executable until the guard restores
+    /// the original protection). Otherwise (code pages, whose maximum
+    /// protection is `r-x`) it requests `VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY`:
+    /// the kernel gives the target a private copy-on-write copy of the page that may be
+    /// written, as debuggers do to plant breakpoints. Dropping the guard restores the
+    /// original protection.
     ///
     /// See: [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
     pub fn make_writable(task: mach_port_t, addr: Address, len: usize) -> Result<Self>
     {
-        Self::with_protection(
-            task,
-            addr,
-            len,
-            libc::VM_PROT_READ | libc::VM_PROT_WRITE | libc::VM_PROT_EXECUTE,
-        )
+        let max_allows_write = len == 0 || (ensure_range(task, addr, len)?.max_protection & libc::VM_PROT_WRITE as u32) != 0;
+        let protection = if max_allows_write {
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE
+        } else {
+            libc::VM_PROT_READ | libc::VM_PROT_WRITE | VM_PROT_COPY
+        };
+        Self::with_protection(task, addr, len, protection)
     }
 
     /// Apply an arbitrary protection mask for the lifetime of the guard.
     ///
     /// Allows setting custom protection flags (e.g., `VM_PROT_READ | VM_PROT_EXECUTE`).
+    /// Write access beyond the region's maximum protection is only possible together
+    /// with `VM_PROT_COPY`.
     ///
     /// See: [mach_vm_protect(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_protect/)
     pub fn with_protection(task: mach_port_t, addr: Address, len: usize, protection: c_int) -> Result<Self>
@@ -645,7 +658,9 @@ impl MemoryProtectionGuard
         let requested_write = (protection & libc::VM_PROT_WRITE) != 0;
         let max_allows_write = (region.max_protection & libc::VM_PROT_WRITE as u32) != 0;
 
-        if requested_write && !max_allows_write {
+        let copy_on_write = (protection & VM_PROT_COPY) != 0;
+
+        if requested_write && !max_allows_write && !copy_on_write {
             return Err(DebuggerError::Io(Error::other(format!(
                 "Cannot make memory writable at 0x{:016x}: region maximum protection (0x{:x}) does not allow writes. \
                  Maximum protection cannot be changed. Consider using hardware breakpoints instead.",
@@ -699,11 +714,11 @@ fn ensure_range_with_permissions(task: mach_port_t, addr: Address, len: usize, r
 {
     if len == 0 {
         return region_for_address(task, addr)?
-            .ok_or_else(|| DebuggerError::Io(Error::other("address is not mapped in target task")));
+            .ok_or_else(|| DebuggerError::Io(Error::new(ErrorKind::NotFound, "address is not mapped in target task")));
     }
 
     let info = region_for_address(task, addr)?
-        .ok_or_else(|| DebuggerError::Io(Error::other("address is not mapped in target task")))?;
+        .ok_or_else(|| DebuggerError::Io(Error::new(ErrorKind::NotFound, "address is not mapped in target task")))?;
 
     let start = addr.value();
     let end = start

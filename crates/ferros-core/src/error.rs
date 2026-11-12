@@ -87,7 +87,7 @@ pub enum DebuggerError
     ///
     /// ## Solution
     ///
-    /// Call `attach(pid)` before performing operations on the process.
+    /// Launch or attach to a process before performing operations on it.
     #[error("Not attached to a process")]
     NotAttached,
 
@@ -99,8 +99,9 @@ pub enum DebuggerError
     ///
     /// ## Solution
     ///
-    /// Call `suspend()` before performing operations that require the process
-    /// to be stopped.
+    /// Wait for the process to stop (for example with
+    /// [`Session::wait`](crate::session::Session::wait)) before performing operations
+    /// that require it to be stopped.
     #[error("Process must be stopped for this operation")]
     NotStopped,
 
@@ -134,18 +135,18 @@ pub enum DebuggerError
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::Debugger;
+    /// use ferros_core::Session;
     /// use ferros_core::breakpoints::BreakpointRequest;
     /// use ferros_core::error::DebuggerError;
     /// use ferros_core::types::Address;
-    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+    /// # fn example(session: &mut Session) -> ferros_core::Result<()> {
     ///
     /// # let address = Address::from(0x1000);
-    /// let breakpoint_id = match debugger.add_breakpoint(BreakpointRequest::Hardware { address }) {
+    /// let breakpoint_id = match session.add_breakpoint(BreakpointRequest::Hardware { address }) {
     ///     Err(DebuggerError::ResourceExhausted(msg)) => {
     ///         println!("Hardware breakpoint limit reached: {}", msg);
     ///         // Try software breakpoint instead
-    ///         debugger.add_breakpoint(BreakpointRequest::Software { address })?
+    ///         session.add_breakpoint(BreakpointRequest::Software { address })?
     ///     }
     ///     Ok(id) => id,
     ///     Err(e) => return Err(e),

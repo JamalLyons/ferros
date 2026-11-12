@@ -1,7 +1,7 @@
 # Agent and Contributor Guide
 
 ## What this is
-Ferros is a Rust debugger designed for macOS arm64. The repository is organized as a Cargo workspace with the following crate layout: `crates/ferros` provides the command-line interface; `crates/ferros-core` implements the low-level debugging engine and Mach process control primitives; `crates/ferros-tests` contains fixture binaries and integration test harnesses; `crates/ferros-utils` provides shared utilities; `crates/ferros-mir` and `crates/ferros-protocol` are workspace members reserved for future compiler IR and protocol support (currently empty); and `crates/ferros-ui` is parked and excluded from the workspace.
+Ferros is a Rust debugger designed for macOS arm64. The repository is organized as a Cargo workspace with the following crate layout: `crates/ferros` provides the command-line interface; `crates/ferros-core` implements the portable debugging engine and holds no OS-specific code; `crates/ferros-macos` implements it for macOS with Mach process control primitives; `crates/ferros-tests` contains fixture binaries and integration test harnesses; `crates/ferros-utils` provides shared utilities; `crates/ferros-mir` and `crates/ferros-protocol` are workspace members reserved for future compiler IR and protocol support (currently empty); and `crates/ferros-ui` is parked and excluded from the workspace.
 
 ## Toolchain
 The project uses the nightly Rust toolchain pinned by `rust-toolchain.toml` with the `rustfmt` and `clippy` components. The task runner for development and CI tasks is `just`.
@@ -13,7 +13,7 @@ just build
 ```
 
 ## Sign
-On macOS, attaching to a process via `task_for_pid` requires either root privileges or the `com.apple.security.cs.debugger` code-signing entitlement. For arm64 macOS development, `.cargo/config.toml` configures `scripts/cargo-test-runner.sh` to automatically ad-hoc sign every executable invoked by Cargo (`cargo test`, `cargo run`, and doctests) with `crates/ferros-core/ferros.entitlements`. Sudo is not needed and must not be used for tests.
+On macOS, attaching to a process via `task_for_pid` requires either root privileges or the `com.apple.security.cs.debugger` code-signing entitlement. For arm64 macOS development, `.cargo/config.toml` configures `scripts/cargo-test-runner.sh` to automatically ad-hoc sign every executable invoked by Cargo (`cargo test`, `cargo run`, and doctests) with `crates/ferros-macos/ferros.entitlements`. Sudo is not needed and must not be used for tests.
 
 To sign a manually executed binary directly:
 ```sh
@@ -22,7 +22,7 @@ just sign-debugger target/debug/ferros
 
 Or with the raw `codesign` command (using `target/debug/ferros` as `<binary>`):
 ```sh
-codesign --entitlements crates/ferros-core/ferros.entitlements --force --sign - target/debug/ferros
+codesign --entitlements crates/ferros-macos/ferros.entitlements --force --sign - target/debug/ferros
 ```
 
 ## Test
@@ -86,9 +86,10 @@ Two environment switches are available for diagnostic and harness verification:
 - `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
 
 ## Conventions
-- `unsafe`: Forbidden workspace-wide via `unsafe_code = "forbid"` in the root `Cargo.toml`. Only `crates/ferros-core` permits `unsafe` for raw Mach FFI bindings.
+- Platform boundary: `crates/ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`), no `cfg(target_os)` and no `unsafe`; `crates/ferros-tests/tests/platform_boundary.rs` enforces this. OS code goes in a platform crate (`crates/ferros-macos`). The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
+- `unsafe`: Forbidden workspace-wide via `unsafe_code = "forbid"` in the root `Cargo.toml`. Only `crates/ferros-macos` permits `unsafe` for raw Mach FFI bindings; `crates/ferros-core` forbids it too.
 - Formatting: Governed by `rustfmt.toml`. Format all code using:
 ```sh
 just fmt
 ```
-- Linting: `just lint` runs clippy with warnings denied. The workspace enables the `pedantic` and `cargo` lint groups; `crates/ferros-core` opts out of `pedantic` for now.
+- Linting: `just lint` runs clippy with warnings denied. The workspace enables the `pedantic` and `cargo` lint groups; `crates/ferros-core` and `crates/ferros-macos` opt out of `pedantic` for now.

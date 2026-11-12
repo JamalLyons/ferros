@@ -39,7 +39,7 @@ Ferros aims to be a Rust-aware debugger: ownership, lifetimes, and MIR-level und
 Ferros is **early and experimental**. What is verified today:
 
 - The workspace builds.
-- On macOS, a binary ad-hoc signed with [`crates/ferros-core/ferros.entitlements`](./crates/ferros-core/ferros.entitlements) can launch a program suspended, obtain its task port, read thread and memory-region counts, resume it, and detach, without `sudo`.
+- On macOS, a binary ad-hoc signed with [`crates/ferros-macos/ferros.entitlements`](./crates/ferros-macos/ferros.entitlements) can launch a program suspended, obtain its task port, read thread and memory-region counts, resume it, and detach, without `sudo`.
 
 Nothing else is covered by tests yet. Other code in `ferros-core` (breakpoints, stack unwinding, symbols, and so on) exists but is unverified, so it is not claimed here. The interactive TUI is being rebuilt: `ferros launch` and `attach` currently behave exactly like `--headless` (print info and exit).
 
@@ -55,7 +55,8 @@ Ferros is structured as a **workspace of multiple crates**, each with a specific
 ferros/
 ├── crates/
 │   ├── ferros/          # Command-line interface
-│   ├── ferros-core/     # Low-level debugging primitives & process control
+│   ├── ferros-core/     # Portable debugging engine (no OS-specific code)
+│   ├── ferros-macos/    # macOS implementation (Mach APIs)
 │   ├── ferros-mir/      # MIR integration & analysis
 │   ├── ferros-ui/       # TUI (excluded from the workspace while being rebuilt)
 │   ├── ferros-protocol/ # Communication layer
@@ -81,7 +82,7 @@ cargo run -p ferros -- launch --headless <program> [args...]
 - **macOS** (Apple Silicon is what CI and development use): the only supported platform today
 - **Linux / Windows**: not implemented
 
-> **Note**: On macOS, debugging other processes needs the binary to be code-signed with the debugger entitlement. Ad-hoc signing with `crates/ferros-core/ferros.entitlements` is the verified path.
+> **Note**: On macOS, debugging other processes needs the binary to be code-signed with the debugger entitlement. Ad-hoc signing with `crates/ferros-macos/ferros.entitlements` is the verified path.
 
 ---
 

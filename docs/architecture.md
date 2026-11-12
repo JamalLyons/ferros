@@ -87,7 +87,8 @@ Ferros is organized as a Cargo workspace with the following crates:
 ferros/
 ├── crates/
 │   ├── ferros/          # Command-line interface
-│   ├── ferros-core/     # Low-level debugging primitives & process control
+│   ├── ferros-core/     # Portable debugging engine (no OS-specific code)
+│   ├── ferros-macos/    # macOS implementation (Mach APIs)
 │   ├── ferros-mir/      # MIR integration & analysis
 │   ├── ferros-ui/       # Terminal User Interface (TUI)
 │   ├── ferros-protocol/ # Communication layer (future)
@@ -146,7 +147,7 @@ The CLI supports several commands:
 
 **Location**: [`crates/ferros-core/`](../crates/ferros-core/)
 
-The `ferros-core` crate is the heart of Ferros. It provides platform-agnostic debugging primitives through the `Debugger` trait and platform-specific implementations.
+The `ferros-core` crate is the heart of Ferros. It provides platform-agnostic debugging primitives through the `Debugger` trait. It holds no OS-specific code: each platform is implemented in its own crate (macOS in [`crates/ferros-macos/`](../crates/ferros-macos/)).
 
 #### Module Structure
 
@@ -173,18 +174,19 @@ ferros-core/src/
 │   ├── registers.rs
 │   ├── stack.rs
 │   └── symbols.rs
-└── platform/           # Platform-specific implementations
-    ├── mod.rs
-    └── macos/
-        ├── mod.rs
-        ├── task.rs      # MacOSDebugger implementation
-        ├── breakpoints.rs
-        ├── memory.rs
-        ├── threads.rs
-        ├── registers/
-        │   ├── arm64.rs
-        │   └── x86_64.rs
-        └── ...
+├── arch/               # CPU knowledge independent of the OS
+└── backend/            # Portable Backend trait, stop events, mock backend
+
+ferros-macos/src/       # macOS implementation (the only crate with OS code)
+├── lib.rs
+├── task.rs             # MacOSDebugger implementation
+├── breakpoints.rs
+├── memory.rs
+├── threads.rs
+├── registers/
+│   ├── arm64.rs
+│   └── x86_64.rs       # carried along, untested
+└── ...
 ```
 
 #### The Debugger Trait
@@ -205,13 +207,13 @@ The `Debugger` trait is the central abstraction in Ferros. It defines what opera
 
 #### Platform Factory
 
-The `create_debugger()` function automatically creates the correct debugger implementation for the current platform:
+The `create_debugger()` function creates the debugger implementation for the current platform. It lives in the CLI crate, which is the only place that switches on the target operating system:
 
 ```rust
-pub fn create_debugger() -> Result<Box<dyn Debugger>>
+pub fn create_debugger() -> ferros_core::Result<Box<dyn Debugger>>
 ```
 
-**Code Reference**: [`crates/ferros-core/src/debugger.rs:774-788`](../crates/ferros-core/src/debugger.rs#L774-L788)
+**Code Reference**: [`crates/ferros/src/platform.rs`](../crates/ferros/src/platform.rs)
 
 #### Error Handling
 
@@ -279,7 +281,7 @@ The `types` module defines core types used throughout Ferros:
 
 #### Platform-Specific Implementation (macOS)
 
-The macOS implementation uses Mach APIs to interact with processes. The main implementation is in [`crates/ferros-core/src/platform/macos/task.rs`](../crates/ferros-core/src/platform/macos/task.rs).
+The macOS implementation uses Mach APIs to interact with processes. It lives in its own crate, `ferros-macos`; the main implementation is in [`crates/ferros-macos/src/task.rs`](../crates/ferros-macos/src/task.rs).
 
 **Key Mach APIs Used**:
 - `task_for_pid()`: Get Mach port to a process
@@ -291,9 +293,9 @@ The macOS implementation uses Mach APIs to interact with processes. The main imp
 
 **Architecture Support**:
 - **ARM64**: Uses `ARM_THREAD_STATE64` flavor
-- **x86_64**: Uses `X86_THREAD_STATE64` flavor
+- **x86_64**: Uses `X86_THREAD_STATE64` flavor (carried along, untested)
 
-**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../crates/ferros-core/src/platform/macos/mod.rs)
+**Code Reference**: [`crates/ferros-macos/src/lib.rs`](../crates/ferros-macos/src/lib.rs)
 
 ---
 
@@ -431,7 +433,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
 2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../crates/ferros/src/main.rs#L182-L223)
-3. **Create debugger**: `create_debugger()` returns platform-specific implementation
+3. **Create debugger**: `create_debugger()` (in `crates/ferros/src/platform.rs`) returns platform-specific implementation
 4. **Launch process**: `debugger.launch()` spawns process in suspended state
 5. **Resume process**: `debugger.resume()` starts execution
 6. **Start TUI**: `ferros_ui::run_tui()` initializes TUI and enters event loop
@@ -474,7 +476,7 @@ Ferros uses a trait-based approach to abstract platform differences. The `Debugg
 
 ### macOS Implementation
 
-**Location**: [`crates/ferros-core/src/platform/macos/`](../crates/ferros-core/src/platform/macos/)
+**Location**: [`crates/ferros-macos/src/`](../crates/ferros-macos/src/)
 
 **Key Files**:
 - **`task.rs`**: Main `MacOSDebugger` implementation
@@ -484,7 +486,7 @@ Ferros uses a trait-based approach to abstract platform differences. The `Debugg
 - **`threads.rs`**: Thread enumeration and management
 - **`registers/`**: Architecture-specific register handling
 
-**Code Reference**: [`crates/ferros-core/src/platform/macos/mod.rs`](../crates/ferros-core/src/platform/macos/mod.rs)
+**Code Reference**: [`crates/ferros-macos/src/lib.rs`](../crates/ferros-macos/src/lib.rs)
 
 ### Future: Linux Implementation
 
@@ -564,7 +566,7 @@ Ferros is designed with a clear separation of concerns, allowing each component 
 For contributors, the key entry points are:
 - **CLI**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
 - **Core API**: [`crates/ferros-core/src/debugger.rs`](../crates/ferros-core/src/debugger.rs)
-- **Platform Implementation**: [`crates/ferros-core/src/platform/`](../crates/ferros-core/src/platform/)
+- **Platform Implementation**: [`crates/ferros-macos/src/`](../crates/ferros-macos/src/)
 - **TUI**: [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs)
 
 Each module is well-documented with Rustdoc comments, and the codebase follows Rust best practices for safety, performance, and maintainability.

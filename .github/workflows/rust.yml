@@ -38,6 +38,9 @@ jobs:
     - uses: actions/checkout@v5
     - name: Build
       run: cargo build --workspace --verbose
+    # ferros-core holds no OS-specific code, so its tests must pass off macOS.
+    - name: Test ferros-core
+      run: cargo test -p ferros-core --all-features
 
   macos:
     runs-on: macos-15

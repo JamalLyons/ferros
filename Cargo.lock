@@ -344,6 +344,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "ferros-core",
+ "ferros-macos",
  "ferros-utils",
 ]
 
@@ -353,14 +354,25 @@ version = "0.0.0"
 dependencies = [
  "addr2line",
  "gimli",
- "libc",
- "libproc",
- "mach2",
  "object 0.38.0",
  "once_cell",
  "rustc-demangle",
  "rustc_version",
  "smallvec",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
+name = "ferros-macos"
+version = "0.0.0"
+dependencies = [
+ "ferros-core",
+ "libc",
+ "libproc",
+ "mach2",
+ "object 0.38.0",
+ "once_cell",
  "thiserror 2.0.17",
  "tracing",
 ]
@@ -378,6 +390,7 @@ name = "ferros-tests"
 version = "0.0.0"
 dependencies = [
  "ferros-core",
+ "ferros-macos",
 ]
 
 [[package]]

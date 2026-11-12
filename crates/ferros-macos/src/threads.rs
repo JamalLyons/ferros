@@ -21,6 +21,8 @@
 
 use std::mem;
 
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::ThreadId;
 use libc::{mach_msg_type_number_t, thread_act_t, vm_address_t, vm_size_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
@@ -29,9 +31,7 @@ use mach2::task::task_threads;
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::ffi;
-use crate::types::ThreadId;
+use crate::ffi;
 
 /// Trait for thread operations that require access to debugger internals.
 pub(crate) trait ThreadOperations

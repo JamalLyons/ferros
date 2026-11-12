@@ -19,6 +19,10 @@
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex, mpsc};
 
+use ferros_core::breakpoints::BreakpointStore;
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::events::{self, DebuggerEvent};
+use ferros_core::types::{Address, Architecture, StopReason, ThreadId};
 use libc::{c_int, mach_port_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exc::{__Reply__exception_raise_t, __Request__exception_raise_t};
@@ -39,11 +43,8 @@ use mach2::ndr::NDR_record;
 use mach2::port::MACH_PORT_NULL;
 use tracing::{debug, error, warn};
 
-use crate::breakpoints::BreakpointStore;
-use crate::error::{DebuggerError, Result};
-use crate::events::{self, DebuggerEvent};
-use crate::platform::macos::{constants, ffi};
-use crate::types::{Address, Architecture, StopReason, ThreadId};
+use crate::error::MachError;
+use crate::{constants, ffi};
 
 /// Shared exception state manipulated by the Mach exception loop and debugger methods.
 #[derive(Debug)]
@@ -128,7 +129,7 @@ fn rewind_breakpoint_pc_arm64(thread: thread_act_t) -> Result<Option<u64>>
         let mut count = constants::ARM_THREAD_STATE64_COUNT;
         let mut kr = ffi::thread_get_state(thread, constants::ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count);
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         let read_u64 = |idx: usize, buf: &[natural_t]| -> u64 {
@@ -149,7 +150,7 @@ fn rewind_breakpoint_pc_arm64(thread: thread_act_t) -> Result<Option<u64>>
             constants::ARM_THREAD_STATE64_COUNT,
         );
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(Some(new_pc))
@@ -205,7 +206,7 @@ fn rewind_breakpoint_pc_x86(thread: thread_act_t) -> Result<Option<u64>>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         let new_pc = state.rip.saturating_sub(constants::X86_64_INSTRUCTION_SIZE);
@@ -218,7 +219,7 @@ fn rewind_breakpoint_pc_x86(thread: thread_act_t) -> Result<Option<u64>>
             constants::X86_THREAD_STATE64_COUNT,
         );
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(Some(new_pc))

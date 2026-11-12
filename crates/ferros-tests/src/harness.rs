@@ -42,7 +42,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferros_core::debugger::create_debugger;
 use ferros_core::{Debugger, DebuggerError, ProcessId};
 
 use crate::Fixture;
@@ -251,7 +250,7 @@ impl TestContext
     ///
     /// # Errors
     ///
-    /// Returns the error from `create_debugger` or `Debugger::launch`.
+    /// Returns the error from `MacOSDebugger::new` or `Debugger::launch`.
     ///
     /// # Panics
     ///
@@ -276,7 +275,7 @@ impl TestContext
         command_line.extend_from_slice(args);
         command_line.push(&tag);
 
-        let mut debugger = create_debugger()?;
+        let mut debugger: Box<dyn Debugger> = Box::new(ferros_macos::MacOSDebugger::new()?);
         debugger.set_capture_process_output(true);
 
         self.shared.tracked().push(Tracked {
@@ -689,7 +688,7 @@ fn permission_guidance(detail: &str) -> String
         "Signing step: run the integration tests with `just test-integration`. On arm64 macOS the cargo runner \
          (scripts/cargo-test-runner.sh, configured in .cargo/config.toml) signs the test executable before running it; \
          make sure FERROS_TEST_UNSIGNED is not set.\nTo sign it manually, from the repository root:\n  codesign \
-         --entitlements crates/ferros-core/ferros.entitlements --force --sign - {}\n",
+         --entitlements crates/ferros-macos/ferros.entitlements --force --sign - {}\n",
         exe.display()
     );
     let authorization_step = "Authorization step: check `DevToolsSecurity -status` (developer mode must be enabled) and \

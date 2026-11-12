@@ -4,7 +4,7 @@
 # Cargo calls this for every executable it runs on arm64 macOS (`cargo test`,
 # `cargo run`, doctests): `$1` is the executable, the remaining arguments are
 # its own arguments. The script ad-hoc signs the executable with the debugger
-# entitlement (crates/ferros-core/ferros.entitlements) so the integration tests
+# entitlement (crates/ferros-macos/ferros.entitlements) so the integration tests
 # in crates/ferros-tests can call task_for_pid() without sudo, then execs it so
 # the exit status and signals pass through unchanged.
 #
@@ -31,7 +31,7 @@ shift
 # Cargo runs each test binary with the package directory as cwd, so resolve the
 # entitlements file relative to this script, not to the current directory.
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-entitlements="$script_dir/../crates/ferros-core/ferros.entitlements"
+entitlements="$script_dir/../crates/ferros-macos/ferros.entitlements"
 entitlement_key="com.apple.security.cs.debugger"
 
 has_debugger_entitlement() {

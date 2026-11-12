@@ -82,7 +82,7 @@ pub enum MachError
 /// This allows us to use `?` operator with Mach API calls:
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::error::MachError;
+/// use ferros_macos::error::MachError;
 /// use libc::{c_int, mach_port_t};
 /// use mach2::kern_return::KERN_SUCCESS;
 ///
@@ -126,6 +126,96 @@ impl From<libc::kern_return_t> for MachError
             libc::KERN_INVALID_ARGUMENT => MachError::InvalidArgument,
             libc::KERN_FAILURE => MachError::ProcessNotFound,
             _ => MachError::Unknown(code),
+        }
+    }
+}
+
+/// Convert a `MachError` into the portable `DebuggerError`
+///
+/// `From<kern_return_t> for MachError` keeps the raw code only for `Unknown`, so the
+/// mapping is:
+///
+/// - `ProtectionFailure` -> `DebuggerError::PermissionDenied`
+/// - `InvalidArgument` -> `DebuggerError::InvalidArgument`
+/// - `ProcessNotFound` (`KERN_FAILURE`) -> `DebuggerError::Os` with code `KERN_FAILURE`
+/// - `Unknown(code)` -> `DebuggerError::Os` with that code
+///
+/// Every variant carries the `MachError` display text as its message.
+impl From<MachError> for ferros_core::DebuggerError
+{
+    fn from(err: MachError) -> Self
+    {
+        let message = err.to_string();
+        match err {
+            MachError::ProtectionFailure => ferros_core::DebuggerError::PermissionDenied(message),
+            MachError::InvalidArgument => ferros_core::DebuggerError::InvalidArgument(message),
+            MachError::ProcessNotFound => ferros_core::DebuggerError::Os {
+                code: i64::from(libc::KERN_FAILURE),
+                message,
+            },
+            MachError::Unknown(code) => ferros_core::DebuggerError::Os {
+                code: i64::from(code),
+                message,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use ferros_core::DebuggerError;
+
+    use super::MachError;
+
+    #[test]
+    fn protection_failure_maps_to_permission_denied()
+    {
+        let err = DebuggerError::from(MachError::from(libc::KERN_PROTECTION_FAILURE));
+        match err {
+            DebuggerError::PermissionDenied(message) => {
+                assert_eq!(message, MachError::ProtectionFailure.to_string());
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_argument_maps_to_invalid_argument()
+    {
+        let err = DebuggerError::from(MachError::from(libc::KERN_INVALID_ARGUMENT));
+        match err {
+            DebuggerError::InvalidArgument(message) => {
+                assert_eq!(message, MachError::InvalidArgument.to_string());
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kern_failure_maps_to_os_with_kern_failure_code()
+    {
+        let err = DebuggerError::from(MachError::from(libc::KERN_FAILURE));
+        match err {
+            DebuggerError::Os { code, message } => {
+                assert_eq!(code, i64::from(libc::KERN_FAILURE));
+                assert_eq!(message, MachError::ProcessNotFound.to_string());
+            }
+            other => panic!("expected Os, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_code_maps_to_os_with_the_raw_code()
+    {
+        let kr = libc::KERN_INVALID_ADDRESS;
+        let err = DebuggerError::from(MachError::from(kr));
+        match err {
+            DebuggerError::Os { code, message } => {
+                assert_eq!(code, i64::from(kr));
+                assert_eq!(message, MachError::Unknown(kr).to_string());
+            }
+            other => panic!("expected Os, got {other:?}"),
         }
     }
 }

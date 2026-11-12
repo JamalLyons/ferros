@@ -13,9 +13,9 @@
 //!
 //! ```rust,no_run
 //! use ferros_core::Debugger;
-//! use ferros_core::platform::macos::MacOSDebugger;
-//! use ferros_core::platform::macos::guards::ThreadSuspendGuard;
 //! use ferros_core::types::ThreadId;
+//! use ferros_macos::MacOSDebugger;
+//! use ferros_macos::guards::ThreadSuspendGuard;
 //!
 //! # let mut debugger = MacOSDebugger::new()?;
 //! # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -31,11 +31,11 @@
 //! # Ok::<(), ferros_core::error::DebuggerError>(())
 //! ```
 
+use ferros_core::breakpoints::BreakpointId;
+use ferros_core::error::Result;
 use libc::thread_act_t;
 
-use crate::breakpoints::BreakpointId;
-use crate::error::Result;
-use crate::platform::macos::ffi;
+use crate::ffi;
 
 /// RAII guard that suspends a thread and automatically resumes it when dropped.
 ///
@@ -47,9 +47,9 @@ use crate::platform::macos::ffi;
 ///
 /// ```rust,no_run
 /// use ferros_core::Debugger;
-/// use ferros_core::platform::macos::MacOSDebugger;
-/// use ferros_core::platform::macos::guards::ThreadSuspendGuard;
 /// use ferros_core::types::ThreadId;
+/// use ferros_macos::MacOSDebugger;
+/// use ferros_macos::guards::ThreadSuspendGuard;
 ///
 /// # let mut debugger = MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -88,7 +88,7 @@ impl ThreadSuspendGuard
         unsafe {
             let result = ffi::thread_suspend(thread_port);
             if result != mach2::kern_return::KERN_SUCCESS {
-                return Err(crate::error::DebuggerError::SuspendFailed(format!(
+                return Err(ferros_core::error::DebuggerError::SuspendFailed(format!(
                     "thread_suspend failed: {}",
                     result
                 )));
@@ -111,7 +111,7 @@ impl ThreadSuspendGuard
             unsafe {
                 let result = ffi::thread_resume(self.thread_port);
                 if result != mach2::kern_return::KERN_SUCCESS {
-                    return Err(crate::error::DebuggerError::ResumeFailed(format!(
+                    return Err(ferros_core::error::DebuggerError::ResumeFailed(format!(
                         "thread_resume failed: {}",
                         result
                     )));
@@ -147,9 +147,9 @@ impl Drop for ThreadSuspendGuard
 /// ```rust,no_run
 /// use ferros_core::Debugger;
 /// use ferros_core::breakpoints::BreakpointRequest;
-/// use ferros_core::platform::macos::MacOSDebugger;
-/// use ferros_core::platform::macos::guards::BreakpointRestoreGuard;
 /// use ferros_core::types::Address;
+/// use ferros_macos::MacOSDebugger;
+/// use ferros_macos::guards::BreakpointRestoreGuard;
 ///
 /// # let mut debugger = MacOSDebugger::new()?;
 /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -168,7 +168,7 @@ impl Drop for ThreadSuspendGuard
 /// ```
 pub struct BreakpointRestoreGuard<'a>
 {
-    debugger: &'a mut dyn crate::debugger::Debugger,
+    debugger: &'a mut dyn ferros_core::debugger::Debugger,
     breakpoint_id: BreakpointId,
     was_enabled: bool,
     active: bool,
@@ -184,7 +184,7 @@ impl<'a> BreakpointRestoreGuard<'a>
     ///
     /// - `BreakpointIdNotFound`: Breakpoint doesn't exist
     /// - `InvalidArgument`: Failed to disable the breakpoint
-    pub fn new(debugger: &'a mut dyn crate::debugger::Debugger, breakpoint_id: BreakpointId) -> Result<Self>
+    pub fn new(debugger: &'a mut dyn ferros_core::debugger::Debugger, breakpoint_id: BreakpointId) -> Result<Self>
     {
         let was_enabled = debugger.breakpoint_info(breakpoint_id)?.enabled;
         if was_enabled {

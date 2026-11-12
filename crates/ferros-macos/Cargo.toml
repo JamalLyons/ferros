@@ -1,0 +1,34 @@
+[package]
+name = "ferros-macos"
+version = "0.0.0"
+edition = "2024"
+description = "macOS (Mach) debugger implementation for Ferros."
+license = "Apache-2.0"
+repository = "https://github.com/jamallyons/ferros"
+readme = "README.md"
+keywords = ["debugger", "rust", "debugging", "macos", "mach"]
+categories = ["development-tools"]
+
+# The whole crate is macOS-only: on any other OS it compiles as an empty crate,
+# so every dependency is a macOS target dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+ferros-core = { path = "../ferros-core" }
+libc = "0.2.177"
+libproc = "0.14"
+mach2 = "0.6.0"
+object = { version = "0.38.0", features = ["read", "macho"] }
+once_cell = "1.19"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# ferros-macos is the one crate in the workspace allowed to use `unsafe`, for raw
+# Mach FFI. Mirror the workspace lints minus `unsafe_code = "forbid"` and minus
+# clippy pedantic (to avoid churn in the moved Mach code; revisit later).
+[lints.rust]
+unused = { level = "warn", priority = -1 }
+rust_2024_incompatible_pat = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -2 }
+nursery = { level = "allow", priority = -1 }
+multiple_crate_versions = { level = "allow", priority = -1 }

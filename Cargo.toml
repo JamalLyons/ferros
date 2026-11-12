@@ -2,6 +2,7 @@
 members = [
     "crates/ferros",
     "crates/ferros-core",
+    "crates/ferros-macos",
     "crates/ferros-mir",
     "crates/ferros-protocol",
     "crates/ferros-tests",

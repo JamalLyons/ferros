@@ -10,7 +10,12 @@
 //!
 //! ## Platform Support
 //!
-//! - **macOS**: Uses Mach APIs (`task_for_pid`, `thread_get_state`, etc.)
+//! ferros-core holds no OS-specific code and no `unsafe`: it does not depend on any
+//! operating-system API. It defines the portable interfaces ([`Debugger`],
+//! [`backend::Backend`]) and the OS-independent pieces (types, symbols, breakpoints
+//! bookkeeping, CPU knowledge). Each operating system is implemented in its own crate:
+//!
+//! - **macOS**: the `ferros-macos` crate (`MacOSDebugger`, using Mach APIs)
 //! - **Linux**: Will use `ptrace` (future)
 //! - **Windows**: Will use Windows Debug API (future)
 //!
@@ -20,20 +25,7 @@
 //! process control, register and memory access, and stop reporting (mechanism only).
 //! [`arch::Arch`] holds CPU knowledge (trap bytes, pc/sp/fp/link register, pointer
 //! authentication) independent of the OS. Neither module contains OS-specific code.
-//!
-//! ## Why unsafe code is needed
-//!
-//! This crate requires `unsafe` code because we're calling low-level system APIs
-//! that interact directly with the kernel. These APIs are inherently unsafe
-//! because they can:
-//! - Access memory of other processes
-//! - Modify process state
-//! - Bypass normal Rust safety guarantees
-//!
-//! We wrap these unsafe calls in safe abstractions, but the underlying system
-//! calls themselves must be `unsafe`.
 
-#![allow(unsafe_code)] // Required for low-level system APIs (Mach, ptrace, etc.)
 #![warn(missing_docs)]
 
 pub mod arch;
@@ -42,7 +34,6 @@ pub mod breakpoints;
 pub mod debugger;
 pub mod error;
 pub mod events;
-pub mod platform;
 pub mod symbols;
 pub mod types;
 
@@ -53,8 +44,6 @@ pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
 pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};
-#[cfg(target_os = "macos")]
-pub use platform::macos::MacOSDebugger;
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
     Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,

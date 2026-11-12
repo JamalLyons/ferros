@@ -16,6 +16,9 @@ clap = { version = "4.5.51", features = ["derive"] }
 ferros-core = { path = "../ferros-core" }
 ferros-utils = { path = "../ferros-utils" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+ferros-macos = { path = "../ferros-macos" }
+
 [lints]
 workspace = true
 

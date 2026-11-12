@@ -17,14 +17,15 @@
 //! - `x86_64` module - General-purpose x86-64 register access
 //! - [breakpoints](../breakpoints) - High-level breakpoint management
 
+use ferros_core::breakpoints::WatchpointAccess;
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::Address;
 use libc::{natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 
-use crate::breakpoints::WatchpointAccess;
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::{constants, ffi};
-use crate::types::Address;
+use crate::error::MachError;
+use crate::{constants, ffi};
 
 // Use constants from the centralized constants module
 
@@ -214,7 +215,7 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         // Find a free slot
@@ -265,7 +266,7 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(slot)
@@ -286,7 +287,7 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         // Clear local enable bit
@@ -300,7 +301,7 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(())
@@ -321,7 +322,7 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         // Find a free slot
@@ -365,7 +366,7 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(slot as u32)
@@ -386,7 +387,7 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         if slot >= 16 {
@@ -404,7 +405,7 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(())
@@ -440,7 +441,7 @@ fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: W
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         // Find a free slot in the watchpoint control registers.
@@ -475,7 +476,7 @@ fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: W
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(slot as u32)
@@ -496,7 +497,7 @@ fn clear_wp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         if slot >= 16 {
@@ -515,7 +516,7 @@ fn clear_wp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::MachError(kr.into()));
+            return Err(DebuggerError::from(MachError::from(kr)));
         }
 
         Ok(())

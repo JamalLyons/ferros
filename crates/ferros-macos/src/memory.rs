@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
 use libc::{c_int, mach_port_t, vm_address_t, vm_map_t, vm_offset_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
@@ -43,9 +45,7 @@ use mach2::vm_statistics::{
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 use once_cell::sync::Lazy;
 
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::{constants, ffi};
-use crate::types::{Address, MemoryRegion, MemoryRegionId};
+use crate::{constants, ffi};
 
 // Use constants from the centralized constants module
 

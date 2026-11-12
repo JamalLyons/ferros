@@ -361,6 +361,10 @@ impl MacOSDebugger
             if result != KERN_SUCCESS {
                 if result == libc::KERN_FAILURE {
                     let process_exists = libc::kill(pid.0 as libc::pid_t, 0) == 0;
+                    // Only ESRCH proves the pid is gone: EPERM means the process exists but
+                    // belongs to another user. Read errno before anything else can change it.
+                    let no_such_process =
+                        !process_exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
 
                     if process_exists {
                         return Err(DebuggerError::PermissionDenied(format!(
@@ -371,7 +375,9 @@ impl MacOSDebugger
                         )));
                     }
 
-                    return Err(DebuggerError::ProcessNotFound(pid.0));
+                    if no_such_process {
+                        return Err(DebuggerError::ProcessNotFound(pid.0));
+                    }
                 }
 
                 return Err(DebuggerError::from(MachError::from(result)));
@@ -1101,9 +1107,10 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `MachError::ProtectionFailure`: Need sudo or entitlements
-    /// - `MachError::InvalidArgument`: Invalid PID
-    /// - `MachError::ProcessNotFound`: Process doesn't exist
+    /// - `PermissionDenied`: Need sudo or entitlements
+    /// - `InvalidArgument`: Invalid PID
+    /// - `ProcessNotFound`: Process doesn't exist
+    /// - `Os`: Any other Mach failure, with the raw `kern_return_t`
     /// - `AttachFailed`: Failed to get threads
     fn attach(&mut self, pid: ProcessId) -> Result<()>
     {

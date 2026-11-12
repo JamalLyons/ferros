@@ -1,7 +1,48 @@
 //! # ferros-macos
 //!
-//! macOS-specific debugger implementation using Mach APIs. [`MacOSDebugger`]
-//! implements the portable [`ferros_core::Debugger`] trait.
+//! macOS-specific debugger backend using Mach APIs. [`MacOSBackend`] implements the
+//! portable [`ferros_core::Backend`] trait: process control, register and memory access,
+//! and stop reporting (mechanism only). The portable engine, [`ferros_core::Session`],
+//! drives it and holds the policy (state machine, software breakpoint table, stack
+//! traces, symbolication):
+//!
+//! ```rust,no_run
+//! use ferros_core::{LaunchSpec, Session};
+//! use ferros_macos::MacOSBackend;
+//!
+//! let mut session = Session::new(Box::new(MacOSBackend::new()?));
+//! session.launch(&LaunchSpec::new("/bin/echo").arg("hello"))?;
+//! let regs = session.read_registers()?;
+//! println!("stopped at entry, pc = {}", regs.pc);
+//! session.detach()?; // the process keeps running
+//!
+//! # Ok::<(), ferros_core::error::DebuggerError>(())
+//! ```
+//!
+//! ## Backend behaviour
+//!
+//! - **Launch** uses `posix_spawn` with `POSIX_SPAWN_START_SUSPENDED`; `LaunchSpec::program`
+//!   is argv\[0\], and its environment, working directory and stdio specs are honoured.
+//! - **Stops**: the exception handler thread suspends the whole task (`task_suspend`)
+//!   before it reports a Mach exception, so every thread is stopped when `wait` returns an
+//!   event. `EXC_BREAKPOINT` is reported as `StopEvent::Breakpoint` with the raw pc;
+//!   faults become `StopEvent::Signal`.
+//! - **Thread ids** are Mach thread port names.
+//! - **Breakpoints**: the backend keeps no breakpoint table; the engine writes trap
+//!   bytes with `write_memory`, which makes code pages writable for the write. Hardware
+//!   breakpoints and watchpoints are not part of the `Backend` interface; the unverified
+//!   helpers in [`breakpoints`] program debug registers directly.
+//! - **Images**: only the main executable is reported (see [`images`]).
+//!
+//! ## Known gaps
+//!
+//! - T06 (issue #32): nothing watches for process exit, so `wait` never reports
+//!   `StopEvent::Exited` or `StopEvent::Killed`, and `wait(None)` on a process that exits
+//!   blocks forever. `kill` is minimal. Signals cannot be passed on resume
+//!   (`BackendError::Unsupported`).
+//! - T07 (issue #33): single-step (`ThreadAction::Step`) returns
+//!   `BackendError::Unsupported`, and so does keeping individual threads suspended.
+//! - Issue #34: shared libraries are not enumerated by `images`.
 //!
 //! This is the only crate in the workspace that talks to an operating-system API
 //! and the only one allowed to use `unsafe` (for raw Mach FFI); `ferros-core` holds
@@ -20,10 +61,9 @@
 //!
 //! ### Minimum macOS Version
 //!
-//! - **macOS 10.5 (Leopard) or later**: Required for `POSIX_SPAWN_START_SUSPENDED` flag
-//!   used in `launch()`. This flag allows spawning processes in a suspended state.
-//! - **Recommended: macOS 10.15 (Catalina) or later**: For best compatibility with
-//!   modern Rust toolchains and development tools.
+//! - **macOS 10.15 (Catalina) or later**: `launch()` uses `POSIX_SPAWN_START_SUSPENDED`
+//!   (macOS 10.5+) and `posix_spawn_file_actions_addchdir_np` (macOS 10.15+) for the
+//!   working directory.
 //!
 //! ### Architecture Support
 //!
@@ -45,10 +85,8 @@
 //! ### Option 1: Launch Processes (Recommended)
 //!
 //! Use `launch()` instead of `attach()` to spawn processes under debugger control.
-//! This avoids permission issues because:
-//! - Launching processes doesn't require special permissions
-//! - The debugger automatically gets control of processes it launches
-//! - Process starts suspended, allowing breakpoints to be set before execution
+//! The process starts suspended, allowing breakpoints to be set before execution.
+//! Taking control of it still calls `task_for_pid()`, so the same permission applies.
 //!
 //! ### Option 2: Attach to Running Processes
 //!
@@ -77,7 +115,9 @@
 //! - `task_for_pid()`: Get a Mach port to a process (declared ourselves - not in mach2)
 //! - `task_threads()`: Enumerate threads in a task (from `mach2` crate)
 //! - `thread_get_state()`: Read thread registers (declared ourselves - not in mach2)
-//! - `thread_set_state()`: Write thread registers (future)
+//! - `thread_set_state()`: Write thread registers
+//! - `task_suspend()` / `task_resume()`: Stop and continue the whole task
+//! - `task_set_exception_ports()` / `mach_msg()`: Receive exceptions
 //! - `posix_spawn()`: Launch processes with `POSIX_SPAWN_START_SUSPENDED` flag
 //!
 //! ## Dependencies
@@ -109,6 +149,7 @@ pub mod error;
 pub mod exception;
 pub mod ffi;
 pub mod guards;
+pub mod images;
 pub mod launch;
 pub mod memory;
 pub mod registers;
@@ -116,4 +157,4 @@ pub mod task;
 pub mod threads;
 pub mod types;
 
-pub use task::MacOSDebugger;
+pub use task::MacOSBackend;

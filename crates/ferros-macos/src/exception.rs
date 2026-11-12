@@ -1,15 +1,25 @@
 //! # Mach Exception Handling
 //!
-//! Mach exception handling for macOS debugger.
+//! Mach exception handling for the macOS backend.
 //!
 //! This module implements the Mach exception handling loop that receives
-//! exceptions from the kernel and processes them (breakpoints, signals, etc.).
+//! exceptions from the kernel and turns them into [`StopEvent`]s.
 //!
 //! ## Mach Exception Ports
 //!
-//! On macOS, exceptions are delivered via Mach ports. The debugger registers
+//! On macOS, exceptions are delivered via Mach ports. The backend registers
 //! an exception port with `task_set_exception_ports()` and then receives
 //! exception messages via `mach_msg()`.
+//!
+//! ## Stops
+//!
+//! When an exception arrives, the loop suspends the whole task (`task_suspend`)
+//! before it reports anything, because the [`Backend`](ferros_core::Backend) contract
+//! says every thread is stopped when `wait` returns an event. It counts that suspend in
+//! [`ExceptionSharedState::suspends`], keeps the exception message (the faulting thread
+//! waits for the reply), and sends the event over a channel that `wait` receives from.
+//! Resuming replies to the held message and then balances the suspends with
+//! `task_resume`.
 //!
 //! ## References
 //!
@@ -17,15 +27,14 @@
 //! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
-use ferros_core::breakpoints::BreakpointStore;
+use ferros_core::backend::StopEvent;
 use ferros_core::error::{DebuggerError, Result};
-use ferros_core::events::{self, DebuggerEvent};
-use ferros_core::types::{Address, Architecture, StopReason, ThreadId};
-use libc::{c_int, mach_port_t, natural_t, thread_act_t};
+use ferros_core::types::{Address, Architecture, ThreadId};
+use libc::{c_int, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
-use mach2::exc::{__Reply__exception_raise_t, __Request__exception_raise_t};
+use mach2::exc::__Reply__exception_raise_t;
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
     EXC_ARITHMETIC, EXC_BAD_ACCESS, EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_SOFTWARE, exception_type_t,
@@ -35,42 +44,76 @@ use mach2::kern_return::KERN_SUCCESS;
 #[cfg(target_os = "macos")]
 use mach2::message::{
     MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_RCV_LARGE, MACH_RCV_MSG,
-    MACH_SEND_MSG, mach_msg, mach_msg_header_t, mach_msg_size_t,
+    MACH_RCV_TIMEOUT, MACH_SEND_MSG, mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_port_descriptor_t,
+    mach_msg_size_t, mach_msg_type_number_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;
 #[cfg(target_os = "macos")]
+use mach2::ndr::NDR_record_t;
+#[cfg(target_os = "macos")]
 use mach2::port::MACH_PORT_NULL;
+#[cfg(target_os = "macos")]
+use mach2::task::task_suspend;
 use tracing::{debug, error, warn};
 
-use crate::error::MachError;
-use crate::{constants, ffi};
-
-/// Shared exception state manipulated by the Mach exception loop and debugger methods.
-#[derive(Debug)]
+/// State shared by the Mach exception loop and the backend, always changed under its lock.
+#[derive(Debug, Default)]
 pub(crate) struct ExceptionSharedState
 {
-    pub stopped: bool,
-    pub stop_reason: StopReason,
-    pub pending_thread: Option<thread_act_t>,
+    /// Number of `task_suspend` calls the backend holds on the task and has not yet
+    /// balanced with `task_resume` (the launch or attach stop, exception stops, interrupts).
+    pub suspends: u32,
+    /// Whether the loop holds an exception message whose thread waits for a reply.
+    pub pending_exception: bool,
 }
 
 impl ExceptionSharedState
 {
     pub(crate) fn new() -> Self
     {
-        Self {
-            stopped: false,
-            stop_reason: StopReason::Running,
-            pending_thread: None,
-        }
+        Self::default()
     }
 }
 
+/// Lock the shared exception state, ignoring poisoning (the state stays consistent).
+pub(crate) fn lock_shared(shared: &Mutex<ExceptionSharedState>) -> std::sync::MutexGuard<'_, ExceptionSharedState>
+{
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Request message of `mach_exception_raise` (MIG id 2405), which the kernel sends for
+/// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`: like `exception_raise`, but with 64-bit
+/// codes. `mach2` only defines the 32-bit `exception_raise` layout. MIG packs these
+/// messages to 4 bytes.
+#[cfg(target_os = "macos")]
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+#[allow(non_snake_case)]
+struct MachExceptionRaiseRequest
+{
+    Head: mach_msg_header_t,
+    msgh_body: mach_msg_body_t,
+    thread: mach_msg_port_descriptor_t,
+    task: mach_msg_port_descriptor_t,
+    NDR: NDR_record_t,
+    exception: exception_type_t,
+    codeCnt: mach_msg_type_number_t,
+    code: [i64; 2],
+}
+
+/// Receive buffer: room for the request plus the trailer the kernel appends.
+#[cfg(target_os = "macos")]
+#[repr(C, align(8))]
+struct ReceiveBuffer([u8; 1024]);
+
+/// Command sent from the backend to the exception loop.
 #[derive(Debug)]
 pub(crate) enum ExceptionLoopCommand
 {
-    Continue,
+    /// Reply to the held exception; the result of the reply is sent back.
+    Continue(mpsc::Sender<std::result::Result<(), String>>),
+    /// Reply to the held exception, if any, and exit the loop.
     Shutdown,
 }
 
@@ -94,166 +137,49 @@ pub(crate) fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
     }
 }
 
-/// Rewind the program counter after a breakpoint hit.
+/// Convert a Mach exception to a [`StopEvent`].
 ///
-/// When a breakpoint is hit, the PC points to the instruction after the
-/// breakpoint. This function rewinds it to point at the breakpoint instruction
-/// itself, allowing the debugger to single-step over it.
-///
-/// ## Architecture-Specific Behavior
-///
-/// - **ARM64**: Subtracts 4 bytes (instruction size)
-/// - **x86-64**: Subtracts 1 byte (INT3 instruction size)
-///
-/// Uses `thread_get_state()` and `thread_set_state()` to read and modify
-/// the thread's register state.
-///
-/// See:
-/// - [thread_get_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
-/// - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
-pub(crate) fn rewind_breakpoint_pc(thread: thread_act_t, architecture: Architecture) -> Result<Option<u64>>
-{
-    match architecture {
-        Architecture::Arm64 => rewind_breakpoint_pc_arm64(thread),
-        Architecture::X86_64 => rewind_breakpoint_pc_x86(thread),
-        Architecture::Unknown(_) => Ok(None),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn rewind_breakpoint_pc_arm64(thread: thread_act_t) -> Result<Option<u64>>
-{
-    unsafe {
-        let mut state: [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize] =
-            [0; constants::ARM_THREAD_STATE64_COUNT as usize];
-        let mut count = constants::ARM_THREAD_STATE64_COUNT;
-        let mut kr = ffi::thread_get_state(thread, constants::ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count);
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
-        }
-
-        let read_u64 = |idx: usize, buf: &[natural_t]| -> u64 {
-            let lo = buf[idx * 2] as u64;
-            let hi = buf[idx * 2 + 1] as u64;
-            lo | (hi << 32)
-        };
-
-        let pc = read_u64(constants::ARM64_PC_INDEX, &state);
-        let new_pc = pc.saturating_sub(constants::ARM64_INSTRUCTION_SIZE);
-        state[constants::ARM64_PC_INDEX_LOW] = (new_pc & constants::U32_MASK) as natural_t;
-        state[constants::ARM64_PC_INDEX_HIGH] = (new_pc >> 32) as natural_t;
-
-        kr = ffi::thread_set_state(
-            thread,
-            constants::ARM_THREAD_STATE64,
-            state.as_ptr(),
-            constants::ARM_THREAD_STATE64_COUNT,
-        );
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
-        }
-
-        Ok(Some(new_pc))
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn rewind_breakpoint_pc_arm64(_thread: thread_act_t) -> Result<Option<u64>>
-{
-    Ok(None)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn rewind_breakpoint_pc_x86(thread: thread_act_t) -> Result<Option<u64>>
-{
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct X86ThreadState64
-    {
-        rax: u64,
-        rbx: u64,
-        rcx: u64,
-        rdx: u64,
-        rdi: u64,
-        rsi: u64,
-        rbp: u64,
-        rsp: u64,
-        r8: u64,
-        r9: u64,
-        r10: u64,
-        r11: u64,
-        r12: u64,
-        r13: u64,
-        r14: u64,
-        r15: u64,
-        rip: u64,
-        rflags: u64,
-        cs: u64,
-        fs: u64,
-        gs: u64,
-    }
-
-    // Use constants from the centralized constants module
-
-    unsafe {
-        let mut state = X86ThreadState64::default();
-        let mut count = constants::X86_THREAD_STATE64_COUNT;
-        let mut kr = ffi::thread_get_state(
-            thread,
-            constants::X86_THREAD_STATE64,
-            &mut state as *mut _ as *mut natural_t,
-            &mut count,
-        );
-
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
-        }
-
-        let new_pc = state.rip.saturating_sub(constants::X86_64_INSTRUCTION_SIZE);
-        state.rip = new_pc;
-
-        kr = ffi::thread_set_state(
-            thread,
-            constants::X86_THREAD_STATE64,
-            &state as *const _ as *const natural_t,
-            constants::X86_THREAD_STATE64_COUNT,
-        );
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
-        }
-
-        Ok(Some(new_pc))
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn rewind_breakpoint_pc_x86(_thread: thread_act_t) -> Result<Option<u64>>
-{
-    Ok(None)
-}
-
-/// Convert a Mach exception to a StopReason.
-///
-/// Maps Mach exception types to platform-agnostic stop reasons.
+/// Maps Mach exception types to portable stop events.
 ///
 /// ## Exception Types
 ///
-/// - `EXC_BREAKPOINT` → `StopReason::Breakpoint`
-/// - `EXC_BAD_ACCESS` → `StopReason::Signal(SIGSEGV)`
-/// - `EXC_BAD_INSTRUCTION` → `StopReason::Signal(SIGILL)`
-/// - `EXC_ARITHMETIC` → `StopReason::Signal(SIGFPE)`
-/// - `EXC_SOFTWARE` → `StopReason::Signal(SIGTRAP)`
+/// - `EXC_BREAKPOINT` -> `StopEvent::Breakpoint` with the raw `pc` (not rewound; on
+///   arm64 it already points at the `brk`, and the engine maps it with
+///   `Arch::pc_after_trap`)
+/// - `EXC_BAD_ACCESS` -> `StopEvent::Signal(SIGSEGV)`
+/// - `EXC_BAD_INSTRUCTION` -> `StopEvent::Signal(SIGILL)`
+/// - `EXC_ARITHMETIC` -> `StopEvent::Signal(SIGFPE)`
+/// - `EXC_SOFTWARE` -> `StopEvent::Signal(SIGTRAP)`
+/// - anything else (or a breakpoint whose pc cannot be read) -> `StopEvent::Other`
 ///
 /// See: [Mach Exception Types](https://developer.apple.com/documentation/kernel/1402149-exception_types/)
-pub(crate) fn stop_reason_from_exception(exception: exception_type_t, pc: Option<u64>, _codes: [i64; 2]) -> StopReason
+pub(crate) fn stop_event_from_exception(
+    exception: exception_type_t,
+    thread: ThreadId,
+    pc: Option<u64>,
+    codes: [i64; 2],
+) -> StopEvent
 {
+    let signal = |signal| StopEvent::Signal { thread, signal };
     match exception as u32 {
-        EXC_BREAKPOINT => StopReason::Breakpoint(pc.unwrap_or(0)),
-        EXC_BAD_ACCESS => StopReason::Signal(libc::SIGSEGV),
-        EXC_BAD_INSTRUCTION => StopReason::Signal(libc::SIGILL),
-        EXC_ARITHMETIC => StopReason::Signal(libc::SIGFPE),
-        EXC_SOFTWARE => StopReason::Signal(libc::SIGTRAP),
-        _ => StopReason::Unknown,
+        EXC_BREAKPOINT => match pc {
+            Some(pc) => StopEvent::Breakpoint {
+                thread,
+                pc: Address::from(pc),
+            },
+            None => StopEvent::Other {
+                thread: Some(thread),
+                reason: format!("EXC_BREAKPOINT (pc unreadable), codes {codes:?}"),
+            },
+        },
+        EXC_BAD_ACCESS => signal(libc::SIGSEGV),
+        EXC_BAD_INSTRUCTION => signal(libc::SIGILL),
+        EXC_ARITHMETIC => signal(libc::SIGFPE),
+        EXC_SOFTWARE => signal(libc::SIGTRAP),
+        other => StopEvent::Other {
+            thread: Some(thread),
+            reason: format!("Mach exception {other}, codes {codes:?}"),
+        },
     }
 }
 
@@ -263,11 +189,14 @@ pub(crate) fn stop_reason_from_exception(exception: exception_type_t, pc: Option
 /// exception messages from the Mach kernel via `mach_msg()`. When an
 /// exception is received, it:
 ///
-/// 1. Determines the stop reason (breakpoint, signal, etc.)
-/// 2. Updates shared exception state
-/// 3. Sends a `DebuggerEvent::TargetStopped` event
-/// 4. Waits for a resume command
+/// 1. Suspends the whole task (`task_suspend`) and counts the suspend
+/// 2. Reads the raw pc of the thread for a breakpoint
+/// 3. Marks the exception as held and sends the [`StopEvent`] to `events`
+/// 4. Waits for a command from the backend
 /// 5. Sends an exception reply via `send_exception_reply()`
+///
+/// The loop exits on [`ExceptionLoopCommand::Shutdown`] (replying first, so the thread
+/// can continue after a detach) or when the exception port is destroyed.
 ///
 /// ## Mach Message Protocol
 ///
@@ -283,20 +212,20 @@ pub(crate) fn stop_reason_from_exception(exception: exception_type_t, pc: Option
 #[cfg(target_os = "macos")]
 pub(crate) fn run_exception_loop(
     exception_port: mach_port_t,
-    resume_rx: mpsc::Receiver<ExceptionLoopCommand>,
-    shared_state: Arc<Mutex<ExceptionSharedState>>,
+    task: mach_port_t,
+    commands: mpsc::Receiver<ExceptionLoopCommand>,
+    shared: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
-    event_tx: events::DebuggerEventSender,
-    breakpoints: Arc<Mutex<BreakpointStore>>,
+    events: mpsc::Sender<StopEvent>,
 )
 {
     loop {
-        let mut request = MaybeUninit::<__Request__exception_raise_t>::uninit();
-        let recv_size = std::mem::size_of::<__Request__exception_raise_t>() as mach_msg_size_t;
+        let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
+        let recv_size = std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t;
 
         let kr = unsafe {
             mach_msg(
-                request.as_mut_ptr() as *mut mach_msg_header_t,
+                buffer.as_mut_ptr() as *mut mach_msg_header_t,
                 MACH_RCV_MSG | MACH_RCV_LARGE,
                 0,
                 recv_size,
@@ -314,15 +243,21 @@ pub(crate) fn run_exception_loop(
             continue;
         }
 
-        let message = unsafe { request.assume_init() };
+        // SAFETY: mach_msg succeeded, so the buffer holds a complete message; the read is
+        // unaligned-safe and the buffer is larger than the request.
+        let message = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const MachExceptionRaiseRequest) };
         let thread_port = message.thread.name as thread_act_t;
-        let codes = [message.code[0] as i64, message.code[1] as i64];
+        let code = message.code;
+        let codes = [code[0], code[1]];
+        let exception_type = message.exception;
 
-        let rewound_pc = if message.exception == EXC_BREAKPOINT as exception_type_t {
-            match rewind_breakpoint_pc(thread_port, architecture) {
-                Ok(value) => value,
+        // The faulting thread is blocked in the kernel until the reply, so its registers
+        // can be read before the task is suspended.
+        let pc = if exception_type == EXC_BREAKPOINT as exception_type_t {
+            match crate::task::read_registers_for_port(architecture, thread_port) {
+                Ok(registers) => Some(registers.pc.value()),
                 Err(err) => {
-                    error!("Failed to rewind breakpoint PC: {err}");
+                    error!("Failed to read the pc of a breakpoint stop: {err}");
                     None
                 }
             }
@@ -330,49 +265,76 @@ pub(crate) fn run_exception_loop(
             None
         };
 
-        let stop_reason = stop_reason_from_exception(message.exception, rewound_pc, codes);
+        let event = stop_event_from_exception(exception_type, ThreadId::from(u64::from(thread_port)), pc, codes);
         {
-            let mut shared = shared_state.lock().unwrap();
-            shared.stopped = true;
-            shared.stop_reason = stop_reason;
-            shared.pending_thread = Some(thread_port);
+            // Stop every thread, mark the exception as held and queue the event in one
+            // step under the lock, so a concurrent resume or interrupt sees either none
+            // or all of this stop.
+            let mut state = lock_shared(&shared);
+            let kr = unsafe { task_suspend(task) };
+            if kr == KERN_SUCCESS {
+                state.suspends += 1;
+            } else {
+                error!("task_suspend failed while handling a Mach exception: {kr}");
+            }
+            state.pending_exception = true;
+            if let Err(err) = events.send(event) {
+                warn!("Failed to send stop event from Mach loop: {err}");
+            }
         }
 
-        if let StopReason::Breakpoint(addr) = stop_reason {
-            let mut store = breakpoints.lock().unwrap();
-            store.record_hit(Address::from(addr));
+        let command = commands.recv();
+        let header = message.Head;
+        let reply = send_exception_reply(&header).map_err(|err| err.to_string());
+        lock_shared(&shared).pending_exception = false;
+        if let Err(err) = &reply {
+            error!("Failed to send Mach exception reply: {err}");
         }
-
-        if let Err(err) = event_tx.send(DebuggerEvent::TargetStopped {
-            reason: stop_reason,
-            thread: Some(ThreadId::from(thread_port as u64)),
-        }) {
-            warn!("Failed to send stop event from Mach loop: {err}");
-        }
-
-        match resume_rx.recv() {
-            Ok(ExceptionLoopCommand::Continue) => {
-                if let Err(err) = send_exception_reply(&message) {
-                    error!("Failed to send Mach exception reply: {err}");
+        match command {
+            Ok(ExceptionLoopCommand::Continue(ack)) => {
+                let failed = reply.is_err();
+                let _ = ack.send(reply);
+                if failed {
                     break;
-                }
-
-                let mut shared = shared_state.lock().unwrap();
-                shared.stopped = false;
-                shared.stop_reason = StopReason::Running;
-                shared.pending_thread = None;
-
-                if let Err(err) = event_tx.send(DebuggerEvent::TargetResumed) {
-                    warn!("Failed to send resume event from Mach loop: {err}");
                 }
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
-                let mut shared = shared_state.lock().unwrap();
-                shared.stopped = false;
-                shared.stop_reason = StopReason::Running;
-                shared.pending_thread = None;
+                reply_to_queued_exceptions(exception_port);
                 break;
             }
+        }
+    }
+}
+
+/// Reply to every exception message still queued on `exception_port`, without blocking.
+///
+/// The loop holds one exception at a time; other threads that raised an exception in
+/// the meantime wait in the port's queue. On shutdown they must be answered too:
+/// destroying the port with a message queued makes the kernel treat the exception as
+/// unhandled, which would kill a target that a detach is supposed to leave running.
+#[cfg(target_os = "macos")]
+fn reply_to_queued_exceptions(exception_port: mach_port_t)
+{
+    loop {
+        let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
+        let kr = unsafe {
+            mach_msg(
+                buffer.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0,
+                std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t,
+                exception_port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        if kr != MACH_MSG_SUCCESS {
+            break;
+        }
+        // SAFETY: mach_msg succeeded, so the buffer starts with a complete header.
+        let header = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const mach_msg_header_t) };
+        if let Err(err) = send_exception_reply(&header) {
+            error!("Failed to reply to a queued Mach exception: {err}");
         }
     }
 }
@@ -383,20 +345,22 @@ pub(crate) fn run_exception_loop(
 /// kernel indicating that the exception has been handled. This allows
 /// the target process to continue execution.
 ///
-/// Uses `mach_msg()` with `MACH_SEND_MSG` to send the reply.
+/// Uses `mach_msg()` with `MACH_SEND_MSG` to send the reply. In a received message the
+/// header's `msgh_remote_port` holds the kernel's send-once reply right, so that is where
+/// the reply goes; its id is the request id plus 100.
 ///
 /// See: [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
 #[cfg(target_os = "macos")]
-fn send_exception_reply(request: &__Request__exception_raise_t) -> Result<()>
+fn send_exception_reply(request: &mach_msg_header_t) -> Result<()>
 {
     let mut reply = __Reply__exception_raise_t {
         Head: mach_msg_header_t {
             msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0),
             msgh_size: std::mem::size_of::<__Reply__exception_raise_t>() as mach_msg_size_t,
-            msgh_remote_port: request.Head.msgh_local_port,
+            msgh_remote_port: request.msgh_remote_port,
             msgh_local_port: MACH_PORT_NULL,
             msgh_voucher_port: MACH_PORT_NULL,
-            msgh_id: request.Head.msgh_id + 100,
+            msgh_id: request.msgh_id + 100,
         },
         NDR: unsafe { NDR_record },
         RetCode: KERN_SUCCESS,

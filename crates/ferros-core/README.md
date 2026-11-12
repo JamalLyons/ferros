@@ -22,31 +22,36 @@ entitlement file (`ferros.entitlements`) and the macOS requirements.
 
 ## Usage
 
-```rust
-use ferros_core::Debugger;
+`Session` is the portable engine. It drives a `Box<dyn Backend>` that comes from a
+platform crate (on macOS, `ferros_macos::MacOSBackend`).
 
-// The debugger implementation comes from a platform crate.
-let debugger: &mut dyn Debugger = /* platform debugger */;
+```rust,ignore
+use ferros_core::{LaunchSpec, Session};
 
-// Launch a process under debugger control (recommended)
-debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
-// Process is now suspended and ready for debugging
+// The backend comes from a platform crate.
+let mut session = Session::new(Box::new(ferros_macos::MacOSBackend::new()?));
 
-// Or attach to an existing process (requires permissions)
-debugger.attach(ProcessId::from(12345))?;
+// Launch a process, stopped before its first instruction. The arguments exclude argv[0].
+session.launch(&LaunchSpec::new("/bin/echo").arg("Hello, world!"))?;
+
+// Or attach to an existing process (requires permissions):
+// session.attach(ProcessId::from(12345))?;
 
 // Inspect the process
-let regs = debugger.read_registers()?;
-println!("Program counter: 0x{:x}", regs.pc);
+let regs = session.read_registers()?;
+println!("Program counter: {}", regs.pc);
+
+// Release it; it keeps running.
+session.detach()?;
 ```
 
 ## Features
 
-- ✅ Process attachment and launching
-- ✅ Register reading (ARM64 and x86_64)
+- ✅ Process launching and attaching
+- ✅ Register reading and writing (ARM64; x86_64 untested)
 - ✅ Memory reading and writing
 - ✅ Memory region enumeration
 - ✅ Thread enumeration
-- ⏳ Register writing (coming soon)
-- ⏳ Breakpoints (coming soon)
-- ⏳ Single-step execution (coming soon)
+- ✅ Software breakpoints (insert, remove, hit counts)
+- ⏳ Stepping over breakpoints and single-step execution (T07, issue #33)
+- ⏳ Process exit detection and signal pass-through (T06, issue #32)

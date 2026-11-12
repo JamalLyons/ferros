@@ -4,10 +4,10 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use ferros_core::types::ProcessId;
-use ferros_core::{Debugger, Result as DebuggerResult};
+use ferros_core::{LaunchSpec, Result as DebuggerResult, Session};
 use ferros_utils::{LogFormat, LogLevel, debug, info, init_logging, init_logging_with_level};
 
-use crate::platform::create_debugger;
+use crate::platform::create_backend;
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]
@@ -147,12 +147,12 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
     match cli.command {
         Commands::Attach { pid, headless: true } => {
             info!("Attaching to process {}", pid);
-            let mut debugger = create_debugger()?;
-            debugger.attach(ProcessId::from(pid))?;
+            let mut session = Session::new(create_backend()?);
+            session.attach(ProcessId::from(pid))?;
             info!("Successfully attached to process {}", pid);
-            print_debugger_info(&*debugger);
-            // Detach after showing info in headless mode
-            debugger.detach()?;
+            print_debugger_info(&mut session);
+            // Detach after showing info in headless mode; the process keeps running.
+            session.detach()?;
             Ok(())
         }
         Commands::Launch {
@@ -161,37 +161,29 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
             headless: true,
         } => {
             info!("Launching program: {} with args: {:?}", program, args);
-            let mut debugger = create_debugger()?;
+            let mut session = Session::new(create_backend()?);
 
             // Convert relative path to absolute path for posix_spawn
             let program_path = std::path::Path::new(&program);
             let absolute_program = if program_path.is_absolute() {
-                program.clone()
+                program_path.to_path_buf()
             } else {
-                std::env::current_dir()?
-                    .join(program_path)
-                    .canonicalize()?
-                    .to_string_lossy()
-                    .to_string()
+                std::env::current_dir()?.join(program_path).canonicalize()?
             };
 
-            // If no args provided, use the program name itself
-            let args_refs: Vec<&str> = if args.is_empty() {
-                vec![&absolute_program]
-            } else {
-                args.iter().map(std::string::String::as_str).collect()
-            };
+            // `args` are the program's arguments; the backend passes the program as argv[0].
+            let spec = LaunchSpec::new(&absolute_program).args(args);
+            let pid = session.launch(&spec)?;
+            info!(
+                "Successfully launched program: {} (PID: {})",
+                absolute_program.display(),
+                pid.0
+            );
 
-            let pid = debugger.launch(&absolute_program, &args_refs)?;
-            info!("Successfully launched program: {} (PID: {})", absolute_program, pid.0);
-
-            // Process starts suspended, resume it so it runs normally
-            debugger.resume()?;
-            info!("Process resumed and running");
-
-            print_debugger_info(&*debugger);
-            // Detach after showing info in headless mode
-            debugger.detach()?;
+            // The process is stopped at entry: show the info, then detach so it runs.
+            print_debugger_info(&mut session);
+            session.detach()?;
+            info!("Process detached and running");
             Ok(())
         }
         Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. } => {
@@ -219,24 +211,24 @@ fn run_command(cli: Cli) -> DebuggerResult<()>
     }
 }
 
-fn print_debugger_info(debugger: &dyn Debugger)
+fn print_debugger_info(session: &mut Session)
 {
     info!("Debugger Information:");
-    info!("  Architecture: {}", debugger.architecture());
-    info!("  Attached: {}", debugger.is_attached());
-    info!("  Stopped: {}", debugger.is_stopped());
-    debug!("  Stop Reason: {:?}", debugger.stop_reason());
+    info!("  Architecture: {}", session.architecture());
+    info!("  State: {:?}", session.state());
+    if let Some(pid) = session.pid() {
+        info!("  PID: {}", pid.0);
+    }
+    debug!("  Last Stop: {:?}", session.last_stop());
 
-    if debugger.is_attached() {
-        if let Ok(threads) = debugger.threads() {
-            info!("  Threads: {}", threads.len());
-            if let Some(active) = debugger.active_thread() {
-                debug!("  Active Thread: {}", active.raw());
-            }
+    if let Ok(threads) = session.threads() {
+        info!("  Threads: {}", threads.len());
+        if let Some(selected) = session.selected_thread() {
+            debug!("  Selected Thread: {}", selected.raw());
         }
+    }
 
-        if let Ok(regions) = debugger.get_memory_regions() {
-            info!("  Memory Regions: {}", regions.len());
-        }
+    if let Ok(regions) = session.memory_regions() {
+        info!("  Memory Regions: {}", regions.len());
     }
 }

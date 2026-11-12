@@ -65,19 +65,26 @@ use ferros_tests::{fixture, harness};
 fn resume_runs_hello()
 {
     harness::run(|t| {
-        // Launched suspended at entry under a fresh debugger; stdout/stderr are captured.
+        // Launched suspended at entry under a fresh `ferros_core::Session` (driving
+        // `ferros_macos::MacOSBackend`); stdout/stderr are captured.
         let mut d = t.launch(&fixture!("hello"));
-        // `d` dereferences to `dyn ferros_core::Debugger`.
+        // `d` dereferences to `ferros_core::Session`.
         d.resume().expect("resume");
         assert!(d.wait_for_stdout("hello from ferros fixture", Duration::from_secs(10)));
-    }); // `d` is dropped here: the process is killed, then the debugger is dropped.
+    }); // `d` is dropped here: the process is killed, then the session is dropped.
 }
 ```
 
 - `t.launch_with_args(&fixture!("loop_counter"), &["100"])` passes fixture arguments; the harness
   appends a unique `--ferros-test-id=...` argument last.
-- The returned `Debuggee` owns the debugger and kills the process when dropped, including when
-  the test panics. Use `d.pid()`, `d.debugger()`, `d.stdout()` and `d.stderr()` as needed.
+- The returned `Debuggee` owns the session and kills the process when dropped, including when
+  the test panics. Use `d.pid()`, `d.session()`, `d.stdout()` and `d.stderr()` as needed.
+- The fixture's stdout and stderr go to two files in a per-launch temporary directory (stdin is
+  `/dev/null`); background threads tail them, and the directory is removed when the `Debuggee`
+  is dropped.
+- Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
+  with a comment naming the issue: `tests/breakpoints.rs` (continuing past a breakpoint,
+  issue #33) and `tests/lifecycle.rs` (exit reporting, issue #32).
 - When the deadline passes, the harness kills that test's processes and fails the test with a
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than

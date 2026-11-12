@@ -371,7 +371,6 @@ dependencies = [
  "libc",
  "libproc",
  "mach2",
- "object 0.38.0",
  "once_cell",
  "thiserror 2.0.17",
  "tracing",

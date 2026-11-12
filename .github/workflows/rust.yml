@@ -36,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Check platform boundary
+      run: sh scripts/check-boundary.sh
     - name: Build
       run: cargo build --workspace --verbose
     # ferros-core holds no OS-specific code, so its tests must pass off macOS.
@@ -52,6 +54,8 @@ jobs:
       run: just fmt-check
     - name: Lint
       run: just lint
+    - name: Check platform boundary
+      run: just check-boundary
     - name: Test
       run: just test
 

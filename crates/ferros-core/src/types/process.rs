@@ -21,12 +21,12 @@ use super::Address;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::types::ProcessId;
-/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+/// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
 /// let pid = ProcessId::from(12345);
-/// debugger.attach(pid)?;
+/// session.attach(pid)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -64,14 +64,14 @@ impl From<ProcessId> for u32
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::types::ThreadId;
-/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+/// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let threads = debugger.threads()?;
+/// # session.attach(ferros_core::types::ProcessId::from(12345))?;
+/// let threads = session.threads()?;
 /// if let Some(thread) = threads.first() {
-///     debugger.set_active_thread(*thread)?;
+///     session.select_thread(*thread)?;
 /// }
 /// # Ok(())
 /// # }
@@ -114,6 +114,10 @@ impl From<u64> for ThreadId
 
 /// Reason why the debugger is currently stopped (if at all)
 ///
+/// [`Session`](crate::session::Session) reports stops as
+/// [`StopEvent`](crate::backend::StopEvent) instead; this enum is kept for the event
+/// helpers in [`events`](crate::events).
+///
 /// This enum describes why a debugged process is currently stopped. The process
 /// can be stopped for various reasons: explicit suspension, signals, breakpoints,
 /// or because it has exited.
@@ -135,12 +139,10 @@ impl From<u64> for ThreadId
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
 /// use ferros_core::types::StopReason;
-/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+/// # fn example(reason: StopReason) -> ferros_core::Result<()> {
 ///
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// match debugger.stop_reason() {
+/// match reason {
 ///     StopReason::Running => println!("Process is running"),
 ///     StopReason::Suspended => println!("Process is suspended"),
 ///     StopReason::Signal(sig) => println!("Stopped by signal: {}", sig),
@@ -203,12 +205,12 @@ pub enum StopReason
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::types::MemoryRegionId;
-/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+/// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// let regions = debugger.get_memory_regions()?;
+/// # session.attach(ferros_core::types::ProcessId::from(12345))?;
+/// let regions = session.memory_regions()?;
 /// for region in regions {
 ///     println!(
 ///         "Region {}: {}-{}",
@@ -480,12 +482,12 @@ impl MemoryRegion
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::types::Architecture;
-/// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
+/// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
-/// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
-/// match debugger.architecture() {
+/// # session.attach(ferros_core::types::ProcessId::from(12345))?;
+/// match session.architecture() {
 ///     Architecture::Arm64 => println!("Debugging ARM64 process"),
 ///     Architecture::X86_64 => println!("Debugging x86-64 process"),
 ///     Architecture::Unknown(name) => println!("Unknown architecture: {}", name),

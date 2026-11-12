@@ -8,6 +8,7 @@
 
 use crate::breakpoints::{BreakpointRequest, WatchpointAccess};
 use crate::error::Result;
+use crate::session::Session;
 use crate::types::{Address, Registers, ThreadId};
 
 /// Type alias for breakpoint condition functions.
@@ -24,15 +25,15 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Debugger;
+/// use ferros_core::Session;
 /// use ferros_core::breakpoints::builder::BreakpointBuilder;
 /// use ferros_core::types::Address;
-/// # fn example<D: ferros_core::Debugger>(debugger: &mut D) -> ferros_core::Result<()> {
+/// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
 /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
 ///     .with_hit_count(5) // Break after 5 hits
 ///     .with_condition(|regs| regs.pc.value() > 0x2000) // Only break if PC > 0x2000
-///     .install(debugger)?;
+///     .install(session)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -262,12 +263,12 @@ impl BreakpointBuilder
 
     /// Install the breakpoint using the configured options.
     ///
-    /// This method creates the breakpoint request and installs it using the
-    /// debugger's `add_breakpoint()` method.
+    /// This method creates the breakpoint request and installs it with
+    /// [`Session::add_breakpoint`].
     ///
     /// ## Parameters
     ///
-    /// - `debugger`: A mutable reference to a debugger instance.
+    /// - `session`: The session that owns the breakpoint table.
     ///
     /// ## Returns
     ///
@@ -276,33 +277,33 @@ impl BreakpointBuilder
     /// ## Errors
     ///
     /// Returns an error if:
-    /// - The debugger is not attached to a process
-    /// - A breakpoint already exists at the address
-    /// - Hardware breakpoint slots are exhausted (for hardware breakpoints)
-    /// - The breakpoint request is invalid
+    /// - The session has no stopped process
+    /// - The request is a hardware breakpoint or watchpoint, which `Session` does not
+    ///   support yet
+    /// - Reading or writing the target's memory fails
     ///
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::Debugger;
+    /// use ferros_core::Session;
     /// use ferros_core::breakpoints::builder::BreakpointBuilder;
     /// use ferros_core::types::Address;
-    /// # fn example<D: ferros_core::Debugger>(debugger: &mut D) -> ferros_core::Result<()> {
+    /// # fn example(session: &mut Session) -> ferros_core::Result<()> {
     ///
-    /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
+    /// # session.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
     ///     .with_hit_count(5)
-    ///     .install(debugger)?;
+    ///     .install(session)?;
     /// println!("Installed breakpoint with ID: {}", bp_id.raw());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn install<D: crate::debugger::Debugger>(self, debugger: &mut D) -> Result<crate::breakpoints::BreakpointId>
+    pub fn install(self, session: &mut Session) -> Result<crate::breakpoints::BreakpointId>
     {
         // For now, we just install the basic breakpoint.
         // Advanced features (hit count, conditions, commands) will be
         // implemented when the breakpoint hit handler supports them.
-        debugger.add_breakpoint(self.request)
+        session.add_breakpoint(self.request)
     }
 
     /// Get the underlying breakpoint request.

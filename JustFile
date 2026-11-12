@@ -282,11 +282,11 @@ sign-debugger BINARY_PATH="target/debug/ferros":
         echo "   Build it first with: cargo build"; \
         exit 1; \
     fi
-    @if [ ! -f "crates/ferros-core/ferros.entitlements" ]; then \
-        echo "❌ Entitlements file not found: crates/ferros-core/ferros.entitlements"; \
+    @if [ ! -f "crates/ferros-macos/ferros.entitlements" ]; then \
+        echo "❌ Entitlements file not found: crates/ferros-macos/ferros.entitlements"; \
         exit 1; \
     fi
-    @codesign --entitlements crates/ferros-core/ferros.entitlements --force --sign - "{{BINARY_PATH}}" || { \
+    @codesign --entitlements crates/ferros-macos/ferros.entitlements --force --sign - "{{BINARY_PATH}}" || { \
         echo "❌ Failed to sign binary. Make sure you have a code signing certificate."; \
         echo "   Create one with: Keychain Access > Certificate Assistant > Create a Certificate"; \
         exit 1; \

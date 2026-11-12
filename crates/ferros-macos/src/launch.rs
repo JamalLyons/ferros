@@ -21,10 +21,10 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::ptr;
 
+use ferros_core::error::{DebuggerError, Result};
 use libc::c_int;
 
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::ffi;
+use crate::ffi;
 
 /// Trait for launch operations that require access to debugger internals.
 pub(crate) trait LaunchOperations

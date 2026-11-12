@@ -4,30 +4,13 @@ Low-level debugging primitives and process control for Ferros.
 
 ## Platform Support
 
+`ferros-core` holds no OS-specific code and no `unsafe`. Each operating system is
+implemented in its own crate.
+
 ### macOS
 
-**Minimum Requirements:**
-- macOS 10.5 (Leopard) or later (for `POSIX_SPAWN_START_SUSPENDED`)
-- Recommended: macOS 10.15 (Catalina) or later
-
-**Architecture Support:**
-- ✅ ARM64 (Apple Silicon) - Primary target
-- ✅ x86_64 (Intel Mac) - Supported for compatibility
-
-**Permissions:**
-
-To debug processes on macOS, you have two options:
-
-1. **Launch processes** (recommended): Use `launch()` to spawn processes under debugger control.
-   This doesn't require special permissions.
-
-2. **Attach to running processes**: Requires debugging permissions. The simplest way is to run with `sudo`:
-   ```bash
-   sudo ferros attach <pid>
-   ```
-   
-   Alternatively, you can code sign with entitlements (see `ferros.entitlements`), but this is optional.
-   Most users will find `sudo` to be the simplest approach.
+Implemented by [`ferros-macos`](../ferros-macos/), which also holds the debugger
+entitlement file (`ferros.entitlements`) and the macOS requirements.
 
 ### Linux
 
@@ -40,11 +23,12 @@ To debug processes on macOS, you have two options:
 ## Usage
 
 ```rust
-use ferros_core::platform::macos::MacOSDebugger;
 use ferros_core::Debugger;
 
+// The debugger implementation comes from a platform crate.
+let debugger: &mut dyn Debugger = /* platform debugger */;
+
 // Launch a process under debugger control (recommended)
-let mut debugger = MacOSDebugger::new()?;
 debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
 // Process is now suspended and ready for debugging
 

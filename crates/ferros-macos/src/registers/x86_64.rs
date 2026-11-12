@@ -26,14 +26,14 @@
 
 use std::mem::MaybeUninit;
 
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::{Address, Architecture, Registers, VectorRegisterValue};
 use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use tracing::debug;
 
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::{constants, ffi};
-use crate::types::{Address, Architecture, Registers, VectorRegisterValue};
+use crate::{constants, ffi};
 
 /// Read x86-64 registers from a thread
 ///

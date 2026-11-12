@@ -4,7 +4,7 @@ _Last updated: 2026-11-11_
 
 **Status:** nothing below is ticked because no item is covered by a test yet. Items are only ticked once a test exercises them. Several of these have code in `ferros-core` that is untested and unverified. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26).
 
-**Verified today (manually, not by tests):** the workspace builds; a binary ad-hoc signed with `crates/ferros-core/ferros.entitlements` can launch a program suspended on macOS, obtain its task port, read thread and memory-region counts, resume, and detach without `sudo`.
+**Verified today (manually, not by tests):** the workspace builds; a binary ad-hoc signed with `crates/ferros-macos/ferros.entitlements` can launch a program suspended on macOS, obtain its task port, read thread and memory-region counts, resume, and detach without `sudo`.
 
 
 This list captures concrete work needed to reach feature parity with production debuggers such as LLDB, GDB, Delve, and rr, with a focus on complete Rust language support. Items are grouped by subsystem to clarify ownership.

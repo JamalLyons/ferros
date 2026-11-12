@@ -21,15 +21,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use libc::{mach_port_t, thread_act_t};
-
-use crate::breakpoints::{
+use ferros_core::breakpoints::{
     BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
     BreakpointStore,
 };
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::{constants, registers};
-use crate::types::{Address, Architecture};
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::{Address, Architecture};
+use libc::{mach_port_t, thread_act_t};
+
+use crate::{constants, registers};
 
 /// Trait for breakpoint operations that require access to debugger internals.
 ///
@@ -241,7 +241,7 @@ impl BreakpointManager
             Err(_) => {
                 // If direct write fails, try making memory writable first
                 // The guard will automatically restore protection when dropped
-                use crate::platform::macos::memory::MemoryProtectionGuard;
+                use crate::memory::MemoryProtectionGuard;
                 let guard_result = MemoryProtectionGuard::make_writable(ops.task_port(), address, trap.len());
 
                 match guard_result {
@@ -406,7 +406,7 @@ impl BreakpointManager
         breakpoints: &Arc<Mutex<BreakpointStore>>,
         address: Address,
         length: usize,
-        access: crate::breakpoints::WatchpointAccess,
+        access: ferros_core::breakpoints::WatchpointAccess,
     ) -> Result<BreakpointId>
     {
         ops.ensure_attached()?;

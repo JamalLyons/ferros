@@ -1,6 +1,12 @@
-//! # macOS Debugging Implementation
+//! # ferros-macos
 //!
-//! macOS-specific debugger implementation using Mach APIs.
+//! macOS-specific debugger implementation using Mach APIs. [`MacOSDebugger`]
+//! implements the portable [`ferros_core::Debugger`] trait.
+//!
+//! This is the only crate in the workspace that talks to an operating-system API
+//! and the only one allowed to use `unsafe` (for raw Mach FFI); `ferros-core` holds
+//! no OS-specific code. The whole crate is macOS-only: on any other OS it compiles
+//! as an empty crate.
 //!
 //! macOS uses the Mach microkernel, which provides debugging capabilities
 //! through Mach ports and messages. Unlike Linux's `ptrace`, macOS debugging
@@ -28,6 +34,10 @@
 //!   - Uses `X86_THREAD_STATE64` flavor for register access
 //!   - Note: Intel Macs are no longer sold, but support is maintained
 //!
+//! Only arm64 is verified: the tests run on Apple Silicon. The x86_64 register code
+//! (`registers/x86_64.rs`, compiled only for `target_arch = "x86_64"`) is carried
+//! along from ferros-core untested.
+//!
 //! ## Permissions and Entitlements
 //!
 //! macOS requires special permissions to debug other processes. There are two approaches:
@@ -53,7 +63,7 @@
 //!    - Requires password each time (or use `sudo` with NOPASSWD)
 //!
 //! 2. **Code signing with entitlements** (Advanced - optional):
-//!    - Create `ferros.entitlements` file (see `crates/ferros-core/ferros.entitlements`)
+//!    - Create `ferros.entitlements` file (see `crates/ferros-macos/ferros.entitlements`)
 //!    - Sign the binary: `codesign --entitlements ferros.entitlements --force --sign - target/debug/ferros`
 //    - The `com.apple.security.cs.debugger` entitlement grants debugging permissions
 //!    - Useful if you want to avoid typing `sudo` repeatedly
@@ -88,6 +98,10 @@
 //! - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 //! - [posix_spawn documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
 //! - [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)
+
+#![cfg(target_os = "macos")]
+#![allow(unsafe_code)] // Required for raw Mach FFI
+#![warn(missing_docs)]
 
 pub mod breakpoints;
 pub mod constants;

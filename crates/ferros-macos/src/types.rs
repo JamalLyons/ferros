@@ -16,8 +16,8 @@ use libc::c_int;
 /// ## Usage
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::constants;
-/// use ferros_core::platform::macos::types::ThreadStateFlavor;
+/// use ferros_macos::constants;
+/// use ferros_macos::types::ThreadStateFlavor;
 ///
 /// let flavor = ThreadStateFlavor::from(constants::ARM_THREAD_STATE64);
 /// ```
@@ -63,8 +63,8 @@ impl From<ThreadStateFlavor> for c_int
 /// ## Usage
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::constants;
-/// use ferros_core::platform::macos::types::DebugStateFlavor;
+/// use ferros_macos::constants;
+/// use ferros_macos::types::DebugStateFlavor;
 ///
 /// let flavor = DebugStateFlavor::from(constants::ARM_DEBUG_STATE64);
 /// ```
@@ -111,8 +111,8 @@ impl From<DebugStateFlavor> for c_int
 /// ## Usage
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::constants;
-/// use ferros_core::platform::macos::types::RegisterIndex;
+/// use ferros_macos::constants;
+/// use ferros_macos::types::RegisterIndex;
 ///
 /// let pc_index = RegisterIndex::from(constants::ARM64_PC_INDEX);
 /// ```
@@ -159,7 +159,7 @@ impl From<RegisterIndex> for usize
 /// ## Usage
 ///
 /// ```rust,no_run
-/// use ferros_core::platform::macos::types::BreakpointSlot;
+/// use ferros_macos::types::BreakpointSlot;
 ///
 /// let slot = BreakpointSlot::new(0);
 /// ```

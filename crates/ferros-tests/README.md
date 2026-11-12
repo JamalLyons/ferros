@@ -37,7 +37,7 @@ just test-integration    # cargo test -p ferros-tests
 The tests launch real fixture processes under the debugger, which needs `task_for_pid`. On arm64
 macOS, `.cargo/config.toml` routes every executable cargo runs through
 `scripts/cargo-test-runner.sh`, which ad-hoc signs it with the `com.apple.security.cs.debugger`
-entitlement from `crates/ferros-core/ferros.entitlements`. No sudo and no prompt are needed.
+entitlement from `crates/ferros-macos/ferros.entitlements`. No sudo and no prompt are needed.
 `just test` excludes this crate, so unit tests never depend on debugging permission.
 
 Environment switches:

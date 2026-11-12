@@ -25,6 +25,13 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use ferros_core::breakpoints::{BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointRequest, BreakpointStore};
+use ferros_core::debugger::Debugger;
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::events::{self, DebuggerEvent};
+use ferros_core::symbols::unwind::{MemoryAccess, StackUnwinder};
+use ferros_core::symbols::{ImageDescriptor, SymbolCache};
+use ferros_core::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
@@ -44,19 +51,13 @@ use mach2::task::{task_resume, task_set_exception_ports, task_suspend, task_thre
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
-use crate::breakpoints::{BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointRequest, BreakpointStore};
-use crate::debugger::Debugger;
-use crate::error::{DebuggerError, Result};
-use crate::events::{self, DebuggerEvent};
-use crate::platform::macos::memory::{MemoryCache, get_memory_regions, write_memory};
+use crate::error::MachError;
+use crate::memory::{MemoryCache, get_memory_regions, write_memory};
 #[cfg(target_arch = "aarch64")]
-use crate::platform::macos::registers::{read_registers_arm64, write_registers_arm64};
+use crate::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
-use crate::platform::macos::registers::{read_registers_x86_64, write_registers_x86_64};
-use crate::platform::macos::{breakpoints, exception, ffi, launch, threads};
-use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
-use crate::symbols::{ImageDescriptor, SymbolCache};
-use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, StackFrame, StopReason, ThreadId};
+use crate::registers::{read_registers_x86_64, write_registers_x86_64};
+use crate::{breakpoints, exception, ffi, launch, threads};
 
 /// macOS debugger implementation using Mach APIs
 ///
@@ -128,7 +129,7 @@ impl breakpoints::BreakpointOperations for MacOSDebugger
 {
     fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>
     {
-        crate::platform::macos::memory::read_memory(self.task, addr, len)
+        crate::memory::read_memory(self.task, addr, len)
     }
 
     fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>
@@ -228,8 +229,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ProcessId;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.attach(ProcessId::from(12345))?;
@@ -300,7 +301,7 @@ impl MacOSDebugger
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// let debugger = MacOSDebugger::new()?;
     /// if debugger.has_debugging_permissions()? {
@@ -322,7 +323,7 @@ impl MacOSDebugger
             match result {
                 KERN_SUCCESS => Ok(true),
                 libc::KERN_PROTECTION_FAILURE => Ok(false),
-                _ => Err(DebuggerError::MachError(result.into())),
+                _ => Err(DebuggerError::from(MachError::from(result))),
             }
         }
     }
@@ -360,6 +361,10 @@ impl MacOSDebugger
             if result != KERN_SUCCESS {
                 if result == libc::KERN_FAILURE {
                     let process_exists = libc::kill(pid.0 as libc::pid_t, 0) == 0;
+                    // Only ESRCH proves the pid is gone: EPERM means the process exists but
+                    // belongs to another user. Read errno before anything else can change it.
+                    let no_such_process =
+                        !process_exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
 
                     if process_exists {
                         return Err(DebuggerError::PermissionDenied(format!(
@@ -369,9 +374,13 @@ impl MacOSDebugger
                             pid.0, pid.0
                         )));
                     }
+
+                    if no_such_process {
+                        return Err(DebuggerError::ProcessNotFound(pid.0));
+                    }
                 }
 
-                return Err(DebuggerError::MachError(result.into()));
+                return Err(DebuggerError::from(MachError::from(result)));
             }
 
             let mut threads: *mut thread_act_t = std::ptr::null_mut();
@@ -657,13 +666,13 @@ impl MacOSDebugger
                 let mut port: mach_port_t = MACH_PORT_NULL;
                 let mut kr = mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &mut port);
                 if kr != KERN_SUCCESS {
-                    return Err(DebuggerError::MachError(kr.into()));
+                    return Err(DebuggerError::from(MachError::from(kr)));
                 }
 
                 kr = mach_port_insert_right(self_task, port, port, MACH_MSG_TYPE_MAKE_SEND);
                 if kr != KERN_SUCCESS {
                     let _ = mach_port_destroy(self_task, port);
-                    return Err(DebuggerError::MachError(kr.into()));
+                    return Err(DebuggerError::from(MachError::from(kr)));
                 }
 
                 let mask: exception_mask_t = EXC_MASK_BREAKPOINT
@@ -676,7 +685,7 @@ impl MacOSDebugger
                 kr = task_set_exception_ports(self.task, mask, port, behavior, flavor);
                 if kr != KERN_SUCCESS {
                     let _ = mach_port_destroy(self_task, port);
-                    return Err(DebuggerError::MachError(kr.into()));
+                    return Err(DebuggerError::from(MachError::from(kr)));
                 }
 
                 let (tx, rx) = mpsc::channel();
@@ -1033,7 +1042,7 @@ impl Debugger for MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
@@ -1098,9 +1107,10 @@ impl Debugger for MacOSDebugger
     ///
     /// ## Errors
     ///
-    /// - `MachError::ProtectionFailure`: Need sudo or entitlements
-    /// - `MachError::InvalidArgument`: Invalid PID
-    /// - `MachError::ProcessNotFound`: Process doesn't exist
+    /// - `PermissionDenied`: Need sudo or entitlements
+    /// - `InvalidArgument`: Invalid PID
+    /// - `ProcessNotFound`: Process doesn't exist
+    /// - `Os`: Any other Mach failure, with the raw `kern_return_t`
     /// - `AttachFailed`: Failed to get threads
     fn attach(&mut self, pid: ProcessId) -> Result<()>
     {
@@ -1500,8 +1510,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ThreadId;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1551,8 +1561,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::ThreadId;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1584,8 +1594,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1612,8 +1622,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1655,8 +1665,8 @@ impl MacOSDebugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::Address;
+    /// use ferros_macos::MacOSDebugger;
     ///
     /// # let mut debugger = MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
@@ -1674,7 +1684,7 @@ impl MacOSDebugger
     /// }
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```
-    pub fn find_symbol(&mut self, address: Address) -> Result<Option<crate::symbols::Symbolication>>
+    pub fn find_symbol(&mut self, address: Address) -> Result<Option<ferros_core::symbols::Symbolication>>
     {
         self.ensure_attached()?;
 
@@ -1687,7 +1697,7 @@ impl MacOSDebugger
             // Find a code region to use as load address
             for region in &regions {
                 if region.permissions.contains('x') && region.permissions.contains('r') {
-                    let desc = crate::symbols::ImageDescriptor {
+                    let desc = ferros_core::symbols::ImageDescriptor {
                         path: exec_path.clone(),
                         load_address: region.start.value(),
                     };
@@ -1710,7 +1720,7 @@ impl MacOSDebugger
                 {
                     continue;
                 }
-                let desc = crate::symbols::ImageDescriptor {
+                let desc = ferros_core::symbols::ImageDescriptor {
                     path: std::path::PathBuf::from(name),
                     load_address: region.start.value(),
                 };

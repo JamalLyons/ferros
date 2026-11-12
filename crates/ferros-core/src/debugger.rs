@@ -119,13 +119,13 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// let mut debugger = MacOSDebugger::new()?;
     /// let pid = debugger.launch("/usr/bin/echo", &["echo", "Hello, world!"])?;
     /// // Process is now suspended and ready for debugging
     /// println!("Launched process with PID: {}", pid.0);
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn launch(&mut self, program: &str, args: &[&str]) -> Result<ProcessId>;
 
@@ -151,12 +151,12 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
-    /// use ferros_core::platform::macos::MacOSDebugger;
     /// use ferros_core::types::{Address, ProcessId};
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// let mut debugger = MacOSDebugger::new()?;
     /// debugger.attach(ProcessId::from(12345))?;
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn attach(&mut self, pid: ProcessId) -> Result<()>;
 
@@ -198,11 +198,12 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// let regs = debugger.read_registers()?;
     /// println!("Program counter: {}", regs.pc);
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn read_registers(&self) -> Result<Registers>;
 
@@ -338,12 +339,13 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::{Address, Debugger};
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let data = debugger.read_memory(Address::from(0x1000), 16)?;
     /// println!("Read {} bytes: {:?}", data.len(), data);
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn read_memory(&self, addr: Address, len: usize) -> Result<Vec<u8>>;
 
@@ -375,12 +377,13 @@ pub trait Debugger
     /// ```rust,no_run
     /// use ferros_core::Debugger;
     /// use ferros_core::types::Address;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let data = vec![0x41, 0x42, 0x43, 0x44];
     /// debugger.write_memory(Address::from(0x1000), &data)?;
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn write_memory(&mut self, addr: Address, data: &[u8]) -> Result<usize>;
 
@@ -407,8 +410,8 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let regions = debugger.get_memory_regions()?;
     /// for region in regions {
@@ -417,7 +420,8 @@ pub trait Debugger
     ///         region.start, region.end, region.permissions, region.name
     ///     );
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn get_memory_regions(&self) -> Result<Vec<crate::types::MemoryRegion>>;
 
@@ -440,15 +444,16 @@ pub trait Debugger
     /// ```rust,no_run
     /// use ferros_core::Debugger;
     /// use ferros_core::types::Architecture;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// match debugger.architecture() {
     ///     Architecture::Arm64 => println!("Debugging ARM64 process"),
     ///     Architecture::X86_64 => println!("Debugging x86-64 process"),
     ///     Architecture::Unknown(name) => println!("Unknown architecture: {}", name),
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn architecture(&self) -> Architecture;
 
@@ -464,12 +469,13 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// if !debugger.is_attached() {
     ///     debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn is_attached(&self) -> bool;
 
@@ -488,15 +494,16 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// if debugger.is_stopped() {
     ///     println!("Process is stopped, can inspect registers/memory");
     /// } else {
     ///     println!("Process is running");
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn is_stopped(&self) -> bool;
 
@@ -517,8 +524,8 @@ pub trait Debugger
     /// ```rust,no_run
     /// use ferros_core::Debugger;
     /// use ferros_core::types::StopReason;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// match debugger.stop_reason() {
     ///     StopReason::Breakpoint(addr) => {
@@ -530,7 +537,8 @@ pub trait Debugger
     ///     }
     ///     _ => {}
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn stop_reason(&self) -> StopReason;
 
@@ -556,13 +564,14 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// debugger.suspend()?;
     /// // Now safe to inspect process state
     /// let regs = debugger.read_registers()?;
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn suspend(&mut self) -> Result<()>;
 
@@ -587,14 +596,15 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// debugger.suspend()?;
     /// // ... inspect process state ...
     /// debugger.resume()?; // Continue execution
     ///
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn resume(&mut self) -> Result<()>;
 
@@ -620,15 +630,16 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let threads = debugger.threads()?;
     /// println!("Process has {} threads", threads.len());
     /// for thread in threads {
     ///     println!("Thread: {}", thread.raw());
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn threads(&self) -> Result<Vec<ThreadId>>;
 
@@ -647,15 +658,16 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// if let Some(thread) = debugger.active_thread() {
     ///     println!("Active thread: {}", thread.raw());
     /// } else {
     ///     println!("No active thread selected");
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn active_thread(&self) -> Option<ThreadId>;
 
@@ -677,8 +689,8 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let threads = debugger.threads()?;
     /// if let Some(thread) = threads.get(1) {
@@ -686,7 +698,8 @@ pub trait Debugger
     ///     // Now read_registers() will read from thread 1
     ///     let regs = debugger.read_registers()?;
     /// }
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn set_active_thread(&mut self, thread: ThreadId) -> Result<()>;
 
@@ -718,14 +731,15 @@ pub trait Debugger
     ///
     /// ```rust,no_run
     /// use ferros_core::Debugger;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// // Thread list may be stale
     /// debugger.refresh_threads()?; // Update thread list
     /// let threads = debugger.threads()?; // Now up-to-date
     ///
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     fn refresh_threads(&mut self) -> Result<()>;
 
@@ -742,49 +756,4 @@ pub trait Debugger
     // /// Single-step execution (execute one instruction)
     // /// Uses hardware single-step support: TF flag (x86) or SS bit (ARM)
     // fn single_step(&mut self) -> Result<()>;
-}
-
-/// Factory function to create a platform-specific debugger
-///
-/// This function automatically creates the correct debugger implementation
-/// for the current platform. It uses conditional compilation (`#[cfg]`)
-/// to select the right implementation at compile time.
-///
-/// ## Why a factory function?
-///
-/// - **Convenience**: Users don't need to know which debugger type to use
-/// - **Platform abstraction**: Same code works on all platforms
-/// - **Type erasure**: Returns `Box<dyn Debugger>` so you can store it generically
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// use ferros_core::Debugger;
-/// use ferros_core::debugger::create_debugger;
-/// use ferros_core::types::ProcessId;
-///
-/// let mut debugger = create_debugger()?;
-/// debugger.attach(ProcessId::from(12345))?;
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
-/// ```
-///
-/// ## Platform Support
-///
-/// - ✅ macOS: Returns `MacOSDebugger`
-/// - ⏳ Linux: Will return `LinuxDebugger` (future)
-/// - ⏳ Windows: Will return `WindowsDebugger` (future)
-pub fn create_debugger() -> Result<Box<dyn Debugger>>
-{
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Box::new(crate::platform::macos::MacOSDebugger::new()?))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(crate::error::DebuggerError::AttachFailed(format!(
-            "Debugger not yet implemented for platform: {}",
-            std::env::consts::OS
-        )))
-    }
 }

@@ -1,10 +1,13 @@
+mod platform;
+
 use std::process;
 
 use clap::{Parser, Subcommand};
-use ferros_core::debugger::create_debugger;
 use ferros_core::types::ProcessId;
 use ferros_core::{Debugger, Result as DebuggerResult};
 use ferros_utils::{LogFormat, LogLevel, debug, info, init_logging, init_logging_with_level};
+
+use crate::platform::create_debugger;
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]

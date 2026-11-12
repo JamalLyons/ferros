@@ -13,6 +13,11 @@ categories = ["development-tools"]
 [dependencies]
 ferros-core = { path = "../ferros-core" }
 
+# The macOS debugger. The crate keeps building on other OSes because the harness that
+# uses it is gated on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+ferros-macos = { path = "../ferros-macos" }
+
 # Only the tests need the scripted mock backend. Keeping the feature here leaves it out
 # of ordinary workspace builds, so the `ferros` binary is not built with the mock.
 [dev-dependencies]

@@ -19,7 +19,7 @@ use thiserror::Error;
 /// - **Type safety**: The compiler ensures we handle all error cases
 /// - **Pattern matching**: Can match on specific error types
 /// - **Better error messages**: Each variant can have a custom message
-/// - **Error chaining**: Can convert from platform-specific errors (like MachError)
+/// - **Error chaining**: Platform crates convert their own errors into these variants
 ///
 /// ## Error Categories
 ///
@@ -28,7 +28,7 @@ use thiserror::Error;
 /// 3. **Breakpoint errors**: NoBreakpoint, BreakpointIdNotFound
 /// 4. **Permission errors**: PermissionDenied
 /// 5. **Resource errors**: ResourceExhausted (hardware breakpoint/watchpoint limits)
-/// 6. **Platform errors**: MachError (macOS-specific)
+/// 6. **OS errors**: Os (any other operating-system failure, with the raw OS code)
 /// 7. **I/O errors**: Io (for file operations, etc.)
 #[derive(Error, Debug)]
 pub enum DebuggerError
@@ -136,8 +136,8 @@ pub enum DebuggerError
     /// use ferros_core::breakpoints::BreakpointRequest;
     /// use ferros_core::error::DebuggerError;
     /// use ferros_core::types::Address;
+    /// # fn example(debugger: &mut dyn ferros_core::Debugger) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # let address = Address::from(0x1000);
     /// let breakpoint_id = match debugger.add_breakpoint(BreakpointRequest::Hardware { address }) {
     ///     Err(DebuggerError::ResourceExhausted(msg)) => {
@@ -148,7 +148,8 @@ pub enum DebuggerError
     ///     Ok(id) => id,
     ///     Err(e) => return Err(e),
     /// };
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
@@ -194,17 +195,15 @@ pub enum DebuggerError
         details: String,
     },
 
-    /// macOS-specific Mach API error
-    ///
-    /// This wraps errors from the Mach kernel APIs. Common errors:
-    /// - `KERN_PROTECTION_FAILURE`: Permission denied
-    /// - `KERN_INVALID_ARGUMENT`: Invalid PID or argument
-    /// - `KERN_FAILURE`: Process not found
-    ///
-    /// See: [Mach Kernel Return Codes](https://developer.apple.com/documentation/kernel/kern_return_t)
-    #[cfg(target_os = "macos")]
-    #[error("Mach API error: {0}")]
-    MachError(#[from] crate::platform::macos::error::MachError),
+    /// Any other operating-system failure, carrying the raw OS code and message.
+    #[error("OS error {code}: {message}")]
+    Os
+    {
+        /// Raw error code reported by the operating system (errno, kern_return_t, ...).
+        code: i64,
+        /// Human-readable description of the failure.
+        message: String,
+    },
 
     /// I/O error (for file operations, etc.)
     ///

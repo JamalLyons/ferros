@@ -33,14 +33,14 @@
 //! - [ARM CPSR Register](https://developer.arm.com/documentation/dui0801/a/A32-and-T32-Instructions/CPSR)
 //! - [ARM_THREAD_STATE64 structure](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/arm/_structs.h)
 
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::{Address, Architecture, Registers, VectorRegisterValue};
 use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use tracing::debug;
 
-use crate::error::{DebuggerError, Result};
-use crate::platform::macos::{constants, ffi};
-use crate::types::{Address, Architecture, Registers, VectorRegisterValue};
+use crate::{constants, ffi};
 
 /// Read ARM64 registers from a thread
 ///

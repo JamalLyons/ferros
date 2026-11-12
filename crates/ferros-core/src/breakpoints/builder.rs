@@ -27,13 +27,14 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 /// use ferros_core::Debugger;
 /// use ferros_core::breakpoints::builder::BreakpointBuilder;
 /// use ferros_core::types::Address;
+/// # fn example<D: ferros_core::Debugger>(debugger: &mut D) -> ferros_core::Result<()> {
 ///
-/// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
 /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
 ///     .with_hit_count(5) // Break after 5 hits
 ///     .with_condition(|regs| regs.pc.value() > 0x2000) // Only break if PC > 0x2000
-///     .install(&mut debugger)?;
-/// # Ok::<(), ferros_core::error::DebuggerError>(())
+///     .install(debugger)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct BreakpointBuilder
 {
@@ -286,14 +287,15 @@ impl BreakpointBuilder
     /// use ferros_core::Debugger;
     /// use ferros_core::breakpoints::builder::BreakpointBuilder;
     /// use ferros_core::types::Address;
+    /// # fn example<D: ferros_core::Debugger>(debugger: &mut D) -> ferros_core::Result<()> {
     ///
-    /// # let mut debugger = ferros_core::platform::macos::MacOSDebugger::new()?;
     /// # debugger.attach(ferros_core::types::ProcessId::from(12345))?;
     /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
     ///     .with_hit_count(5)
-    ///     .install(&mut debugger)?;
+    ///     .install(debugger)?;
     /// println!("Installed breakpoint with ID: {}", bp_id.raw());
-    /// # Ok::<(), ferros_core::error::DebuggerError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn install<D: crate::debugger::Debugger>(self, debugger: &mut D) -> Result<crate::breakpoints::BreakpointId>
     {

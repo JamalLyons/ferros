@@ -550,26 +550,38 @@ impl OutputBuffer
     }
 }
 
-/// Returns the pids of live processes whose argument list contains `tag` (`pgrep -f`).
+/// Returns the pids of live processes whose argument list contains `tag`.
+///
+/// The process list comes from `ps`, whose own arguments do not contain the tag. `pgrep -f`
+/// must not be used here: a `pgrep` carries the tag in its own argument list, so two searches
+/// running at the same time (a launch watchdog sweeping while the test thread checks) list
+/// each other and report a pid for a process that is not a fixture.
 ///
 /// Exited processes that have not been reaped (zombies) have no argument list and are not
 /// returned.
 #[must_use]
 pub fn tagged_pids(tag: &str) -> Vec<u32>
 {
-    let Ok(output) = Command::new("/usr/bin/pgrep")
-        .arg("-f")
-        .arg("--")
-        .arg(tag)
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-axww", "-o", "pid=,command="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&output.stdout)
+    pids_with_tag(&String::from_utf8_lossy(&output.stdout), tag)
+}
+
+/// Picks the pids out of `ps -o pid=,command=` output whose command line contains `tag`.
+fn pids_with_tag(ps_output: &str, tag: &str) -> Vec<u32>
+{
+    ps_output
         .lines()
-        .filter_map(|line| line.trim().parse().ok())
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(char::is_whitespace)?;
+            if command.contains(tag) { pid.parse().ok() } else { None }
+        })
         .collect()
 }
 
@@ -803,6 +815,33 @@ mod tests
         assert!(!status.success(), "the tagged process should have been killed, got {status}");
         assert!(watchdog.disarm(), "disarm() must report that the launch stalled");
         assert_eq!(tagged_pids(&tag), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn concurrent_tag_searches_do_not_list_each_other()
+    {
+        // Nothing carries this tag, so every search must come back empty even while other
+        // threads search for the same tag (the watchdog does exactly that during a sweep).
+        let tag = unique_tag();
+        let searchers: Vec<_> = (0..4)
+            .map(|_| {
+                let tag = tag.clone();
+                thread::spawn(move || (0..10).flat_map(|_| tagged_pids(&tag)).collect::<Vec<u32>>())
+            })
+            .collect();
+        for searcher in searchers {
+            assert_eq!(searcher.join().expect("searcher thread"), Vec::<u32>::new());
+        }
+    }
+
+    #[test]
+    fn pids_with_tag_matches_only_command_lines_that_contain_the_tag()
+    {
+        let ps_output = "    1 /sbin/launchd\n  412 /tmp/ferros-fixture-hello --ferros-test-id=7-0-1\n 5021 /usr/bin/yes \
+                         --ferros-test-id=7-1-2\n  733 (yes)\n";
+        assert_eq!(pids_with_tag(ps_output, "--ferros-test-id=7-0-1"), vec![412]);
+        assert_eq!(pids_with_tag(ps_output, "--ferros-test-id=7-"), vec![412, 5021]);
+        assert_eq!(pids_with_tag(ps_output, "--ferros-test-id=9"), Vec::<u32>::new());
     }
 
     #[test]

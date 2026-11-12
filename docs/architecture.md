@@ -151,11 +151,39 @@ The `ferros-core` crate contains the portable debugging engine. `Session` applie
 
 #### Module Structure
 
-The session engine is organized under `crates/ferros-core/src/session/`, with lifecycle, breakpoints, stack and images modules. The portable `Backend` trait and scripted `MockBackend` are in `crates/ferros-core/src/backend/`; CPU-specific knowledge is in `arch/`.
+```
+ferros-core/src/
+├── lib.rs              # Public API and re-exports, #![forbid(unsafe_code)]
+├── session/            # Session: the portable engine (policy)
+│   ├── mod.rs          # State machine, thread selection, registers, memory
+│   ├── lifecycle.rs    # launch, attach, detach, resume, wait
+│   ├── breakpoints.rs  # Software breakpoint table
+│   ├── stack.rs        # Stack traces and symbolication
+│   └── images.rs       # Loading the backend's image list into the symbol cache
+├── backend/            # Backend trait (mechanism), StopEvent, LaunchSpec, MockBackend
+├── arch/               # CPU knowledge independent of the OS
+├── breakpoints/        # Breakpoint types and store
+├── symbols/            # Symbol resolution, DWARF parsing, unwinding
+├── types/              # Core type definitions
+├── error.rs            # Error types
+└── events.rs           # Event types
 
-`Session::new(backend: Box<dyn Backend>)` creates a session. It owns process state, thread selection, software breakpoints, stack traces and symbolication. Software breakpoint trap bytes are written through `Backend::write_memory` using `Arch::trap_instruction`.
+ferros-macos/src/       # macOS implementation (the only crate with OS code)
+├── lib.rs
+├── task.rs             # MacOSBackend: impl Backend
+├── exception.rs        # Mach exception port loop, stop events
+├── launch.rs           # posix_spawn with LaunchSpec
+├── images.rs           # Backend::images (main executable only for now)
+├── memory.rs
+├── threads.rs
+├── breakpoints.rs      # Hardware breakpoints and watchpoints (not on Session)
+├── registers/
+│   ├── arm64.rs
+│   └── x86_64.rs       # carried along, untested
+└── ...
+```
 
-`crates/ferros-macos` exposes `ferros_macos::MacOSBackend`, which implements `ferros_core::Backend`. Its image enumeration delegates to `src/images.rs` and currently returns only the main executable. Hardware breakpoints and watchpoints remain public in the macOS crate.
+`Session::new(backend: Box<dyn Backend>)` creates a session. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
 
 #### Platform Factory
 
@@ -373,8 +401,8 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../crates/ferros/src/main.rs#L182-L223)
 3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
 4. **Launch process**: `session.launch()` spawns process in suspended state
-5. **Resume process**: `session.resume()` starts execution
-6. **Start TUI**: `ferros_ui::run_tui()` initializes TUI and enters event loop
+5. **Show information**: the headless CLI prints the state, threads and memory regions while the process is stopped at entry
+6. **Detach**: `session.detach()` releases the process, which then runs on its own (the interactive front end is being rebuilt)
 
 ### Attaching to a Process
 
@@ -399,24 +427,65 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 1. **User requests breakpoint**: Via CLI or TUI
 2. **Create request**: `BreakpointRequest::Software { address }`
 3. **Add breakpoint**: `session.add_breakpoint(request)`
-4. **Platform installs**:
-   - macOS: Read original instruction, write BRK/INT3, store original bytes
-   - Linux: Similar process with ptrace
-5. **Process hits breakpoint**: Kernel delivers exception
-6. **Session receives event**: `TargetStopped { reason: Breakpoint(addr) }`
+4. **Session installs**: reads the original instruction with `Backend::read_memory`, writes the trap from `Arch::trap_instruction` with `Backend::write_memory`, and stores the original bytes in its table
+5. **Process hits breakpoint**: the kernel delivers an exception to the backend, which stops every thread
+6. **Session receives event**: `Session::wait` returns `StopEvent::Breakpoint { thread, pc }` and records the hit
 7. **TUI updates**: Shows breakpoint hit, allows inspection
 
 ---
 
 ## Platform Boundary
 
-`Backend` is mechanism, `Session` is policy, and `Arch` is CPU knowledge. The portable `Session` engine drives any `Backend`.
+All operating-system code sits behind one trait. Three pieces of `ferros-core` define the boundary:
 
-The rules are: `ferros-core` has no OS dependency, no `cfg(target_os)`, and no `unsafe`; `unsafe` belongs only in a platform crate; and the CLI names a platform crate only in `crates/ferros/src/platform.rs`. CI enforces the boundary with `just check-boundary` on both runners, alongside `crates/ferros-tests/tests/platform_boundary.rs`.
+| Piece | Role | Where |
+|-------|------|-------|
+| `Backend` | Mechanism: control one process, read and write its registers and memory, list threads, regions and images, and report why it stopped (`StopEvent`). | [`crates/ferros-core/src/backend/`](../crates/ferros-core/src/backend/) |
+| `Session` | Policy: the process state machine (not started, running, stopped, exited), thread selection, the software breakpoint table, stack traces and symbolication. It owns a `Box<dyn Backend>` and works with any backend. | [`crates/ferros-core/src/session/`](../crates/ferros-core/src/session/) |
+| `Arch` | CPU knowledge that does not depend on the OS: trap bytes, which register is the pc, how to map the pc of a trap stop. | [`crates/ferros-core/src/arch/`](../crates/ferros-core/src/arch/) |
+
+A backend never interprets what it is asked to do. Software breakpoints show the split: `Session` reads the original bytes with `Backend::read_memory`, writes `Arch::trap_instruction` with `Backend::write_memory`, and keeps the original bytes in its own table. The backend knows nothing about breakpoints; it reports a trap as `StopEvent::Breakpoint` with the raw pc, and `Session` maps that pc with `Arch::pc_after_trap` and counts the hit. The state machine and the full contract of every call are documented on the `Backend` trait and in the `session` module.
+
+Two backends exist:
+
+- `ferros_macos::MacOSBackend` in [`crates/ferros-macos/`](../crates/ferros-macos/) uses Mach process control (`task_for_pid`, thread state, `mach_vm` memory calls, Mach exception ports) and `posix_spawn`. `Backend::images` delegates to `src/images.rs`, which for now reports only the main executable. Hardware breakpoints and watchpoints are not part of `Backend` or `Session`; that code stays public inside the macOS crate.
+- `MockBackend` in `ferros_core::backend::mock` is a scripted, in-memory backend. It is compiled for `ferros-core`'s own tests and, through the `test-util` feature, for other crates' tests. The `Session` unit tests run against it on any OS, including the Ubuntu CI job.
+
+### Rules
+
+1. `ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`, a platform crate), no `cfg(target_os)` and no `unsafe`. It declares `#![forbid(unsafe_code)]`.
+2. `unsafe` is allowed only in a platform crate, for raw OS bindings.
+3. The CLI names a platform crate in exactly one module, [`crates/ferros/src/platform.rs`](../crates/ferros/src/platform.rs). That module is also the only `cfg(target_os)` switch outside the platform and test crates.
+4. Engine behaviour is tested twice: against `MockBackend` in `ferros-core`, and against real fixture processes in `crates/ferros-tests`.
+
+The rules are enforced by `just check-boundary` ([`scripts/check-boundary.sh`](../scripts/check-boundary.sh)), which CI runs on both the Ubuntu and the macOS runner, and by [`crates/ferros-tests/tests/platform_boundary.rs`](../crates/ferros-tests/tests/platform_boundary.rs).
 
 ### How to Add a Platform
 
-Create a crate that implements `Backend`, then add one `cfg(target_os = ...)` arm to `create_backend` in `crates/ferros/src/platform.rs`. Test the engine against `MockBackend` and the platform against real fixture processes.
+1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
+2. Add the crate as a target-specific dependency of `crates/ferros` and add one arm to the factory:
+
+```rust
+pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
+{
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(ferros_macos::MacOSBackend::new()?))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(ferros_linux::LinuxBackend::new()?))
+    }
+    // ...
+}
+```
+
+3. Add integration tests for the platform in `crates/ferros-tests` that debug the fixture programs through `Session`.
+
+Nothing in `ferros-core` changes: `Session`, the breakpoint table, unwinding and symbolication already work with any `Backend`. If the new platform needs something the trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
+
+---
 
 ## Error Handling
 

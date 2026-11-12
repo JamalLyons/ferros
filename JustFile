@@ -98,6 +98,10 @@ fmt-check:
     @echo "🔍 Checking code formatting..."
     @cargo fmt --all -- --check
 
+# Check the portable platform boundary
+check-boundary:
+    @sh scripts/check-boundary.sh
+
 # Run clippy linter
 lint:
     @echo "🔍 Running clippy..."

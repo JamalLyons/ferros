@@ -15,7 +15,7 @@ This document provides a comprehensive guide to Ferros' architecture, designed t
    - [ferros-mir](#ferros-mir)
    - [ferros-utils](#ferros-utils)
 5. [Data Flow](#data-flow)
-6. [Platform Abstraction](#platform-abstraction)
+6. [Platform Boundary](#platform-boundary)
 7. [Error Handling](#error-handling)
 8. [Future Architecture](#future-architecture)
 
@@ -57,7 +57,7 @@ The architecture follows a **layered design** where each crate has a specific re
 │  │  └────┬────┘  └────┬─────┘  └────┬─────┘               │  │
 │  │       │            │             │                     │  │
 │  │  ┌────┴────────────┴─────────────┴───────┐             │  │
-│  │  │         Debugger Trait                │             │  │
+│  │  │       Session and Backend              │             │  │
 │  │  └───────────────────────────────────────┘             │  │
 │  └────────────────────────────────────────────────────────┘  │
 └───────────────────────────┬──────────────────────────────────┘
@@ -147,77 +147,29 @@ The CLI supports several commands:
 
 **Location**: [`crates/ferros-core/`](../crates/ferros-core/)
 
-The `ferros-core` crate is the heart of Ferros. It provides platform-agnostic debugging primitives through the `Debugger` trait. It holds no OS-specific code: each platform is implemented in its own crate (macOS in [`crates/ferros-macos/`](../crates/ferros-macos/)).
+The `ferros-core` crate contains the portable debugging engine. `Session` applies debugging policy through the `Backend` mechanism interface; `Arch` contains CPU knowledge. Platform implementations live in their own crates.
 
 #### Module Structure
 
-```
-ferros-core/src/
-├── lib.rs              # Public API and re-exports
-├── debugger.rs         # Debugger trait definition
-├── error.rs            # Error types
-├── events.rs           # Event system for async notifications
-├── breakpoints/        # Breakpoint management
-│   ├── mod.rs
-│   └── builder.rs
-├── symbols/            # Symbol resolution and DWARF parsing
-│   ├── mod.rs
-│   ├── cache.rs
-│   ├── demangle.rs
-│   ├── extractor.rs
-│   ├── image.rs
-│   └── unwind.rs
-├── types/              # Core type definitions
-│   ├── mod.rs
-│   ├── address.rs
-│   ├── process.rs
-│   ├── registers.rs
-│   ├── stack.rs
-│   └── symbols.rs
-├── arch/               # CPU knowledge independent of the OS
-└── backend/            # Portable Backend trait, stop events, mock backend
+The session engine is organized under `crates/ferros-core/src/session/`, with lifecycle, breakpoints, stack and images modules. The portable `Backend` trait and scripted `MockBackend` are in `crates/ferros-core/src/backend/`; CPU-specific knowledge is in `arch/`.
 
-ferros-macos/src/       # macOS implementation (the only crate with OS code)
-├── lib.rs
-├── task.rs             # MacOSDebugger implementation
-├── breakpoints.rs
-├── memory.rs
-├── threads.rs
-├── registers/
-│   ├── arm64.rs
-│   └── x86_64.rs       # carried along, untested
-└── ...
-```
+`Session::new(backend: Box<dyn Backend>)` creates a session. It owns process state, thread selection, software breakpoints, stack traces and symbolication. Software breakpoint trap bytes are written through `Backend::write_memory` using `Arch::trap_instruction`.
 
-#### The Debugger Trait
-
-The `Debugger` trait is the central abstraction in Ferros. It defines what operations a debugger can perform, regardless of the underlying platform. This trait is defined in [`crates/ferros-core/src/debugger.rs`](../crates/ferros-core/src/debugger.rs).
-
-**Key Methods**:
-
-- **Lifecycle**: `launch()`, `attach()`, `detach()`
-- **Execution Control**: `suspend()`, `resume()`
-- **Inspection**: `read_registers()`, `read_memory()`, `get_memory_regions()`
-- **Thread Management**: `threads()`, `set_active_thread()`, `refresh_threads()`
-- **Breakpoints**: `add_breakpoint()`, `remove_breakpoint()`, `enable_breakpoint()`, etc.
-- **Stack Unwinding**: `stack_trace()`
-- **State Queries**: `is_attached()`, `is_stopped()`, `stop_reason()`, `architecture()`
-
-**Code Reference**: [`crates/ferros-core/src/debugger.rs:52-743`](../crates/ferros-core/src/debugger.rs#L52-L743)
+`crates/ferros-macos` exposes `ferros_macos::MacOSBackend`, which implements `ferros_core::Backend`. Its image enumeration delegates to `src/images.rs` and currently returns only the main executable. Hardware breakpoints and watchpoints remain public in the macOS crate.
 
 #### Platform Factory
 
-The `create_debugger()` function creates the debugger implementation for the current platform. It lives in the CLI crate, which is the only place that switches on the target operating system:
+The CLI factory is `crates/ferros/src/platform.rs`:
 
 ```rust
-pub fn create_debugger() -> ferros_core::Result<Box<dyn Debugger>>
+pub fn create_backend() -> ferros_core::Result<Box<dyn ferros_core::Backend>>
 ```
 
-**Code Reference**: [`crates/ferros/src/platform.rs`](../crates/ferros/src/platform.rs)
+It is the only CLI module that names a platform crate and the only `cfg(target_os)` switch outside platform and test crates.
 
 #### Error Handling
 
-All debugger operations return `Result<T, DebuggerError>`. The error types are defined in [`crates/ferros-core/src/error.rs`](../crates/ferros-core/src/error.rs) and use `thiserror` for structured error handling.
+Session and backend operations return the crate result type. The error types are defined in [`crates/ferros-core/src/error.rs`](../crates/ferros-core/src/error.rs) and use `thiserror` for structured error handling.
 
 **Common Error Types**:
 - `NotAttached`: Operation requires an attached process
@@ -279,23 +231,9 @@ The `types` module defines core types used throughout Ferros:
 
 **Code Reference**: [`crates/ferros-core/src/types/mod.rs`](../crates/ferros-core/src/types/mod.rs)
 
-#### Platform-Specific Implementation (macOS)
+#### Platform Implementation (macOS)
 
-The macOS implementation uses Mach APIs to interact with processes. It lives in its own crate, `ferros-macos`; the main implementation is in [`crates/ferros-macos/src/task.rs`](../crates/ferros-macos/src/task.rs).
-
-**Key Mach APIs Used**:
-- `task_for_pid()`: Get Mach port to a process
-- `task_threads()`: Enumerate threads
-- `thread_get_state()`: Read thread registers
-- `vm_read()`/`vm_write()`: Read/write memory
-- `mach_vm_region()`: Enumerate memory regions
-- `posix_spawn()`: Launch processes
-
-**Architecture Support**:
-- **ARM64**: Uses `ARM_THREAD_STATE64` flavor
-- **x86_64**: Uses `X86_THREAD_STATE64` flavor (carried along, untested)
-
-**Code Reference**: [`crates/ferros-macos/src/lib.rs`](../crates/ferros-macos/src/lib.rs)
+The `ferros-macos` crate implements `Backend` using macOS process and Mach APIs. `MacOSBackend` is its public backend type. `Backend::images` delegates to `crates/ferros-macos/src/images.rs`.
 
 ---
 
@@ -321,7 +259,7 @@ ferros-ui/src/
 
 The `App` struct in [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs) manages the application state:
 
-- **Debugger instance**: The `Debugger` trait object
+- **Session**: A `Session` drives its backend
 - **View modes**: Overview, Registers, Threads, Memory Regions, Output
 - **Table states**: For navigating registers, threads, memory regions
 - **Process output**: Captured stdout/stderr from launched processes
@@ -433,23 +371,23 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
 2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../crates/ferros/src/main.rs#L182-L223)
-3. **Create debugger**: `create_debugger()` (in `crates/ferros/src/platform.rs`) returns platform-specific implementation
-4. **Launch process**: `debugger.launch()` spawns process in suspended state
-5. **Resume process**: `debugger.resume()` starts execution
+3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
+4. **Launch process**: `session.launch()` spawns process in suspended state
+5. **Resume process**: `session.resume()` starts execution
 6. **Start TUI**: `ferros_ui::run_tui()` initializes TUI and enters event loop
 
 ### Attaching to a Process
 
 1. **User invokes**: `ferros attach <pid>`
 2. **CLI parses command**: [`crates/ferros/src/main.rs:167-180`](../crates/ferros/src/main.rs#L167-L180)
-3. **Create debugger**: Platform-specific debugger instance
-4. **Attach to process**: `debugger.attach(pid)` gets Mach port (macOS) or uses ptrace (Linux)
+3. **Create backend**: `create_backend()` supplies the platform mechanism
+4. **Attach to process**: `session.attach(pid)` gets Mach port (macOS) or uses ptrace (Linux)
 5. **Start TUI**: Interactive debugging session begins
 
 ### Reading Registers
 
 1. **User presses key** in TUI to view registers
-2. **TUI calls**: `debugger.read_registers()`
+2. **TUI calls**: `session.read_registers()`
 3. **Platform implementation**: 
    - macOS: `thread_get_state()` with appropriate flavor
    - Linux: `ptrace(PTRACE_GETREGS)`
@@ -460,51 +398,25 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User requests breakpoint**: Via CLI or TUI
 2. **Create request**: `BreakpointRequest::Software { address }`
-3. **Add breakpoint**: `debugger.add_breakpoint(request)`
+3. **Add breakpoint**: `session.add_breakpoint(request)`
 4. **Platform installs**:
    - macOS: Read original instruction, write BRK/INT3, store original bytes
    - Linux: Similar process with ptrace
 5. **Process hits breakpoint**: Kernel delivers exception
-6. **Debugger receives event**: `TargetStopped { reason: Breakpoint(addr) }`
+6. **Session receives event**: `TargetStopped { reason: Breakpoint(addr) }`
 7. **TUI updates**: Shows breakpoint hit, allows inspection
 
 ---
 
-## Platform Abstraction
+## Platform Boundary
 
-Ferros uses a trait-based approach to abstract platform differences. The `Debugger` trait defines the interface, and each platform provides its own implementation.
+`Backend` is mechanism, `Session` is policy, and `Arch` is CPU knowledge. The portable `Session` engine drives any `Backend`.
 
-### macOS Implementation
+The rules are: `ferros-core` has no OS dependency, no `cfg(target_os)`, and no `unsafe`; `unsafe` belongs only in a platform crate; and the CLI names a platform crate only in `crates/ferros/src/platform.rs`. CI enforces the boundary with `just check-boundary` on both runners, alongside `crates/ferros-tests/tests/platform_boundary.rs`.
 
-**Location**: [`crates/ferros-macos/src/`](../crates/ferros-macos/src/)
+### How to Add a Platform
 
-**Key Files**:
-- **`task.rs`**: Main `MacOSDebugger` implementation
-- **`ffi.rs`**: Foreign function declarations for Mach APIs
-- **`launch.rs`**: Process launching with `posix_spawn`
-- **`memory.rs`**: Memory reading/writing with `vm_read`/`vm_write`
-- **`threads.rs`**: Thread enumeration and management
-- **`registers/`**: Architecture-specific register handling
-
-**Code Reference**: [`crates/ferros-macos/src/lib.rs`](../crates/ferros-macos/src/lib.rs)
-
-### Future: Linux Implementation
-
-Linux will use `ptrace` system calls:
-- `PTRACE_ATTACH`: Attach to process
-- `PTRACE_GETREGS`: Read registers
-- `PTRACE_PEEKDATA`/`PTRACE_POKEDATA`: Read/write memory
-- `PTRACE_CONT`: Resume execution
-
-### Future: Windows Implementation
-
-Windows will use the Windows Debug API:
-- `DebugActiveProcess()`: Attach to process
-- `GetThreadContext()`/`SetThreadContext()`: Register access
-- `ReadProcessMemory()`/`WriteProcessMemory()`: Memory access
-- `ContinueDebugEvent()`: Resume execution
-
----
+Create a crate that implements `Backend`, then add one `cfg(target_os = ...)` arm to `create_backend` in `crates/ferros/src/platform.rs`. Test the engine against `MockBackend` and the platform against real fixture processes.
 
 ## Error Handling
 
@@ -525,7 +437,7 @@ Ferros uses structured error handling with `thiserror` for library errors and `a
 Errors are propagated using the `?` operator:
 
 ```rust
-let regs = debugger.read_registers()?;  // Propagates DebuggerError
+let regs = session.read_registers()?;
 ```
 
 **Code Reference**: [`crates/ferros-core/src/error.rs`](../crates/ferros-core/src/error.rs)
@@ -561,11 +473,11 @@ The `ferros-protocol` crate will enable:
 
 ## Conclusion
 
-Ferros is designed with a clear separation of concerns, allowing each component to be developed and tested independently. The trait-based platform abstraction enables cross-platform support while maintaining a clean API.
+Ferros is designed with a clear separation of concerns, allowing each component to be developed and tested independently. The `Backend` mechanism interface and `Session` policy engine support platform implementations behind a stable boundary.
 
 For contributors, the key entry points are:
 - **CLI**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
-- **Core API**: [`crates/ferros-core/src/debugger.rs`](../crates/ferros-core/src/debugger.rs)
+- **Core API**: [`crates/ferros-core/src/session/`](../crates/ferros-core/src/session/)
 - **Platform Implementation**: [`crates/ferros-macos/src/`](../crates/ferros-macos/src/)
 - **TUI**: [`crates/ferros-ui/src/app.rs`](../crates/ferros-ui/src/app.rs)
 

@@ -41,17 +41,19 @@ Run tests for an individual crate with `just test-crate <crate>` (concrete examp
 just test-crate ferros-core
 ```
 
-Check formatting and linting (clippy runs with warnings denied):
+Check the platform boundary, formatting and linting (clippy runs with warnings denied):
 ```sh
 just fmt-check
 just lint
+just check-boundary
 ```
 
-Before committing changes, ensure all four verification checks pass:
+Before committing changes, ensure all five verification checks pass:
 1. `just fmt-check`
 2. `just lint`
 3. `just test`
 4. `just test-integration`
+5. `just check-boundary`
 
 ## Rule
 Every engine change lands with an integration test in `crates/ferros-tests` that fails without the change. Tests for known-broken behaviour are kept as `#[ignore = "..."]` with a comment naming the issue that will fix it, not deleted.
@@ -88,7 +90,7 @@ Two environment switches are available for diagnostic and harness verification:
 - `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
 
 ## Conventions
-- Platform boundary: `crates/ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`), no `cfg(target_os)` and no `unsafe`; `crates/ferros-tests/tests/platform_boundary.rs` enforces this. OS code goes in a platform crate (`crates/ferros-macos`). The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
+- Platform boundary: `crates/ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`), no `cfg(target_os)` and no `unsafe`; `just check-boundary` and `crates/ferros-tests/tests/platform_boundary.rs` both enforce this. OS code goes in a platform crate (`crates/ferros-macos`). The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
 - `unsafe`: Forbidden workspace-wide via `unsafe_code = "forbid"` in the root `Cargo.toml`. Only `crates/ferros-macos` permits `unsafe` for raw Mach FFI bindings; `crates/ferros-core` forbids it too.
 - Formatting: Governed by `rustfmt.toml`. Format all code using:
 ```sh

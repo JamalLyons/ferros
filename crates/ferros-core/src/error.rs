@@ -8,6 +8,8 @@
 
 use thiserror::Error;
 
+use crate::backend::BackendError;
+
 /// Main error type for debugger operations
 ///
 /// This enum represents all the ways a debugger operation can fail.
@@ -211,6 +213,49 @@ pub enum DebuggerError
     /// This is a standard Rust `std::io::Error` converted to our error type.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A process is already being debugged, so `launch` or `attach` is refused.
+    ///
+    /// Returned by [`Session::launch`](crate::session::Session::launch) and
+    /// [`Session::attach`](crate::session::Session::attach) while the session is
+    /// stopped or running. Detach first, or wait for the process to exit.
+    #[error("A process is already being debugged")]
+    AlreadyAttached,
+
+    /// Operation requires the process to be running.
+    ///
+    /// Returned by [`Session::wait`](crate::session::Session::wait) with no timeout
+    /// while the process is stopped and no stop event is pending, since that wait
+    /// would never return.
+    #[error("Process must be running for this operation")]
+    NotRunning,
+
+    /// The named thread does not belong to the debugged process.
+    #[error("No thread with id {0}")]
+    ThreadNotFound(u64),
+
+    /// The operation needs a selected thread, but the process has no thread to select.
+    #[error("No thread is selected")]
+    NoThreadSelected,
+
+    /// An error reported by a [`Backend`](crate::backend::Backend), kept as is.
+    ///
+    /// [`BackendError::PermissionDenied`] is not wrapped: it converts to
+    /// [`DebuggerError::PermissionDenied`] instead, so callers that match on that
+    /// variant keep working.
+    #[error(transparent)]
+    Backend(BackendError),
+}
+
+impl From<BackendError> for DebuggerError
+{
+    fn from(error: BackendError) -> Self
+    {
+        match error {
+            BackendError::PermissionDenied(message) => Self::PermissionDenied(message),
+            other => Self::Backend(other),
+        }
+    }
 }
 
 /// Convenience type alias for `Result<T, DebuggerError>`

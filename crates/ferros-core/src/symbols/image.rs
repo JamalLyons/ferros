@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use addr2line::Context;
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian, SectionId};
@@ -234,7 +234,9 @@ pub struct BinaryImage
     eh_frame_hdr: Option<SectionBlob>,
     debug_frame: Option<SectionBlob>,
     dwarf_cache: OnceCell<OwnedDwarf>,
-    context_cache: OnceCell<Context<OwnedReader>>,
+    /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
+    /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
+    context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
     type_cache: RwLock<HashMap<String, Arc<TypeSummary>>>,
 }
 
@@ -588,12 +590,13 @@ impl BinaryImage
         EndianArcSlice::new(data, self.endian)
     }
 
-    fn symbol_context(&self) -> Result<&Context<OwnedReader>>
+    fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
     {
         self.context_cache.get_or_try_init(|| {
             let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF for addr2line: {err}")))?;
             Context::from_dwarf(dwarf)
+                .map(Mutex::new)
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to build addr2line context: {err}")))
         })
     }
@@ -647,7 +650,7 @@ impl BinaryImage
         };
 
         let ctx = match self.symbol_context() {
-            Ok(ctx) => ctx,
+            Ok(ctx) => ctx.lock().unwrap_or_else(PoisonError::into_inner),
             Err(e) => {
                 use tracing::debug;
                 debug!("Failed to get symbol context for {}: {}", self.path.display(), e);

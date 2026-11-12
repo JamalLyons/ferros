@@ -25,8 +25,15 @@
 //! process control, register and memory access, and stop reporting (mechanism only).
 //! [`arch::Arch`] holds CPU knowledge (trap bytes, pc/sp/fp/link register, pointer
 //! authentication) independent of the OS. Neither module contains OS-specific code.
+//!
+//! ## Session engine
+//!
+//! [`session::Session`] is the portable engine: it owns a `Box<dyn Backend>` and holds
+//! the policy (state machine, software breakpoint table, stack traces and
+//! symbolication) that works the same with every backend.
 
 #![warn(missing_docs)]
+#![forbid(unsafe_code)]
 
 pub mod arch;
 pub mod backend;
@@ -34,6 +41,7 @@ pub mod breakpoints;
 pub mod debugger;
 pub mod error;
 pub mod events;
+pub mod session;
 pub mod symbols;
 pub mod types;
 
@@ -44,6 +52,7 @@ pub use debugger::Debugger;
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
 pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};
+pub use session::{Session, SessionState};
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
     Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,

@@ -21,9 +21,13 @@ fn main()
         .nth(1)
         .and_then(|arg| arg.parse::<u64>().ok())
         .unwrap_or(3000);
+    let progress = std::env::args().nth(2).as_deref() == Some("--progress");
     let mut counter = 0;
     for _ in 0..count {
         counter = tick(counter); // BREAK: loop_call
+        if progress {
+            println!("tick: {counter}");
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     println!("final count: {counter}");

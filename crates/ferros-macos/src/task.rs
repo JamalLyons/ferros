@@ -30,8 +30,9 @@
 //! `resume` honours every [`ThreadAction`]. Before the target runs it `thread_suspend`s
 //! every thread whose action is `Suspend` and sets the hardware single-step bit
 //! (`MDSCR_EL1.SS`, see [`crate::registers::set_single_step`]) of every thread whose
-//! action is `Step`; the held exceptions of the suspended threads stay unanswered (see
-//! the exception module's "Kept exceptions"). When `wait` delivers the next stop, the
+//! action is `Step`. Suspended threads retain their stop records and unanswered Unix
+//! signal replies (see the exception module's "Held signals and retained thread
+//! rights"). Hardware replies have already been sent. When `wait` delivers the next stop, the
 //! whole task is `task_suspend`ed by the exception loop, so the backend balances its
 //! `thread_suspend`s with `thread_resume` and clears the single-step bit of every thread
 //! it asked to step: a step that did not complete is cancelled, as the contract says,
@@ -409,14 +410,12 @@ impl MacOSBackend
         threads::ThreadManager::resume_thread(&self.threads, thread_id)
     }
 
-    /// Test hook: make the next exception reply sent on resume report a failure.
+    /// Test hook: make the next exception reply report a failure.
     ///
-    /// The next time `resume` answers a held Mach exception, the reply is treated as if
-    /// `mach_msg` had failed with `MACH_SEND_INVALID_DEST`: `resume` still succeeds, and
-    /// the next `wait` returns `BackendError::Os` naming the reply failure, as it does for
-    /// a real failure. A real lost reply would leave the faulting thread blocked forever,
-    /// so the hook still sends the real reply; the target keeps running and can produce
-    /// later stops. Only replies sent on resume are affected, not those sent on detach.
+    /// The reply is still sent so the thread is not stranded, but `wait` reports an
+    /// injected `MACH_SEND_INVALID_DEST`. Hardware replies precede the stop event;
+    /// drain the stop and then the error before resuming. Unix signal replies remain
+    /// deferred until resume. An error from `wait` leaves the state unchanged.
     #[doc(hidden)]
     pub fn fail_next_exception_reply(&mut self)
     {
@@ -600,22 +599,12 @@ impl MacOSBackend
             let shared_state = Arc::clone(&self.exception_state);
             let architecture = self.architecture;
             let task = self.task;
-            let pid = self.pid.0 as libc::pid_t;
             let faults = self.reply_faults.clone();
             info!("Spawning Mach exception handler thread");
             let handle = thread::Builder::new()
                 .name("ferros-mac-exc".to_string())
                 .spawn(move || {
-                    exception::run_exception_loop(
-                        port,
-                        task,
-                        pid,
-                        command_rx,
-                        shared_state,
-                        architecture,
-                        loop_events,
-                        faults,
-                    );
+                    exception::run_exception_loop(port, task, command_rx, shared_state, architecture, loop_events, faults);
                 })
                 .map_err(|e| DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}")))?;
 
@@ -1241,9 +1230,8 @@ impl Backend for MacOSBackend
 
     /// Receive the next stop event from the exception loop (or an interrupt).
     ///
-    /// When the exception loop failed to reply to an exception on the last resume, that
-    /// failure is returned once as `BackendError::Os` (the state does not change), and
-    /// later calls report later stops as usual.
+    /// An exception reply failure is returned once as `BackendError::Os` (the state
+    /// does not change), and later calls report later stops as usual.
     ///
     /// The kqueue watcher publishes terminal events after waitpid has collected status.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>
@@ -1295,8 +1283,8 @@ impl Backend for MacOSBackend
     ///
     /// 1. `thread_suspend` every thread whose action is `Suspend` and set the single-step
     ///    bit (`MDSCR_EL1.SS`) of every thread whose action is `Step`;
-    /// 2. reply to the held exceptions of the threads that run (`Continue` or `Step`);
-    ///    those of `Suspend`ed threads stay held, and so do their signals;
+    /// 2. release runnable threads' stop records and answer their Unix signal replies;
+    ///    suspended threads retain their records and held signals;
     /// 3. `task_resume` once per suspend the backend holds.
     ///
     /// A step that completes is reported by `wait` as [`StopEvent::SingleStep`]. Whatever

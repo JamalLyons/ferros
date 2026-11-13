@@ -393,6 +393,13 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
             .status()
             .expect("run /bin/kill");
         assert!(status.success());
+        assert_eq!(
+            backend(&mut d)
+                .wait(Some(Duration::from_millis(100)))
+                .expect("wait while stopped"),
+            None,
+            "a signal sent while stopped was published before resume"
+        );
         backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
         let signalled = match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the signal") {
             Some(StopEvent::Signal { thread, signal: SIGUSR1 }) => thread,

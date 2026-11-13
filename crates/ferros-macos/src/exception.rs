@@ -20,24 +20,27 @@
 //! the running threads have stopped, so a thread that raised an exception at the same
 //! moment has queued its message by then: the loop drains the port without blocking and
 //! reports one event per message. It counts one suspend per stop in
-//! [`ExceptionSharedState::suspends`], keeps every message of the stop (each faulting
-//! thread waits for its reply), and queues the events on a channel that `wait` receives
-//! from, all under the shared lock. Resuming replies to the held messages and then
-//! balances the suspends with `task_resume`.
+//! [`ExceptionSharedState::suspends`], answers hardware exception messages, and queues
+//! their events under the shared lock. User code remains stopped by the task
+//! suspension. Keeping hardware replies unanswered would prevent external SIGKILL
+//! from taking effect. The loop still services the port while stopped, so it can
+//! answer SIGKILL without resuming user code. Only the exit watcher marks death and
+//! publishes terminal status.
 //!
-//! ## Kept exceptions
+//! ## Held signals and retained thread rights
 //!
-//! A resume can keep threads suspended (`ThreadAction::Suspend`, for example while
-//! another thread single-steps). The held exceptions of those threads are *kept*: they
-//! stay unanswered in [`ExceptionSharedState::held`] while the target runs, so their
-//! threads cannot move, and a kept soft-signal exception stays in
-//! [`ExceptionSharedState::soft_signals`], so a later resume can still pass or discard
-//! its signal. A kept exception is answered by the first later resume that lets its
-//! thread run (by the loop when that resume ends a stop it is waiting on, or by the
-//! backend itself when the loop is blocked receiving), and on shutdown, including when
-//! the loop exits because its port was destroyed. Kept exceptions never set
-//! [`ExceptionSharedState::pending_exception`], which means only "the loop is waiting
-//! for a command".
+//! Unix signal replies stay held until resume selects a signal with `PT_THUPDATE`.
+//! This preserves suppression, replacement and per-thread delivery semantics, but
+//! means external SIGKILL during a held signal stop is still deferred (issue #56).
+//! Ordinary signals received during a breakpoint stop are deferred until resume;
+//! their held replies can also defer SIGKILL before their signal stop is reported.
+//! Private attach/detach SIGSTOP replies also stay held for their ptrace handshake.
+//!
+//! A selective resume uses `thread_suspend` to keep threads stopped. Their logical
+//! exception records and any held signal replies remain in
+//! [`ExceptionSharedState::held`] until a later resume lets them run. Records own the
+//! message's thread right even after an early hardware reply; removing a record
+//! releases that right exactly once.
 //!
 //! ## Single-step
 //!
@@ -49,9 +52,9 @@
 //! ## Port rights
 //!
 //! Each exception message carries a send right for the faulting thread and one for its
-//! task. The loop releases the task right as soon as the message is decoded and the
-//! thread right once the message is answered (the backend holds its own right to the
-//! thread by then, so the name, which is the [`ThreadId`], stays valid). The reply
+//! task. The loop releases the task right when it processes the request (deferred
+//! requests retain it until resume or shutdown), and the thread right when its stop record is released (the backend holds its own right to
+//! the thread by then, so the name, which is the [`ThreadId`], stays valid). The reply
 //! consumes the send-once reply right.
 //!
 //! ## Failed replies
@@ -112,15 +115,14 @@ pub(crate) struct ExceptionSharedState
     /// Number of `task_suspend` calls the backend holds on the task and has not yet
     /// balanced with `task_resume` (the launch or attach stop, exception stops, interrupts).
     pub suspends: u32,
-    /// Whether the loop has reported a stop and waits for a command (it holds that
-    /// stop's exception messages). Kept exceptions alone never set it, so while the
-    /// target runs it is `false` until the loop reports the next exception stop.
+    /// Whether the loop has reported a stop and awaits its Continue command, while
+    /// still servicing the exception port. Kept records alone never set it.
     pub pending_exception: bool,
-    /// Every exception message held unanswered: the current stop's, and the kept ones
-    /// of threads a resume left suspended. Each thread waits in the kernel for its reply.
+    /// Logical records for the current stop and threads a resume left suspended.
+    /// Hardware exceptions are already replied to; soft signals retain their reply.
     pub(crate) held: Vec<HeldException>,
-    /// Threads of the held soft-signal exceptions (current or kept), whose ports remain
-    /// owned until reply.
+    /// Threads whose soft signals still await a client decision. The stop records
+    /// retain their thread rights until the threads are allowed to run.
     pub soft_signals: Vec<thread_act_t>,
     /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
     pub internal_stop: Option<mpsc::Sender<()>>,
@@ -152,7 +154,7 @@ pub struct ReplyFaultInjector(Arc<AtomicBool>);
 
 impl ReplyFaultInjector
 {
-    /// Make the next exception reply the backend sends on resume report a failure.
+    /// Make the next exception reply report a failure.
     ///
     /// See [`MacOSBackend::fail_next_exception_reply`](crate::MacOSBackend::fail_next_exception_reply).
     pub fn fail_next_exception_reply(&self)
@@ -197,14 +199,13 @@ struct MachExceptionRaiseRequest
 #[repr(C, align(8))]
 struct ReceiveBuffer([u8; 1024]);
 
-/// An exception message the loop holds: its thread waits in the kernel for the reply.
+/// A logical exception stop, retaining its thread right and any unanswered reply.
 #[derive(Debug)]
 pub(crate) struct HeldException
 {
-    /// Header of the request; `msgh_remote_port` is the send-once reply right.
-    header: mach_msg_header_t,
-    /// The send right for the faulting thread carried by the message, released after the
-    /// reply.
+    /// An unanswered request's send-once reply right; None after it is consumed.
+    header: Option<mach_msg_header_t>,
+    /// The message's thread send right, retained until its logical stop is released.
     thread: mach_port_t,
     soft_signal: bool,
 }
@@ -213,15 +214,13 @@ pub(crate) struct HeldException
 #[derive(Debug)]
 pub(crate) enum ExceptionLoopCommand
 {
-    /// Reply to every held exception except those of the threads in `keep`, which stay
-    /// held (see [`answer_held_exceptions`]). `()` is sent back on `ack` once every reply
-    /// was attempted; a reply that failed is queued as an `Err` on the event channel
-    /// before that.
+    /// Release stop records except for threads in `keep`, including any outstanding
+    /// signal replies (see [`answer_held_exceptions`]). Acknowledge after cleanup.
     Continue
     {
-        /// Receives `()` once the replies were attempted.
+        /// Receives `()` once the records were released.
         ack: mpsc::Sender<()>,
-        /// Threads whose held exceptions must stay unanswered (they stay suspended).
+        /// Threads whose stop records and deferred signal decisions must remain.
         keep: Vec<thread_act_t>,
     },
     /// Reply to every held exception (kept ones included), answer the queued ones, and
@@ -467,16 +466,11 @@ pub(crate) const EXC_SOFT_SIGNAL: i64 = 0x10003;
 /// `EXC_BREAKPOINT` (a `brk`, a hardware breakpoint, or a completed single-step).
 pub(crate) const EXC_ARM_BREAKPOINT: i64 = 1;
 
-/// Answer every held exception whose thread is not in `keep`, and keep the others.
+/// Release stop records for threads outside `keep`, answering any remaining replies.
 ///
-/// Called under the shared lock, by the exception loop when a resume ends the stop it is
-/// waiting on, and by the backend itself when a resume lets kept threads run while the
-/// loop is blocked receiving. Each answered message's thread right is released once,
-/// after its reply; a failed reply is queued as an `Err` on `events` (unless the process
-/// is dead). Soft signals of answered exceptions are dropped from
-/// [`ExceptionSharedState::soft_signals`]; those of kept exceptions stay, so a later
-/// resume can still pass or discard them. The caller has already issued `PT_THUPDATE`
-/// for the answered soft-signal exceptions.
+/// Called under the shared lock after the caller selects signals. Retained records
+/// keep their thread rights and signal decisions for a later resume. Failed replies
+/// are reported through `events` unless death is already known.
 #[cfg(target_os = "macos")]
 pub(crate) fn answer_held_exceptions(
     state: &mut ExceptionSharedState,
@@ -489,8 +483,10 @@ pub(crate) fn answer_held_exceptions(
     let (kept, answer): (Vec<HeldException>, Vec<HeldException>) = std::mem::take(&mut state.held)
         .into_iter()
         .partition(|exception| keep.contains(&exception.thread));
-    for exception in &answer {
-        let Err(failure) = reply_to_held(exception, faults) else {
+    for mut exception in answer {
+        let result = reply_to_held(&mut exception, faults);
+        deallocate_right(exception.thread);
+        let Err(failure) = result else {
             continue;
         };
         if state.dead || crate::lifecycle::task_is_dead(task) {
@@ -513,7 +509,9 @@ pub(crate) fn answer_held_exceptions(
 pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
 {
     for exception in std::mem::take(&mut state.held) {
-        if let Err(err) = send_exception_reply(&exception.header) {
+        if let Some(header) = exception.header
+            && let Err(err) = send_exception_reply(&header)
+        {
             error!("Failed to reply to a held Mach exception on shutdown: mach_msg returned {err:#x}");
         }
         deallocate_right(exception.thread);
@@ -522,24 +520,14 @@ pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
     state.soft_signals.clear();
 }
 
-/// Main exception handling loop that receives Mach exceptions.
+/// Receive Mach exceptions, suspend the task, and answer hardware exceptions before
+/// publishing their stops. Unix signal replies stay held until a Continue command.
+/// While stopped, alternate bounded Mach receives with command checks so SIGKILL
+/// can be answered when no held Unix signal blocks its delivery.
 ///
-/// This function runs in a separate thread and receives exception messages from the
-/// kernel via `mach_msg()`. For each stop it:
-///
-/// 1. Blocks until a message arrives, decodes it and reads the raw pc of the thread for a
-///    breakpoint
-/// 2. Under the shared lock: suspends the whole task (`task_suspend`, counted once),
-///    drains every other message already queued on the port without blocking, marks the
-///    exceptions as held and queues one [`StopEvent`] per message
-/// 3. Waits for a command from the backend
-/// 4. On [`ExceptionLoopCommand::Continue`], replies to every held message except the
-///    kept ones (see [`answer_held_exceptions`]), queues a failed reply as an `Err` for
-///    the next `wait`, and goes back to receiving
-///
-/// The loop exits on [`ExceptionLoopCommand::Shutdown`] (replying to the held and
-/// queued messages first, so the threads can continue after a detach) or when the
-/// exception port is destroyed (replying to the kept messages it still holds).
+/// Continue releases records of runnable threads and answers their remaining replies;
+/// Shutdown answers all held replies, drains queued messages and exits. Destroying
+/// the receive port also exits the loop and releases retained thread rights.
 ///
 /// See:
 /// - [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
@@ -549,7 +537,6 @@ pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
 pub(crate) fn run_exception_loop(
     exception_port: mach_port_t,
     task: mach_port_t,
-    pid: libc::pid_t,
     commands: mpsc::Receiver<ExceptionLoopCommand>,
     shared: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
@@ -557,48 +544,51 @@ pub(crate) fn run_exception_loop(
     faults: ReplyFaultInjector,
 )
 {
+    let mut deferred = std::collections::VecDeque::new();
     loop {
-        let buffer = match receive_exception(exception_port, false) {
-            Ok(buffer) => buffer,
-            Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
-                debug!("Mach exception port closed, exiting handler loop");
-                break;
-            }
-            Err(_) => continue,
-        };
-        let Some(first) = decode_request(&buffer) else {
-            continue;
-        };
-
-        // SIGKILL cannot be held or suppressed: Darwin delivers it through the
-        // signal-exception path too. Answer it and release our task suspensions so
-        // exit can finish even when the client is waiting while Stopped.
-        let codes = first.code;
-        if first.exception == EXC_SOFTWARE as exception_type_t
-            && codes[0] == EXC_SOFT_SIGNAL
-            && codes[1] == i64::from(libc::SIGKILL)
-        {
-            let (exception, _) = hold_exception(&first, architecture);
-            let mut state = lock_shared(&shared);
-            state.dead = true;
-            // SAFETY: this is the signal stop of our tracee; addr encodes its owned
-            // thread port. SIGKILL must be delivered before replying to the exception.
-            unsafe {
-                crate::ffi::ptrace(
-                    crate::ffi::ptrace_requests::PT_THUPDATE,
-                    pid,
-                    exception.thread as usize as *mut libc::c_char,
-                    libc::SIGKILL,
-                );
-            }
-            let _ = send_exception_reply(&exception.header);
-            deallocate_right(exception.thread);
-            for _ in 0..std::mem::take(&mut state.suspends) {
-                // SAFETY: balances only suspensions this backend owns.
-                unsafe {
-                    mach2::task::task_resume(task);
+        let pending = lock_shared(&shared).pending_exception;
+        if pending {
+            match commands.try_recv() {
+                Ok(ExceptionLoopCommand::Continue { ack, keep }) => {
+                    let mut state = lock_shared(&shared);
+                    answer_held_exceptions(&mut state, &keep, &faults, &events, task);
+                    state.pending_exception = false;
+                    let _ = ack.send(());
+                    continue;
                 }
+                Ok(ExceptionLoopCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                    release_held_exceptions(&mut lock_shared(&shared));
+                    reply_to_queued_exceptions(exception_port);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        let first = if !pending && !deferred.is_empty() {
+            deferred.pop_front().expect("deferred request")
+        } else {
+            let buffer = match receive_exception_with_timeout(exception_port, pending.then_some(10)) {
+                Ok(buffer) => buffer,
+                Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
+                    debug!("Mach exception port closed, exiting handler loop");
+                    break;
+                }
+                Err(_) => continue,
+            };
+            let Some(request) = decode_request(&buffer) else {
+                continue;
+            };
+            request
+        };
+        if reply_to_sigkill(&first, &events, &faults) {
+            continue;
+        }
+        if pending {
+            // An ordinary signal can enter the kernel after an early hardware
+            // reply, even though user code remains suspended. Preserve its reply
+            // until the client resumes; reporting a new stop now would change which
+            // signals must be drained before that resume. Still service SIGKILL.
+            deferred.push_back(first);
             continue;
         }
 
@@ -617,10 +607,15 @@ pub(crate) fn run_exception_loop(
             }
 
             let mut stops = vec![hold_exception(&first, architecture)];
+            for request in deferred.drain(..) {
+                stops.push(hold_exception(&request, architecture));
+            }
             // `task_suspend` returned, so threads that raised an exception at the same
             // moment have queued their messages: take them without blocking.
             while let Ok(buffer) = receive_exception(exception_port, true) {
-                if let Some(request) = decode_request(&buffer) {
+                if let Some(request) = decode_request(&buffer)
+                    && !reply_to_sigkill(&request, &events, &faults)
+                {
                     stops.push(hold_exception(&request, architecture));
                 }
             }
@@ -629,19 +624,28 @@ pub(crate) fn run_exception_loop(
             }
 
             state.pending_exception = true;
-            for (exception, event) in stops {
-                if matches!(event, StopEvent::Signal { .. }) && exception.soft_signal {
-                    state.soft_signals.push(exception.thread);
-                }
-                state.held.push(exception);
-                if matches!(
+            for (mut exception, event) in stops {
+                let internal = matches!(
                     event,
                     StopEvent::Signal {
                         signal: libc::SIGSTOP,
                         ..
                     }
-                ) && let Some(ready) = state.internal_stop.take()
-                {
+                ) && state.internal_stop.is_some();
+                // Hardware exceptions can be answered while the task remains
+                // suspended. Keeping their replies would defer an external SIGKILL.
+                // Unix signals must keep their reply until PT_THUPDATE on resume
+                // decides whether to suppress or deliver them (the remaining #56 gap).
+                let failure = if exception.soft_signal {
+                    None
+                } else {
+                    reply_to_held(&mut exception, &faults).err()
+                };
+                if matches!(event, StopEvent::Signal { .. }) && exception.soft_signal {
+                    state.soft_signals.push(exception.thread);
+                }
+                state.held.push(exception);
+                if internal && let Some(ready) = state.internal_stop.take() {
                     let _ = ready.send(());
                     continue;
                 }
@@ -651,24 +655,16 @@ pub(crate) fn run_exception_loop(
                 if let Err(err) = events.send(Ok(event)) {
                     warn!("Failed to send stop event from Mach loop: {err}");
                 }
-            }
-        }
-
-        match commands.recv() {
-            Ok(ExceptionLoopCommand::Continue { ack, keep }) => {
-                {
-                    let mut state = lock_shared(&shared);
-                    answer_held_exceptions(&mut state, &keep, &faults, &events, task);
-                    state.pending_exception = false;
+                if let Some(err) = failure {
+                    let _ = events.send(Err(err));
                 }
-                let _ = ack.send(());
-            }
-            Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
-                release_held_exceptions(&mut lock_shared(&shared));
-                reply_to_queued_exceptions(exception_port);
-                break;
             }
         }
+    }
+    // Deferred requests retain both message rights and their reply until the
+    // current stop is resumed or the handler shuts down.
+    for request in deferred {
+        reply_to_request(&request);
     }
     // The port was destroyed while the loop was blocked receiving: exceptions kept for
     // suspended threads are still held. Answer them, so those threads are not left
@@ -681,12 +677,22 @@ pub(crate) fn run_exception_loop(
 #[cfg(target_os = "macos")]
 fn receive_exception(exception_port: mach_port_t, poll: bool) -> std::result::Result<ReceiveBuffer, mach_msg_return_t>
 {
+    receive_exception_with_timeout(exception_port, poll.then_some(0))
+}
+
+/// A bounded receive also lets the loop check commands while a stop is pending.
+#[cfg(target_os = "macos")]
+fn receive_exception_with_timeout(
+    exception_port: mach_port_t,
+    timeout_ms: Option<u32>,
+) -> std::result::Result<ReceiveBuffer, mach_msg_return_t>
+{
     let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
     // No `MACH_RCV_LARGE`: an oversized message (never an exception request, which is
     // far smaller than the buffer) is destroyed instead of staying queued and spinning
     // the loop.
-    let (options, timeout) = if poll {
-        (MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0)
+    let (options, timeout) = if let Some(timeout) = timeout_ms {
+        (MACH_RCV_MSG | MACH_RCV_TIMEOUT, timeout)
     } else {
         (MACH_RCV_MSG, MACH_MSG_TIMEOUT_NONE)
     };
@@ -742,7 +748,7 @@ fn decode_request(buffer: &ReceiveBuffer) -> Option<MachExceptionRaiseRequest>
 ///
 /// Reads the pc of the faulting thread for a breakpoint (the thread is blocked in the
 /// kernel until the reply), then releases the task right the message carried. The thread
-/// right is kept until the reply.
+/// right is kept until the logical stop record is released.
 #[cfg(target_os = "macos")]
 fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architecture) -> (HeldException, StopEvent)
 {
@@ -767,7 +773,7 @@ fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architectur
     let event = stop_event_from_exception(exception_type, ThreadId::from(u64::from(thread_port)), pc, codes);
     (
         HeldException {
-            header: request.Head,
+            header: Some(request.Head),
             thread: thread_port,
             soft_signal: exception_type == EXC_SOFTWARE as exception_type_t && codes[0] == EXC_SOFT_SIGNAL,
         },
@@ -775,16 +781,49 @@ fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architectur
     )
 }
 
-/// Reply to a held exception on resume and release its thread right.
+/// Answer SIGKILL without releasing suspensions or marking death before the reaper.
+/// Returns true after consuming a SIGKILL request and its carried rights.
+#[cfg(target_os = "macos")]
+fn reply_to_sigkill(
+    request: &MachExceptionRaiseRequest,
+    events: &mpsc::Sender<LoopEvent>,
+    faults: &ReplyFaultInjector,
+) -> bool
+{
+    let codes = request.code;
+    if request.exception != EXC_SOFTWARE as exception_type_t
+        || codes[0] != EXC_SOFT_SIGNAL
+        || codes[1] != i64::from(libc::SIGKILL)
+    {
+        return false;
+    }
+    deallocate_right(request.task.name);
+    let mut exception = HeldException {
+        header: Some(request.Head),
+        thread: request.thread.name,
+        soft_signal: true,
+    };
+    // Darwin's issig delivers SIGKILL unconditionally after this reply, even
+    // with the task still suspended. Only the exit watcher marks and reaps death.
+    if let Err(err) = reply_to_held(&mut exception, faults) {
+        let _ = events.send(Err(err));
+    }
+    deallocate_right(exception.thread);
+    true
+}
+
+/// Consume an outstanding reply; the caller retains ownership of the thread right.
 ///
 /// With a failure injected through [`ReplyFaultInjector`], the reply is reported as
 /// failed although it is still sent, so the thread does not stay blocked forever.
 #[cfg(target_os = "macos")]
-fn reply_to_held(exception: &HeldException, faults: &ReplyFaultInjector) -> BackendResult<()>
+fn reply_to_held(exception: &mut HeldException, faults: &ReplyFaultInjector) -> BackendResult<()>
 {
+    let Some(header) = exception.header.take() else {
+        return Ok(());
+    };
     let injected = faults.take();
-    let sent = send_exception_reply(&exception.header);
-    deallocate_right(exception.thread);
+    let sent = send_exception_reply(&header);
     let failure = match sent {
         Err(kr) => Some((kr, "")),
         Ok(()) if injected => Some((MACH_SEND_INVALID_DEST, " (injected by fail_next_exception_reply)")),
@@ -831,12 +870,19 @@ fn reply_to_queued_exceptions(exception_port: mach_port_t)
         let Some(request) = decode_request(&buffer) else {
             continue;
         };
-        if let Err(kr) = send_exception_reply(&request.Head) {
-            error!("Failed to reply to a queued Mach exception: mach_msg returned {kr:#x}");
-        }
-        deallocate_right(request.thread.name);
-        deallocate_right(request.task.name);
+        reply_to_request(&request);
     }
+}
+
+/// Answer an unreported exception and release its carried send rights.
+#[cfg(target_os = "macos")]
+fn reply_to_request(request: &MachExceptionRaiseRequest)
+{
+    if let Err(kr) = send_exception_reply(&request.Head) {
+        error!("Failed to reply to a queued Mach exception: mach_msg returned {kr:#x}");
+    }
+    deallocate_right(request.thread.name);
+    deallocate_right(request.task.name);
 }
 
 /// Send a reply to a Mach exception message.

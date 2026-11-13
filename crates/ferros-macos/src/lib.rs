@@ -34,8 +34,8 @@
 //! - **Resume** honours every `ThreadAction`. `Step` sets the arm64 hardware single-step
 //!   bit (`MDSCR_EL1.SS`) of the thread, which then executes one instruction and stops
 //!   with `StopEvent::SingleStep`. `Suspend` keeps the thread `thread_suspend`ed while the
-//!   others run, and its held exception (and held signal) stays unanswered until a later
-//!   resume lets it run. The next stop `wait` delivers ends that resume: the per-thread
+//!   others run. Its stop record and any held Unix signal reply remain until a later
+//!   resume lets it run; hardware exception replies are sent while the task is stopped. The next stop `wait` delivers ends that resume: the per-thread
 //!   suspends are balanced and every single-step bit is cleared, so a step that did not
 //!   complete is cancelled; `detach`, `kill` and drop balance them too. `Step` is not
 //!   implemented on x86-64 (`BackendError::Unsupported`).

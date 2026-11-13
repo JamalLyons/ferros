@@ -90,8 +90,9 @@ fn resume_runs_hello()
   `/dev/null`); background threads tail them, and the directory is removed when the `Debuggee`
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
-  with a comment naming the issue: `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL
-  sent from outside while a stop is held, issue #56).
+  with a comment naming the issue: `tests/lifecycle.rs` (a SIGKILL sent from outside
+  while a Unix signal stop is held, issue #56). The corresponding breakpoint-stop
+  regression in `tests/exceptions.rs` is enabled.
 - `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.

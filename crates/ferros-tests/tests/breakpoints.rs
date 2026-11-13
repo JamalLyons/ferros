@@ -227,8 +227,9 @@ fn resume_stops_at_breakpoint_in_a_function()
     });
 }
 
-/// AC5: continuing from a breakpoint stop steps over the trap and the program runs to
-/// completion.
+/// Continuing from a breakpoint stop steps over the trap and the program runs to
+/// completion, without the caller calling `wait`. This was the test kept `#[ignore]`d for
+/// T07; AC5 (no ignored test names T07 any more) holds now that it runs.
 #[test]
 fn continue_past_breakpoint_runs_to_completion()
 {

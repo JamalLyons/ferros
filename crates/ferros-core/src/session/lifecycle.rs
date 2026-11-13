@@ -130,6 +130,7 @@ impl Session
     /// [`last_stop`](Self::last_stop) `None`) and that error is returned.
     pub fn resume(&mut self) -> Result<()>
     {
+        self.carried_signals.clear();
         self.resume_request(ResumeRequest::continue_all())
     }
 
@@ -138,12 +139,19 @@ impl Session
     /// (`ResumeRequest::continue_all().with_signal(thread, signal)`), so the program
     /// receives it. After any other stop it is the same as `resume`.
     ///
+    /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
+    /// because another stop cut its step-over sequence short (the signal is still held),
+    /// that signal is passed again now, together with the last stop's.
+    ///
     /// # Errors
     ///
     /// As for [`resume`](Self::resume).
     pub fn resume_with_signal(&mut self) -> Result<()>
     {
         let mut request = ResumeRequest::continue_all();
+        for (thread, signal) in std::mem::take(&mut self.carried_signals) {
+            request = request.with_signal(thread, signal);
+        }
         if let Some(StopEvent::Signal { thread, signal }) = self.last_stop.as_ref() {
             request = request.with_signal(*thread, *signal);
         }
@@ -154,9 +162,10 @@ impl Session
     {
         self.require_stopped()?;
         self.interrupt_requested = false;
-        if let Some(event) = self.backend.wait(Some(Duration::ZERO))? {
+        if let Some(event) = self.backend_wait(Some(Duration::ZERO))? {
             self.deferred = Some(event);
         } else {
+            self.stale_step = None;
             self.start_continue(request)?;
         }
         self.state = SessionState::Running;
@@ -196,6 +205,10 @@ impl Session
     /// threads, selection and breakpoint table are cleared. Traps are not restored: the
     /// memory that held them is gone.
     ///
+    /// If the process already ended while `resume` was stepping over a breakpoint (its
+    /// terminal event is waiting for the next [`wait`](Self::wait)), nothing is killed:
+    /// that event, for example `Exited { code }`, is recorded and returned instead.
+    ///
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, or the backend's error (the
@@ -203,11 +216,16 @@ impl Session
     pub fn kill(&mut self) -> Result<StopEvent>
     {
         self.require_process()?;
-        // A terminal event `resume` already took from the backend means the backend has
-        // no process left to kill.
-        if !self.deferred.as_ref().is_some_and(StopEvent::is_terminal) {
-            self.backend.kill()?;
+        // A terminal event `resume` already took from the backend means the process is
+        // gone and the backend has nothing left to kill: report how it really ended.
+        if let Some(event) = self.deferred.take_if(|event| event.is_terminal()) {
+            self.clear_process();
+            self.state = SessionState::Exited;
+            self.ownership = None;
+            self.last_stop = Some(event.clone());
+            return Ok(event);
         }
+        self.backend.kill()?;
         self.clear_process();
         self.state = SessionState::Exited;
         self.ownership = None;
@@ -266,11 +284,11 @@ impl Session
             let event = match self.state {
                 SessionState::Running => match self.deferred.take() {
                     Some(event) => Some(event),
-                    None => self.backend.wait(remaining)?,
+                    None => self.backend_wait(remaining)?,
                 },
                 _ => match timeout {
-                    Some(_) => self.backend.wait(remaining)?,
-                    None => Some(self.backend.wait(Some(Duration::ZERO))?.ok_or(DebuggerError::NotRunning)?),
+                    Some(_) => self.backend_wait(remaining)?,
+                    None => Some(self.backend_wait(Some(Duration::ZERO))?.ok_or(DebuggerError::NotRunning)?),
                 },
             };
             let Some(event) = event else {

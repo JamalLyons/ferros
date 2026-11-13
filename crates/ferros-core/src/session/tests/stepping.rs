@@ -449,11 +449,123 @@ fn terminal_event_during_resume_is_reported_and_kill_still_works()
         session.resume().unwrap();
         assert_eq!(session.state(), SessionState::Running);
         if kill {
-            assert_eq!(session.kill().unwrap(), StopEvent::Killed { signal: SIGKILL });
+            // The process already exited: kill reports that, not a SIGKILL.
+            assert_eq!(session.kill().unwrap(), StopEvent::Exited { code: 3 });
+            assert_eq!(session.last_stop(), Some(&StopEvent::Exited { code: 3 }));
         } else {
             assert_eq!(session.wait(None).unwrap(), Some(StopEvent::Exited { code: 3 }));
         }
         assert_eq!(session.state(), SessionState::Exited);
         assert_eq!(mock.state(), MockState::NoProcess);
     }
+}
+
+/// One stop reports the internal step and another thread's breakpoint: the breakpoint is
+/// reported, nothing is resumed while it is pending.
+#[test]
+fn event_reported_with_the_internal_step_is_not_skipped()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    mock.script_simultaneous([
+        MockStop::new(StopEvent::SingleStep { thread: T1 })
+            .set_pc(T1, Address::new(BP + 4))
+            .expect_resume(ResumeRequest::step(T1)),
+        MockStop::new(StopEvent::Breakpoint {
+            thread: T2,
+            pc: Address::new(BP2),
+        }),
+    ]);
+    session.resume().unwrap();
+    assert_eq!(peek(&mock, BP), TRAP);
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Breakpoint {
+            thread: T2,
+            pc: Address::new(BP2)
+        })
+    );
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert!(!mock.calls().contains(&MockCall::Resume(ResumeRequest::continue_all())));
+    // Nothing else is pending and the next resume works.
+    assert_eq!(session.wait(Some(Duration::ZERO)).unwrap(), None);
+    hit(&mock, BP2);
+    session.resume().unwrap();
+    assert!(matches!(session.wait(None).unwrap(), Some(StopEvent::Breakpoint { .. })));
+}
+
+/// Another event arrives before the internal step's completion in the same stop: the
+/// late `SingleStep` is dropped and never reaches the caller.
+#[test]
+fn late_single_step_of_an_abandoned_step_is_dropped()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    let interrupted = StopEvent::Interrupted { thread: None };
+    mock.script_simultaneous([
+        MockStop::new(interrupted.clone()).expect_resume(ResumeRequest::step(T1)),
+        MockStop::new(StopEvent::SingleStep { thread: T1 }).set_pc(T1, Address::new(BP + 4)),
+    ]);
+    session.resume().unwrap();
+    assert_eq!(session.wait(None).unwrap(), Some(interrupted));
+    assert_eq!(peek(&mock, BP), TRAP);
+    assert_eq!(session.wait(Some(Duration::ZERO)).unwrap(), None);
+    hit(&mock, BP2);
+    session.resume().unwrap();
+    assert!(matches!(session.wait(None).unwrap(), Some(StopEvent::Breakpoint { .. })));
+}
+
+/// `resume_with_signal` passes a signal to T2 on the final continue; T1's step-over is cut
+/// short by T1's own signal. T2's signal is still held, so the next `resume_with_signal`
+/// passes it together with T1's.
+#[test]
+fn signal_for_another_thread_survives_an_abandoned_step_over()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    session.last_stop = Some(StopEvent::Signal { thread: T2, signal: 30 });
+    let alarm = StopEvent::Signal { thread: T1, signal: 14 };
+    mock.script(MockStop::new(alarm.clone()).expect_resume(ResumeRequest::step(T1)));
+    session.resume_with_signal().unwrap();
+    assert_eq!(session.wait(None).unwrap(), Some(alarm));
+
+    // T1 is still at the breakpoint: it steps over with its own signal, and T2's signal
+    // goes on the final continue.
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1).with_signal(T1, 14));
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: T1,
+            pc: Address::new(BP2),
+        })
+        .expect_resume(ResumeRequest::continue_all().with_signal(T2, 30)),
+    );
+    session.resume_with_signal().unwrap();
+    assert!(matches!(session.wait(None).unwrap(), Some(StopEvent::Breakpoint { .. })));
+}
+
+/// A plain `resume` discards a carried signal, as it discards every held signal.
+#[test]
+fn plain_resume_drops_a_carried_signal()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    session.last_stop = Some(StopEvent::Signal { thread: T2, signal: 30 });
+    let alarm = StopEvent::Signal { thread: T1, signal: 14 };
+    mock.script(MockStop::new(alarm.clone()).expect_resume(ResumeRequest::step(T1)));
+    session.resume_with_signal().unwrap();
+    assert_eq!(session.wait(None).unwrap(), Some(alarm));
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    hit(&mock, BP2);
+    session.resume().unwrap();
+    assert!(mock.calls().contains(&MockCall::Resume(ResumeRequest::continue_all())));
+    session.wait(None).unwrap();
+}
+
+/// A step the caller asked for is reported as `SingleStep` even when an interrupt lost
+/// the race, at a breakpoint as at a plain pc.
+#[test]
+fn requested_step_at_a_breakpoint_reports_single_step_despite_interrupt()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    session.step_instruction(T1).unwrap();
+    session.interrupt_requested = true;
+    assert_eq!(session.wait(None).unwrap(), Some(StopEvent::SingleStep { thread: T1 }));
+    assert_eq!(peek(&mock, BP), TRAP);
 }

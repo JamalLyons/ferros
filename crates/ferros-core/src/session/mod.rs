@@ -120,6 +120,12 @@ pub struct Session
     /// A backend `wait` error met while `resume` drove a step-over, returned by the
     /// next `wait`.
     deferred_error: Option<DebuggerError>,
+    /// Thread of an internal step that was abandoned because another event arrived
+    /// first: its `SingleStep`, if still queued in the backend, is dropped, not reported.
+    stale_step: Option<ThreadId>,
+    /// Signals a `resume_with_signal` meant to pass on the final continue of a step-over
+    /// sequence that another event cut short; the next `resume_with_signal` passes them.
+    carried_signals: Vec<(ThreadId, i32)>,
     breakpoints: BreakpointStore,
     symbols: SymbolCache,
     /// Images (path, load address) already given to the symbol cache, loaded or not.
@@ -205,6 +211,9 @@ impl Drop for Session
 ///
 /// One instruction normally completes at once; the limit only matters when the stepped
 /// thread is blocked (for example in a system call) while the other threads are suspended.
+/// Such a step completes only if the call can finish without the suspended threads: a
+/// breakpoint on a system call that waits for another thread (a join, a lock, a pipe read)
+/// leaves the step pending, and `wait(None)` then blocks until [`Session::interrupt`].
 pub const STEP_OVER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long dropping a session that is running an attached process waits for the
@@ -267,6 +276,8 @@ impl Session
             step_plan: None,
             interrupt_requested: false,
             deferred_error: None,
+            stale_step: None,
+            carried_signals: Vec::new(),
             breakpoints: BreakpointStore::new(),
             symbols: SymbolCache::new(),
             loaded_images: HashSet::new(),
@@ -391,6 +402,8 @@ impl Session
         self.step_plan = None;
         self.interrupt_requested = false;
         self.deferred_error = None;
+        self.stale_step = None;
+        self.carried_signals.clear();
         self.breakpoints.drain();
     }
 

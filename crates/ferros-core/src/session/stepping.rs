@@ -118,9 +118,15 @@ impl Session
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
         self.interrupt_requested = false;
-        if let Some(event) = self.backend.wait(Some(std::time::Duration::ZERO))? {
+        if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             self.deferred = Some(event);
-        } else if let Some(current) = self.breakpoint_at_pc(thread)? {
+            return self.enter_running();
+        }
+        self.stale_step = None;
+        // The stepping thread's held signal is discarded by this step; other threads stay
+        // suspended, so a signal carried for them is still held.
+        self.carried_signals.retain(|(carried, _)| *carried != thread);
+        if let Some(current) = self.breakpoint_at_pc(thread)? {
             self.start_plan(StepPlan {
                 current,
                 remaining: VecDeque::new(),
@@ -129,9 +135,42 @@ impl Session
         } else {
             self.backend.resume(&ResumeRequest::step(thread))?;
         }
+        self.enter_running()
+    }
+
+    fn enter_running(&mut self) -> Result<()>
+    {
         self.state = SessionState::Running;
         self.last_stop = None;
         Ok(())
+    }
+
+    /// `Backend::wait`, minus the `SingleStep` of an abandoned internal step (see
+    /// `stale_step`), which belongs to no request of the caller.
+    pub(super) fn backend_wait(&mut self, timeout: Option<std::time::Duration>) -> Result<Option<StopEvent>>
+    {
+        loop {
+            let event = self.backend.wait(timeout)?;
+            match (&event, self.stale_step) {
+                (Some(StopEvent::SingleStep { thread }), Some(stale)) if *thread == stale => {
+                    self.stale_step = None;
+                }
+                _ => return Ok(event),
+            }
+        }
+    }
+
+    /// Give up the rest of `plan` because a stop other than its step completion is
+    /// reported: a late `SingleStep` of the step is dropped, and signals meant for the
+    /// final continue are carried to the next `resume_with_signal`.
+    fn abandon(&mut self, plan: StepPlan, step_completed: bool)
+    {
+        if !step_completed {
+            self.stale_step = Some(plan.current.thread);
+        }
+        if let Some(final_request) = plan.final_request {
+            self.carried_signals = final_request.signals;
+        }
     }
 
     /// Drive the step-overs started by `resume` until the final continue is issued, so the
@@ -144,11 +183,11 @@ impl Session
     pub(super) fn drive_step_overs(&mut self) -> Result<()>
     {
         while self.step_plan.as_ref().is_some_and(|plan| plan.final_request.is_some()) {
-            let event = match self.backend.wait(Some(super::STEP_OVER_TIMEOUT)) {
+            let event = match self.backend_wait(Some(super::STEP_OVER_TIMEOUT)) {
                 Ok(Some(event)) => event,
                 Ok(None) => return Ok(()),
                 Err(error) => {
-                    self.deferred_error = Some(error.into());
+                    self.deferred_error = Some(error);
                     return Ok(());
                 }
             };
@@ -184,15 +223,23 @@ impl Session
                 thread: plan.current.thread,
             })
         {
+            self.abandon(plan, false);
+            return Ok(Some(event));
+        }
+        // A step the caller asked for is reported as such, interrupt or not.
+        if plan.final_request.is_none() {
             return Ok(Some(event));
         }
         if self.interrupt_requested {
-            return Ok(Some(StopEvent::Interrupted {
-                thread: Some(plan.current.thread),
-            }));
+            let thread = plan.current.thread;
+            self.abandon(plan, true);
+            return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
         }
-        if plan.final_request.is_none() {
-            return Ok(Some(event));
+        // The stop that completed the step may have reported other threads' events too;
+        // the backend refuses to resume until they are drained, and they are the caller's.
+        if let Some(pending) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+            self.abandon(plan, true);
+            return Ok(Some(pending));
         }
         if let Some(next) = plan.remaining.pop_front() {
             plan.current = next;

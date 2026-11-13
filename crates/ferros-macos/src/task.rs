@@ -1032,7 +1032,6 @@ impl MacOSBackend
         // so it comes before the reply.
         self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
         self.traced = false;
-        self.requeue_handshake_signals(false)?;
         Ok(())
     }
 
@@ -1041,16 +1040,27 @@ impl MacOSBackend
     fn requeue_handshake_signals(&self, traced: bool) -> BackendResult<()>
     {
         let mut shared = lock_shared(&self.exception_state);
+        let mut failure = None;
         for signal in shared.handshake_signals.take().unwrap_or_default() {
-            // SAFETY: the saved signal owns an independent tracee thread send right.
-            if unsafe { ffi::__pthread_kill(signal.thread, signal.signal) } != 0 {
-                return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
+            let error = if self
+                .reply_faults
+                .handshake_requeue
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Some(std::io::Error::from_raw_os_error(libc::ESRCH))
+            } else {
+                // SAFETY: the saved signal owns an independent tracee thread send right.
+                (unsafe { ffi::__pthread_kill(signal.thread, signal.signal) } != 0).then(std::io::Error::last_os_error)
+            };
+            if let Some(error) = error {
+                failure.get_or_insert_with(|| backend_error(DebuggerError::Io(error)));
+                continue;
             }
             if traced {
                 shared.requeued_signals.push(signal);
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Shut down tracing, restore exception handlers and balance our suspensions.
@@ -1067,6 +1077,13 @@ impl MacOSBackend
         // of a released process may be left single-stepping either.
         self.undo_thread_actions();
         let traced = self.stop_tracing();
+        // Replay errors cannot undo a successful PT_DETACH. In particular they
+        // must not skip the SIGCONT that completes our private-stop cleanup.
+        let replayed = if traced.is_ok() {
+            self.requeue_handshake_signals(false)
+        } else {
+            Ok(())
+        };
         let fallback = if traced.is_err() && self.traced {
             let result = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
             if result.is_ok() {
@@ -1101,7 +1118,7 @@ impl MacOSBackend
             }
         }
         self.release_ports();
-        let failures: Vec<_> = [traced, fallback, restored]
+        let failures: Vec<_> = [traced, replayed, fallback, restored]
             .into_iter()
             .filter_map(|result| result.err())
             .map(|err| err.to_string())

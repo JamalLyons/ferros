@@ -29,8 +29,9 @@ fn main()
                 std::fs::write(directory.join(format!("handled-{slot}")), b"handled").expect("handler acknowledgement");
             }
         }
-        if directory.join("snapshot").exists() {
-            std::fs::write(directory.join("observed"), handled.to_string()).expect("handler snapshot");
+        if directory.join("snapshot").exists() && !directory.join("observed").exists() {
+            std::fs::write(directory.join("observed.tmp"), handled.to_string()).expect("handler snapshot");
+            std::fs::rename(directory.join("observed.tmp"), directory.join("observed")).expect("publish snapshot");
         }
         std::thread::sleep(Duration::from_millis(1));
     }

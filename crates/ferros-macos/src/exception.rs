@@ -184,6 +184,7 @@ pub struct ReplyFaultInjector
     stop_publication: Arc<AtomicU8>,
     publish_during_resume: Arc<AtomicBool>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
+    pub(crate) handshake_requeue: Arc<AtomicBool>,
 }
 
 impl ReplyFaultInjector
@@ -214,6 +215,12 @@ impl ReplyFaultInjector
     pub fn race_next_private_stop(&self, separate: bool)
     {
         self.private_stop_race.store(if separate { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Simulate an exited recipient when replaying the next handshake signal. Tests only.
+    pub fn fail_next_handshake_signal_requeue(&self)
+    {
+        self.handshake_requeue.store(true, Ordering::SeqCst);
     }
 
     /// Whether the exception loop currently holds a reported stop. Tests only.
@@ -1052,7 +1059,9 @@ fn preserve_handshake_stop(
 ) -> BackendResult<()>
 {
     let result = (|| {
-        if let StopEvent::Signal { signal, .. } = event {
+        if let StopEvent::Signal { signal, .. } = event
+            && exception.soft_signal
+        {
             let queued = RequeuedSignal::new(exception.thread, *signal)?;
             prepare_stop(&mut exception, pid, faults)?;
             state.handshake_signals.as_mut().expect("active handshake").push(queued);
@@ -1272,6 +1281,33 @@ fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), 
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn hardware_fault_is_not_requeued_as_a_unix_signal_during_a_handshake()
+    {
+        // A hardware exception may map to Signal for the portable event API, but
+        // only EXC_SOFT_SIGNAL denotes a Unix signal that can be replayed.
+        // SAFETY: mach_thread_self returns an owned send right for this live thread.
+        let thread = unsafe { mach2::mach_init::mach_thread_self() };
+        let mut state = ExceptionSharedState::new();
+        state.handshake_signals = Some(Vec::new());
+        preserve_handshake_stop(
+            HeldException {
+                header: None,
+                thread,
+                soft_signal: false,
+            },
+            &StopEvent::Signal {
+                thread: ThreadId::from(u64::from(thread)),
+                signal: libc::SIGSEGV,
+            },
+            &mut state,
+            std::process::id() as libc::pid_t,
+            &ReplyFaultInjector::default(),
+        )
+        .expect("release hardware exception");
+        assert!(state.handshake_signals.as_ref().unwrap().is_empty());
+    }
 
     #[test]
     fn restore_reports_every_failed_group()

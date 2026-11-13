@@ -83,6 +83,34 @@ fn detach_preserves_a_new_signal_racing_its_private_stop()
     });
 }
 
+#[test]
+fn detach_releases_the_target_even_if_a_racing_signal_cannot_be_replayed()
+{
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready");
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(target.pid()).expect("attach");
+        let probe = backend.reply_fault_injector();
+        probe.race_next_private_stop(true);
+        probe.fail_next_handshake_signal_requeue();
+        assert!(matches!(
+            backend.detach(),
+            Err(ferros_core::backend::BackendError::DetachCleanup(_))
+        ));
+        observer.wait("continued");
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &target.pid().0.to_string()])
+                .status()
+                .expect("fresh signal")
+                .success()
+        );
+        observer.wait("handled");
+    });
+}
+
 /// A real signal stop has reached the loop, but wait has not delivered it: the
 /// backend still considers itself Running. This is the G6 drop ordering (#57).
 #[test]

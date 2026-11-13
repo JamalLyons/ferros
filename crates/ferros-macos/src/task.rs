@@ -857,7 +857,11 @@ impl MacOSBackend
     fn start_tracing(&mut self) -> BackendResult<()>
     {
         let (ready, wait) = mpsc::channel();
-        lock_shared(&self.exception_state).internal_stop = Some(ready);
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            shared.internal_stop = Some(ready);
+            shared.handshake_signals = Some(Vec::new());
+        }
         self.ptrace(ffi::ptrace_requests::PT_ATTACHEXC, 0, 0)?;
         self.traced = true;
         if self.launched {
@@ -877,7 +881,11 @@ impl MacOSBackend
         self.exception_commands
             .as_ref()
             .expect("handler started")
-            .send(ExceptionLoopCommand::Continue { ack, keep: Vec::new() })
+            .send(ExceptionLoopCommand::Continue {
+                ack,
+                keep: Vec::new(),
+                discard_deferred: false,
+            })
             .map_err(|_| BackendError::Os {
                 code: -1,
                 message: "attach reply channel closed".into(),
@@ -886,11 +894,13 @@ impl MacOSBackend
             code: -1,
             message: "attach reply timed out".into(),
         })?;
+        self.requeue_handshake_signals(true)?;
         self.exit_watcher = Some(crate::lifecycle::ExitWatcher::start(
             self.pid.0 as libc::pid_t,
             Arc::clone(&self.exception_state),
             self.events_tx.as_ref().expect("handler started").clone(),
             self.launched.then(|| self.child_cleanup.clone()),
+            self.reply_faults.clone(),
         )?);
         Ok(())
     }
@@ -918,9 +928,14 @@ impl MacOSBackend
     /// Select a signal for a logical stop whose kernel exception may already be
     /// answered. Keep queuing and its internal-stop record atomic with respect to
     /// the exception loop, including when XNU delivers the new signal immediately.
-    fn select_resumed_signal(&self, port: thread_act_t, original: c_int, signal: c_int) -> BackendResult<()>
+    fn select_resumed_signal(
+        &self,
+        shared: &mut ExceptionSharedState,
+        port: thread_act_t,
+        original: c_int,
+        signal: c_int,
+    ) -> BackendResult<()>
     {
-        let mut shared = lock_shared(&self.exception_state);
         let reply_pending = shared.has_signal_reply(port);
         let requeue = signal != 0 && (!reply_pending || signal != original);
         let queued = if requeue {
@@ -956,25 +971,59 @@ impl MacOSBackend
         if !self.traced {
             return Ok(());
         }
-        // Always end the trace from the private SIGSTOP. If a user signal is held, the
-        // resume below suppresses it (detach discards held signals) before the SIGSTOP
-        // is taken; delivering it after detach would, for SIGUSR1, kill the target.
+        // Discard client decisions already held when detach began. New signals
+        // arriving during the handshake are preserved independently by the loop.
         let (ready, wait) = mpsc::channel();
-        {
+        let pending = {
             let mut shared = lock_shared(&self.exception_state);
             if shared.dead {
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
             shared.internal_stop = Some(ready);
-            // SAFETY: the lock excludes reaping until after this signal.
+            shared.handshake_signals = Some(Vec::new());
+            shared.pending_exception
+        };
+        if pending {
+            let (ack, replied) = mpsc::channel();
+            self.exception_commands
+                .as_ref()
+                .expect("handler started")
+                .send(ExceptionLoopCommand::Continue {
+                    ack,
+                    keep: Vec::new(),
+                    discard_deferred: true,
+                })
+                .map_err(|_| BackendError::Os {
+                    code: -1,
+                    message: "detach reply channel closed".into(),
+                })?;
+            replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+                code: -1,
+                message: "detach reply timed out".into(),
+            })?;
+        } else if let Some(events) = &self.events_tx {
+            exception::answer_held_exceptions(
+                &mut lock_shared(&self.exception_state),
+                &[],
+                &self.reply_faults,
+                events,
+                self.task,
+            );
+        }
+        while self.try_next_event().is_some() {}
+        {
+            let shared = lock_shared(&self.exception_state);
+            if shared.dead {
+                return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
+            }
+            // SAFETY: the shared lock excludes the watcher's reaping of this pid.
             if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
                 return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
             }
         }
-        if self.state == BackendState::Stopped {
-            while self.try_next_event().is_some() {}
-            self.resume(&ResumeRequest::continue_all())?;
-        }
+        // Backend state can still be Running while the exception loop already owns
+        // a pending stop. Release physical holds regardless of the last delivered event.
+        self.release_suspends();
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "detach SIGSTOP did not arrive within 5s".into(),
@@ -984,6 +1033,34 @@ impl MacOSBackend
         self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
         self.traced = false;
         Ok(())
+    }
+
+    /// Deliver signals that arrived during the private handshake on their original
+    /// threads. Attach still owns a task suspend; detach still holds its private reply.
+    fn requeue_handshake_signals(&self, traced: bool) -> BackendResult<()>
+    {
+        let mut shared = lock_shared(&self.exception_state);
+        let mut failure = None;
+        for signal in shared.handshake_signals.take().unwrap_or_default() {
+            let error = if self
+                .reply_faults
+                .handshake_requeue
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Some(std::io::Error::from_raw_os_error(libc::ESRCH))
+            } else {
+                // SAFETY: the saved signal owns an independent tracee thread send right.
+                (unsafe { ffi::__pthread_kill(signal.thread, signal.signal) } != 0).then(std::io::Error::last_os_error)
+            };
+            if let Some(error) = error {
+                failure.get_or_insert_with(|| backend_error(DebuggerError::Io(error)));
+                continue;
+            }
+            if traced {
+                shared.requeued_signals.push(signal);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Shut down tracing, restore exception handlers and balance our suspensions.
@@ -1000,6 +1077,13 @@ impl MacOSBackend
         // of a released process may be left single-stepping either.
         self.undo_thread_actions();
         let traced = self.stop_tracing();
+        // Replay errors cannot undo a successful PT_DETACH. In particular they
+        // must not skip the SIGCONT that completes our private-stop cleanup.
+        let replayed = if traced.is_ok() {
+            self.requeue_handshake_signals(false)
+        } else {
+            Ok(())
+        };
         let fallback = if traced.is_err() && self.traced {
             let result = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
             if result.is_ok() {
@@ -1034,7 +1118,7 @@ impl MacOSBackend
             }
         }
         self.release_ports();
-        let failures: Vec<_> = [traced, fallback, restored]
+        let failures: Vec<_> = [traced, replayed, fallback, restored]
             .into_iter()
             .filter_map(|result| result.err())
             .map(|err| err.to_string())
@@ -1297,15 +1381,27 @@ impl Backend for MacOSBackend
         self.release_thread_suspends();
         let _ = self.stop_exception_handler(false);
         self.release_suspends();
-        if let Some(watcher) = &self.exit_watcher {
-            watcher.wait(KILL_REAP_TIMEOUT)?;
+        let reaped = if let Some(watcher) = &self.exit_watcher {
+            watcher.wait(KILL_REAP_TIMEOUT)
         } else if self.launched {
-            launch::reap_child(pid, KILL_REAP_TIMEOUT)?;
-            self.child_cleanup.reaped();
-        }
+            let result = launch::reap_child(pid, KILL_REAP_TIMEOUT);
+            if result.is_ok() {
+                self.child_cleanup.reaped();
+            }
+            result
+        } else {
+            Ok(())
+        };
         self.exit_watcher = None;
+        if reaped.is_err() && self.launched {
+            // A failed watcher is no longer a reaper. Transfer the remaining child
+            // claim before local teardown, so even a failed fallback remains owned
+            // by the harness/embedding cleanup handle rather than being forgotten.
+            self.child_cleanup.detach(self.traced);
+            let _ = self.child_cleanup.reap();
+        }
         self.release_ports();
-        Ok(())
+        reaped.map_err(|err| BackendError::KillCleanup(err.to_string()))
     }
 
     /// Receive the next stop event from the exception loop (or an interrupt).
@@ -1322,7 +1418,16 @@ impl Backend for MacOSBackend
         let deadline = timeout.map(|duration| Instant::now() + duration);
         loop {
             let queued = self.try_next_event();
-            let dead = lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task);
+            let shared = lock_shared(&self.exception_state);
+            let dead = shared.dead || crate::lifecycle::task_is_dead(self.task);
+            // The watcher has ended: after draining queued terminal events, neither
+            // this nor a later wait(None) may block waiting for it to send another.
+            if queued.is_none()
+                && let Some(error) = &shared.watcher_error
+            {
+                return Err(error.clone());
+            }
+            drop(shared);
             if queued.is_none() && self.state == BackendState::Stopped && timeout.is_none() && !dead {
                 return Err(BackendError::InvalidState(
                     "wait without a timeout while stopped with no pending event would block forever".into(),
@@ -1412,6 +1517,7 @@ impl Backend for MacOSBackend
                 !shared.held.is_empty(),
             )
         };
+        self.reply_faults.publish_resume_race();
         let restore = |backend: &mut Self, count: u32| {
             backend.undo_thread_actions();
             let mut shared = lock_shared(&backend.exception_state);
@@ -1425,33 +1531,54 @@ impl Backend for MacOSBackend
             return Err(err);
         }
 
-        if pending || held {
-            // A selectively suspended thread retains its logical signal decision
-            // until a later resume allows that thread to run.
-            let signals = lock_shared(&self.exception_state).soft_signals.clone();
-            for (port, original) in signals.into_iter().filter(|(port, _)| !suspend.contains(port)) {
-                let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
-                if let Err(err) = self.select_resumed_signal(port, original, signal) {
-                    restore(self, count);
-                    return Err(err);
+        {
+            // G8 (#57): the task remains physically suspended, but the exception
+            // loop may already have received a request before the interrupt that
+            // stopped us. It can publish that request between our lock sections.
+            // Recheck for its stop before changing signal decisions, and hold this
+            // same lock through direct replies: otherwise those replies could erase
+            // the new stop's records while the loop waits for its Continue command.
+            let mut shared = lock_shared(&shared_state);
+            if let Some(event) = self.try_next_event() {
+                self.peeked = Some(event);
+                drop(shared);
+                restore(self, count);
+                return Err(BackendError::InvalidState(
+                    "resume is not allowed while stop events are pending; drain them with wait".into(),
+                ));
+            }
+            if pending || held {
+                // A selectively suspended thread retains its logical signal decision
+                // until a later resume allows that thread to run.
+                let signals = shared.soft_signals.clone();
+                for (port, original) in signals.into_iter().filter(|(port, _)| !suspend.contains(port)) {
+                    let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
+                    if let Err(err) = self.select_resumed_signal(&mut shared, port, original, signal) {
+                        drop(shared);
+                        restore(self, count);
+                        return Err(err);
+                    }
                 }
             }
-        }
-        if !pending && held {
-            // Only kept exceptions are held and the loop is blocked receiving: answer
-            // those of the threads that run now from here, under the lock.
-            if let Some(events) = self.events_tx.clone() {
-                let mut shared = lock_shared(&self.exception_state);
-                exception::answer_held_exceptions(&mut shared, &suspend, &self.reply_faults, &events, self.task);
+            if !pending && held {
+                // Only retained stop records remain; the loop is receiving rather
+                // than awaiting Continue, so their replies are owned here.
+                if let Some(events) = self.events_tx.clone() {
+                    exception::answer_held_exceptions(&mut shared, &suspend, &self.reply_faults, &events, self.task);
+                }
             }
         }
         if pending {
             let (ack_tx, ack_rx) = mpsc::channel();
             let keep = suspend.clone();
-            let sent = self
-                .exception_commands
-                .as_ref()
-                .is_some_and(|tx| tx.send(ExceptionLoopCommand::Continue { ack: ack_tx, keep }).is_ok());
+            let sent = self.exception_commands.as_ref().is_some_and(|tx| {
+                tx.send(ExceptionLoopCommand::Continue {
+                    ack: ack_tx,
+                    keep,
+                    discard_deferred: false,
+                })
+                .is_ok()
+            });
             let replied = if sent {
                 ack_rx
                     .recv_timeout(EXCEPTION_REPLY_TIMEOUT)

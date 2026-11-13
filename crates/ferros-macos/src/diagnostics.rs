@@ -257,3 +257,67 @@ pub fn sigcont_observed() -> bool
 {
     SIGCONT_OBSERVED.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Install the SIGUSR1 observer used by the signal-tracing fixture. Tests only.
+#[doc(hidden)]
+pub fn install_sigusr1_observer() -> std::io::Result<()>
+{
+    // SAFETY: the static handler only performs an atomic store.
+    if unsafe { libc::signal(libc::SIGUSR1, observe_sigusr1 as *const () as libc::sighandler_t) } == libc::SIG_ERR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+static SIGUSR1_OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+extern "C" fn observe_sigusr1(_: libc::c_int)
+{
+    use std::sync::atomic::Ordering;
+    SIGUSR1_OBSERVED.store(true, Ordering::Relaxed);
+    // SAFETY: pthread_self only reads the calling thread identity. The handler
+    // otherwise performs lock-free atomic accesses, never allocates or locks.
+    let current = unsafe { libc::pthread_self() } as usize;
+    for (slot, thread) in SIGNAL_THREADS.iter().enumerate() {
+        if thread.load(Ordering::Relaxed) == current {
+            SIGNAL_HANDLED.fetch_or(1 << slot, Ordering::Relaxed);
+        }
+    }
+}
+/// Whether the fixture handled SIGUSR1. Tests only.
+#[doc(hidden)]
+#[must_use]
+pub fn sigusr1_observed() -> bool
+{
+    SIGUSR1_OBSERVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SIGNAL_THREADS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+static SIGNAL_HANDLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Register a fixture worker's identity for the SIGUSR1 observer. Tests only.
+#[doc(hidden)]
+pub fn register_signal_worker(slot: usize)
+{
+    // SAFETY: pthread_self returns the calling thread's opaque identity.
+    SIGNAL_THREADS[slot].store(unsafe { libc::pthread_self() } as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bitset of registered workers whose SIGUSR1 handler ran. Tests only.
+#[doc(hidden)]
+#[must_use]
+pub fn signal_workers_handled() -> usize
+{
+    SIGNAL_HANDLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Raise SIGUSR1 on the calling fixture worker. Tests only.
+#[doc(hidden)]
+pub fn raise_sigusr1() -> std::io::Result<()>
+{
+    // SAFETY: SIGUSR1 is installed by the fixture before workers start.
+    if unsafe { libc::raise(libc::SIGUSR1) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}

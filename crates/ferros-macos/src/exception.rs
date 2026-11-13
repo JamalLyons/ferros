@@ -37,7 +37,10 @@
 //! nothing. Thus external SIGKILL can complete even before the client calls `wait`.
 //! Signals arriving during an existing stop are also answered early, but their
 //! logical events are deferred until resume. Private attach/detach SIGSTOP replies
-//! stay held for their ptrace handshake.
+//! stay held for their ptrace handshake. During a handshake, competing application
+//! signals are answered without creating client stops or adding task suspends, so
+//! they cannot prevent the private SIGSTOP from arriving. Independent thread rights
+//! preserve those signals for internal delivery after attach or detach completes.
 //!
 //! A selective resume uses `thread_suspend` to keep threads stopped. Their logical
 //! exception records and signal decisions remain in
@@ -72,7 +75,7 @@
 //! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use ferros_core::backend::{BackendError, BackendResult, StopEvent};
@@ -134,8 +137,13 @@ pub(crate) struct ExceptionSharedState
     pub requeued_signals: Vec<RequeuedSignal>,
     /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
     pub internal_stop: Option<mpsc::Sender<()>>,
+    /// Signals caught during a private attach/detach handshake. They are delivered
+    /// internally after the private stop, never exposed as stale client stop events.
+    pub handshake_signals: Option<Vec<RequeuedSignal>>,
     /// Set by the exit watcher before publishing the terminal event.
     pub dead: bool,
+    /// Sticky watcher failure: no later terminal event can arrive from that watcher.
+    pub watcher_error: Option<BackendError>,
 }
 
 impl ExceptionSharedState
@@ -171,6 +179,12 @@ pub struct ReplyFaultInjector
     reply: Arc<AtomicBool>,
     pub(crate) resume: Arc<AtomicBool>,
     restore: Arc<AtomicBool>,
+    private_stop_race: Arc<AtomicI32>,
+    pending_stop: Arc<AtomicBool>,
+    stop_publication: Arc<AtomicU8>,
+    publish_during_resume: Arc<AtomicBool>,
+    pub(crate) other_exit_reaper: Arc<AtomicBool>,
+    pub(crate) handshake_requeue: Arc<AtomicBool>,
 }
 
 impl ReplyFaultInjector
@@ -193,6 +207,65 @@ impl ReplyFaultInjector
     pub fn fail_next_exception_port_restore(&self)
     {
         self.restore.store(true, Ordering::SeqCst);
+    }
+
+    /// Deliver a real SIGUSR1 to another thread when the next private SIGSTOP arrives.
+    /// `separate` processes that signal as an earlier, separate batch. Otherwise the
+    /// two real kernel exceptions are processed in the same batch. Tests only.
+    pub fn race_next_private_stop(&self, separate: bool)
+    {
+        self.private_stop_race.store(if separate { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Simulate an exited recipient when replaying the next handshake signal. Tests only.
+    pub fn fail_next_handshake_signal_requeue(&self)
+    {
+        self.handshake_requeue.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the exception loop currently holds a reported stop. Tests only.
+    #[must_use]
+    pub fn has_pending_stop(&self) -> bool
+    {
+        self.pending_stop.load(Ordering::SeqCst)
+    }
+
+    /// Pause the next nonprivate exception before publishing its stop. Tests only.
+    pub fn pause_next_stop_publication(&self)
+    {
+        self.stop_publication.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether the exception loop received the paused exception. Tests only.
+    #[must_use]
+    pub fn stop_publication_is_paused(&self) -> bool
+    {
+        self.stop_publication.load(Ordering::SeqCst) == 2
+    }
+
+    /// Publish that exception between the next resume's lock sections. Tests only.
+    pub fn publish_paused_stop_during_next_resume(&self)
+    {
+        self.publish_during_resume.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn publish_resume_race(&self)
+    {
+        if self.publish_during_resume.swap(false, Ordering::SeqCst) {
+            self.stop_publication.store(3, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !self.pending_stop.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline, "paused stop was not published");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Let a competing debugger thread reap the next exited tracee before its watcher.
+    /// Tests only; the watcher then observes a real `ECHILD`.
+    pub fn reap_before_exit_watcher(&self)
+    {
+        self.other_exit_reaper.store(true, Ordering::SeqCst);
     }
 
     /// Consume a pending injected failure.
@@ -248,8 +321,8 @@ pub(crate) struct HeldException
 #[derive(Debug)]
 pub(crate) struct RequeuedSignal
 {
-    thread: thread_act_t,
-    signal: c_int,
+    pub(crate) thread: thread_act_t,
+    pub(crate) signal: c_int,
 }
 
 #[cfg(target_os = "macos")]
@@ -292,6 +365,8 @@ pub(crate) enum ExceptionLoopCommand
         ack: mpsc::Sender<()>,
         /// Threads whose stop records and deferred signal decisions must remain.
         keep: Vec<thread_act_t>,
+        /// Teardown discards stops deferred before the handshake began.
+        discard_deferred: bool,
     },
     /// Reply to every held exception (kept ones included), answer the queued ones, and
     /// exit the loop.
@@ -626,15 +701,26 @@ pub(crate) fn run_exception_loop(
     faults: ReplyFaultInjector,
 )
 {
-    let mut deferred = std::collections::VecDeque::new();
+    let mut deferred: std::collections::VecDeque<(HeldException, StopEvent)> = std::collections::VecDeque::new();
     loop {
         let pending = lock_shared(&shared).pending_exception;
         if pending {
             match commands.try_recv() {
-                Ok(ExceptionLoopCommand::Continue { ack, keep }) => {
+                Ok(ExceptionLoopCommand::Continue {
+                    ack,
+                    keep,
+                    discard_deferred,
+                }) => {
+                    if discard_deferred {
+                        for (mut exception, _) in deferred.drain(..) {
+                            let _ = reply_to_held(&mut exception, &faults);
+                            deallocate_right(exception.thread);
+                        }
+                    }
                     let mut state = lock_shared(&shared);
                     answer_held_exceptions(&mut state, &keep, &faults, &events, task);
                     state.pending_exception = false;
+                    faults.pending_stop.store(false, Ordering::SeqCst);
                     let _ = ack.send(());
                     continue;
                 }
@@ -646,7 +732,7 @@ pub(crate) fn run_exception_loop(
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        let first = if !pending && !deferred.is_empty() {
+        let mut first = if !pending && !deferred.is_empty() {
             deferred.pop_front().expect("deferred request")
         } else {
             let buffer = match receive_exception_with_timeout(exception_port, pending.then_some(10)) {
@@ -665,6 +751,68 @@ pub(crate) fn run_exception_loop(
             }
             hold_exception(&request, architecture)
         };
+        let mut injected_batch = Vec::new();
+        if is_internal_stop(&first.1, &lock_shared(&shared)) {
+            let race = faults.private_stop_race.swap(0, Ordering::SeqCst);
+            if race != 0 {
+                // Consume the first private stop, then arrange a fresh private
+                // SIGSTOP behind a real application signal. This lets the test force
+                // either order without depending on scheduler timing.
+                prepare_stop(&mut first.0, pid, &faults).expect("consume initial private stop");
+                let ports = crate::threads::ThreadManager::refresh_thread_list(task, &[])
+                    .expect("enumerate threads for private-stop race");
+                let other = *ports
+                    .iter()
+                    .find(|&&port| port != first.0.thread)
+                    .expect("private-stop race fixture needs another thread");
+                deallocate_right(first.0.thread);
+                // SAFETY: refresh_thread_list retained this tracee thread right.
+                assert_eq!(unsafe { crate::ffi::__pthread_kill(other, libc::SIGUSR1) }, 0);
+                let buffer = receive_exception_with_timeout(exception_port, Some(1000)).expect("racing signal exception");
+                let request = decode_request(&buffer).expect("racing exception request");
+                let mut racing = hold_exception(&request, architecture);
+                for port in ports {
+                    deallocate_right(port);
+                }
+                if race == 2 {
+                    prepare_stop(&mut racing.0, pid, &faults).expect("prepare same-batch signal");
+                }
+                // SAFETY: the original private stop's tracee still belongs to us.
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+                if race == 1 {
+                    first = racing;
+                } else {
+                    let buffer = receive_exception_with_timeout(exception_port, Some(1000)).expect("fresh private stop");
+                    let request = decode_request(&buffer).expect("private exception request");
+                    first = hold_exception(&request, architecture);
+                    injected_batch.push(racing);
+                }
+            }
+        }
+        {
+            let mut state = lock_shared(&shared);
+            if state.handshake_signals.is_some() && !is_internal_stop(&first.1, &state) {
+                // Do not suspend the task for a stop that won the race against our
+                // SIGSTOP: doing so prevents that private stop from ever arriving.
+                if let Err(err) = preserve_handshake_stop(first.0, &first.1, &mut state, pid, &faults) {
+                    let _ = events.send(Err(err));
+                }
+                continue;
+            }
+        }
+        if !pending
+            && faults
+                .stop_publication
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while faults.stop_publication.load(Ordering::SeqCst) == 2 {
+                assert!(std::time::Instant::now() < deadline, "paused stop was not released");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            faults.stop_publication.store(0, Ordering::SeqCst);
+        }
         if pending {
             // Preserve the next logical stop, but not its kernel reply: otherwise an
             // ordinary signal arriving at a breakpoint could block a later SIGKILL.
@@ -695,6 +843,7 @@ pub(crate) fn run_exception_loop(
             }
 
             let mut stops = vec![first];
+            stops.extend(injected_batch);
             stops.extend(deferred.drain(..));
             // `task_suspend` returned, so threads that raised an exception at the same
             // moment have queued their messages: take them without blocking.
@@ -710,8 +859,15 @@ pub(crate) fn run_exception_loop(
             }
 
             state.pending_exception = true;
+            faults.pending_stop.store(true, Ordering::SeqCst);
             for (mut exception, event) in stops {
                 let internal = is_internal_stop(&event, &state);
+                if state.handshake_signals.is_some() && !internal {
+                    if let Err(err) = preserve_handshake_stop(exception, &event, &mut state, pid, &faults) {
+                        let _ = events.send(Err(err));
+                    }
+                    continue;
+                }
                 // Private attach/detach signals retain their reply for the ptrace
                 // handshake. All client signals are suppressed now and requeued only
                 // if selected on resume, with the task suspension holding user code.
@@ -890,6 +1046,35 @@ fn prepare_stop(exception: &mut HeldException, pid: libc::pid_t, faults: &ReplyF
         }
     }
     reply_to_held(exception, faults)
+}
+
+/// A handshake does not create client stops. Keep independent rights for application
+/// signals so the backend can requeue them after the private stop has been consumed.
+fn preserve_handshake_stop(
+    mut exception: HeldException,
+    event: &StopEvent,
+    state: &mut ExceptionSharedState,
+    pid: libc::pid_t,
+    faults: &ReplyFaultInjector,
+) -> BackendResult<()>
+{
+    let result = (|| {
+        if let StopEvent::Signal { signal, .. } = event
+            && exception.soft_signal
+        {
+            let queued = RequeuedSignal::new(exception.thread, *signal)?;
+            prepare_stop(&mut exception, pid, faults)?;
+            state.handshake_signals.as_mut().expect("active handshake").push(queued);
+        } else {
+            reply_to_held(&mut exception, faults)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = reply_to_held(&mut exception, faults);
+    }
+    deallocate_right(exception.thread);
+    result
 }
 
 fn is_internal_stop(event: &StopEvent, state: &ExceptionSharedState) -> bool
@@ -1096,6 +1281,33 @@ fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), 
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn hardware_fault_is_not_requeued_as_a_unix_signal_during_a_handshake()
+    {
+        // A hardware exception may map to Signal for the portable event API, but
+        // only EXC_SOFT_SIGNAL denotes a Unix signal that can be replayed.
+        // SAFETY: mach_thread_self returns an owned send right for this live thread.
+        let thread = unsafe { mach2::mach_init::mach_thread_self() };
+        let mut state = ExceptionSharedState::new();
+        state.handshake_signals = Some(Vec::new());
+        preserve_handshake_stop(
+            HeldException {
+                header: None,
+                thread,
+                soft_signal: false,
+            },
+            &StopEvent::Signal {
+                thread: ThreadId::from(u64::from(thread)),
+                signal: libc::SIGSEGV,
+            },
+            &mut state,
+            std::process::id() as libc::pid_t,
+            &ReplyFaultInjector::default(),
+        )
+        .expect("release hardware exception");
+        assert!(state.handshake_signals.as_ref().unwrap().is_empty());
+    }
 
     #[test]
     fn restore_reports_every_failed_group()

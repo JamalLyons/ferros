@@ -31,6 +31,11 @@ pub enum BackendError
     #[error("detach teardown completed with errors: {0}")]
     DetachCleanup(String),
 
+    /// Kill completed local teardown despite a failure to confirm death or reaping.
+    /// The backend is *NoProcess*; no exit status is claimed. Retrying kill is invalid.
+    #[error("kill teardown completed with errors: {0}")]
+    KillCleanup(String),
+
     /// Any other operating-system failure, carrying the raw OS code and message.
     #[error("OS error {code}: {message}")]
     Os

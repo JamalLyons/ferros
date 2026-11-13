@@ -58,6 +58,7 @@ impl ExitWatcher
         shared: Arc<Mutex<ExceptionSharedState>>,
         events: mpsc::Sender<LoopEvent>,
         child_cleanup: Option<crate::launch::ChildCleanup>,
+        faults: crate::exception::ReplyFaultInjector,
     ) -> BackendResult<Self>
     {
         // SAFETY: kqueue takes no arguments and returns a new owned descriptor.
@@ -84,8 +85,9 @@ impl ExitWatcher
         let thread = thread::Builder::new()
             .name("ferros-exit".into())
             .spawn(move || {
-                let result = watch(queue, pid, &shared, &events, &cancellation, child_cleanup.as_ref());
+                let result = watch(queue, pid, &shared, &events, &cancellation, child_cleanup.as_ref(), &faults);
                 if let Err(err) = &result {
+                    lock_shared(&shared).watcher_error = Some(err.clone());
                     let _ = events.send(Err(err.clone()));
                 }
                 let _ = done.send(result);
@@ -129,6 +131,7 @@ fn watch(
     events: &mpsc::Sender<LoopEvent>,
     cancel: &mpsc::Receiver<()>,
     child_cleanup: Option<&crate::launch::ChildCleanup>,
+    faults: &crate::exception::ReplyFaultInjector,
 ) -> BackendResult<()>
 {
     loop {
@@ -161,6 +164,13 @@ fn watch(
         // NOTE_EXIT can precede the status becoming waitable. No other path reaps
         // while this watcher exists, so retry until terminal status or cancellation.
         lock_shared(shared).dead = true;
+        if faults.other_exit_reaper.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            // A real competing waitpid on a different debugger thread models an
+            // embedding host that collects this child before the exit watcher.
+            thread::spawn(move || crate::launch::reap_child(pid, Duration::from_secs(2)))
+                .join()
+                .expect("competing reaper panicked")?;
+        }
         let mut terminal = None;
         loop {
             let mut status = 0;
@@ -201,7 +211,15 @@ fn watch(
                 return Ok(());
             }
             if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return Err(os_error("reap traced process"));
+                let error = os_error("reap traced process");
+                if matches!(error, BackendError::Os { code, .. } if code == i64::from(libc::ECHILD))
+                    && let Some(child) = child_cleanup
+                {
+                    // Another reaper consumed this claim. Do not let cleanup later
+                    // issue waitpid against a pid that may already have been reused.
+                    child.reaped();
+                }
+                return Err(error);
             }
             if cancel.recv_timeout(Duration::from_millis(5)) != Err(mpsc::RecvTimeoutError::Timeout) {
                 return Ok(());

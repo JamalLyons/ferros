@@ -371,6 +371,7 @@ dependencies = [
  "libc",
  "libproc",
  "mach2",
+ "object 0.41.0",
  "once_cell",
  "thiserror 2.0.17",
  "tracing",
@@ -682,6 +683,15 @@ dependencies = [
  "flate2",
  "memchr",
  "ruzstd",
+]
+
+[[package]]
+name = "object"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11dbdb66876026054e4ffc8d757d862bdf5df5aebd5c0b95a41f17832a94f7d2"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

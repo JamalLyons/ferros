@@ -238,9 +238,14 @@ pub trait Backend: Send
 
     /// Resume the target as described by `request`; the backend becomes *Running*.
     ///
-    /// On macOS, `Suspend` applies to the thread snapshot taken at resume. Threads
-    /// created afterward may run until the next stop and resume, even when the default
-    /// action is `Suspend` (including during a single-step request).
+    /// On macOS arm64, a thread created while the default action is `Suspend` does not
+    /// execute application code until a later resume allows it to run. The backend holds
+    /// it at the first instruction of `libsystem_pthread`'s `_thread_start` or
+    /// `_start_wqthread` and that instruction runs when the thread is next allowed to.
+    /// Until dyld publishes that library the entries are not mapped, so the resume
+    /// installs no traps. Once it is published, a failure to install them fails the
+    /// resume and leaves the target stopped. `ThreadAction::Step` as the default
+    /// action, and a thread created at any other address, are outside this guarantee.
     ///
     /// # Preconditions
     ///

@@ -34,11 +34,19 @@
 //! - **Resume** honours every `ThreadAction`. `Step` sets the arm64 hardware single-step
 //!   bit (`MDSCR_EL1.SS`) of the thread, which then executes one instruction and stops
 //!   with `StopEvent::SingleStep`. `Suspend` keeps the thread `thread_suspend`ed while the
-//!   others run. Its stop record and any held Unix signal reply remain until a later
+//!   others run. When that is the default and some thread runs, a thread created during
+//!   the resume is held at `_thread_start` or `_start_wqthread` in `libsystem_pthread`
+//!   until a later resume lets it execute that first instruction. Continuing every
+//!   thread removes those traps. Before dyld publishes the library the resume installs
+//!   no traps, because those entries are not mapped yet. Once it has, failure to install
+//!   them fails the resume.
+//!   Its stop record and any held Unix signal reply remain until a later
 //!   resume lets it run; hardware exception replies are sent while the task is stopped. The next stop `wait` delivers ends that resume: the per-thread
 //!   suspends are balanced and every single-step bit is cleared, so a step that did not
 //!   complete is cancelled; `detach`, `kill` and drop balance them too. `Step` is not
-//!   implemented on x86-64 (`BackendError::Unsupported`).
+//!   implemented on x86-64 (`BackendError::Unsupported`). `ThreadAction::Step` as the
+//!   default, and threads whose start address is neither pthread entry, are outside the
+//!   new-thread guarantee.
 //! - **Exception ports**: attaching saves the target's exception ports and detaching
 //!   restores them. The port rights each exception message carries are released.
 //!   [`diagnostics`] lets tests check both.
@@ -56,7 +64,8 @@
 //!
 //! ## Known gaps
 //!
-//! - Issue #34: shared libraries are not enumerated by `images`.
+//! - New-thread suspension covers arm64 `libsystem_pthread` entries only, and only after
+//!   dyld has published that image. `images` walks the full dyld list.
 //!
 //! This is the only crate in the workspace that talks to an operating-system API
 //! and the only one allowed to use `unsafe` (for raw Mach FFI); `ferros-core` holds
@@ -160,6 +169,7 @@
 #![allow(unsafe_code)] // Required for raw Mach FFI
 #![warn(missing_docs)]
 
+mod birth;
 pub mod breakpoints;
 pub mod constants;
 pub mod diagnostics;

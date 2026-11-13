@@ -23,8 +23,9 @@ The crate defines nine fixture binaries:
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).
-- `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward,
-  demonstrating the macOS resume suspension snapshot.
+- `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward.
+  `pause=<milliseconds>` delays the second thread so a test can attach first. The second thread
+  is a normal pthread and must stay stopped while the default resume action is `Suspend`.
 
 ## Marker Convention
 
@@ -166,8 +167,9 @@ step, then checks that continuing produces no stray stop. The session
 unit tests script an interrupt before internal step completion and separately force the
 interrupt-policy flag when completion wins. They also script a simultaneous late
 `SingleStep` after another event and verify it is discarded before continuing; that
-precise simultaneous ordering remains mock-only. The macOS suspend-snapshot test also
-shows that a thread created after resume can run despite the default `Suspend` action.
+precise simultaneous ordering remains mock-only. `new_threads_can_run_after_suspend_snapshot`
+is the original regression for that snapshot: a thread created after resume now stays
+stopped until a later continue, including across a single-step of its pthread entry.
 
 Draining events alongside an internal completion and carrying signals from an abandoned
 step-over also retain deterministic session mock tests. Real kernel scheduling cannot

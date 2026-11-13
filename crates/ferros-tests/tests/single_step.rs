@@ -451,35 +451,322 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
     });
 }
 
-/// Suspension applies to existing threads, not threads created by a continuing one.
+/// How long a new thread is given to do work it must not do.
+const BIRTH_QUIET: Duration = Duration::from_millis(400);
+
+/// `brk #0` as a decoded instruction.
+const BRK: u32 = u32::from_le_bytes(TRAP);
+
+/// Stop at `spawn_later`, with every other thread's pc recorded.
+fn stop_before_second_thread(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, Vec<(ThreadId, Address)>)
+{
+    let address = function_address(d, fixture, "spawn_later");
+    let original = plant_trap(d, address);
+    let (creator, _) = run_to_trap(d, address);
+    backend(d).write_memory(address, &original).expect("restore");
+    let images = backend(d).images().expect("images");
+    assert!(
+        images
+            .iter()
+            .any(|image| image.path.file_name().is_some_and(|name| name == "libsystem_pthread.dylib")),
+        "dyld did not publish libsystem_pthread after the process ran: {images:?}"
+    );
+    let existing = backend(d).threads().expect("threads");
+    assert!(existing.len() >= 2, "expected an existing worker: {existing:?}");
+    let suspended = existing
+        .into_iter()
+        .filter(|&id| id != creator)
+        .map(|id| (id, pc_of(d, id)))
+        .collect();
+    (creator, suspended)
+}
+
+/// Resume `creator` under default `Suspend` and require the new pthread to stay at a trap.
+fn hold_new_thread(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, Vec<(ThreadId, Address)>, ThreadId)
+{
+    let (creator, suspended) = stop_before_second_thread(d, fixture);
+    backend(d)
+        .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+        .expect("resume creator");
+    assert!(
+        !d.wait_for_stdout("new worker ran", BIRTH_QUIET),
+        "new thread executed application code during Suspend, stdout: {}",
+        d.stdout()
+    );
+    assert_eq!(
+        backend(d).wait(Some(Duration::from_millis(50))).expect("wait"),
+        None,
+        "the birth trap was delivered to the client"
+    );
+    backend(d).interrupt().expect("interrupt");
+    assert!(matches!(
+        backend(d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+        Some(StopEvent::Interrupted { .. })
+    ));
+    assert_suspended_still(d, &suspended);
+    let known: Vec<_> = suspended.iter().map(|(id, _)| *id).chain(std::iter::once(creator)).collect();
+    let newborn = backend(d)
+        .threads()
+        .expect("threads")
+        .into_iter()
+        .find(|id| !known.contains(id))
+        .expect("the new thread was not enumerated");
+    let pc = pc_of(d, newborn);
+    assert_eq!(instruction_at(d, pc), BRK, "new thread is not held on a trap at {pc}");
+    (creator, suspended, newborn)
+}
+
+fn assert_suspended_still(d: &mut Debuggee, suspended: &[(ThreadId, Address)])
+{
+    for (id, pc) in suspended {
+        assert_eq!(pc_of(d, *id), *pc, "existing suspended thread {id:?} moved");
+    }
+}
+
+/// The original regression: a thread created after a suspend snapshot used to run.
+/// It now stays at the pthread entry until a later continue, which then finishes the process.
 #[test]
 fn new_threads_can_run_after_suspend_snapshot()
 {
     harness::run(|t| {
         let fixture = fixture!("spawn_thread");
         let mut d = t.launch(&fixture);
-        let address = function_address(&mut d, &fixture, "spawn_later");
-        let original = plant_trap(&mut d, address);
-        let (creator, _) = run_to_trap(&mut d, address);
-        backend(&mut d).write_memory(address, &original).expect("restore");
-        let existing = backend(&mut d).threads().expect("threads");
-        assert!(existing.len() >= 2, "expected an existing worker: {existing:?}");
-        let suspended: Vec<_> = existing
-            .into_iter()
-            .filter(|&id| id != creator)
-            .map(|id| (id, pc_of(&mut d, id)))
-            .collect();
+        let (_creator, suspended, _newborn) = hold_new_thread(&mut d, &fixture);
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert!(
+            d.wait_for_stdout("workers finished", STOP_TIMEOUT),
+            "a later continue did not let the held thread finish, stdout: {}",
+            d.stdout()
+        );
+        assert!(
+            d.stdout().contains("new worker ran"),
+            "the held thread never ran: {}",
+            d.stdout()
+        );
+        let _ = suspended;
+    });
+}
+
+/// Continuing only the held thread, while the default stays `Suspend`, executes the
+/// original pthread instruction and reaches application code. The trap stays armed for
+/// any later newborn, so this is the internal step off the site.
+#[test]
+fn held_new_thread_runs_original_instruction_under_suspend()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (_creator, suspended, newborn) = hold_new_thread(&mut d, &fixture);
         backend(&mut d)
-            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
-            .expect("resume creator");
-        assert!(d.wait_for_stdout("new worker ran", STOP_TIMEOUT), "new thread did not run");
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(newborn, ThreadAction::Continue))
+            .expect("continue the newborn");
+        assert!(
+            d.wait_for_stdout("new worker ran", STOP_TIMEOUT),
+            "stepping off the birth trap did not run the new thread, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "stepping off the birth trap reported a stop"
+        );
         backend(&mut d).interrupt().expect("interrupt");
         assert!(matches!(
             backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
             Some(StopEvent::Interrupted { .. })
         ));
+        assert_suspended_still(&mut d, &suspended);
+    });
+}
+
+/// A requested single-step of the held thread executes the original `stp` and stops on
+/// the following `bl`, with the birth trap armed again.
+#[test]
+fn single_step_of_held_new_thread_executes_pthread_prologue()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (_creator, suspended, newborn) = hold_new_thread(&mut d, &fixture);
+        let pc = pc_of(&mut d, newborn);
+        let event = step(&mut d, newborn);
+        assert_eq!(event, StopEvent::SingleStep { thread: newborn });
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+        let next = pc_of(&mut d, newborn);
+        assert_eq!(
+            next.value(),
+            pc.value() + 4,
+            "the step did not execute exactly one instruction"
+        );
+        assert_eq!(instruction_at(&mut d, pc), BRK, "the birth trap was not restored");
+        let branch = instruction_at(&mut d, next);
+        assert_eq!(
+            branch & 0xfc00_0000,
+            0x9400_0000,
+            "the instruction after the prologue is not bl: {branch:#010x}"
+        );
+        assert_suspended_still(&mut d, &suspended);
+        assert!(!d.stdout().contains("new worker ran"), "the single-step ran the worker body");
+    });
+}
+
+/// Creating a thread while another thread is mid single-step still holds the newborn.
+#[test]
+fn new_thread_created_during_step_stays_at_the_trap()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (creator, suspended) = stop_before_second_thread(&mut d, &fixture);
+        let (stepped, stepped_pc) = suspended[0];
+        let held: Vec<_> = suspended.iter().copied().filter(|(id, _)| *id != stepped).collect();
+        backend(&mut d)
+            .resume(
+                &ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(creator, ThreadAction::Continue)
+                    .with_thread(stepped, ThreadAction::Step),
+            )
+            .expect("resume creator and step another thread");
+        assert!(
+            !d.wait_for_stdout("new worker ran", BIRTH_QUIET),
+            "new thread ran during a step resume, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "the step or the birth trap stopped the process early"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        assert_suspended_still(&mut d, &held);
+        let known: Vec<_> = suspended.iter().map(|(id, _)| *id).chain(std::iter::once(creator)).collect();
+        let newborn = backend(&mut d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| !known.contains(id))
+            .expect("the new thread was not enumerated");
+        let pc = pc_of(&mut d, newborn);
+        assert_eq!(instruction_at(&mut d, pc), BRK);
+        // The stepped thread was blocked in its sleep, so the step should not have landed.
+        assert_eq!(pc_of(&mut d, stepped), stepped_pc, "the stepped sleeper moved");
+    });
+}
+
+/// A resume that fails after the birth traps are installed leaves the target stopped and runnable.
+#[test]
+fn failed_birth_resume_can_still_continue()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], debugger);
+        let (creator, _suspended) = stop_before_second_thread(&mut d, &fixture);
+        faults.fail_next_task_resume();
+        let failed =
+            backend(&mut d).resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue));
+        assert!(failed.is_err(), "the injected task_resume failure was ignored: {failed:?}");
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all())
+            .expect("continue after the failure");
+        assert!(
+            d.wait_for_stdout("workers finished", STOP_TIMEOUT),
+            "the target stayed stuck after a failed resume, stdout: {}",
+            d.stdout()
+        );
+    });
+}
+
+/// Detach, while a newborn is held, lets the process finish. Drop of a launched target
+/// that still holds one is covered by killing below.
+#[test]
+fn detach_releases_a_held_new_thread_and_the_process_finishes()
+{
+    harness::run_with_timeout(Duration::from_secs(30), |t| {
+        let fixture = fixture!("spawn_thread");
+        let mut target = t.spawn(&fixture, &["pause=4000"]);
+        let pid = target.pid();
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            match session.attach(pid) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(err) => panic!("attach failed: {err}"),
+            }
+        }
+        let address = function_address(&mut session, &fixture, "spawn_later");
+        let original = {
+            let bytes = session.read_memory(address, TRAP.len()).expect("read");
+            session.write_memory(address, &TRAP).expect("trap");
+            bytes
+        };
+        session.resume().expect("run to spawn_later");
+        let creator = match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
+            Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+            other => panic!("expected the spawn_later breakpoint, got {other:?}"),
+        };
+        session.write_memory(address, &original).expect("restore");
+        let threads = session.threads().expect("threads");
+        let suspended: Vec<_> = threads
+            .into_iter()
+            .filter(|&id| id != creator)
+            .map(|id| (id, session.read_registers_for(id).expect("registers").pc))
+            .collect();
+        session
+            .backend_mut()
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+            .expect("hold new threads");
+        std::thread::sleep(BIRTH_QUIET);
+        session.backend_mut().interrupt().expect("interrupt the hold");
+        assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
         for (id, pc) in suspended {
-            assert_eq!(pc_of(&mut d, id), pc, "existing suspended thread moved");
+            assert_eq!(
+                session.read_registers_for(id).expect("registers").pc,
+                pc,
+                "suspended thread moved"
+            );
+        }
+        session.detach().expect("detach");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            if let Some(status) = target.try_wait().expect("status") {
+                assert!(status.success(), "detached process failed: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached process did not finish: {}",
+                process_state(pid.0)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+/// Killing a launched process that holds a newborn releases that hold and reaps it.
+#[test]
+fn kill_releases_a_held_new_thread()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let pid = d.pid();
+        let _held = hold_new_thread(&mut d, &fixture);
+        backend(&mut d).kill().expect("kill");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !process_state(pid.0).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "killed process still present: {}",
+                process_state(pid.0)
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     });
 }

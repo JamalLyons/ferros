@@ -71,12 +71,18 @@ fn resume_runs_hello()
         // `d` dereferences to `ferros_core::Session`.
         d.resume().expect("resume");
         assert!(d.wait_for_stdout("hello from ferros fixture", Duration::from_secs(10)));
-    }); // `d` is dropped here: the process is killed, then the session is dropped.
+    }); // `d` is dropped here: the session kills and reaps its target; the tag sweep is a backstop.
 }
 ```
 
 - `t.launch_with_args(&fixture!("loop_counter"), &["100"])` passes fixture arguments; the harness
   appends a unique `--ferros-test-id=...` argument last.
+- `t.launch_with_backend(&fixture, &args, backend)` launches under a `MacOSBackend` the test built
+  first, for example to keep a test hook handle (`backend.reply_fault_injector()`) after the session
+  owns the backend.
+- `t.spawn(&fixture!("loop_counter"), &args)` starts a fixture outside the debugger (stdio null, tagged
+  and killed on the deadline like a launch), for tests that attach to a running process; dropping the
+  returned `Spawned` kills and reaps it.
 - The returned `Debuggee` owns the session and kills the process when dropped, including when
   the test panics. Use `d.pid()`, `d.session()`, `d.stdout()` and `d.stderr()` as needed.
 - The fixture's stdout and stderr go to two files in a per-launch temporary directory (stdin is
@@ -84,11 +90,19 @@ fn resume_runs_hello()
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
   with a comment naming the issue: `tests/breakpoints.rs` (continuing past a breakpoint,
-  issue #33) and `tests/lifecycle.rs` (exit reporting, issue #32).
+  issue #33), and `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL sent from outside
+  while a stop is held, issue #56).
+- `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
+  timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
+  Process-gone assertions reject zombies.
 - When the deadline passes, the harness kills that test's processes and fails the test with a
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+- `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
+  port restore on detach, failed replies). It reads Mach state through the safe
+  `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the
+  test process's own IPC space.
 
 ## Tests without a real process
 

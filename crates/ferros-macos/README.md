@@ -10,9 +10,12 @@ and symbolication:
 let mut session = ferros_core::Session::new(Box::new(ferros_macos::MacOSBackend::new()?));
 ```
 
-Known gaps, fixed by later tasks: `wait` never reports process exit and signals cannot
-be passed on resume (T06, issue #32); single-step is unsupported (T07, issue #33);
-`images` reports only the main executable (issue #34).
+The target is traced with `ptrace(PT_ATTACHEXC)`: signals are reported as stops and can
+be passed on or suppressed on resume, and exit is detected with a kqueue watcher that
+reaps the process and reports `Exited` or `Killed` through `wait`.
+
+Known gaps, fixed by later tasks: single-step is unsupported (T07, issue #33); `images`
+reports only the main executable (issue #34).
 
 All Mach FFI and all `unsafe` code in the workspace lives in this crate; `ferros-core`
 holds no OS-specific code. The crate is macOS-only: on any other OS it compiles as an

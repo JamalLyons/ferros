@@ -15,19 +15,22 @@
 //! ## State machine
 //!
 //! ```text
-//!  NotStarted --launch/attach--> Stopped --resume--> Running
-//!      ^                          ^  |                  |
-//!      |                          |  |   wait returns a non-terminal event
-//!      |                          +--|------------------+
-//!      +------- detach --------------+                  |
-//!  Exited <------- wait returns a terminal event -------+
+//!  NotStarted --launch/attach--> Stopped --resume/resume_with_signal--> Running
+//!      ^                          ^  |                                    |
+//!      |                          |  |   wait returns a non-terminal event (e.g. after interrupt)
+//!      |                          +--|------------------------------------+
+//!      +------- detach --------------+                                    |
+//!  Exited <------- wait returns a terminal event -------------------------+
+//!  Exited <------- kill (from Stopped or Running) ------------------------+
 //!  Exited --launch/attach--> Stopped
 //! ```
 //!
 //! | Call                                                       | NotStarted / Exited | Stopped             | Running        |
 //! |------------------------------------------------------------|---------------------|---------------------|----------------|
 //! | `launch`, `attach`                                         | yes                 | `AlreadyAttached`   | `AlreadyAttached` |
-//! | `detach`, `resume`                                         | `NotAttached`       | yes                 | `NotStopped`   |
+//! | `detach`, `resume`, `resume_with_signal`                   | `NotAttached`       | yes                 | `NotStopped`   |
+//! | `interrupt`                                                | `NotAttached`       | yes (no-op)         | yes            |
+//! | `kill`                                                     | `NotAttached`       | yes                 | yes            |
 //! | `threads`, `select_thread`, registers, memory, regions     | `NotAttached`       | yes                 | `NotStopped`   |
 //! | breakpoint add/remove/enable/disable                       | `NotAttached`       | yes                 | `NotStopped`   |
 //! | `stack_trace`, `symbolicate`, `images`                     | `NotAttached`       | yes                 | `NotStopped`   |
@@ -47,10 +50,18 @@
 //!   [`SessionState::Exited`]: the pid, thread list and selection are cleared and the
 //!   breakpoint table is emptied (the process memory that held the traps is gone).
 //!
-//! Dropping a session while the process is stopped restores the original bytes of every
-//! inserted trap first (best effort), so a process the backend releases on drop is not
-//! left with traps nobody handles. Call [`Session::detach`] to release a process
-//! deliberately and see errors.
+//! - [`Session::kill`] also moves the session to [`SessionState::Exited`], with
+//!   [`Session::last_stop`] set to `StopEvent::Killed { signal: SIGKILL }` (the backend
+//!   reports no event for a kill).
+//!
+//! ## Ownership
+//!
+//! A process the session launched belongs to it: dropping the session kills it. A
+//! process the session attached to does not: dropping the session restores every trap
+//! and detaches, leaving it running (a running process is interrupted first, waiting at
+//! most [`DROP_STOP_TIMEOUT`]). Drop ignores failures; call [`Session::kill`] or
+//! [`Session::detach`] to end a session deliberately and see errors.
+//! [`Session::ownership`] tells which rule applies.
 //!
 //! ## Known gaps
 //!
@@ -62,8 +73,7 @@
 //!   trap bytes of inserted breakpoints.
 //! - T07 (issue #33): [`Session::write_memory`] over an inserted trap bypasses the
 //!   breakpoint table (the saved original bytes are not updated).
-//! - T06 (issue #32) and T07 (issue #33): `Session` has no `interrupt`, `kill` or
-//!   `step_instruction` yet.
+//! - T07 (issue #33): `Session` has no `step_instruction` yet.
 
 #![forbid(unsafe_code)]
 
@@ -76,6 +86,7 @@ mod tests;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, StopEvent};
 use crate::breakpoints::BreakpointStore;
@@ -106,6 +117,7 @@ pub struct Session
 {
     backend: Box<dyn Backend>,
     state: SessionState,
+    ownership: Option<ProcessOwnership>,
     pid: Option<ProcessId>,
     threads: Vec<ThreadId>,
     selected: Option<ThreadId>,
@@ -117,6 +129,21 @@ pub struct Session
     /// Images (path, load address) already given to the symbol cache, loaded or not.
     loaded_images: HashSet<(PathBuf, u64)>,
 }
+
+/// How the session got its process, which decides what dropping the session does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOwnership
+{
+    /// Started by [`Session::launch`]: killed when the session is dropped.
+    Launched,
+    /// Taken over by [`Session::attach`]: released, still running, when the session is
+    /// dropped.
+    Attached,
+}
+
+/// Signal number of `SIGKILL` (9 on every POSIX system), reported in
+/// [`StopEvent::Killed`] by [`Session::kill`].
+pub const SIGKILL: i32 = 9;
 
 impl std::fmt::Debug for Session
 {
@@ -135,23 +162,87 @@ impl std::fmt::Debug for Session
 
 impl Drop for Session
 {
-    /// Restore the original bytes of every inserted trap while the process is stopped.
+    /// Apply the ownership rules: kill a launched process, release an attached one.
     ///
-    /// The backend decides what happens to the process itself when it is dropped (the
-    /// macOS backend kills a process it launched and releases one it attached to). A
-    /// released process must not keep trap instructions it has no debugger for, and
-    /// only the session knows where they are. Failures are ignored: this is best
-    /// effort, and nothing can be restored while the process is running.
+    /// - Launched: the original bytes of every inserted trap are restored while it is
+    ///   stopped (harmless, and it keeps the target's memory honest for a backend that
+    ///   outlives the call), then the process is killed with [`Backend::kill`], whether
+    ///   it is stopped or running.
+    /// - Attached: the process is left running without traps. A running process is
+    ///   interrupted first and the stop awaited for at most [`DROP_STOP_TIMEOUT`]; once
+    ///   stopped, every trap is restored and [`Backend::detach`] releases it. If it
+    ///   exits meanwhile there is nothing left to do; if it never stops, `detach` is
+    ///   still attempted.
+    ///
+    /// Failures are ignored and the drop never blocks for longer than the timeout. Call
+    /// [`Session::kill`] or [`Session::detach`] to end a session deliberately and see
+    /// errors.
     fn drop(&mut self)
     {
-        if self.state == SessionState::Stopped {
-            let _ = self.restore_all_traps();
+        match (self.ownership, self.state) {
+            (Some(ProcessOwnership::Launched), SessionState::Stopped) => {
+                let _ = self.restore_all_traps();
+                let _ = self.backend.kill();
+            }
+            (Some(ProcessOwnership::Launched), SessionState::Running) => {
+                let _ = self.backend.kill();
+            }
+            (Some(ProcessOwnership::Attached), SessionState::Running) => {
+                if self.stop_for_release() {
+                    let _ = self.restore_all_traps();
+                    let _ = self.backend.detach();
+                }
+            }
+            (Some(ProcessOwnership::Attached), SessionState::Stopped) => {
+                let _ = self.restore_all_traps();
+                let _ = self.backend.detach();
+            }
+            _ => {}
         }
     }
 }
 
+/// How long dropping a session that is running an attached process waits for the
+/// interrupt to stop it before detaching anyway.
+pub const DROP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
 impl Session
 {
+    /// Bring a running attached process to a stop so it can be released (used by drop).
+    ///
+    /// Returns `false` when the process is gone (a terminal event arrived), `true`
+    /// otherwise, including when no stop arrived within [`DROP_STOP_TIMEOUT`] (detach is
+    /// then still worth trying). Every pending event is drained, so the backend has
+    /// nothing queued when it is detached.
+    fn stop_for_release(&mut self) -> bool
+    {
+        // An event drained by `resume` means the backend never resumed: it is stopped.
+        if let Some(event) = self.deferred.take() {
+            if event.is_terminal() {
+                return false;
+            }
+        } else {
+            let _ = self.backend.interrupt();
+            let deadline = Instant::now() + DROP_STOP_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.backend.wait(Some(remaining)) {
+                    Ok(Some(event)) if event.is_terminal() => return false,
+                    Ok(Some(_)) => break,
+                    Ok(None) | Err(_) if remaining.is_zero() => return true,
+                    Ok(None) | Err(_) => {}
+                }
+            }
+        }
+        self.state = SessionState::Stopped;
+        loop {
+            match self.backend.wait(Some(Duration::ZERO)) {
+                Ok(Some(event)) if event.is_terminal() => return false,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return true,
+            }
+        }
+    }
     /// A session with no process, driving `backend`.
     ///
     /// The backend should have no process either; the session starts in
@@ -162,6 +253,7 @@ impl Session
         Self {
             backend,
             state: SessionState::NotStarted,
+            ownership: None,
             pid: None,
             threads: Vec::new(),
             selected: None,
@@ -178,6 +270,14 @@ impl Session
     pub fn state(&self) -> SessionState
     {
         self.state
+    }
+
+    /// Whether the current process was launched or attached to, or `None` when there is
+    /// no process. See [Ownership](self#ownership).
+    #[must_use]
+    pub fn ownership(&self) -> Option<ProcessOwnership>
+    {
+        self.ownership
     }
 
     /// Pid of the debugged process, or `None` when there is no process.
@@ -276,6 +376,7 @@ impl Session
     fn clear_process(&mut self)
     {
         self.pid = None;
+        self.ownership = None;
         self.threads.clear();
         self.selected = None;
         self.deferred = None;

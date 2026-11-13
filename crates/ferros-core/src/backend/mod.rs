@@ -221,7 +221,8 @@ pub trait Backend: Send
     ///
     /// - [`BackendError::InvalidState`] with no process, or with `timeout = None` while
     ///   the target is stopped with nothing pending (it would block forever).
-    /// - [`BackendError::Os`] if waiting on the OS fails.
+    /// - [`BackendError::Os`] if waiting on the OS fails, or an exception reply from
+    ///   the previous resume failed. The backend state is unchanged by that error.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>;
 
     /// Resume the target as described by `request`; the backend becomes *Running*.

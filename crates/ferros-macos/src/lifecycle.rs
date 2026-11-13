@@ -32,6 +32,17 @@ pub(crate) fn task_is_dead(task: mach_port_t) -> bool
     kr != mach2::kern_return::KERN_SUCCESS || kind & (1 << (mach2::port::MACH_PORT_RIGHT_DEAD_NAME + 16)) != 0
 }
 
+/// Whether `pid` is stopped by a signal (BSD state `SSTOP`, `ps` state `T`).
+pub(crate) fn is_job_control_stopped(pid: pid_t) -> bool
+{
+    // SAFETY: zero is a valid bit pattern for this plain C struct.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes and outlives the call.
+    let written = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    written == size && info.pbi_status == libc::SSTOP
+}
+
 /// A cancellable exit watcher that owns the tracee's waitpid calls.
 pub(crate) struct ExitWatcher
 {

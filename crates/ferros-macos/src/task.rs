@@ -79,6 +79,10 @@ use crate::{ffi, images, launch, threads};
 /// How long `resume` waits for the exception loop to confirm its reply.
 const EXCEPTION_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long detach waits for the private SIGSTOP to take effect before continuing the
+/// released process.
+const DETACH_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How long `kill` waits for a launched process to be reaped.
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -754,49 +758,84 @@ impl MacOSBackend
         Err(backend_error(DebuggerError::Io(err)))
     }
 
-    /// PT_DETACH requires a BSD signal stop, not just task_suspend. Establish a
-    /// private SIGSTOP if the current stop is a breakpoint or a Mach interrupt.
+    /// End the trace: PT_DETACH requires the tracee to wait in a signal exception, not
+    /// just a task_suspend, so the backend raises a private SIGSTOP and detaches while its
+    /// exception is held. Answering that exception afterwards stops the process for real;
+    /// [`detach_target`](Self::detach_target) continues it once the reply is sent.
     fn stop_tracing(&mut self) -> BackendResult<()>
     {
         if !self.traced {
             return Ok(());
         }
-        if lock_shared(&self.exception_state).soft_signals.is_empty() {
-            let (ready, wait) = mpsc::channel();
-            {
-                let mut shared = lock_shared(&self.exception_state);
-                if shared.dead {
-                    return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
-                }
-                shared.internal_stop = Some(ready);
-                // SAFETY: the lock excludes reaping until after this signal.
-                if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
-                    return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
-                }
+        // Always end the trace from the private SIGSTOP. If a user signal is held, the
+        // resume below suppresses it (detach discards held signals) before the SIGSTOP
+        // is taken; delivering it after detach would, for SIGUSR1, kill the target.
+        let (ready, wait) = mpsc::channel();
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            if shared.dead {
+                return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
-            if self.state == BackendState::Stopped {
-                while self.try_next_event().is_some() {}
-                self.resume(&ResumeRequest::continue_all())?;
+            shared.internal_stop = Some(ready);
+            // SAFETY: the lock excludes reaping until after this signal.
+            if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
+                return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
             }
-            wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
-                code: -1,
-                message: "detach SIGSTOP did not arrive within 5s".into(),
-            })?;
         }
+        if self.state == BackendState::Stopped {
+            while self.try_next_event().is_some() {}
+            self.resume(&ResumeRequest::continue_all())?;
+        }
+        wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+            code: -1,
+            message: "detach SIGSTOP did not arrive within 5s".into(),
+        })?;
+        // PT_DETACH needs the tracee waiting in its signal exception (EBUSY otherwise),
+        // so it comes before the reply.
         self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
         self.traced = false;
         Ok(())
     }
 
     /// Shut down tracing, restore exception handlers and balance our suspensions.
+    ///
+    /// The teardown always runs, even when ending the trace fails (for example the
+    /// private SIGSTOP never arrives because another stop won the race): skipping it
+    /// would leak the handler thread, its port and the task rights and leave the target
+    /// suspended. In that case `PT_DETACH` is still attempted and the first error is
+    /// returned afterwards.
     fn detach_target(&mut self) -> BackendResult<()>
     {
-        self.stop_tracing()?;
+        let traced = self.stop_tracing();
+        if traced.is_err() && self.traced {
+            let _ = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
+            self.traced = false;
+        }
         self.exit_watcher = None;
         self.stop_exception_handler(true);
         self.release_suspends();
+        if traced.is_ok() {
+            // The handler answered the private SIGSTOP exception after PT_DETACH, so the
+            // kernel takes the SIGSTOP as an ordinary job-control stop (state `T`) once the
+            // thread processes the reply. Wait (bounded) until it has, so the SIGCONT
+            // cannot overtake the stop, then undo our own stop: the released process must
+            // keep running. A program with a SIGCONT handler sees one extra SIGCONT.
+            let pid = self.pid.0 as libc::pid_t;
+            let deadline = Instant::now() + DETACH_STOP_TIMEOUT;
+            while !crate::lifecycle::is_job_control_stopped(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // SAFETY: plain kill(2) on the pid this backend still holds (not yet released).
+            if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGCONT) } != 0 {
+                tracing::warn!(
+                    "SIGCONT after detach failed: {}; process {} may stay stopped",
+                    std::io::Error::last_os_error(),
+                    self.pid.0
+                );
+            }
+        }
         self.release_ports();
-        Ok(())
+        traced
     }
 
     fn invalid_state(&self, what: &str) -> BackendError

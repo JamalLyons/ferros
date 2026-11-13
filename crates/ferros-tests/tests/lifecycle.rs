@@ -7,7 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferros_core::backend::{Backend, BackendError, ResumeRequest};
-use ferros_core::{LaunchSpec, ProcessOwnership, Session, SessionState, StopEvent};
+use ferros_core::{LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::{fixture, harness};
 
@@ -328,5 +328,176 @@ fn external_kill_while_a_signal_stop_is_held_is_reported()
             Some(StopEvent::Killed { signal: 9 })
         );
         assert_eq!(d.state(), SessionState::Exited);
+    });
+}
+
+/// The `ps` state of `pid` (for example `S`, `R` or `T`), empty if it does not exist.
+fn process_state(pid: u32) -> String
+{
+    let output = Command::new("/bin/ps")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A fixture started through `/bin/sh`, so its parent is the shell and not this test
+/// process: attaching reparents it to the debugger and detaching hands it back, as for a
+/// process started from a terminal. The shell waits for it, so the shell exits when the
+/// fixture does.
+struct Grandchild
+{
+    shell: std::process::Child,
+    pid: u32,
+}
+
+impl Grandchild
+{
+    fn spawn(args: &[&str]) -> Self
+    {
+        let shell = Command::new("/bin/sh")
+            .arg("-c")
+            // Not just `"$@"`: the shell would exec the fixture instead of waiting for it.
+            .arg("\"$@\"; status=$?; exit $status")
+            .arg("sh")
+            .arg(fixture!("loop_counter").path())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sh");
+        let deadline = Instant::now() + TIMEOUT;
+        let pid = loop {
+            let output = Command::new("/usr/bin/pgrep")
+                .args(["-P", &shell.id().to_string()])
+                .output()
+                .expect("pgrep");
+            if let Some(pid) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell did not start the fixture");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Self { shell, pid }
+    }
+
+    /// Whether the fixture (and so the shell) exited by itself within `timeout`, with
+    /// status 0.
+    fn ran_to_completion(&mut self, timeout: Duration) -> Option<std::process::ExitStatus>
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.shell.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Grandchild
+{
+    fn drop(&mut self)
+    {
+        let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
+        let _ = self.shell.kill();
+        let _ = self.shell.wait();
+    }
+}
+
+/// A process the debugger releases runs on to completion: it is not left stopped by the
+/// private SIGSTOP that ends tracing, and a user signal held when it is released is
+/// discarded, not delivered.
+///
+/// The released process must not be in state `T`, and `loop_counter 100` must run its
+/// second or so to completion and exit 0 (a delivered SIGUSR1 would kill it). The
+/// target's parent is a shell, as for a process started from a terminal (see
+/// [`Grandchild`]).
+#[test]
+fn released_processes_run_to_completion()
+{
+    const SHORT_LOOP: &str = "100";
+    const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+    /// How the attached process is released.
+    const CASES: &[&str] = &[
+        "detach after inspecting",
+        "detach",
+        "drop stopped",
+        "drop running",
+        "backend drop",
+        "detach with held signal",
+    ];
+
+    harness::run_with_timeout(Duration::from_secs(120), |t| {
+        for &case in CASES {
+            let mut target = Grandchild::spawn(&[SHORT_LOOP]);
+            let pid = ProcessId::from(target.pid);
+            let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            session.attach(pid).expect("attach");
+            match case {
+                "detach" => session.detach().expect("detach"),
+                "detach after inspecting" => {
+                    // What `ferros attach --headless` does before it detaches.
+                    session.threads().expect("threads");
+                    session.memory_regions().expect("memory_regions");
+                    session.detach().expect("detach");
+                }
+                "drop stopped" => drop(session),
+                "drop running" => {
+                    session.resume().expect("resume");
+                    drop(session);
+                }
+                "backend drop" => {
+                    session.detach().expect("detach the session");
+                    let mut backend = MacOSBackend::new().expect("backend");
+                    backend.attach(pid).expect("attach the bare backend");
+                    drop(backend);
+                }
+                "detach with held signal" => {
+                    session.resume().expect("resume");
+                    signal(target.pid, "-USR1");
+                    assert!(matches!(
+                        session.wait(Some(TIMEOUT)).expect("signal stop"),
+                        Some(StopEvent::Signal { signal: SIGUSR1, .. })
+                    ));
+                    // Detach discards the held signal (SIGUSR1 would terminate it).
+                    session.detach().expect("detach with a held signal");
+                }
+                _ => unreachable!(),
+            }
+            // Not left job-control stopped. (`ps` state is reliable here: the target
+            // was not launched suspended.) The shell would not show it: it continues a
+            // stopped child itself.
+            for _ in 0..5 {
+                let stat = process_state(target.pid);
+                assert!(
+                    !stat.starts_with('T'),
+                    "{case}: the released process is stopped (state {stat})"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let status = target
+                .ran_to_completion(EXIT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{case}: the released process did not run to completion"));
+            assert!(status.success(), "{case}: the released process exited with {status}");
+        }
+
+        // A launched process released with detach also runs to completion.
+        let mut d = t.launch_with_args(&fixture!("loop_counter"), &[SHORT_LOOP]);
+        d.detach().expect("detach a launched process");
+        assert!(
+            d.wait_for_stdout("final count: 100", EXIT_TIMEOUT),
+            "the detached launched process did not run to completion"
+        );
     });
 }

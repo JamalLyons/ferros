@@ -91,7 +91,7 @@ fn resume_runs_hello()
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
   with a comment naming the issue: `tests/breakpoints.rs` (continuing past a breakpoint,
   issue #33), and `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL sent from outside
-  while a stop is held, a follow-up to issue #32).
+  while a stop is held, issue #56).
 - `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.

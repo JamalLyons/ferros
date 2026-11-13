@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines eight fixture binaries:
+The crate defines nine fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -21,7 +21,10 @@ The crate defines eight fixture binaries:
 - `ferros-fixture-thread_signals`: Two workers raise thread-directed SIGUSR1 independently and report
   which worker handlers ran, for selective delivery and retained-stop races (macOS).
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
-  first argument keeps the process running that many milliseconds after both workers exit.
+  first argument keeps the process running that many milliseconds after both workers exit; a second
+  sets the worker sleep duration (default 50 milliseconds).
+- `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward,
+  demonstrating the macOS resume suspension snapshot.
 
 ## Marker Convention
 
@@ -155,3 +158,22 @@ permission to wait. The real failed Mach-send cleanup is tested with isolated po
 - `tests/exit_watcher.rs` covers a competing debugger thread reaping a tracee before
   its exit watcher (#57): errors remain observable after death and across repeated
   waits, and kill teardown releases backend resources and clears Session ownership.
+
+Stepping race coverage: `single_step.rs` races a real interrupt against a requested
+instruction step and accepts either reported winner; scheduling does not guarantee that
+both orderings occur. A separate bounded test requires a pending signal to beat a real
+step, then checks that continuing produces no stray stop. The session
+unit tests script an interrupt before internal step completion and separately force the
+interrupt-policy flag when completion wins. They also script a simultaneous late
+`SingleStep` after another event and verify it is discarded before continuing; that
+precise simultaneous ordering remains mock-only. The macOS suspend-snapshot test also
+shows that a thread created after resume can run despite the default `Suspend` action.
+
+Draining events alongside an internal completion and carrying signals from an abandoned
+step-over also retain deterministic session mock tests. Real kernel scheduling cannot
+guarantee these exact message orderings; the mock tests force each ordering without
+adding production hooks that synthesize kernel events. The real-process tests complement
+these checks with actual interrupts, signal cancellation, and retained breakpoint replies.
+For attached processes, the detach regression starts a step and covers both direct drop
+(which stops and detaches internally) and explicit interrupt/wait/detach; public `detach`
+continues to require a stopped session.

@@ -407,3 +407,92 @@ fn ordinary_signals_do_not_release_a_breakpoint_stop()
         }
     });
 }
+
+/// Exercise stepping while another thread's breakpoint exception remains held. The
+/// simultaneous stop is a scheduling race, so retry rather than pretend it is guaranteed.
+#[test]
+fn kept_exception_rights_do_not_grow_during_steps()
+{
+    let _serial = serial();
+    harness::run_with_timeout(Duration::from_secs(120), |t| {
+        let fixture = fixture!("threads");
+        for _ in 0..SIMULTANEOUS_TRIALS {
+            let mut d = t.launch(&fixture);
+            let address = marker_address(&mut d, &fixture, "worker_body");
+            d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+            d.resume().expect("resume");
+            let first = expect_breakpoint(&mut d, address, "first worker");
+            let second = d.wait(Some(Duration::ZERO)).expect("drain");
+            if !matches!(second, Some(StopEvent::Breakpoint { thread, pc }) if thread != first && pc == address) {
+                continue;
+            }
+            let registers = d.session_mut().read_registers_for(first).expect("breakpoint registers");
+            assert_eq!(registers.pc, address);
+            let measure = || {
+                (
+                    diagnostics::port_name_count().expect("names"),
+                    diagnostics::send_right_references().expect("references"),
+                )
+            };
+            d.step_instruction(first).expect("warmup step");
+            assert_eq!(
+                d.wait(Some(STOP_TIMEOUT)).expect("step"),
+                Some(StopEvent::SingleStep { thread: first })
+            );
+            let (names, refs) = measure();
+            for _ in 0..12 {
+                // Revisit the trapped instruction to exercise repeated step-overs.
+                d.session_mut().write_registers_for(first, &registers).expect("rewind");
+                d.step_instruction(first).expect("step with other exception kept");
+                assert_eq!(
+                    d.wait(Some(STOP_TIMEOUT)).expect("step"),
+                    Some(StopEvent::SingleStep { thread: first })
+                );
+            }
+            let (after_names, after_refs) = measure();
+            assert!(
+                after_names as u64 <= names as u64 + PORT_TOLERANCE,
+                "port names grew: {names} -> {after_names}"
+            );
+            assert!(
+                after_refs <= refs + PORT_TOLERANCE,
+                "send rights grew: {refs} -> {after_refs}"
+            );
+            return;
+        }
+        panic!("no simultaneous breakpoint stops in {SIMULTANEOUS_TRIALS} trials");
+    });
+}
+
+/// A signal arriving at a breakpoint survives stepping over it and is then passed on.
+#[test]
+fn resume_with_signal_from_breakpoint_then_passes_pending_signal()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        let id = d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+        d.resume().expect("resume");
+        expect_breakpoint(&mut d, address, "breakpoint");
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &d.pid().0.to_string()])
+                .status()
+                .expect("signal")
+                .success()
+        );
+        d.resume_with_signal().expect("step over breakpoint");
+        match d.wait(Some(STOP_TIMEOUT)).expect("signal stop") {
+            Some(StopEvent::Signal { signal: 30, .. }) => {}
+            other => panic!("expected SIGUSR1, got {other:?}"),
+        }
+        d.remove_breakpoint(id).expect("remove breakpoint");
+        d.resume_with_signal().expect("pass SIGUSR1");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("termination"),
+            Some(StopEvent::Killed { signal: 30 })
+        );
+    });
+}

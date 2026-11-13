@@ -428,6 +428,16 @@ impl Spawned
     {
         ProcessId::from(self.child.id())
     }
+
+    /// Check whether this fixture exited, collecting its status without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error if querying the child status fails.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>
+    {
+        self.child.try_wait()
+    }
 }
 
 impl Drop for Spawned

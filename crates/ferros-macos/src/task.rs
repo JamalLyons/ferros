@@ -30,9 +30,9 @@
 //! `resume` honours every [`ThreadAction`]. Before the target runs it `thread_suspend`s
 //! every thread whose action is `Suspend` and sets the hardware single-step bit
 //! (`MDSCR_EL1.SS`, see [`crate::registers::set_single_step`]) of every thread whose
-//! action is `Step`. Suspended threads retain their stop records and unanswered Unix
-//! signal replies (see the exception module's "Held signals and retained thread
-//! rights"). Hardware replies have already been sent. When `wait` delivers the next stop, the
+//! action is `Step`. Suspended threads retain their stop records and Unix
+//! signal decisions (see the exception module's "Held signals and retained thread
+//! rights"). Client exception replies have already been sent. When `wait` delivers the next stop, the
 //! whole task is `task_suspend`ed by the exception loop, so the backend balances its
 //! `thread_suspend`s with `thread_resume` and clears the single-step bit of every thread
 //! it asked to step: a step that did not complete is cancelled, as the contract says,
@@ -424,9 +424,9 @@ impl MacOSBackend
     /// Test hook: make the next exception reply report a failure.
     ///
     /// The reply is still sent so the thread is not stranded, but `wait` reports an
-    /// injected `MACH_SEND_INVALID_DEST`. Hardware replies precede the stop event;
-    /// drain the stop and then the error before resuming. Unix signal replies remain
-    /// deferred until resume. An error from `wait` leaves the state unchanged.
+    /// injected `MACH_SEND_INVALID_DEST`. Client exception replies precede the stop
+    /// event; drain the stop and then the error before resuming. An error from
+    /// `wait` leaves the state unchanged.
     #[doc(hidden)]
     pub fn fail_next_exception_reply(&mut self)
     {
@@ -915,6 +915,38 @@ impl MacOSBackend
         Err(backend_error(DebuggerError::Io(err)))
     }
 
+    /// Select a signal for a logical stop whose kernel exception may already be
+    /// answered. Keep queuing and its internal-stop record atomic with respect to
+    /// the exception loop, including when XNU delivers the new signal immediately.
+    fn select_resumed_signal(&self, port: thread_act_t, original: c_int, signal: c_int) -> BackendResult<()>
+    {
+        let mut shared = lock_shared(&self.exception_state);
+        let reply_pending = shared.has_signal_reply(port);
+        let requeue = signal != 0 && (!reply_pending || signal != original);
+        let queued = if requeue {
+            Some(exception::RequeuedSignal::new(port, signal)?)
+        } else {
+            None
+        };
+        if requeue {
+            // The original was suppressed before its early reply. Queue the chosen
+            // signal on the same thread so XNU evaluates its properties afresh.
+            // Track SIGKILL too: thread-directed delivery can raise a soft exception.
+            // SAFETY: the stop record retains a thread right belonging to our tracee.
+            if unsafe { ffi::__pthread_kill(port, signal) } != 0 {
+                return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
+            }
+        }
+        if reply_pending {
+            // Private handshakes and failed early suppressions still own a reply.
+            self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, if requeue { 0 } else { signal })?;
+        }
+        if let Some(queued) = queued {
+            shared.requeued_signals.push(queued);
+        }
+        Ok(())
+    }
+
     /// End the trace: PT_DETACH requires the tracee to wait in a signal exception, not
     /// just a task_suspend, so the backend raises a private SIGSTOP and detaches while its
     /// exception is held. Answering that exception afterwards stops the process for real;
@@ -1331,8 +1363,8 @@ impl Backend for MacOSBackend
     ///
     /// 1. `thread_suspend` every thread whose action is `Suspend` and set the single-step
     ///    bit (`MDSCR_EL1.SS`) of every thread whose action is `Step`;
-    /// 2. release runnable threads' stop records and answer their Unix signal replies;
-    ///    suspended threads retain their records and held signals;
+    /// 2. requeue runnable threads' selected signals and release their stop records;
+    ///    suspended threads retain their records and signal decisions;
     /// 3. `task_resume` once per suspend the backend holds.
     ///
     /// A step that completes is reported by `wait` as [`StopEvent::SingleStep`]. Whatever
@@ -1373,6 +1405,7 @@ impl Backend for MacOSBackend
                     "resume is not allowed while stop events are pending; drain them with wait".to_string(),
                 ));
             }
+            shared.preparing_resume = true;
             (
                 std::mem::take(&mut shared.suspends),
                 shared.pending_exception,
@@ -1381,7 +1414,9 @@ impl Backend for MacOSBackend
         };
         let restore = |backend: &mut Self, count: u32| {
             backend.undo_thread_actions();
-            lock_shared(&backend.exception_state).suspends += count;
+            let mut shared = lock_shared(&backend.exception_state);
+            shared.suspends += count;
+            shared.preparing_resume = false;
         };
 
         // Suspend and arm the threads before any of them can run.
@@ -1391,44 +1426,14 @@ impl Backend for MacOSBackend
         }
 
         if pending || held {
-            // Only the exceptions answered now get their signal decided; a kept one (its
-            // thread stays suspended) keeps its signal held for a later resume.
+            // A selectively suspended thread retains its logical signal decision
+            // until a later resume allows that thread to run.
             let signals = lock_shared(&self.exception_state).soft_signals.clone();
             for (port, original) in signals.into_iter().filter(|(port, _)| !suspend.contains(port)) {
                 let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
-                let replace = signal != 0 && signal != original && signal != libc::SIGKILL;
-                let replacement = if replace {
-                    match exception::ReplacementSignal::new(port, signal) {
-                        Ok(queued) => Some(queued),
-                        Err(err) => {
-                            restore(self, count);
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    None
-                };
-                if replace {
-                    // XNU's issignal_locked caches the original signal's properties
-                    // before the exception. Updating its number with PT_THUPDATE
-                    // reuses those properties (SIGUSR1 -> SIGCONT can be fatal).
-                    // Queue the replacement on the same Mach thread, then suppress
-                    // the original so the kernel evaluates the new signal afresh.
-                    // SAFETY: `port` is a retained thread right for this tracee;
-                    // the request's signal number was validated above.
-                    if unsafe { ffi::__pthread_kill(port, signal) } != 0 {
-                        let err = backend_error(DebuggerError::Io(std::io::Error::last_os_error()));
-                        restore(self, count);
-                        return Err(err);
-                    }
-                }
-                let update = if replace { 0 } else { signal };
-                if let Err(err) = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, update) {
+                if let Err(err) = self.select_resumed_signal(port, original, signal) {
                     restore(self, count);
                     return Err(err);
-                }
-                if let Some(queued) = replacement {
-                    lock_shared(&self.exception_state).replacement_signals.push(queued);
                 }
             }
         }
@@ -1463,6 +1468,9 @@ impl Backend for MacOSBackend
             }
         }
 
+        // Continue has been acknowledged before any actual task_resume. The loop
+        // can no longer use these in-flight suspends to answer deferred signals.
+        lock_shared(&self.exception_state).preparing_resume = false;
         self.memory_cache.clear();
         for done in 0..count {
             let kr = if self.reply_faults.resume.swap(false, std::sync::atomic::Ordering::SeqCst) {

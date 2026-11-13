@@ -200,6 +200,73 @@ fn unix_signal_can_be_suppressed_or_delivered()
     });
 }
 
+/// An early-replied signal still supports both suppression and delivery to a
+/// real handler; the handler cannot run before the client's resume decision.
+#[test]
+fn early_replied_signal_preserves_handler_delivery_and_suppression()
+{
+    harness::run(|t| {
+        for deliver in [false, true] {
+            let mut d = t.launch(&fixture!("signal_handler"));
+            d.resume().expect("resume");
+            assert!(d.wait_for_stdout("ready", TIMEOUT));
+            signal(d.pid().0, "-CONT");
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("SIGCONT stop"),
+                Some(StopEvent::Signal { signal: 19, .. })
+            ));
+            assert!(
+                !d.wait_for_stdout("continued", Duration::from_millis(150)),
+                "handler ran before resume"
+            );
+            if !deliver {
+                d.resume().expect("suppress SIGCONT");
+                assert!(
+                    !d.wait_for_stdout("continued", Duration::from_millis(150)),
+                    "suppressed handler ran"
+                );
+                signal(d.pid().0, "-CONT");
+                assert!(matches!(
+                    d.wait(Some(TIMEOUT)).expect("fresh SIGCONT stop"),
+                    Some(StopEvent::Signal { signal: 19, .. })
+                ));
+            }
+            d.resume_with_signal().expect("deliver SIGCONT");
+            assert!(d.wait_for_stdout("continued", TIMEOUT), "selected handler did not run");
+            assert_eq!(
+                d.wait(Some(Duration::from_millis(150))).expect("no duplicate signal stop"),
+                None
+            );
+            let pid = d.pid().0;
+            d.kill().expect("kill");
+            assert_reaped(pid);
+        }
+    });
+}
+
+#[test]
+fn early_replied_signal_can_be_replaced_with_sigkill()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("loop_counter"));
+        let pid = d.pid().0;
+        signal(pid, "-USR1");
+        d.resume().expect("resume to SIGUSR1");
+        let thread = match d.wait(Some(TIMEOUT)).expect("signal stop") {
+            Some(StopEvent::Signal { signal: SIGUSR1, thread }) => thread,
+            other => panic!("expected SIGUSR1, got {other:?}"),
+        };
+        d.backend_mut()
+            .resume(&ResumeRequest::continue_all().with_signal(thread, 9))
+            .expect("select SIGKILL");
+        assert_eq!(
+            d.wait(Some(TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_reaped(pid);
+    });
+}
+
 /// A nonfatal replacement is passed once, without exposing a second signal stop.
 #[test]
 fn held_signal_can_be_replaced_with_a_nonfatal_signal()
@@ -385,12 +452,9 @@ fn kill_attached_process_reaps_and_discards_events()
     });
 }
 
-/// A process killed from outside while the session holds its signal stop (the faulting
-/// thread waits for the exception reply) still dies and is reported as killed.
-// A held Unix-signal reply still defers external SIGKILL. Preserving signal
-// suppression/replacement without that reply remains unresolved in issue #56.
+/// A process killed from outside while the session holds its logical signal stop
+/// still dies before the next wait and is reported as killed (#56).
 #[test]
-#[ignore = "external SIGKILL during a held signal stop is deferred until resume (issue #56)"]
 fn external_kill_while_a_signal_stop_is_held_is_reported()
 {
     harness::run(|t| {
@@ -402,6 +466,51 @@ fn external_kill_while_a_signal_stop_is_held_is_reported()
             d.wait(Some(TIMEOUT)).expect("signal stop"),
             Some(StopEvent::Signal { signal: SIGUSR1, .. })
         ));
+        signal(pid, "-9");
+        assert_reaped(pid);
+        assert_eq!(
+            d.wait(Some(TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_eq!(d.state(), SessionState::Exited);
+    });
+}
+
+/// Early replies must also permit autonomous death for an attached tracee, and
+/// the watcher must return it to its original parent before publishing death.
+#[test]
+fn external_kill_of_an_attached_signal_stop_is_reported()
+{
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
+        let pid = target.pid();
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        session.attach(pid).expect("attach");
+        session.resume().expect("resume");
+        signal(pid.0, "-USR1");
+        assert!(matches!(
+            session.wait(Some(TIMEOUT)).expect("signal stop"),
+            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+        ));
+        signal(pid.0, "-9");
+        assert_eq!(
+            session.wait(Some(TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_eq!(session.state(), SessionState::Exited);
+        drop(target); // The original parent owns final reaping after the tracer wait.
+        assert_reaped(pid.0);
+    });
+}
+
+#[test]
+fn external_kill_while_running_reports_only_the_terminal_event()
+{
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("loop_counter"), &["100000", "--progress"]);
+        let pid = d.pid().0;
+        d.resume().expect("resume");
+        assert!(d.wait_for_stdout("tick:", TIMEOUT), "fixture did not run");
         signal(pid, "-9");
         assert_reaped(pid);
         assert_eq!(
@@ -605,34 +714,39 @@ fn ordinary_signals_do_not_release_a_signal_stop()
             );
             assert!(!harness::process_is_gone(pid), "fixture died after {other}");
             assert_eq!(d.state(), SessionState::Stopped);
-            d.kill().expect("kill after the signal-stop guard");
+            signal(pid, "-9");
             assert_reaped(pid);
+            assert_eq!(
+                d.wait(Some(TIMEOUT)).expect("terminal event"),
+                Some(StopEvent::Killed { signal: 9 })
+            );
+            assert_eq!(d.state(), SessionState::Exited);
         }
     });
 }
 
-/// #58 L-1: replying and resuming fail independently. The second error remains
-/// queued exactly once; neither failure may leave the Session claiming to run.
+/// #58 L-1: early replying and resuming fail independently. Each error is reported
+/// once, and neither failure may leave the Session claiming to run.
 #[test]
-fn reply_and_task_resume_failure_are_reported_once_each()
+fn early_reply_and_task_resume_failures_are_reported_once_each()
 {
     harness::run(|t| {
         let backend = MacOSBackend::new().expect("backend");
         let faults = backend.reply_fault_injector();
         let mut d = t.launch_with_backend(&fixture!("loop_counter"), &["100000"], backend);
         d.resume().expect("resume");
+        faults.fail_next_exception_reply();
         signal(d.pid().0, "-USR1");
         assert!(matches!(
             d.wait(Some(TIMEOUT)).expect("signal stop"),
             Some(StopEvent::Signal { signal: SIGUSR1, .. })
         ));
-        faults.fail_next_exception_reply();
         faults.fail_next_task_resume();
-        let first = d.resume().expect_err("task_resume failure");
-        assert!(first.to_string().contains("task_resume"), "{first}");
+        let first = d.resume().expect_err("queued early reply failure");
+        assert!(first.to_string().contains("reply"), "{first}");
         assert_eq!(d.state(), SessionState::Stopped);
-        let second = d.resume().expect_err("queued reply failure");
-        assert!(second.to_string().contains("reply"), "{second}");
+        let second = d.resume().expect_err("task_resume failure");
+        assert!(second.to_string().contains("task_resume"), "{second}");
         assert_eq!(d.state(), SessionState::Stopped);
         d.resume().expect("both errors consumed; retry runs");
         d.interrupt().expect("interrupt after recovery");

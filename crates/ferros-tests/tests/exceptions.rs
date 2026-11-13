@@ -331,6 +331,52 @@ fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
     });
 }
 
+/// A signal deferred behind a breakpoint must not retain a kernel reply that
+/// prevents a subsequent external SIGKILL from completing (#56).
+#[test]
+fn external_kill_after_a_signal_arrives_at_a_breakpoint_is_reported()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP, "--progress"]);
+        let pid = d.pid().0;
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+        d.resume().expect("resume");
+        expect_breakpoint(&mut d, address, "breakpoint");
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &pid.to_string()])
+                .status()
+                .expect("SIGUSR1")
+                .success()
+        );
+        assert!(
+            !d.wait_for_stdout("tick:", Duration::from_millis(400)),
+            "fixture ran while stopped"
+        );
+        assert_eq!(d.state(), SessionState::Stopped);
+        assert_eq!(d.read_registers().expect("registers").pc, address);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-9", &pid.to_string()])
+                .status()
+                .expect("SIGKILL")
+                .success()
+        );
+        assert!(
+            harness::wait_until_gone(pid, STOP_TIMEOUT),
+            "tracee was not reaped before wait"
+        );
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_eq!(d.state(), SessionState::Exited);
+    });
+}
+
 /// Other signals must never let user code run while the breakpoint stop is held (#56).
 #[test]
 fn ordinary_signals_do_not_release_a_breakpoint_stop()

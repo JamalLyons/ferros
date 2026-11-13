@@ -30,6 +30,9 @@
 //! ## Held signals and retained thread rights
 //!
 //! Unix signal replies stay held until resume selects a signal with `PT_THUPDATE`.
+//! Replacements are queued with `__pthread_kill` on the same Mach thread while
+//! `PT_THUPDATE(0)` suppresses the original. A fresh kernel signal pass evaluates
+//! the replacement's default action; the loop consumes its one internal stop.
 //! This preserves suppression, replacement and per-thread delivery semantics, but
 //! means external SIGKILL during a held signal stop is still deferred (issue #56).
 //! Ordinary signals received during a breakpoint stop are deferred until resume;
@@ -121,9 +124,11 @@ pub(crate) struct ExceptionSharedState
     /// Logical records for the current stop and threads a resume left suspended.
     /// Hardware exceptions are already replied to; soft signals retain their reply.
     pub(crate) held: Vec<HeldException>,
-    /// Threads whose soft signals still await a client decision. The stop records
+    /// Threads and original signal numbers still awaiting a client decision. The stop records
     /// retain their thread rights until the threads are allowed to run.
-    pub soft_signals: Vec<thread_act_t>,
+    pub soft_signals: Vec<(thread_act_t, c_int)>,
+    /// Replacement signals queued for a fresh kernel pass, replied to once internally.
+    pub replacement_signals: Vec<ReplacementSignal>,
     /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
     pub internal_stop: Option<mpsc::Sender<()>>,
     /// Set by the exit watcher before publishing the terminal event.
@@ -208,6 +213,43 @@ pub(crate) struct HeldException
     /// The message's thread send right, retained until its logical stop is released.
     thread: mach_port_t,
     soft_signal: bool,
+}
+
+/// A queued replacement owns a thread right even if it remains masked while
+/// the backend refreshes its thread list. Its port name cannot be reused meanwhile.
+#[derive(Debug)]
+pub(crate) struct ReplacementSignal
+{
+    thread: thread_act_t,
+    signal: c_int,
+}
+
+#[cfg(target_os = "macos")]
+impl ReplacementSignal
+{
+    pub(crate) fn new(thread: thread_act_t, signal: c_int) -> BackendResult<Self>
+    {
+        // SAFETY: the held exception owns a send right to this thread; retain an
+        // independent reference until delivery or shutdown.
+        let kr =
+            unsafe { mach2::mach_port::mach_port_mod_refs(mach_task_self(), thread, mach2::port::MACH_PORT_RIGHT_SEND, 1) };
+        if kr != KERN_SUCCESS {
+            return Err(BackendError::Os {
+                code: i64::from(kr),
+                message: "failed to retain replacement signal thread".into(),
+            });
+        }
+        Ok(Self { thread, signal })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ReplacementSignal
+{
+    fn drop(&mut self)
+    {
+        deallocate_right(self.thread);
+    }
 }
 
 /// Command sent from the backend to the exception loop.
@@ -499,7 +541,7 @@ pub(crate) fn answer_held_exceptions(
     }
     state
         .soft_signals
-        .retain(|port| kept.iter().any(|exception| exception.thread == *port));
+        .retain(|(port, _)| kept.iter().any(|exception| exception.thread == *port));
     state.held = kept;
 }
 
@@ -518,6 +560,7 @@ pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
     }
     state.pending_exception = false;
     state.soft_signals.clear();
+    state.replacement_signals.clear();
 }
 
 /// Receive Mach exceptions, suspend the task, and answer hardware exceptions before
@@ -537,6 +580,7 @@ pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
 pub(crate) fn run_exception_loop(
     exception_port: mach_port_t,
     task: mach_port_t,
+    pid: libc::pid_t,
     commands: mpsc::Receiver<ExceptionLoopCommand>,
     shared: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
@@ -580,7 +624,7 @@ pub(crate) fn run_exception_loop(
             };
             request
         };
-        if reply_to_sigkill(&first, &events, &faults) {
+        if reply_to_internal_signal(&first, &mut lock_shared(&shared), pid, &events, &faults) {
             continue;
         }
         if pending {
@@ -614,7 +658,7 @@ pub(crate) fn run_exception_loop(
             // moment have queued their messages: take them without blocking.
             while let Ok(buffer) = receive_exception(exception_port, true) {
                 if let Some(request) = decode_request(&buffer)
-                    && !reply_to_sigkill(&request, &events, &faults)
+                    && !reply_to_internal_signal(&request, &mut state, pid, &events, &faults)
                 {
                     stops.push(hold_exception(&request, architecture));
                 }
@@ -641,8 +685,10 @@ pub(crate) fn run_exception_loop(
                 } else {
                     reply_to_held(&mut exception, &faults).err()
                 };
-                if matches!(event, StopEvent::Signal { .. }) && exception.soft_signal {
-                    state.soft_signals.push(exception.thread);
+                if let StopEvent::Signal { signal, .. } = event
+                    && exception.soft_signal
+                {
+                    state.soft_signals.push((exception.thread, signal));
                 }
                 state.held.push(exception);
                 if internal && let Some(ready) = state.internal_stop.take() {
@@ -781,20 +827,47 @@ fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architectur
     )
 }
 
-/// Answer SIGKILL without releasing suspensions or marking death before the reaper.
-/// Returns true after consuming a SIGKILL request and its carried rights.
+/// Answer SIGKILL or a queued replacement without exposing another signal stop.
+/// Returns true after consuming an internal request and its carried rights.
 #[cfg(target_os = "macos")]
-fn reply_to_sigkill(
+fn reply_to_internal_signal(
     request: &MachExceptionRaiseRequest,
+    state: &mut ExceptionSharedState,
+    pid: libc::pid_t,
     events: &mpsc::Sender<LoopEvent>,
     faults: &ReplyFaultInjector,
 ) -> bool
 {
     let codes = request.code;
-    if request.exception != EXC_SOFTWARE as exception_type_t
-        || codes[0] != EXC_SOFT_SIGNAL
-        || codes[1] != i64::from(libc::SIGKILL)
-    {
+    if request.exception != EXC_SOFTWARE as exception_type_t || codes[0] != EXC_SOFT_SIGNAL {
+        return false;
+    }
+    let replacement = state
+        .replacement_signals
+        .iter()
+        .position(|queued| queued.thread == request.thread.name && i64::from(queued.signal) == codes[1]);
+    if let Some(index) = replacement {
+        let queued = state.replacement_signals.remove(index);
+        // The fresh exception marks BSD state SSTOP. Select the now-correct signal
+        // again to restore SRUN before replying, just as for a client-visible stop.
+        // SAFETY: this loop belongs to the traced pid; the message and queued record
+        // both retain the thread right. PT_THUPDATE treats addr as a port name.
+        let result = unsafe {
+            crate::ffi::ptrace(
+                crate::ffi::ptrace_requests::PT_THUPDATE,
+                pid,
+                queued.thread as usize as *mut libc::c_char,
+                queued.signal,
+            )
+        };
+        if result != 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = events.send(Err(BackendError::Os {
+                code: i64::from(err.raw_os_error().unwrap_or(-1)),
+                message: format!("select replacement signal: {err}"),
+            }));
+        }
+    } else if codes[1] != i64::from(libc::SIGKILL) {
         return false;
     }
     deallocate_right(request.task.name);
@@ -803,6 +876,8 @@ fn reply_to_sigkill(
         thread: request.thread.name,
         soft_signal: true,
     };
+    // A replacement now has its own signal properties in issignal_locked, so
+    // the default action is evaluated for the replacement rather than its original.
     // Darwin's issig delivers SIGKILL unconditionally after this reply, even
     // with the task still suspended. Only the exit watcher marks and reaps death.
     if let Err(err) = reply_to_held(&mut exception, faults) {

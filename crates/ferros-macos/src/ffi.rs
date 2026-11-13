@@ -651,6 +651,15 @@ unsafe extern "C" {
     /// `addr` is request-specific: PT_THUPDATE encodes a Mach thread port name,
     /// not a dereferenceable pointer. The caller must own the traced process.
     pub fn ptrace(request: libc::c_int, pid: libc::pid_t, addr: *mut libc::c_char, data: libc::c_int) -> libc::c_int;
+
+    /// Darwin's thread-directed signal syscall, taking a Mach thread port rather
+    /// than the process-local pthread_t used by pthread_kill. Returns -1 and sets
+    /// errno on failure. Exported by libsystem_kernel; see XNU bsd/kern/kern_sig.c.
+    ///
+    /// # Safety
+    /// The caller must hold a valid thread control right for the intended target
+    /// and pass a valid Darwin signal number.
+    pub fn __pthread_kill(thread_port: mach_port_t, signal: c_int) -> c_int;
 }
 
 unsafe extern "C" {

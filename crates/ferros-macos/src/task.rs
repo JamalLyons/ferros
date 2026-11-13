@@ -599,12 +599,22 @@ impl MacOSBackend
             let shared_state = Arc::clone(&self.exception_state);
             let architecture = self.architecture;
             let task = self.task;
+            let pid = self.pid.0 as libc::pid_t;
             let faults = self.reply_faults.clone();
             info!("Spawning Mach exception handler thread");
             let handle = thread::Builder::new()
                 .name("ferros-mac-exc".to_string())
                 .spawn(move || {
-                    exception::run_exception_loop(port, task, command_rx, shared_state, architecture, loop_events, faults);
+                    exception::run_exception_loop(
+                        port,
+                        task,
+                        pid,
+                        command_rx,
+                        shared_state,
+                        architecture,
+                        loop_events,
+                        faults,
+                    );
                 })
                 .map_err(|e| DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}")))?;
 
@@ -840,7 +850,7 @@ impl MacOSBackend
         // Suppress and answer the attach signal while retaining the task suspend.
         // Holding this exception indefinitely would defer an external SIGKILL.
         let ports = lock_shared(&self.exception_state).soft_signals.clone();
-        for port in ports {
+        for (port, _) in ports {
             self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0)?;
         }
         let (ack, replied) = mpsc::channel();
@@ -1065,7 +1075,7 @@ impl MacOSBackend
             if !lock_shared(&self.exception_state)
                 .soft_signals
                 .iter()
-                .any(|&port| thread.raw() == u64::from(port))
+                .any(|&(port, _)| thread.raw() == u64::from(port))
             {
                 return Err(BackendError::Unsupported(
                     "signal injection requires a held soft-signal exception".into(),
@@ -1344,11 +1354,41 @@ impl Backend for MacOSBackend
             // Only the exceptions answered now get their signal decided; a kept one (its
             // thread stays suspended) keeps its signal held for a later resume.
             let signals = lock_shared(&self.exception_state).soft_signals.clone();
-            for port in signals.into_iter().filter(|port| !suspend.contains(port)) {
+            for (port, original) in signals.into_iter().filter(|(port, _)| !suspend.contains(port)) {
                 let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
-                if let Err(err) = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, signal) {
+                let replace = signal != 0 && signal != original && signal != libc::SIGKILL;
+                let replacement = if replace {
+                    match exception::ReplacementSignal::new(port, signal) {
+                        Ok(queued) => Some(queued),
+                        Err(err) => {
+                            restore(self, count);
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if replace {
+                    // XNU's issignal_locked caches the original signal's properties
+                    // before the exception. Updating its number with PT_THUPDATE
+                    // reuses those properties (SIGUSR1 -> SIGCONT can be fatal).
+                    // Queue the replacement on the same Mach thread, then suppress
+                    // the original so the kernel evaluates the new signal afresh.
+                    // SAFETY: `port` is a retained thread right for this tracee;
+                    // the request's signal number was validated above.
+                    if unsafe { ffi::__pthread_kill(port, signal) } != 0 {
+                        let err = backend_error(DebuggerError::Io(std::io::Error::last_os_error()));
+                        restore(self, count);
+                        return Err(err);
+                    }
+                }
+                let update = if replace { 0 } else { signal };
+                if let Err(err) = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, update) {
                     restore(self, count);
                     return Err(err);
+                }
+                if let Some(queued) = replacement {
+                    lock_shared(&self.exception_state).replacement_signals.push(queued);
                 }
             }
         }

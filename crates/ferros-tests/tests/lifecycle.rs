@@ -200,6 +200,91 @@ fn unix_signal_can_be_suppressed_or_delivered()
     });
 }
 
+/// A nonfatal replacement is passed once, without exposing a second signal stop.
+#[test]
+fn held_signal_can_be_replaced_with_a_nonfatal_signal()
+{
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("loop_counter"), &["25"]);
+        let pid = d.pid().0;
+        signal(pid, "-USR1");
+        d.resume().expect("resume to signal");
+        let thread = match d.wait(Some(TIMEOUT)).expect("signal stop") {
+            Some(StopEvent::Signal { signal: SIGUSR1, thread }) => thread,
+            other => panic!("expected SIGUSR1, got {other:?}"),
+        };
+        // Darwin SIGCONT is 19. Its default action is nonfatal.
+        d.session_mut()
+            .backend_mut()
+            .resume(&ResumeRequest::continue_all().with_signal(thread, 19))
+            .expect("replace SIGUSR1 with SIGCONT");
+        assert_eq!(
+            d.wait(Some(TIMEOUT)).expect("exit without duplicate stop"),
+            Some(StopEvent::Exited { code: 0 })
+        );
+        assert!(d.wait_for_stdout("final count: 25", TIMEOUT));
+        assert_reaped(pid);
+    });
+}
+
+/// Each replacement decision consumes just its own internal signal stop.
+#[test]
+fn replacement_signals_do_not_hide_later_signal_stops()
+{
+    harness::run(|t| {
+        // SIGCONT, SIGCHLD, SIGURG and SIGWINCH have nonfatal default actions.
+        const CASES: &[(i32, &str)] = &[(19, "-CONT"), (20, "-CHLD"), (16, "-URG"), (28, "-WINCH")];
+        for &(replacement, name) in CASES {
+            let mut d = t.launch(&fixture!("loop_counter"));
+            let pid = d.pid().0;
+            signal(pid, "-USR1");
+            d.resume().expect("resume to original signal");
+            let thread = match d.wait(Some(TIMEOUT)).expect("original signal stop") {
+                Some(StopEvent::Signal { signal: SIGUSR1, thread }) => thread,
+                other => panic!("expected SIGUSR1, got {other:?}"),
+            };
+            d.backend_mut()
+                .resume(&ResumeRequest::continue_all().with_signal(thread, replacement))
+                .expect("replace with a nonfatal signal");
+            assert_eq!(d.wait(Some(Duration::from_millis(100))).expect("no duplicate stop"), None);
+            let stat = process_state(pid);
+            assert!(!stat.starts_with('T'), "replacement left BSD state stopped: {stat}");
+            signal(pid, name);
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("later signal stop"),
+                Some(StopEvent::Signal { signal, .. }) if signal == replacement
+            ));
+            d.resume().expect("suppress later signal");
+            d.kill().expect("kill");
+            assert_reaped(pid);
+        }
+    });
+}
+
+/// Replacement must also refresh the properties of a nonfatal original signal.
+#[test]
+fn held_nonfatal_signal_can_be_replaced_with_a_fatal_signal()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("loop_counter"));
+        let pid = d.pid().0;
+        signal(pid, "-CONT");
+        d.resume().expect("resume to SIGCONT");
+        let thread = match d.wait(Some(TIMEOUT)).expect("signal stop") {
+            Some(StopEvent::Signal { signal: 19, thread }) => thread,
+            other => panic!("expected SIGCONT, got {other:?}"),
+        };
+        d.backend_mut()
+            .resume(&ResumeRequest::continue_all().with_signal(thread, SIGUSR1))
+            .expect("replace SIGCONT with SIGUSR1");
+        assert_eq!(
+            d.wait(Some(TIMEOUT)).expect("signal exit without duplicate stop"),
+            Some(StopEvent::Killed { signal: SIGUSR1 })
+        );
+        assert_reaped(pid);
+    });
+}
+
 #[test]
 fn attached_session_drop_releases_ownership_and_restores_ports()
 {

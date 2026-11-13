@@ -33,6 +33,11 @@
 //! - **Exception ports**: attaching saves the target's exception ports and detaching
 //!   restores them. The port rights each exception message carries are released.
 //!   [`diagnostics`] lets tests check both.
+//! - **Lifecycle**: PT_ATTACHEXC routes Unix signals through the exception port. The
+//!   attach SIGSTOP is private; resume suppresses held signals unless explicitly passed.
+//!   A kqueue watcher reaps exits with waitpid and reports Exited/Killed, including
+//!   death while stopped. Kill terminates and reaps; detach uses PT_DETACH and restores
+//!   the saved exception ports. Launched targets are killed on drop, attached ones released.
 //! - **Thread ids** are Mach thread port names.
 //! - **Breakpoints**: the backend keeps no breakpoint table; the engine writes trap
 //!   bytes with `write_memory`, which makes code pages writable for the write. Hardware
@@ -42,10 +47,6 @@
 //!
 //! ## Known gaps
 //!
-//! - T06 (issue #32): nothing watches for process exit, so `wait` never reports
-//!   `StopEvent::Exited` or `StopEvent::Killed`, and `wait(None)` on a process that exits
-//!   blocks forever. `kill` is minimal. Signals cannot be passed on resume
-//!   (`BackendError::Unsupported`).
 //! - T07 (issue #33): single-step (`ThreadAction::Step`) returns
 //!   `BackendError::Unsupported`, and so does keeping individual threads suspended.
 //! - Issue #34: shared libraries are not enumerated by `images`.
@@ -160,6 +161,7 @@ pub mod ffi;
 pub mod guards;
 pub mod images;
 pub mod launch;
+mod lifecycle;
 pub mod memory;
 pub mod registers;
 pub mod task;

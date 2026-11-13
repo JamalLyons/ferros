@@ -20,9 +20,10 @@
 //! Guarantees:
 //!
 //! - **No leaked processes.** Each launch appends a unique `--ferros-test-id=...` argument to
-//!   the fixture's argv. Dropping the [`Debuggee`] (normal return or unwinding) kills the
-//!   process by pid and by that argument; a failed launch kills any process left behind by
-//!   the argument; a timeout kills every process the test launched. The per-launch directory
+//!   the fixture's argv. Dropping the [`Debuggee`] (normal return or unwinding) drops its
+//!   session first, then sweeps processes by that argument; a failed launch kills any
+//!   process left behind by the argument; a timeout kills every process the test launched.
+//!   The per-launch directory
 //!   that captures a debuggee's output is removed on the same paths.
 //! - **Hard deadline.** The body runs on a worker thread. If it does not finish in time the
 //!   test fails with a "timed out" message after its debuggees are killed. Only that test's
@@ -160,12 +161,11 @@ enum Outcome
     TimedOut,
 }
 
-/// A process launched by one test: its identifying argument, once known its pid, and the
-/// directory capturing its output (none for a [`Spawned`] process).
+/// A process launched by one test: its identifying argument and capture directory
+/// (none for a [`Spawned`] process).
 struct Tracked
 {
     tag: String,
-    pid: Option<u32>,
     capture_dir: Option<PathBuf>,
 }
 
@@ -185,13 +185,6 @@ impl Shared
         self.tracked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn set_pid(&self, tag: &str, pid: u32)
-    {
-        if let Some(entry) = self.tracked().iter_mut().find(|entry| entry.tag == tag) {
-            entry.pid = Some(pid);
-        }
-    }
-
     fn forget(&self, tag: &str)
     {
         self.tracked().retain(|entry| entry.tag != tag);
@@ -207,7 +200,7 @@ impl Shared
         let entries = std::mem::take(&mut *self.tracked());
         let mut killed = Vec::new();
         for entry in entries {
-            killed.extend(kill_debuggee(entry.pid, &entry.tag));
+            killed.extend(kill_debuggee(&entry.tag));
             if let Some(dir) = &entry.capture_dir {
                 let _ = fs::remove_dir_all(dir);
             }
@@ -320,7 +313,6 @@ impl TestContext
 
         self.shared.tracked().push(Tracked {
             tag: tag.clone(),
-            pid: None,
             capture_dir: Some(capture.path.clone()),
         });
 
@@ -334,7 +326,7 @@ impl TestContext
         if watchdog.disarm() {
             // The launch outlived its deadline and the test is being failed for it. Whatever
             // launch returned in the end, leave no process and report the same reason.
-            kill_debuggee(launched.as_ref().ok().map(|pid| pid.0), &tag);
+            kill_debuggee(&tag);
             self.shared.forget(&tag);
             drop(session);
             panic!("{}", launch_stalled_guidance());
@@ -345,13 +337,12 @@ impl TestContext
             Err(err) => {
                 // A failed launch can leave a suspended child behind (task_for_pid denied
                 // after posix_spawn). Kill it by its argument before releasing the session.
-                kill_debuggee(None, &tag);
+                kill_debuggee(&tag);
                 self.shared.forget(&tag);
                 drop(session);
                 return Err(err);
             }
         };
-        self.shared.set_pid(&tag, pid.0);
 
         let stdout = OutputBuffer::spawn_reader(capture.stdout_path());
         let stderr = OutputBuffer::spawn_reader(capture.stderr_path());
@@ -394,7 +385,6 @@ impl TestContext
         let tag = unique_tag();
         self.shared.tracked().push(Tracked {
             tag: tag.clone(),
-            pid: None,
             capture_dir: None,
         });
         let child = Command::new(fixture.path())
@@ -411,7 +401,6 @@ impl TestContext
                 panic!("ferros-tests: failed to spawn fixture '{}': {err}", fixture.name());
             }
         };
-        self.shared.set_pid(&tag, child.id());
         Spawned {
             child,
             tag,
@@ -443,8 +432,8 @@ impl Drop for Spawned
 {
     fn drop(&mut self)
     {
-        kill_debuggee(Some(self.child.id()), &self.tag);
-        let _ = self.child.kill();
+        kill_debuggee(&self.tag);
+        let _ = self.child.try_wait();
         let _ = self.child.wait();
         self.shared.forget(&self.tag);
     }
@@ -498,7 +487,7 @@ impl LaunchWatchdog
                 on_stall();
                 let give_up = Instant::now() + STALL_SWEEP_LIMIT;
                 loop {
-                    kill_debuggee(None, &tag);
+                    kill_debuggee(&tag);
                     let launch_still_blocked = wait.recv_timeout(STALL_SWEEP_INTERVAL) == Err(RecvTimeoutError::Timeout);
                     if !launch_still_blocked || Instant::now() >= give_up {
                         break;
@@ -527,10 +516,10 @@ impl LaunchWatchdog
 /// A launched fixture process together with the [`Session`] debugging it.
 ///
 /// Dereferences to [`Session`], so session methods can be called directly
-/// (`debuggee.read_registers()`). Dropping it kills the process (`kill -9` by pid and by its
-/// identifying argument), stops the output readers, removes the capture directory, and then
-/// drops the session; this is safe whether the process is suspended at entry, running,
-/// already exited, or detached. Drop never panics and waits at most about two seconds.
+/// (`debuggee.read_registers()`). Dropping it drops the session first, letting its ownership
+/// policy terminate and reap a launched target. A tag sweep catches a detached target;
+/// no stale pid is ever signalled. Output readers and capture files are then removed.
+/// Cleanup logs any process that remains and never panics.
 pub struct Debuggee
 {
     session: Session,
@@ -627,10 +616,15 @@ impl Drop for Debuggee
 {
     fn drop(&mut self)
     {
-        // Kill before the session is dropped (fields drop after this function): a detached
-        // process keeps running, and a process left suspended at entry would otherwise
-        // survive forever.
-        kill_debuggee(Some(self.pid.0), &self.tag);
+        let empty = Session::new(Box::new(ferros_macos::MacOSBackend::new().expect("empty backend")));
+        drop(std::mem::replace(&mut self.session, empty));
+        kill_debuggee(&self.tag);
+        // Detaching a launched target transfers execution ownership but we are still
+        // its Unix parent. Reap it after the tag sweep, without signalling a stale pid.
+        ferros_macos::launch::reap_detached_child(self.pid);
+        if !process_is_gone(self.pid.0) {
+            eprintln!("ferros-tests: cleanup left pid {} present", self.pid.0);
+        }
         self.shared.forget(&self.tag);
         self.stdout.stop();
         self.stderr.stop();
@@ -804,12 +798,12 @@ fn pids_with_tag(ps_output: &str, tag: &str) -> Vec<u32>
 )]
 pub fn kill_tagged(tag: &str) -> Vec<u32>
 {
-    kill_debuggee(None, tag)
+    kill_debuggee(tag)
 }
 
-/// Returns `true` when `pid` no longer runs: either no such process exists or it exited and
-/// only its zombie entry remains (the harness never reaps debuggees, so their pids cannot be
-/// reused while the test binary runs).
+/// Returns `true` only when `pid` has no process-table entry. A zombie is still present
+/// and is a cleanup failure: launched targets are now reaped by the debugger. Never use
+/// a remembered pid for signalling after a session may have reaped it.
 #[must_use]
 pub fn process_is_gone(pid: u32) -> bool
 {
@@ -826,7 +820,7 @@ pub fn process_is_gone(pid: u32) -> bool
     };
     let state = String::from_utf8_lossy(&output.stdout);
     let state = state.trim();
-    state.is_empty() || state.starts_with('Z')
+    state.is_empty()
 }
 
 /// Waits up to `timeout` for [`process_is_gone`] to report `true`.
@@ -845,16 +839,11 @@ pub fn wait_until_gone(pid: u32, timeout: Duration) -> bool
     }
 }
 
-/// Sends SIGKILL to `pid` (when given) and to every process tagged `tag`, then waits up to
+/// Sends SIGKILL only to processes currently carrying `tag`, then waits up to
 /// [`KILL_SETTLE`] for them to disappear. Returns the pids signalled.
-fn kill_debuggee(pid: Option<u32>, tag: &str) -> Vec<u32>
+fn kill_debuggee(tag: &str) -> Vec<u32>
 {
-    let mut targets: Vec<u32> = pid.into_iter().filter(|&pid| pid > 1).collect();
-    for tagged in tagged_pids(tag) {
-        if tagged > 1 && !targets.contains(&tagged) {
-            targets.push(tagged);
-        }
-    }
+    let targets: Vec<u32> = tagged_pids(tag).into_iter().filter(|&pid| pid > 1).collect();
     if targets.is_empty() {
         return targets;
     }

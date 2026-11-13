@@ -54,4 +54,4 @@ session.detach()?;
 - ✅ Thread enumeration
 - ✅ Software breakpoints (insert, remove, hit counts)
 - ⏳ Stepping over breakpoints and single-step execution (T07, issue #33)
-- ⏳ Process exit detection and signal pass-through (T06, issue #32)
+- ✅ Process exit detection, signal pass-through, interrupt and kill

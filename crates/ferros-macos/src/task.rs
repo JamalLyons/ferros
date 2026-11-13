@@ -20,8 +20,8 @@
 //! ## Suspend accounting
 //!
 //! *Stopped* means the backend holds at least one `task_suspend` on the task: the
-//! suspended start of a launch, the `task_suspend` of an attach, one per exception stop
-//! and one per interrupt. The count lives in the shared exception state; `resume`,
+//! private attach SIGSTOP of a launch or attach, one per exception stop, and one per
+//! interrupt. PT_ATTACHEXC consumes the suspended spawn before this private stop. The count lives in the shared exception state; `resume`,
 //! `detach` and `kill` balance it with `task_resume`. Threads that stop at the same time
 //! form one stop: one suspend, one event per thread.
 //!
@@ -242,6 +242,10 @@ pub struct MacOSBackend
     state: BackendState,
     /// Whether this backend spawned the target (and so reaps it on `kill`).
     launched: bool,
+    /// Whether PT_ATTACHEXC has established tracing.
+    traced: bool,
+    /// Sole owner of waitpid while tracing.
+    exit_watcher: Option<crate::lifecycle::ExitWatcher>,
     /// Mach exception port used to receive stop notifications.
     exception_port: mach_port_t,
     /// Thread running the Mach exception handling loop.
@@ -292,6 +296,8 @@ impl MacOSBackend
             architecture: Architecture::current(),
             state: BackendState::NoProcess,
             launched: false,
+            traced: false,
+            exit_watcher: None,
             exception_port: MACH_PORT_NULL,
             exception_thread: None,
             exception_commands: None,
@@ -567,12 +573,22 @@ impl MacOSBackend
             let shared_state = Arc::clone(&self.exception_state);
             let architecture = self.architecture;
             let task = self.task;
+            let pid = self.pid.0 as libc::pid_t;
             let faults = self.reply_faults.clone();
             info!("Spawning Mach exception handler thread");
             let handle = thread::Builder::new()
                 .name("ferros-mac-exc".to_string())
                 .spawn(move || {
-                    exception::run_exception_loop(port, task, command_rx, shared_state, architecture, loop_events, faults);
+                    exception::run_exception_loop(
+                        port,
+                        task,
+                        pid,
+                        command_rx,
+                        shared_state,
+                        architecture,
+                        loop_events,
+                        faults,
+                    );
                 })
                 .map_err(|e| DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}")))?;
 
@@ -660,32 +676,127 @@ impl MacOSBackend
         self.threads.clear();
         self.pid = ProcessId(0);
         self.launched = false;
+        self.traced = false;
         self.state = BackendState::NoProcess;
         self.memory_cache.clear();
         *lock_shared(&self.exception_state) = ExceptionSharedState::new();
     }
 
     /// Kill and reap a process this backend spawned but could not take control of.
-    fn discard_child(pid: libc::pid_t)
+    fn discard_child(pid: libc::pid_t) -> BackendResult<()>
     {
-        unsafe {
-            let _ = libc::kill(pid, libc::SIGKILL);
+        // SAFETY: posix_spawn returned our unreaped child; its pid cannot be reused.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(backend_error(err.into()));
+            }
         }
-        Self::reap(pid);
+        launch::reap_child(pid, KILL_REAP_TIMEOUT)
     }
 
-    /// Reap the child `pid`, waiting at most [`KILL_REAP_TIMEOUT`].
-    fn reap(pid: libc::pid_t)
+    /// Establish signal tracing and wait for its private SIGSTOP exception. Darwin's
+    /// PT_ATTACHEXC consumes a pre-existing task suspend (including suspended spawn).
+    fn start_tracing(&mut self) -> BackendResult<()>
     {
-        let deadline = Instant::now() + KILL_REAP_TIMEOUT;
-        loop {
-            let mut status: c_int = 0;
-            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if reaped != 0 || Instant::now() >= deadline {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
+        let (ready, wait) = mpsc::channel();
+        lock_shared(&self.exception_state).internal_stop = Some(ready);
+        self.ptrace(ffi::ptrace_requests::PT_ATTACHEXC, 0, 0)?;
+        self.traced = true;
+        wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+            code: -1,
+            message: "ptrace attach SIGSTOP did not arrive within 5s".into(),
+        })?;
+        // Suppress and answer the attach signal while retaining the task suspend.
+        // Holding this exception indefinitely would defer an external SIGKILL.
+        let ports = lock_shared(&self.exception_state).soft_signals.clone();
+        for port in ports {
+            self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0)?;
         }
+        let (ack, replied) = mpsc::channel();
+        self.exception_commands
+            .as_ref()
+            .expect("handler started")
+            .send(ExceptionLoopCommand::Continue(ack))
+            .map_err(|_| BackendError::Os {
+                code: -1,
+                message: "attach reply channel closed".into(),
+            })?;
+        replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+            code: -1,
+            message: "attach reply timed out".into(),
+        })?;
+        self.exit_watcher = Some(crate::lifecycle::ExitWatcher::start(
+            self.pid.0 as libc::pid_t,
+            Arc::clone(&self.exception_state),
+            self.events_tx.as_ref().expect("handler started").clone(),
+        )?);
+        Ok(())
+    }
+
+    /// Issue one Darwin tracing request; the address encodes a thread port, never memory.
+    fn ptrace(&self, request: c_int, thread: thread_act_t, signal: c_int) -> BackendResult<()>
+    {
+        // SAFETY: this backend owns the pid's tracing relationship (or is attaching);
+        // Darwin interprets the address as a Mach port name for PT_THUPDATE only.
+        let result = unsafe {
+            ffi::ptrace(
+                request,
+                self.pid.0 as libc::pid_t,
+                thread as usize as *mut libc::c_char,
+                signal,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        Err(backend_error(DebuggerError::Io(err)))
+    }
+
+    /// PT_DETACH requires a BSD signal stop, not just task_suspend. Establish a
+    /// private SIGSTOP if the current stop is a breakpoint or a Mach interrupt.
+    fn stop_tracing(&mut self) -> BackendResult<()>
+    {
+        if !self.traced {
+            return Ok(());
+        }
+        if lock_shared(&self.exception_state).soft_signals.is_empty() {
+            let (ready, wait) = mpsc::channel();
+            {
+                let mut shared = lock_shared(&self.exception_state);
+                if shared.dead {
+                    return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
+                }
+                shared.internal_stop = Some(ready);
+                // SAFETY: the lock excludes reaping until after this signal.
+                if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
+                    return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
+                }
+            }
+            if self.state == BackendState::Stopped {
+                while self.try_next_event().is_some() {}
+                self.resume(&ResumeRequest::continue_all())?;
+            }
+            wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+                code: -1,
+                message: "detach SIGSTOP did not arrive within 5s".into(),
+            })?;
+        }
+        self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
+        self.traced = false;
+        Ok(())
+    }
+
+    /// Shut down tracing, restore exception handlers and balance our suspensions.
+    fn detach_target(&mut self) -> BackendResult<()>
+    {
+        self.stop_tracing()?;
+        self.exit_watcher = None;
+        self.stop_exception_handler(true);
+        self.release_suspends();
+        self.release_ports();
+        Ok(())
     }
 
     fn invalid_state(&self, what: &str) -> BackendError
@@ -742,11 +853,13 @@ impl MacOSBackend
         {
             self.threads = threads;
         }
-        self.state = if event.is_terminal() {
-            BackendState::NoProcess
+        if event.is_terminal() {
+            self.exit_watcher = None;
+            self.stop_exception_handler(false);
+            self.release_ports();
         } else {
-            BackendState::Stopped
-        };
+            self.state = BackendState::Stopped;
+        }
         event
     }
 
@@ -770,10 +883,19 @@ impl MacOSBackend
                 "keeping individual threads suspended is not implemented yet".to_string(),
             )),
         };
-        if !request.signals.is_empty() {
-            return Err(BackendError::Unsupported(
-                "passing signals on resume is not implemented yet (T06, issue #32)".to_string(),
-            ));
+        for (thread, signal) in &request.signals {
+            if !lock_shared(&self.exception_state)
+                .soft_signals
+                .iter()
+                .any(|&port| thread.raw() == u64::from(port))
+            {
+                return Err(BackendError::Unsupported(
+                    "signal injection requires a held soft-signal exception".into(),
+                ));
+            }
+            if !(0..32).contains(signal) {
+                return Err(BackendError::Unsupported(format!("invalid signal {signal}")));
+            }
         }
         if let Some(err) = unsupported(request.default_action) {
             return Err(err);
@@ -830,18 +952,27 @@ impl Backend for MacOSBackend
         debug!("Attaching to spawned process");
         let process_id = ProcessId::from(pid as u32);
         if let Err(err) = self.attach_task(process_id) {
-            Self::discard_child(pid);
+            Self::discard_child(pid).map_err(|cleanup| BackendError::Os {
+                code: -1,
+                message: format!("launch failed ({err}); child cleanup also failed: {cleanup}"),
+            })?;
             return Err(backend_error(err));
         }
-        // The suspended start counts as the first suspend.
-        lock_shared(&self.exception_state).suspends = 1;
         self.launched = true;
         self.state = BackendState::Stopped;
+        if let Err(err) = self.start_tracing() {
+            self.kill().map_err(|cleanup| BackendError::Os {
+                code: -1,
+                message: format!("tracing setup failed ({err}); child cleanup also failed: {cleanup}"),
+            })?;
+            return Err(err);
+        }
         info!("Successfully launched and attached to process {}", pid);
         Ok(process_id)
     }
 
-    /// Attach with `task_for_pid()` and stop the target with `task_suspend()`.
+    /// Attach with `task_for_pid()` and PT_ATTACHEXC. Its private SIGSTOP
+    /// establishes the initial whole-task suspension and is suppressed internally.
     fn attach(&mut self, pid: ProcessId) -> BackendResult<()>
     {
         if self.state != BackendState::NoProcess {
@@ -849,18 +980,19 @@ impl Backend for MacOSBackend
         }
 
         self.attach_task(pid).map_err(backend_error)?;
-        let kr = unsafe { task_suspend(self.task) };
-        if kr != KERN_SUCCESS {
-            self.stop_exception_handler(true);
-            self.release_suspends();
-            self.release_ports();
-            return Err(mach_error(kr, "task_suspend failed"));
-        }
-        // Add, do not assign: the exception loop is already running and may have counted
-        // a suspend of its own for an exception raised before this one took effect.
-        lock_shared(&self.exception_state).suspends += 1;
-        self.launched = false;
         self.state = BackendState::Stopped;
+        if let Err(err) = self.start_tracing() {
+            // Before tracing succeeds no SIGSTOP was sent; afterwards undo tracing
+            // before restoring ports, so no signal can strand the target.
+            if self.traced {
+                let _ = self.detach_target();
+            } else {
+                self.stop_exception_handler(true);
+                self.release_suspends();
+                self.release_ports();
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -872,22 +1004,19 @@ impl Backend for MacOSBackend
         use tracing::info;
 
         self.require_stopped("detach")?;
-        let alive = unsafe { libc::kill(self.pid.0 as libc::pid_t, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        let alive = !lock_shared(&self.exception_state).dead && !crate::lifecycle::task_is_dead(self.task);
         if !alive {
             return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
         }
 
         let pid = self.pid.0;
         info!("Detaching from process {}", pid);
-        self.stop_exception_handler(true);
-        self.release_suspends();
-        self.release_ports();
+        self.detach_target()?;
         info!("Successfully detached from process {}", pid);
         Ok(())
     }
 
-    /// Minimal kill: `SIGKILL`, let a suspended task die, reap a launched process.
+    /// SIGKILL works at Mach and ptrace stops; release holds and await the sole reaper.
     fn kill(&mut self) -> BackendResult<()>
     {
         if self.state == BackendState::NoProcess {
@@ -895,21 +1024,31 @@ impl Backend for MacOSBackend
         }
 
         let pid = self.pid.0 as libc::pid_t;
-        let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if killed != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EPERM) {
-                return Err(BackendError::PermissionDenied(format!("cannot kill process {pid}: {err}")));
+        {
+            let shared = lock_shared(&self.exception_state);
+            // The watcher marks death before it can reap, under this lock. Never
+            // signal a remembered pid once reaping may have allowed pid reuse.
+            if !shared.dead {
+                // SAFETY: this tracee is not yet reaped; kill does not access memory.
+                let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
+                if killed != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(backend_error(DebuggerError::Io(err)));
+                    }
+                }
             }
-            // ESRCH: already dead, which counts as success.
         }
 
         // The process is dying: its exception ports need no restoring, only releasing.
         self.stop_exception_handler(false);
         self.release_suspends();
-        if self.launched {
-            Self::reap(pid);
+        if let Some(watcher) = &self.exit_watcher {
+            watcher.wait(KILL_REAP_TIMEOUT)?;
+        } else if self.launched {
+            launch::reap_child(pid, KILL_REAP_TIMEOUT)?;
         }
+        self.exit_watcher = None;
         self.release_ports();
         Ok(())
     }
@@ -920,44 +1059,47 @@ impl Backend for MacOSBackend
     /// failure is returned once as `BackendError::Os` (the state does not change), and
     /// later calls report later stops as usual.
     ///
-    /// Known gap (T06, issue #32): nothing watches for process exit, so `Exited` and
-    /// `Killed` are never reported, and `wait(None)` on a process that exits blocks.
+    /// The kqueue watcher publishes terminal events after waitpid has collected status.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>
     {
-        match self.state {
-            BackendState::NoProcess => Err(self.invalid_state("wait")),
-            BackendState::Stopped => match self.try_next_event() {
-                Some(Ok(event)) => Ok(Some(self.deliver(event))),
-                Some(Err(err)) => Err(err),
-                None if timeout.is_none() => Err(BackendError::InvalidState(
-                    "wait without a timeout while the target is stopped with no pending event would block forever"
-                        .to_string(),
-                )),
-                None => Ok(None),
-            },
-            BackendState::Running => {
-                if let Some(peeked) = self.peeked.take() {
-                    return peeked.map(|event| Some(self.deliver(event)));
+        if self.state == BackendState::NoProcess {
+            return Err(self.invalid_state("wait"));
+        }
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+        loop {
+            let queued = self.try_next_event();
+            let dead = lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task);
+            if queued.is_none() && self.state == BackendState::Stopped && timeout.is_none() && !dead {
+                return Err(BackendError::InvalidState(
+                    "wait without a timeout while stopped with no pending event would block forever".into(),
+                ));
+            }
+            let received = match queued {
+                Some(event) => Ok(event),
+                None => {
+                    let rx = self.events_rx.as_ref().ok_or_else(|| BackendError::Os {
+                        code: -1,
+                        message: "the exception handler is not running".into(),
+                    })?;
+                    match deadline {
+                        None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                        Some(deadline) => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                    }
                 }
-                let Some(rx) = self.events_rx.as_ref() else {
+            };
+            match received {
+                Ok(Ok(event)) if event.is_terminal() => return Ok(Some(self.deliver(event))),
+                // A terminal event takes precedence over stale stops and reply failures
+                // from dead threads, even if those reached the channel first.
+                Ok(_) if dead || crate::lifecycle::task_is_dead(self.task) => continue,
+                Ok(Ok(event)) => return Ok(Some(self.deliver(event))),
+                Ok(Err(err)) => return Err(err),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(BackendError::Os {
                         code: -1,
-                        message: "the exception handler is not running".to_string(),
+                        message: "the event channel stopped".into(),
                     });
-                };
-                let received = match timeout {
-                    None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-                    Some(timeout) => rx.recv_timeout(timeout),
-                };
-                match received {
-                    // A reply the exception loop failed to send; the state does not change.
-                    Ok(Err(err)) => Err(err),
-                    Ok(Ok(event)) => Ok(Some(self.deliver(event))),
-                    Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(BackendError::Os {
-                        code: -1,
-                        message: "the exception handler stopped".to_string(),
-                    }),
                 }
             }
         }
@@ -969,14 +1111,19 @@ impl Backend for MacOSBackend
     /// A reply that fails does not fail the resume: the next `wait` reports it. The resume
     /// fails only if the exception handler does not answer at all.
     ///
-    /// Only [`ResumeRequest::continue_all`] is supported: `Step` (T07, issue #33),
-    /// per-thread `Suspend` and signals (T06, issue #32) return
-    /// [`BackendError::Unsupported`].
+    /// Held Unix signals are suppressed unless named in `request.signals`.
+    /// `Step` (T07, issue #33), per-thread `Suspend`, and signal injection without
+    /// a held soft-signal exception return [`BackendError::Unsupported`].
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         use tracing::info;
 
         self.require_stopped("resume")?;
+        if lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task) {
+            return Err(BackendError::InvalidState(
+                "process death is pending; drain it with wait".into(),
+            ));
+        }
         self.check_resume_request(request)?;
         // The exception loop queues a stop event under this lock, together with its
         // suspend and the held-exception flag. Checking the queue under the same lock
@@ -996,6 +1143,18 @@ impl Backend for MacOSBackend
         let restore = |backend: &Self, count: u32| lock_shared(&backend.exception_state).suspends += count;
 
         if pending {
+            let signals = lock_shared(&self.exception_state).soft_signals.clone();
+            for port in signals {
+                let signal = request
+                    .signals
+                    .iter()
+                    .find(|(thread, _)| thread.raw() == u64::from(port))
+                    .map_or(0, |(_, signal)| *signal);
+                if let Err(err) = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, signal) {
+                    restore(self, count);
+                    return Err(err);
+                }
+            }
             let (ack_tx, ack_rx) = mpsc::channel();
             let sent = self
                 .exception_commands
@@ -1021,6 +1180,22 @@ impl Backend for MacOSBackend
         for done in 0..count {
             let kr = unsafe { task_resume(self.task) };
             if kr != KERN_SUCCESS {
+                // Delivering a fatal soft signal can destroy the task as soon as its
+                // exception is answered, before task_resume reaches the kernel. Resume
+                // succeeded; wait owns the pending terminal event.
+                // The task can be inactive before its port becomes a dead name or
+                // NOTE_EXIT is published. Give the watcher a bounded chance to confirm.
+                let deadline = Instant::now() + Duration::from_millis(200);
+                loop {
+                    if lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task) {
+                        self.state = BackendState::Running;
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
                 // Re-suspend what was already resumed so the target stays stopped.
                 for _ in 0..done {
                     unsafe {
@@ -1139,15 +1314,24 @@ impl Drop for MacOSBackend
     fn drop(&mut self)
     {
         if self.state == BackendState::NoProcess {
-            self.stop_exception_handler(true);
+            self.exit_watcher = None;
+            self.stop_exception_handler(false);
+            self.release_ports();
             return;
         }
         if self.launched {
             let _ = Backend::kill(self);
-        } else {
-            self.stop_exception_handler(true);
-            self.release_suspends();
+        } else if lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task) {
+            // Death may be observed before the status becomes waitable. Let the
+            // watcher finish handing the tracee back/reaping before cancelling it.
+            if let Some(watcher) = &self.exit_watcher {
+                let _ = watcher.wait(KILL_REAP_TIMEOUT);
+            }
+            self.exit_watcher = None;
+            self.stop_exception_handler(false);
             self.release_ports();
+        } else if let Err(err) = self.detach_target() {
+            tracing::error!("backend drop could not detach: {err}");
         }
     }
 }

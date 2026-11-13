@@ -149,7 +149,8 @@ fn drop_after_detach_kills_debuggee()
         let mut d = t.launch_with_args(&fixture!("loop_counter"), &["3000"]);
         d.detach().expect("detach");
         let (pid, tag) = (d.pid().0, d.tag().to_owned());
-        // Detaching does not end a launched process; only the guard's kill does.
+        // Detach releases session ownership; the guard's tag sweep is the backstop.
+        assert_eq!(d.ownership(), None);
         thread::sleep(Duration::from_millis(100));
         assert!(!harness::process_is_gone(pid), "detach unexpectedly ended the debuggee");
         drop(d);

@@ -241,3 +241,45 @@ impl LaunchManager
         }
     }
 }
+
+/// Reap a detached launch child after a test harness has ended it by its unique tag.
+///
+/// This never sends a signal. It is safe if the backend already reaped the child:
+/// waitpid then returns ECHILD. A still-running child is left alone after two seconds.
+#[doc(hidden)]
+pub fn reap_detached_child(pid: ferros_core::types::ProcessId)
+{
+    if let Err(err) = reap_child(pid.0 as libc::pid_t, std::time::Duration::from_secs(2)) {
+        tracing::warn!("test cleanup could not reap detached child {}: {err}", pid.0);
+    }
+}
+
+/// Collect all tracer/parent statuses, ignoring intermediate ptrace stops. A successful
+/// wait does not necessarily mean reaped: Darwin can return the same child to its parent.
+pub(crate) fn reap_child(pid: libc::pid_t, timeout: std::time::Duration) -> ferros_core::backend::BackendResult<()>
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        // SAFETY: status is writable; WNOHANG only collects children of this process.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(crate::task::backend_error(err.into()));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ferros_core::backend::BackendError::Os {
+                code: i64::from(libc::ETIMEDOUT),
+                message: format!("timed out reaping child {pid}"),
+            });
+        }
+        if result <= 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}

@@ -629,3 +629,34 @@ pub mod spawn_flags
     /// See: [POSIX_SPAWN_START_SUSPENDED documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawn.3.html)
     pub const POSIX_SPAWN_START_SUSPENDED: c_short = 0x0080;
 }
+
+/// Darwin ptrace requests from `<sys/ptrace.h>`.
+/// See <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/ptrace.h>.
+pub mod ptrace_requests
+{
+    /// Trace a process and receive Unix signals as Mach exceptions.
+    pub const PT_ATTACHEXC: libc::c_int = 14;
+    /// Release a traced process.
+    pub const PT_DETACH: libc::c_int = 11;
+    /// Replace the signal held by a thread (zero suppresses it).
+    pub const PT_THUPDATE: libc::c_int = 13;
+    /// Kill a traced process.
+    pub const PT_KILL: libc::c_int = 8;
+}
+
+unsafe extern "C" {
+    /// Darwin ptrace(2), declared by `<sys/ptrace.h>`.
+    ///
+    /// # Safety
+    /// `addr` is request-specific: PT_THUPDATE encodes a Mach thread port name,
+    /// not a dereferenceable pointer. The caller must own the traced process.
+    pub fn ptrace(request: libc::c_int, pid: libc::pid_t, addr: *mut libc::c_char, data: libc::c_int) -> libc::c_int;
+}
+
+unsafe extern "C" {
+    /// Query the right types of a name in an IPC space (`<mach/mach_port.h>`).
+    ///
+    /// # Safety
+    /// `kind` must point to writable storage for one mach_port_type_t.
+    pub fn mach_port_type(task: libc::mach_port_t, name: libc::mach_port_t, kind: *mut libc::c_uint) -> libc::kern_return_t;
+}

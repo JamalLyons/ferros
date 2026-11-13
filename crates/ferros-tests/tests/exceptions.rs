@@ -115,12 +115,10 @@ fn expect_interrupted(d: &mut Debuggee, what: &str)
     );
 }
 
-/// Ask the running target to stop. `Session::interrupt` does not exist on this branch
-/// yet (issue #32 adds it), so this goes to the backend directly; the session sees the
-/// stop through its next `wait`.
+/// Ask the running target to stop through the session.
 fn interrupt(d: &mut Debuggee)
 {
-    d.backend_mut().interrupt().expect("interrupt");
+    d.interrupt().expect("interrupt");
 }
 
 /// How many launches the simultaneous-stop test tries before giving up.

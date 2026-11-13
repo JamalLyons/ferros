@@ -93,6 +93,12 @@ pub(crate) struct ExceptionSharedState
     pub suspends: u32,
     /// Whether the loop holds exception messages whose threads wait for a reply.
     pub pending_exception: bool,
+    /// Soft-signal exceptions held by the loop, whose ports remain owned until reply.
+    pub soft_signals: Vec<thread_act_t>,
+    /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
+    pub internal_stop: Option<mpsc::Sender<()>>,
+    /// Set by the exit watcher before publishing the terminal event.
+    pub dead: bool,
 }
 
 impl ExceptionSharedState
@@ -173,6 +179,7 @@ struct HeldException
     /// The send right for the faulting thread carried by the message, released after the
     /// reply.
     thread: mach_port_t,
+    soft_signal: bool,
 }
 
 /// Command sent from the backend to the exception loop.
@@ -378,7 +385,7 @@ pub(crate) fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
 /// - `EXC_BAD_ACCESS` -> `StopEvent::Signal(SIGSEGV)`
 /// - `EXC_BAD_INSTRUCTION` -> `StopEvent::Signal(SIGILL)`
 /// - `EXC_ARITHMETIC` -> `StopEvent::Signal(SIGFPE)`
-/// - `EXC_SOFTWARE` -> `StopEvent::Signal(SIGTRAP)`
+/// - `EXC_SOFTWARE/EXC_SOFT_SIGNAL` -> the held Unix signal; other software exceptions -> SIGTRAP
 /// - anything else (or a breakpoint whose pc cannot be read) -> `StopEvent::Other`
 ///
 /// See: [Mach Exception Types](https://developer.apple.com/documentation/kernel/1402149-exception_types/)
@@ -404,6 +411,7 @@ pub(crate) fn stop_event_from_exception(
         EXC_BAD_ACCESS => signal(libc::SIGSEGV),
         EXC_BAD_INSTRUCTION => signal(libc::SIGILL),
         EXC_ARITHMETIC => signal(libc::SIGFPE),
+        EXC_SOFTWARE if codes[0] == EXC_SOFT_SIGNAL => signal(codes[1] as c_int),
         EXC_SOFTWARE => signal(libc::SIGTRAP),
         other => StopEvent::Other {
             thread: Some(thread),
@@ -411,6 +419,9 @@ pub(crate) fn stop_event_from_exception(
         },
     }
 }
+
+/// Unix signal exception code from `<mach/exception_types.h>`.
+pub(crate) const EXC_SOFT_SIGNAL: i64 = 0x10003;
 
 /// Main exception handling loop that receives Mach exceptions.
 ///
@@ -434,9 +445,11 @@ pub(crate) fn stop_event_from_exception(
 /// - [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
 /// - [Mach Exception Handling](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_exception_loop(
     exception_port: mach_port_t,
     task: mach_port_t,
+    pid: libc::pid_t,
     commands: mpsc::Receiver<ExceptionLoopCommand>,
     shared: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
@@ -456,6 +469,38 @@ pub(crate) fn run_exception_loop(
         let Some(first) = decode_request(&buffer) else {
             continue;
         };
+
+        // SIGKILL cannot be held or suppressed: Darwin delivers it through the
+        // signal-exception path too. Answer it and release our task suspensions so
+        // exit can finish even when the client is waiting while Stopped.
+        let codes = first.code;
+        if first.exception == EXC_SOFTWARE as exception_type_t
+            && codes[0] == EXC_SOFT_SIGNAL
+            && codes[1] == i64::from(libc::SIGKILL)
+        {
+            let (exception, _) = hold_exception(&first, architecture);
+            let mut state = lock_shared(&shared);
+            state.dead = true;
+            // SAFETY: this is the signal stop of our tracee; addr encodes its owned
+            // thread port. SIGKILL must be delivered before replying to the exception.
+            unsafe {
+                crate::ffi::ptrace(
+                    crate::ffi::ptrace_requests::PT_THUPDATE,
+                    pid,
+                    exception.thread as usize as *mut libc::c_char,
+                    libc::SIGKILL,
+                );
+            }
+            let _ = send_exception_reply(&exception.header);
+            deallocate_right(exception.thread);
+            for _ in 0..std::mem::take(&mut state.suspends) {
+                // SAFETY: balances only suspensions this backend owns.
+                unsafe {
+                    mach2::task::task_resume(task);
+                }
+            }
+            continue;
+        }
 
         let mut held = Vec::new();
         {
@@ -486,7 +531,24 @@ pub(crate) fn run_exception_loop(
 
             state.pending_exception = true;
             for (exception, event) in stops {
+                if matches!(event, StopEvent::Signal { .. }) && exception.soft_signal {
+                    state.soft_signals.push(exception.thread);
+                }
                 held.push(exception);
+                if matches!(
+                    event,
+                    StopEvent::Signal {
+                        signal: libc::SIGSTOP,
+                        ..
+                    }
+                ) && let Some(ready) = state.internal_stop.take()
+                {
+                    let _ = ready.send(());
+                    continue;
+                }
+                if state.dead {
+                    continue;
+                }
                 if let Err(err) = events.send(Ok(event)) {
                     warn!("Failed to send stop event from Mach loop: {err}");
                 }
@@ -502,7 +564,11 @@ pub(crate) fn run_exception_loop(
                 {
                     let mut state = lock_shared(&shared);
                     state.pending_exception = false;
+                    state.soft_signals.clear();
                     for failure in failures {
+                        if state.dead || crate::lifecycle::task_is_dead(task) {
+                            continue;
+                        }
                         error!("{failure}");
                         if let Err(err) = events.send(Err(failure)) {
                             warn!("Failed to queue a reply failure from Mach loop: {err}");
@@ -518,7 +584,11 @@ pub(crate) fn run_exception_loop(
                     }
                     deallocate_right(exception.thread);
                 }
-                lock_shared(&shared).pending_exception = false;
+                {
+                    let mut state = lock_shared(&shared);
+                    state.pending_exception = false;
+                    state.soft_signals.clear();
+                }
                 reply_to_queued_exceptions(exception_port);
                 break;
             }
@@ -619,6 +689,7 @@ fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architectur
         HeldException {
             header: request.Head,
             thread: thread_port,
+            soft_signal: exception_type == EXC_SOFTWARE as exception_type_t && codes[0] == EXC_SOFT_SIGNAL,
         },
         event,
     )

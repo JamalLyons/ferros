@@ -71,3 +71,8 @@ test = false
 name = "ferros-fixture-thread_signals"
 path = "fixtures/thread_signals.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-spawn_thread"
+path = "fixtures/spawn_thread.rs"
+test = false

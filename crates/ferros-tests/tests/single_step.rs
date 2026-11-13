@@ -450,3 +450,162 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
         }
     });
 }
+
+/// Suspension applies to existing threads, not threads created by a continuing one.
+#[test]
+fn new_threads_can_run_after_suspend_snapshot()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let address = function_address(&mut d, &fixture, "spawn_later");
+        let original = plant_trap(&mut d, address);
+        let (creator, _) = run_to_trap(&mut d, address);
+        backend(&mut d).write_memory(address, &original).expect("restore");
+        let existing = backend(&mut d).threads().expect("threads");
+        assert!(existing.len() >= 2, "expected an existing worker: {existing:?}");
+        let suspended: Vec<_> = existing
+            .into_iter()
+            .filter(|&id| id != creator)
+            .map(|id| (id, pc_of(&mut d, id)))
+            .collect();
+        backend(&mut d)
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+            .expect("resume creator");
+        assert!(d.wait_for_stdout("new worker ran", STOP_TIMEOUT), "new thread did not run");
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        for (id, pc) in suspended {
+            assert_eq!(pc_of(&mut d, id), pc, "existing suspended thread moved");
+        }
+    });
+}
+
+/// Releasing an attached session after starting a step resumes every suspended thread.
+/// Explicit detach requires a stopped session; drop performs its own stop and detach.
+#[test]
+fn detach_cleanup_after_starting_step_releases_suspended_threads()
+{
+    harness::run_with_timeout(Duration::from_secs(30), |t| {
+        for explicit in [false, true] {
+            let target = t.spawn(&fixture!("threads"), &["1000", "1000"]);
+            let pid = target.pid();
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while thread_count(pid.0) < 3 {
+                assert!(Instant::now() < deadline, "workers never started");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            session.attach(pid).expect("attach");
+            let threads = session.threads().expect("threads");
+            assert!(threads.len() >= 3, "expected multiple threads: {threads:?}");
+            session.step_instruction(threads[1]).expect("start step");
+            if explicit {
+                session.interrupt().expect("interrupt step");
+                assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
+                while session.wait(Some(Duration::ZERO)).expect("drain").is_some() {}
+                session.detach().expect("detach after stop");
+            }
+            drop(session);
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while !process_state(pid.0).starts_with('Z') {
+                assert!(
+                    Instant::now() < deadline,
+                    "attached process did not finish (explicit: {explicit}): {}",
+                    process_state(pid.0)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    });
+}
+
+/// Race an interrupt against a requested step, accepting either documented winner.
+#[test]
+fn interrupt_races_a_real_instruction_step()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d).write_memory(tick, &original).expect("restore");
+        backend(&mut d).resume(&ResumeRequest::step(thread)).expect("step");
+        backend(&mut d).interrupt().expect("interrupt");
+        let event = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait");
+        assert!(
+            matches!(event, Some(StopEvent::SingleStep { thread: id }) if id == thread)
+                || matches!(event, Some(StopEvent::Interrupted { .. })),
+            "unexpected race outcome: {event:?}"
+        );
+        // Drain any event from the same stop before continuing, then ensure no step
+        // exception appears after the next continue.
+        while backend(&mut d).wait(Some(Duration::ZERO)).expect("drain").is_some() {}
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(300))).expect("wait"),
+            None,
+            "stray stop after cancellation"
+        );
+        backend(&mut d).interrupt().expect("interrupt after continue");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+    });
+}
+
+/// Deliver a signal while stopped and race it against a step. When the signal wins,
+/// a subsequent plain continue must not leave hardware single-step enabled.
+#[test]
+fn signal_cancels_a_real_step_without_a_stray_step_stop()
+{
+    const TRIALS: usize = 20;
+    harness::run_with_timeout(Duration::from_secs(60), |t| {
+        let fixture = fixture!("loop_counter");
+        for trial in 1..=TRIALS {
+            let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+            let tick = function_address(&mut d, &fixture, "tick");
+            let original = plant_trap(&mut d, tick);
+            let (thread, _) = run_to_trap(&mut d, tick);
+            backend(&mut d).write_memory(tick, &original).expect("restore");
+            assert!(
+                Command::new("/bin/kill")
+                    .args(["-USR1", &d.pid().0.to_string()])
+                    .status()
+                    .expect("signal")
+                    .success()
+            );
+            backend(&mut d).resume(&ResumeRequest::step(thread)).expect("start step");
+            let event = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("step or signal");
+            match event {
+                Some(StopEvent::SingleStep { thread: id }) if id == thread => continue,
+                Some(StopEvent::Signal { signal: SIGUSR1, .. }) => {}
+                other => panic!("unexpected step race outcome: {other:?}"),
+            }
+            // Suppress the held signal and resume freely. A stale step bit would stop
+            // the target immediately with SingleStep instead of running the loop.
+            assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+            backend(&mut d)
+                .resume(&ResumeRequest::continue_all())
+                .expect("continue after signal");
+            assert_eq!(
+                backend(&mut d).wait(Some(Duration::from_millis(300))).expect("wait"),
+                None,
+                "stray stop after signal cancelled the step"
+            );
+            backend(&mut d).interrupt().expect("interrupt");
+            assert!(matches!(
+                backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+                Some(StopEvent::Interrupted { .. })
+            ));
+            eprintln!("signal won the step race on trial {trial} of {TRIALS}");
+            return;
+        }
+        panic!("signal did not win the step race in {TRIALS} trials");
+    });
+}

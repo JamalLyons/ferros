@@ -2,7 +2,8 @@
 //!
 //! An optional first argument is a number of milliseconds to keep running after both
 //! workers have exited (default 0), for tests that need a live process whose worker
-//! threads are gone.
+//! threads are gone. A second optional argument sets the worker sleep in milliseconds
+//! (default 50), for tests that need workers alive during attach.
 //!
 //! Functions:
 //! - `main`
@@ -12,20 +13,26 @@
 //! - `worker_body`
 //! - `after_join`
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
+
+static WORKER_SLEEP_MS: AtomicU64 = AtomicU64::new(50);
 
 #[inline(never)]
 fn worker_body(id: u64) -> u64
 {
     let input = std::hint::black_box(id); // BREAK: worker_body
-    thread::sleep(Duration::from_millis(50));
+    thread::sleep(Duration::from_millis(WORKER_SLEEP_MS.load(Ordering::Relaxed)));
     std::hint::black_box(input.wrapping_mul(10))
 }
 
 fn main()
 {
+    if let Some(ms) = std::env::args().nth(2).and_then(|arg| arg.parse::<u64>().ok()) {
+        WORKER_SLEEP_MS.store(ms, Ordering::Relaxed);
+    }
     let barrier = Arc::new(Barrier::new(2));
 
     let b1 = Arc::clone(&barrier);

@@ -6,8 +6,8 @@
 //! debugger entitlement, and they are not limited to macOS.
 
 use ferros_core::arch;
-use ferros_core::backend::mock::{MockBackend, MockCall, MockState, MockStop, arm64_registers};
-use ferros_core::backend::{Backend, BackendResult, LaunchSpec, ResumeRequest, StopEvent};
+use ferros_core::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
+use ferros_core::backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent};
 use ferros_core::types::{Address, ProcessId, ThreadId};
 
 const THREAD: ThreadId = ThreadId(1);
@@ -200,4 +200,17 @@ fn kill_cleanup_error_clears_session_but_ordinary_error_preserves_it()
             session.kill().expect("retry kill");
         }
     }
+}
+
+#[test]
+fn public_nth_failure_is_one_shot_and_counts_matching_calls()
+{
+    let mut mock = scripted_process();
+    mock.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let error = BackendError::PermissionDenied("injected".into());
+    mock.fail_on_nth(MockCallKind::ReadMemory, 2, error.clone());
+    assert!(mock.read_memory(BREAKPOINT, 4).is_ok());
+    assert!(mock.threads().is_ok());
+    assert_eq!(mock.read_memory(BREAKPOINT, 4), Err(error));
+    assert!(mock.read_memory(BREAKPOINT, 4).is_ok());
 }

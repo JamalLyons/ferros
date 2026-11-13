@@ -238,6 +238,10 @@ pub trait Backend: Send
 
     /// Resume the target as described by `request`; the backend becomes *Running*.
     ///
+    /// On macOS, `Suspend` applies to the thread snapshot taken at resume. Threads
+    /// created afterward may run until the next stop and resume, even when the default
+    /// action is `Suspend` (including during a single-step request).
+    ///
     /// # Preconditions
     ///
     /// The target is *Stopped* and no event is pending from [`wait`](Self::wait).

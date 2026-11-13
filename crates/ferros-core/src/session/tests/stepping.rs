@@ -569,3 +569,45 @@ fn requested_step_at_a_breakpoint_reports_single_step_despite_interrupt()
     assert_eq!(session.wait(None).unwrap(), Some(StopEvent::SingleStep { thread: T1 }));
     assert_eq!(peek(&mock, BP), TRAP);
 }
+
+#[test]
+fn internal_wait_failure_is_deferred_until_wait()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    let error = BackendError::Os {
+        code: 5,
+        message: "internal wait failed".into(),
+    };
+    // The first wait checks for pending events before starting the step.
+    mock.fail_on_nth(MockCallKind::Wait, 2, error);
+    session.resume().unwrap();
+    assert_eq!(session.state(), SessionState::Running);
+    assert!(session.step_plan.is_some());
+    assert!(session.wait(None).unwrap_err().to_string().contains("internal wait failed"));
+    assert_eq!(session.state(), SessionState::Running);
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    hit(&mock, BP2);
+    assert!(matches!(session.wait(None).unwrap(), Some(StopEvent::Breakpoint { .. })));
+    assert_eq!(peek(&mock, BP), TRAP);
+}
+
+#[test]
+fn final_continue_failure_inside_resume_leaves_session_stopped()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    mock.fail_on_nth(
+        MockCallKind::Resume,
+        2,
+        BackendError::Os {
+            code: 5,
+            message: "final continue failed".into(),
+        },
+    );
+    assert!(session.resume().unwrap_err().to_string().contains("final continue failed"));
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(mock.state(), MockState::Stopped);
+    assert!(session.last_stop().is_none());
+    assert!(session.step_plan.is_none());
+    assert_eq!(peek(&mock, BP), TRAP);
+}

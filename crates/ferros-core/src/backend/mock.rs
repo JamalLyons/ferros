@@ -356,7 +356,7 @@ struct Inner
     pending: VecDeque<StopEvent>,
     interrupt_requested: bool,
     calls: Vec<MockCall>,
-    failures: VecDeque<(MockCallKind, BackendError)>,
+    failures: VecDeque<(MockCallKind, usize, BackendError)>,
 }
 
 /// In-memory, scripted implementation of [`Backend`]. See the [module documentation](self).
@@ -445,11 +445,15 @@ impl Inner
     {
         let kind = call.kind();
         self.calls.push(call);
-        let index = self.failures.iter().position(|(k, _)| *k == kind);
-        match index.and_then(|index| self.failures.remove(index)) {
-            Some((_, error)) => Err(error),
-            None => Ok(()),
+        if let Some(index) = self.failures.iter().position(|(k, _, _)| *k == kind) {
+            let remaining = &mut self.failures[index].1;
+            *remaining -= 1;
+            if *remaining == 0 {
+                let (_, _, error) = self.failures.remove(index).expect("queued failure");
+                return Err(error);
+            }
         }
+        Ok(())
     }
 
     fn require_stopped(&self, call: &str) -> BackendResult<()>
@@ -680,7 +684,21 @@ impl MockBackend
     /// each is used once.
     pub fn fail_next(&self, kind: MockCallKind, error: BackendError)
     {
-        self.lock().failures.push_back((kind, error));
+        self.fail_on_nth(kind, 1, error);
+    }
+
+    /// Fail the `nth` matching call after earlier same-kind injections have fired
+    /// (one-based).
+    /// Failures of the same kind are processed in queue order: later countdowns begin
+    /// only after earlier failures have fired. Calls of other kinds do not count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nth` is zero.
+    pub fn fail_on_nth(&self, kind: MockCallKind, nth: usize, error: BackendError)
+    {
+        assert!(nth > 0, "failure index must be one-based");
+        self.lock().failures.push_back((kind, nth, error));
     }
 
     /// Every recorded call so far, oldest first.
@@ -1416,6 +1434,29 @@ mod tests
         ));
         assert_eq!(mock.read_memory(Address::new(CODE), 1), Ok(vec![0]));
         assert_eq!(mock.calls().len(), 4);
+    }
+
+    #[test]
+    fn nth_failure_counts_matching_calls_and_queues_by_kind()
+    {
+        let mut mock = process();
+        mock.launch(&spec()).unwrap();
+        let first = BackendError::PermissionDenied("first".into());
+        let second = BackendError::PermissionDenied("second".into());
+        mock.fail_on_nth(MockCallKind::ReadMemory, 2, first.clone());
+        mock.fail_next(MockCallKind::ReadMemory, second.clone());
+        assert_eq!(mock.read_memory(Address::new(CODE), 1), Ok(vec![0]));
+        assert!(mock.threads().is_ok()); // A different kind does not consume the countdown.
+        assert_eq!(mock.read_memory(Address::new(CODE), 1), Err(first));
+        assert_eq!(mock.read_memory(Address::new(CODE), 1), Err(second));
+        assert_eq!(mock.read_memory(Address::new(CODE), 1), Ok(vec![0]));
+    }
+
+    #[test]
+    #[should_panic(expected = "failure index must be one-based")]
+    fn nth_failure_rejects_zero()
+    {
+        process().fail_on_nth(MockCallKind::Wait, 0, BackendError::PermissionDenied("no".into()));
     }
 
     #[test]

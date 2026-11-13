@@ -36,14 +36,18 @@ Ferros aims to be a Rust-aware debugger: ownership, lifetimes, and MIR-level und
 
 ## Current Status
 
-Ferros is **early and experimental**. What is verified today:
+Ferros is **early and actively developed**. What is verified today:
 
-- The workspace builds.
-- On macOS, a binary ad-hoc signed with [`crates/ferros-macos/ferros.entitlements`](./crates/ferros-macos/ferros.entitlements) can launch a program suspended, obtain its task port, read thread and memory-region counts, resume it, and detach, without `sudo`.
+- The workspace builds cleanly on nightly Rust (Edition 2024).
+- **Process lifecycle & control**: On macOS arm64, launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (verified by `tests/lifecycle.rs` and `tests/smoke.rs`).
+- **Mach exception loop**: Queueing simultaneous stops, exception port rights lifecycle, port restoration on detach, and signal delivery (verified by `tests/exceptions.rs`).
+- **Single-stepping**: Hardware single-step (`MDSCR_EL1.SS`), per-thread single-stepping while other threads remain suspended (verified by `tests/single_step.rs`).
+- **Software breakpoints**: Trap insertion, hit counting, transparent trap-hiding in memory reads, automatic serial step-over on resume, and trap restoration on detach and drop (verified by `tests/breakpoints.rs`).
+- **Platform boundary**: Zero unsafe code and zero OS dependencies in `ferros-core`, strictly enforced by `just check-boundary` and `tests/platform_boundary.rs`.
 
-Nothing else is covered by tests yet. Other code in `ferros-core` (breakpoints, stack unwinding, symbols, and so on) exists but is unverified, so it is not claimed here. The interactive TUI is being rebuilt: `ferros launch` and `attach` currently behave exactly like `--headless` (print info and exit).
+The interactive TUI is being rebuilt: `ferros launch` and `attach` currently run in headless mode (inspect and exit/detach). Areas currently in progress include DWARF/symbol ingestion, call stack unwinding, and Linux support.
 
-The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for the item list (none ticked until a test covers it).
+The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for milestone tracking.
 
 ---
 
@@ -57,10 +61,11 @@ ferros/
 │   ├── ferros/          # Command-line interface
 │   ├── ferros-core/     # Portable debugging engine (no OS-specific code)
 │   ├── ferros-macos/    # macOS implementation (Mach APIs)
-│   ├── ferros-mir/      # MIR integration & analysis
-│   ├── ferros-ui/       # TUI (excluded from the workspace while being rebuilt)
-│   ├── ferros-protocol/ # Communication layer
-│   └── ferros-utils/    # Shared utilities & helpers
+│   ├── ferros-tests/    # Integration test suite, harness, and fixture programs
+│   ├── ferros-utils/    # Shared utilities & structured logging
+│   ├── ferros-mir/      # MIR integration & analysis (reserved)
+│   ├── ferros-protocol/ # Communication layer (reserved)
+│   └── ferros-ui/       # TUI (excluded from workspace while being rebuilt)
 ```
 
 📖 **Learn more:** See [ARCHITECTURE.md](./docs/architecture.md) for detailed architecture documentation.

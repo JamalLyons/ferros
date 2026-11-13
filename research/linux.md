@@ -553,9 +553,9 @@ This document provides comprehensive learning resources organized by topic to su
 - Parse your first DWARF symbols
 
 **Weeks 5-12: Core Implementation**
-- ferros-core (process control)
-- ferros-protocol (symbols)
-- ferros-utils
+- ferros-core (process control, breakpoints, symbols)
+- ferros-protocol (protocol & serialization)
+- ferros-utils (logging & shared helpers)
 
 **Weeks 13-16: CLI & Features**
 - Command-line interface

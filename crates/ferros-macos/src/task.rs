@@ -22,7 +22,15 @@
 //! *Stopped* means the backend holds at least one `task_suspend` on the task: the
 //! suspended start of a launch, the `task_suspend` of an attach, one per exception stop
 //! and one per interrupt. The count lives in the shared exception state; `resume`,
-//! `detach` and `kill` balance it with `task_resume`.
+//! `detach` and `kill` balance it with `task_resume`. Threads that stop at the same time
+//! form one stop: one suspend, one event per thread.
+//!
+//! ## Exception ports
+//!
+//! Attaching installs the backend's handler with `task_swap_exception_ports` and keeps
+//! the ports it replaced; `detach` (and dropping an attached backend, and a failed
+//! attach) puts them back before the handler port is destroyed, so the target ends up
+//! with the exception ports it had before.
 //!
 //! ## References
 //!
@@ -53,12 +61,14 @@ use mach2::message::MACH_MSG_TYPE_MAKE_SEND;
 #[cfg(target_os = "macos")]
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
 #[cfg(target_os = "macos")]
-use mach2::task::{task_resume, task_set_exception_ports, task_suspend, task_threads};
+use mach2::task::{task_resume, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
 use crate::error::MachError;
-use crate::exception::{self, ExceptionLoopCommand, ExceptionSharedState, lock_shared};
+use crate::exception::{
+    self, ExceptionLoopCommand, ExceptionSharedState, LoopEvent, ReplyFaultInjector, SavedExceptionPorts, lock_shared,
+};
 use crate::memory::{MemoryCache, MemoryProtectionGuard, get_memory_regions, write_memory};
 #[cfg(target_arch = "aarch64")]
 use crate::registers::{read_registers_arm64, write_registers_arm64};
@@ -240,12 +250,16 @@ pub struct MacOSBackend
     exception_commands: Option<mpsc::Sender<ExceptionLoopCommand>>,
     /// Suspend count and held exception, shared with the exception loop.
     exception_state: Arc<Mutex<ExceptionSharedState>>,
+    /// The target's exception ports from before the handler was installed.
+    saved_exception_ports: Option<SavedExceptionPorts>,
+    /// Test hook shared with the exception loop (see `fail_next_exception_reply`).
+    reply_faults: ReplyFaultInjector,
     /// Sender side of the stop event channel (the exception loop holds a clone).
-    events_tx: Option<mpsc::Sender<StopEvent>>,
+    events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
-    events_rx: Option<mpsc::Receiver<StopEvent>>,
+    events_rx: Option<mpsc::Receiver<LoopEvent>>,
     /// An event taken off the channel by `resume` while checking for pending events.
-    peeked: Option<StopEvent>,
+    peeked: Option<LoopEvent>,
     /// Cached memory pages for repeated reads; cleared whenever the target may run.
     memory_cache: MemoryCache,
 }
@@ -282,6 +296,8 @@ impl MacOSBackend
             exception_thread: None,
             exception_commands: None,
             exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
+            saved_exception_ports: None,
+            reply_faults: ReplyFaultInjector::default(),
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -358,6 +374,30 @@ impl MacOSBackend
     pub fn resume_thread(&mut self, thread_id: ThreadId) -> Result<()>
     {
         threads::ThreadManager::resume_thread(&self.threads, thread_id)
+    }
+
+    /// Test hook: make the next exception reply sent on resume report a failure.
+    ///
+    /// The next time `resume` answers a held Mach exception, the reply is treated as if
+    /// `mach_msg` had failed with `MACH_SEND_INVALID_DEST`: `resume` still succeeds, and
+    /// the next `wait` returns `BackendError::Os` naming the reply failure, as it does for
+    /// a real failure. A real lost reply would leave the faulting thread blocked forever,
+    /// so the hook still sends the real reply; the target keeps running and can produce
+    /// later stops. Only replies sent on resume are affected, not those sent on detach.
+    #[doc(hidden)]
+    pub fn fail_next_exception_reply(&mut self)
+    {
+        self.reply_faults.fail_next_exception_reply();
+    }
+
+    /// Test hook: a handle that calls
+    /// [`fail_next_exception_reply`](Self::fail_next_exception_reply) on this backend
+    /// after it has been moved into a `ferros_core::Session`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reply_fault_injector(&self) -> ReplyFaultInjector
+    {
+        self.reply_faults.clone()
     }
 
     /// Obtain the Mach task port and thread list for `pid` and start the exception
@@ -437,6 +477,7 @@ impl MacOSBackend
         self.peeked = None;
 
         if let Err(err) = self.start_exception_handler() {
+            self.stop_exception_handler(true);
             self.release_ports();
             return Err(err);
         }
@@ -446,15 +487,17 @@ impl MacOSBackend
 
     /// Start the Mach exception handler thread.
     ///
-    /// This creates a Mach receive port, registers it with `task_set_exception_ports()`,
-    /// creates the stop event channel and spawns a background thread to handle exceptions
-    /// (breakpoints, faults, etc.).
+    /// This creates a Mach receive port, registers it with `task_swap_exception_ports()`
+    /// (saving the ports it replaces for [`stop_exception_handler`](Self::stop_exception_handler)
+    /// to restore), creates the stop event channel and spawns a background thread to handle
+    /// exceptions (breakpoints, faults, etc.).
     ///
     /// ## Mach APIs Used
     ///
     /// - **mach_port_allocate()**: Creates a Mach receive port
     /// - **mach_port_insert_right()**: Makes the port sendable
-    /// - **task_set_exception_ports()**: Registers the exception port with the task
+    /// - **task_swap_exception_ports()**: Registers the exception port with the task and
+    ///   returns the previous ones
     ///
     /// ## Exception Mask
     ///
@@ -479,7 +522,7 @@ impl MacOSBackend
     {
         use tracing::info;
 
-        self.stop_exception_handler();
+        self.stop_exception_handler(true);
 
         if self.task == MACH_PORT_NULL {
             return Ok(());
@@ -506,11 +549,17 @@ impl MacOSBackend
                 | EXC_MASK_SOFTWARE;
             let behavior: exception_behavior_t = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as exception_behavior_t;
             let flavor = exception::thread_state_flavor_for_arch(self.architecture);
-            kr = task_set_exception_ports(self.task, mask, port, behavior, flavor);
-            if kr != KERN_SUCCESS {
-                let _ = mach_port_destroy(self_task, port);
-                return Err(DebuggerError::from(MachError::from(kr)));
-            }
+            let saved = match SavedExceptionPorts::install(self.task, mask, port, behavior, flavor) {
+                Ok(saved) => saved,
+                Err(kr) => {
+                    let _ = mach_port_destroy(self_task, port);
+                    return Err(DebuggerError::from(MachError::from(kr)));
+                }
+            };
+            // From here on, `stop_exception_handler` restores the saved ports and destroys
+            // the port, including when spawning the thread fails.
+            self.saved_exception_ports = Some(saved);
+            self.exception_port = port;
 
             let (command_tx, command_rx) = mpsc::channel();
             let (events_tx, events_rx) = mpsc::channel();
@@ -518,18 +567,15 @@ impl MacOSBackend
             let shared_state = Arc::clone(&self.exception_state);
             let architecture = self.architecture;
             let task = self.task;
+            let faults = self.reply_faults.clone();
             info!("Spawning Mach exception handler thread");
             let handle = thread::Builder::new()
                 .name("ferros-mac-exc".to_string())
                 .spawn(move || {
-                    exception::run_exception_loop(port, task, command_rx, shared_state, architecture, loop_events);
+                    exception::run_exception_loop(port, task, command_rx, shared_state, architecture, loop_events, faults);
                 })
-                .map_err(|e| {
-                    let _ = mach_port_destroy(self_task, port);
-                    DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}"))
-                })?;
+                .map_err(|e| DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}")))?;
 
-            self.exception_port = port;
             self.exception_thread = Some(handle);
             self.exception_commands = Some(command_tx);
             self.events_tx = Some(events_tx);
@@ -541,11 +587,20 @@ impl MacOSBackend
 
     /// Stop the exception handler thread.
     ///
-    /// A held exception is replied to first, so its thread can continue once the task
-    /// is resumed. Queued stop events are discarded.
-    fn stop_exception_handler(&mut self)
+    /// With `restore`, the target's saved exception ports are put back first, so new
+    /// exceptions go to their old handlers; without it (the process is being killed) the
+    /// saved rights are only released. Held exceptions are then replied to, so their
+    /// threads can continue once the task is resumed. Queued stop events are discarded.
+    fn stop_exception_handler(&mut self, restore: bool)
     {
-        // If the loop holds an exception it is waiting for a command: let it reply, answer
+        if let Some(saved) = self.saved_exception_ports.take() {
+            if restore && self.task != MACH_PORT_NULL {
+                saved.restore(self.task);
+            }
+            drop(saved);
+        }
+
+        // If the loop holds exceptions it is waiting for a command: let it reply, answer
         // the exceptions still queued on the port and exit before the port is destroyed.
         // Otherwise it is blocked receiving, and destroying the port is what wakes it.
         let holds_exception = lock_shared(&self.exception_state).pending_exception;
@@ -672,9 +727,21 @@ impl MacOSBackend
     }
 
     /// Record that `event` was returned by `wait` and update the state.
+    ///
+    /// A thread the event names that is not in the thread list yet (it started after the
+    /// last enumeration) is added now, while the exception loop still holds the message's
+    /// right to it: the backend's own right keeps the port name, which is the
+    /// [`ThreadId`], valid after the loop releases its right on resume.
     fn deliver(&mut self, event: StopEvent) -> StopEvent
     {
         self.memory_cache.clear();
+        if let Some(thread) = event.thread()
+            && let Ok(port) = thread_act_t::try_from(thread.raw())
+            && !self.threads.contains(&port)
+            && let Ok(threads) = threads::ThreadManager::refresh_thread_list(self.task, &self.threads)
+        {
+            self.threads = threads;
+        }
         self.state = if event.is_terminal() {
             BackendState::NoProcess
         } else {
@@ -683,8 +750,8 @@ impl MacOSBackend
         event
     }
 
-    /// Take a queued event without blocking.
-    fn try_next_event(&mut self) -> Option<StopEvent>
+    /// Take a queued event (or queued failure) without blocking.
+    fn try_next_event(&mut self) -> Option<LoopEvent>
     {
         self.peeked
             .take()
@@ -784,7 +851,7 @@ impl Backend for MacOSBackend
         self.attach_task(pid).map_err(backend_error)?;
         let kr = unsafe { task_suspend(self.task) };
         if kr != KERN_SUCCESS {
-            self.stop_exception_handler();
+            self.stop_exception_handler(true);
             self.release_suspends();
             self.release_ports();
             return Err(mach_error(kr, "task_suspend failed"));
@@ -797,8 +864,9 @@ impl Backend for MacOSBackend
         Ok(())
     }
 
-    /// Shut down the exception handler (replying to a held exception), balance the task
-    /// suspend count with `task_resume`, and release the ports. The target keeps running.
+    /// Restore the target's exception ports, shut down the exception handler (replying to
+    /// held and queued exceptions), balance the task suspend count with `task_resume`, and
+    /// release the ports. The target keeps running.
     fn detach(&mut self) -> BackendResult<()>
     {
         use tracing::info;
@@ -812,7 +880,7 @@ impl Backend for MacOSBackend
 
         let pid = self.pid.0;
         info!("Detaching from process {}", pid);
-        self.stop_exception_handler();
+        self.stop_exception_handler(true);
         self.release_suspends();
         self.release_ports();
         info!("Successfully detached from process {}", pid);
@@ -836,7 +904,8 @@ impl Backend for MacOSBackend
             // ESRCH: already dead, which counts as success.
         }
 
-        self.stop_exception_handler();
+        // The process is dying: its exception ports need no restoring, only releasing.
+        self.stop_exception_handler(false);
         self.release_suspends();
         if self.launched {
             Self::reap(pid);
@@ -847,6 +916,10 @@ impl Backend for MacOSBackend
 
     /// Receive the next stop event from the exception loop (or an interrupt).
     ///
+    /// When the exception loop failed to reply to an exception on the last resume, that
+    /// failure is returned once as `BackendError::Os` (the state does not change), and
+    /// later calls report later stops as usual.
+    ///
     /// Known gap (T06, issue #32): nothing watches for process exit, so `Exited` and
     /// `Killed` are never reported, and `wait(None)` on a process that exits blocks.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>
@@ -854,7 +927,8 @@ impl Backend for MacOSBackend
         match self.state {
             BackendState::NoProcess => Err(self.invalid_state("wait")),
             BackendState::Stopped => match self.try_next_event() {
-                Some(event) => Ok(Some(self.deliver(event))),
+                Some(Ok(event)) => Ok(Some(self.deliver(event))),
+                Some(Err(err)) => Err(err),
                 None if timeout.is_none() => Err(BackendError::InvalidState(
                     "wait without a timeout while the target is stopped with no pending event would block forever"
                         .to_string(),
@@ -862,8 +936,8 @@ impl Backend for MacOSBackend
                 None => Ok(None),
             },
             BackendState::Running => {
-                if let Some(event) = self.peeked.take() {
-                    return Ok(Some(self.deliver(event)));
+                if let Some(peeked) = self.peeked.take() {
+                    return peeked.map(|event| Some(self.deliver(event)));
                 }
                 let Some(rx) = self.events_rx.as_ref() else {
                     return Err(BackendError::Os {
@@ -876,7 +950,9 @@ impl Backend for MacOSBackend
                     Some(timeout) => rx.recv_timeout(timeout),
                 };
                 match received {
-                    Ok(event) => Ok(Some(self.deliver(event))),
+                    // A reply the exception loop failed to send; the state does not change.
+                    Ok(Err(err)) => Err(err),
+                    Ok(Ok(event)) => Ok(Some(self.deliver(event))),
                     Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
                     Err(mpsc::RecvTimeoutError::Disconnected) => Err(BackendError::Os {
                         code: -1,
@@ -887,8 +963,11 @@ impl Backend for MacOSBackend
         }
     }
 
-    /// Continue every thread: reply to the held exception, if any, then `task_resume`
+    /// Continue every thread: reply to the held exceptions, if any, then `task_resume`
     /// once per suspend the backend holds.
+    ///
+    /// A reply that fails does not fail the resume: the next `wait` reports it. The resume
+    /// fails only if the exception handler does not answer at all.
     ///
     /// Only [`ResumeRequest::continue_all`] is supported: `Step` (T07, issue #33),
     /// per-thread `Suspend` and signals (T06, issue #32) return
@@ -925,9 +1004,9 @@ impl Backend for MacOSBackend
             let replied = if sent {
                 ack_rx
                     .recv_timeout(EXCEPTION_REPLY_TIMEOUT)
-                    .unwrap_or_else(|_| Err("the exception handler did not answer".to_string()))
+                    .map_err(|_| "the exception handler did not answer")
             } else {
-                Err("the exception handler is not running".to_string())
+                Err("the exception handler is not running")
             };
             if let Err(message) = replied {
                 restore(self, count);
@@ -978,7 +1057,7 @@ impl Backend for MacOSBackend
                     }
                     shared.suspends += 1;
                     if let Some(tx) = &self.events_tx {
-                        let _ = tx.send(StopEvent::Interrupted { thread: None });
+                        let _ = tx.send(Ok(StopEvent::Interrupted { thread: None }));
                     }
                 }
                 Ok(())
@@ -1060,13 +1139,13 @@ impl Drop for MacOSBackend
     fn drop(&mut self)
     {
         if self.state == BackendState::NoProcess {
-            self.stop_exception_handler();
+            self.stop_exception_handler(true);
             return;
         }
         if self.launched {
             let _ = Backend::kill(self);
         } else {
-            self.stop_exception_handler();
+            self.stop_exception_handler(true);
             self.release_suspends();
             self.release_ports();
         }

@@ -25,8 +25,14 @@
 //!   is argv\[0\], and its environment, working directory and stdio specs are honoured.
 //! - **Stops**: the exception handler thread suspends the whole task (`task_suspend`)
 //!   before it reports a Mach exception, so every thread is stopped when `wait` returns an
-//!   event. `EXC_BREAKPOINT` is reported as `StopEvent::Breakpoint` with the raw pc;
-//!   faults become `StopEvent::Signal`.
+//!   event. Threads that raised exceptions at the same moment are reported together: one
+//!   event each, queued for `wait` before the target runs again. `EXC_BREAKPOINT` is
+//!   reported as `StopEvent::Breakpoint` with the raw pc; faults become
+//!   `StopEvent::Signal`. A failed exception reply is returned by the next `wait` as
+//!   `BackendError::Os`, and stops keep being reported.
+//! - **Exception ports**: attaching saves the target's exception ports and detaching
+//!   restores them. The port rights each exception message carries are released.
+//!   [`diagnostics`] lets tests check both.
 //! - **Thread ids** are Mach thread port names.
 //! - **Breakpoints**: the backend keeps no breakpoint table; the engine writes trap
 //!   bytes with `write_memory`, which makes code pages writable for the write. Hardware
@@ -117,7 +123,8 @@
 //! - `thread_get_state()`: Read thread registers (declared ourselves - not in mach2)
 //! - `thread_set_state()`: Write thread registers
 //! - `task_suspend()` / `task_resume()`: Stop and continue the whole task
-//! - `task_set_exception_ports()` / `mach_msg()`: Receive exceptions
+//! - `task_swap_exception_ports()` / `mach_msg()`: Receive exceptions (`task_set_exception_ports()`
+//!   restores the saved ports on detach)
 //! - `posix_spawn()`: Launch processes with `POSIX_SPAWN_START_SUSPENDED` flag
 //!
 //! ## Dependencies
@@ -126,7 +133,8 @@
 //! - **mach2 crate**: For well-maintained Mach APIs (`mach_task_self`, `task_threads`, `KERN_SUCCESS`)
 //! - **libc crate**: For type definitions (`mach_port_t`, `thread_act_t`, `posix_spawnattr_t`, etc.)
 //! - **ffi module**: Centralized FFI declarations for restricted functions not in mach2
-//!   (`task_for_pid`, `thread_get_state`, `vm_read`, `vm_write`, `mach_vm_region`, `posix_spawn`)
+//!   (`task_for_pid`, `thread_get_state`, `vm_read`, `vm_write`, `mach_vm_region`, `posix_spawn`,
+//!   `mach_port_names`, `mach_port_get_refs`)
 //!
 //! This gives us the best of both worlds: well-maintained APIs where available,
 //! and direct control over restricted functions.
@@ -145,6 +153,7 @@
 
 pub mod breakpoints;
 pub mod constants;
+pub mod diagnostics;
 pub mod error;
 pub mod exception;
 pub mod ffi;

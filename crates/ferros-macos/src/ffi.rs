@@ -148,6 +148,30 @@ unsafe extern "C" {
     ///
     /// See: [mach_port_deallocate(3) man page](https://developer.apple.com/documentation/kernel/1578777-mach_port_deallocate/)
     pub fn mach_port_deallocate(target_task: mach_port_t, name: mach_port_t) -> kern_return_t;
+
+    /// List every port name in an IPC space and the rights each name denotes.
+    ///
+    /// On success `names` and `types` point to `*names_count` / `*types_count` entries
+    /// allocated in the caller's address space; free both with `vm_deallocate()`.
+    ///
+    /// ## Documentation
+    ///
+    /// See: [mach_port_names](https://developer.apple.com/documentation/kernel/1578762-mach_port_names)
+    pub fn mach_port_names(
+        task: mach_port_t,
+        names: *mut *mut mach_port_t,
+        names_count: *mut libc::mach_msg_type_number_t,
+        types: *mut *mut u32,
+        types_count: *mut libc::mach_msg_type_number_t,
+    ) -> kern_return_t;
+
+    /// Read the user-reference count of one right (`right`, a `MACH_PORT_RIGHT_*` value)
+    /// that `name` denotes in `task`'s IPC space.
+    ///
+    /// ## Documentation
+    ///
+    /// See: [mach_port_get_refs](https://developer.apple.com/documentation/kernel/1578745-mach_port_get_refs)
+    pub fn mach_port_get_refs(task: mach_port_t, name: mach_port_t, right: u32, refs: *mut u32) -> kern_return_t;
 }
 
 // Thread State Functions

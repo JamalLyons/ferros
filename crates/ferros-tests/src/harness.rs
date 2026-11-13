@@ -38,7 +38,7 @@ use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -161,12 +161,12 @@ enum Outcome
 }
 
 /// A process launched by one test: its identifying argument, once known its pid, and the
-/// directory capturing its output.
+/// directory capturing its output (none for a [`Spawned`] process).
 struct Tracked
 {
     tag: String,
     pid: Option<u32>,
-    capture_dir: PathBuf,
+    capture_dir: Option<PathBuf>,
 }
 
 /// State shared between a test's worker thread, its guards and the controlling thread.
@@ -208,7 +208,9 @@ impl Shared
         let mut killed = Vec::new();
         for entry in entries {
             killed.extend(kill_debuggee(entry.pid, &entry.tag));
-            let _ = fs::remove_dir_all(&entry.capture_dir);
+            if let Some(dir) = &entry.capture_dir {
+                let _ = fs::remove_dir_all(dir);
+            }
         }
         killed
     }
@@ -273,6 +275,32 @@ impl TestContext
     /// thread fails the test with the permission guidance).
     pub fn try_launch_with_args(&self, fixture: &Fixture, args: &[&str]) -> Result<Debuggee, DebuggerError>
     {
+        self.try_launch_with_backend(fixture, args, ferros_macos::MacOSBackend::new()?)
+    }
+
+    /// Like [`TestContext::launch_with_args`], but the session drives `backend`, which the
+    /// test may have prepared first (for example to keep a test hook handle of it).
+    ///
+    /// # Panics
+    ///
+    /// As for [`TestContext::launch_with_args`].
+    #[must_use]
+    pub fn launch_with_backend(&self, fixture: &Fixture, args: &[&str], backend: ferros_macos::MacOSBackend) -> Debuggee
+    {
+        match self.try_launch_with_backend(fixture, args, backend) {
+            Ok(debuggee) => debuggee,
+            Err(DebuggerError::PermissionDenied(detail)) => panic!("{}", permission_guidance(&detail)),
+            Err(err) => panic!("ferros-tests: failed to launch fixture '{}': {err}", fixture.name()),
+        }
+    }
+
+    fn try_launch_with_backend(
+        &self,
+        fixture: &Fixture,
+        args: &[&str],
+        backend: ferros_macos::MacOSBackend,
+    ) -> Result<Debuggee, DebuggerError>
+    {
         assert!(
             !self.shared.cancelled.load(Ordering::SeqCst),
             "ferros-tests: refusing to launch '{}': this test already failed its deadline",
@@ -288,12 +316,12 @@ impl TestContext
             .stdout(StdioSpec::Path(capture.stdout_path()))
             .stderr(StdioSpec::Path(capture.stderr_path()));
 
-        let mut session = Session::new(Box::new(ferros_macos::MacOSBackend::new()?));
+        let mut session = Session::new(Box::new(backend));
 
         self.shared.tracked().push(Tracked {
             tag: tag.clone(),
             pid: None,
-            capture_dir: capture.path.clone(),
+            capture_dir: Some(capture.path.clone()),
         });
 
         // Watchdog: if launch has not returned by the deadline, it tells the controller (which
@@ -344,6 +372,81 @@ impl TestContext
             fixture.name()
         );
         Ok(guard)
+    }
+
+    /// Starts `fixture` with `args` as an ordinary child process, not under the debugger
+    /// (for example to attach to it later). The harness's identifying argument is
+    /// appended, stdio is the null device, and the process is killed on the test's
+    /// deadline like a launched one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test has already failed its deadline or the process cannot be
+    /// started.
+    #[must_use]
+    pub fn spawn(&self, fixture: &Fixture, args: &[&str]) -> Spawned
+    {
+        assert!(
+            !self.shared.cancelled.load(Ordering::SeqCst),
+            "ferros-tests: refusing to spawn '{}': this test already failed its deadline",
+            fixture.name()
+        );
+        let tag = unique_tag();
+        self.shared.tracked().push(Tracked {
+            tag: tag.clone(),
+            pid: None,
+            capture_dir: None,
+        });
+        let child = Command::new(fixture.path())
+            .args(args)
+            .arg(&tag)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(err) => {
+                self.shared.forget(&tag);
+                panic!("ferros-tests: failed to spawn fixture '{}': {err}", fixture.name());
+            }
+        };
+        self.shared.set_pid(&tag, child.id());
+        Spawned {
+            child,
+            tag,
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// A fixture started by [`TestContext::spawn`], not under the debugger. Dropping it kills
+/// and reaps the process.
+pub struct Spawned
+{
+    child: Child,
+    tag: String,
+    shared: Arc<Shared>,
+}
+
+impl Spawned
+{
+    /// Process id of the fixture.
+    #[must_use]
+    pub fn pid(&self) -> ProcessId
+    {
+        ProcessId::from(self.child.id())
+    }
+}
+
+impl Drop for Spawned
+{
+    fn drop(&mut self)
+    {
+        kill_debuggee(Some(self.child.id()), &self.tag);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.shared.forget(&self.tag);
     }
 }
 

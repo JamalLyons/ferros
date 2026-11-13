@@ -77,6 +77,12 @@ fn resume_runs_hello()
 
 - `t.launch_with_args(&fixture!("loop_counter"), &["100"])` passes fixture arguments; the harness
   appends a unique `--ferros-test-id=...` argument last.
+- `t.launch_with_backend(&fixture, &args, backend)` launches under a `MacOSBackend` the test built
+  first, for example to keep a test hook handle (`backend.reply_fault_injector()`) after the session
+  owns the backend.
+- `t.spawn(&fixture!("loop_counter"), &args)` starts a fixture outside the debugger (stdio null, tagged
+  and killed on the deadline like a launch), for tests that attach to a running process; dropping the
+  returned `Spawned` kills and reaps it.
 - The returned `Debuggee` owns the session and kills the process when dropped, including when
   the test panics. Use `d.pid()`, `d.session()`, `d.stdout()` and `d.stderr()` as needed.
 - The fixture's stdout and stderr go to two files in a per-launch temporary directory (stdin is
@@ -89,6 +95,10 @@ fn resume_runs_hello()
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+- `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
+  port restore on detach, failed replies). It reads Mach state through the safe
+  `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the
+  test process's own IPC space.
 
 ## Tests without a real process
 

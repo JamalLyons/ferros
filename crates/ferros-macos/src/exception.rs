@@ -8,18 +8,36 @@
 //! ## Mach Exception Ports
 //!
 //! On macOS, exceptions are delivered via Mach ports. The backend registers
-//! an exception port with `task_set_exception_ports()` and then receives
-//! exception messages via `mach_msg()`.
+//! an exception port with `task_swap_exception_ports()` (keeping the target's previous
+//! exception ports, which a detach puts back) and then receives exception messages via
+//! `mach_msg()`.
 //!
 //! ## Stops
 //!
 //! When an exception arrives, the loop suspends the whole task (`task_suspend`)
 //! before it reports anything, because the [`Backend`](ferros_core::Backend) contract
-//! says every thread is stopped when `wait` returns an event. It counts that suspend in
-//! [`ExceptionSharedState::suspends`], keeps the exception message (the faulting thread
-//! waits for the reply), and sends the event over a channel that `wait` receives from.
-//! Resuming replies to the held message and then balances the suspends with
-//! `task_resume`.
+//! says every thread is stopped when `wait` returns an event. `task_suspend` returns once
+//! the running threads have stopped, so a thread that raised an exception at the same
+//! moment has queued its message by then: the loop drains the port without blocking and
+//! reports one event per message. It counts one suspend per stop in
+//! [`ExceptionSharedState::suspends`], keeps every message of the stop (each faulting
+//! thread waits for its reply), and queues the events on a channel that `wait` receives
+//! from, all under the shared lock. Resuming replies to every held message and then
+//! balances the suspends with `task_resume`.
+//!
+//! ## Port rights
+//!
+//! Each exception message carries a send right for the faulting thread and one for its
+//! task. The loop releases the task right as soon as the message is decoded and the
+//! thread right once the message is answered (the backend holds its own right to the
+//! thread by then, so the name, which is the [`ThreadId`], stays valid). The reply
+//! consumes the send-once reply right.
+//!
+//! ## Failed replies
+//!
+//! A reply that cannot be sent does not stop the loop: the failure is queued as an
+//! `Err` on the event channel, so the next `wait` returns it, and the loop keeps
+//! receiving.
 //!
 //! ## References
 //!
@@ -27,35 +45,44 @@
 //! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
-use ferros_core::backend::StopEvent;
-use ferros_core::error::{DebuggerError, Result};
+use ferros_core::backend::{BackendError, BackendResult, StopEvent};
 use ferros_core::types::{Address, Architecture, ThreadId};
 use libc::{c_int, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exc::__Reply__exception_raise_t;
 #[cfg(target_os = "macos")]
 use mach2::exception_types::{
-    EXC_ARITHMETIC, EXC_BAD_ACCESS, EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_SOFTWARE, exception_type_t,
+    EXC_ARITHMETIC, EXC_BAD_ACCESS, EXC_BAD_INSTRUCTION, EXC_BREAKPOINT, EXC_SOFTWARE, exception_behavior_t,
+    exception_mask_t, exception_type_t,
 };
 #[cfg(target_os = "macos")]
-use mach2::kern_return::KERN_SUCCESS;
+use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 #[cfg(target_os = "macos")]
 use mach2::message::{
-    MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_RCV_LARGE, MACH_RCV_MSG,
-    MACH_RCV_TIMEOUT, MACH_SEND_MSG, mach_msg, mach_msg_body_t, mach_msg_header_t, mach_msg_port_descriptor_t,
-    mach_msg_size_t, mach_msg_type_number_t,
+    MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_MSGH_BITS_COMPLEX,
+    MACH_RCV_INVALID_NAME, MACH_RCV_MSG, MACH_RCV_PORT_DIED, MACH_RCV_TIMEOUT, MACH_SEND_INVALID_DEST, MACH_SEND_MSG,
+    MACH_SEND_TIMED_OUT, mach_msg, mach_msg_body_t, mach_msg_destroy, mach_msg_header_t, mach_msg_port_descriptor_t,
+    mach_msg_return_t, mach_msg_size_t, mach_msg_type_number_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record_t;
 #[cfg(target_os = "macos")]
-use mach2::port::MACH_PORT_NULL;
+use mach2::port::{MACH_PORT_DEAD, MACH_PORT_NULL};
 #[cfg(target_os = "macos")]
-use mach2::task::task_suspend;
+use mach2::task::{task_get_exception_ports, task_set_exception_ports, task_suspend, task_swap_exception_ports};
+#[cfg(target_os = "macos")]
+use mach2::thread_status::thread_state_flavor_t;
+#[cfg(target_os = "macos")]
+use mach2::traps::mach_task_self;
 use tracing::{debug, error, warn};
+
+/// An item on the stop event channel: a stop, or a failure the next `wait` reports.
+pub(crate) type LoopEvent = BackendResult<StopEvent>;
 
 /// State shared by the Mach exception loop and the backend, always changed under its lock.
 #[derive(Debug, Default)]
@@ -64,7 +91,7 @@ pub(crate) struct ExceptionSharedState
     /// Number of `task_suspend` calls the backend holds on the task and has not yet
     /// balanced with `task_resume` (the launch or attach stop, exception stops, interrupts).
     pub suspends: u32,
-    /// Whether the loop holds an exception message whose thread waits for a reply.
+    /// Whether the loop holds exception messages whose threads wait for a reply.
     pub pending_exception: bool,
 }
 
@@ -81,6 +108,36 @@ pub(crate) fn lock_shared(shared: &Mutex<ExceptionSharedState>) -> std::sync::Mu
 {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// Fault injection for tests: makes the exception loop report the next reply as failed.
+///
+/// Obtained from [`MacOSBackend::reply_fault_injector`](crate::MacOSBackend::reply_fault_injector);
+/// see there. Not part of the supported API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct ReplyFaultInjector(Arc<AtomicBool>);
+
+impl ReplyFaultInjector
+{
+    /// Make the next exception reply the backend sends on resume report a failure.
+    ///
+    /// See [`MacOSBackend::fail_next_exception_reply`](crate::MacOSBackend::fail_next_exception_reply).
+    pub fn fail_next_exception_reply(&self)
+    {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Consume a pending injected failure.
+    fn take(&self) -> bool
+    {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// MIG id of `mach_exception_raise`, the request the kernel sends for
+/// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`.
+#[cfg(target_os = "macos")]
+const MACH_EXCEPTION_RAISE_ID: i32 = 2405;
 
 /// Request message of `mach_exception_raise` (MIG id 2405), which the kernel sends for
 /// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`: like `exception_raise`, but with 64-bit
@@ -107,14 +164,186 @@ struct MachExceptionRaiseRequest
 #[repr(C, align(8))]
 struct ReceiveBuffer([u8; 1024]);
 
+/// An exception message the loop holds: its thread waits in the kernel for the reply.
+#[cfg(target_os = "macos")]
+struct HeldException
+{
+    /// Header of the request; `msgh_remote_port` is the send-once reply right.
+    header: mach_msg_header_t,
+    /// The send right for the faulting thread carried by the message, released after the
+    /// reply.
+    thread: mach_port_t,
+}
+
 /// Command sent from the backend to the exception loop.
 #[derive(Debug)]
 pub(crate) enum ExceptionLoopCommand
 {
-    /// Reply to the held exception; the result of the reply is sent back.
-    Continue(mpsc::Sender<std::result::Result<(), String>>),
-    /// Reply to the held exception, if any, and exit the loop.
+    /// Reply to every held exception. `()` is sent back once every reply was attempted; a
+    /// reply that failed is queued as an `Err` on the event channel before that.
+    Continue(mpsc::Sender<()>),
+    /// Reply to the held exceptions, if any, answer the queued ones, and exit the loop.
     Shutdown,
+}
+
+/// Capacity of the arrays passed to `task_get_exception_ports` /
+/// `task_swap_exception_ports` (the kernel has fewer than this many exception types).
+#[cfg(target_os = "macos")]
+const EXCEPTION_PORT_SLOTS: usize = 32;
+
+/// One group of a task's exception ports: the exception types in `mask` share
+/// `handler`, `behavior` and `flavor`. `handler` is a send right owned by whoever
+/// obtained the entry (or `MACH_PORT_NULL` / `MACH_PORT_DEAD`).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExceptionPortEntry
+{
+    pub mask: exception_mask_t,
+    pub handler: mach_port_t,
+    pub behavior: exception_behavior_t,
+    pub flavor: thread_state_flavor_t,
+}
+
+/// Arrays filled by `task_get_exception_ports` and `task_swap_exception_ports`.
+#[cfg(target_os = "macos")]
+struct ExceptionPortArrays
+{
+    masks: [exception_mask_t; EXCEPTION_PORT_SLOTS],
+    handlers: [mach_port_t; EXCEPTION_PORT_SLOTS],
+    behaviors: [exception_behavior_t; EXCEPTION_PORT_SLOTS],
+    flavors: [thread_state_flavor_t; EXCEPTION_PORT_SLOTS],
+    count: mach_msg_type_number_t,
+}
+
+#[cfg(target_os = "macos")]
+impl ExceptionPortArrays
+{
+    fn new() -> Self
+    {
+        Self {
+            masks: [0; EXCEPTION_PORT_SLOTS],
+            handlers: [MACH_PORT_NULL; EXCEPTION_PORT_SLOTS],
+            behaviors: [0; EXCEPTION_PORT_SLOTS],
+            flavors: [0; EXCEPTION_PORT_SLOTS],
+            count: EXCEPTION_PORT_SLOTS as mach_msg_type_number_t,
+        }
+    }
+
+    fn entries(&self) -> Vec<ExceptionPortEntry>
+    {
+        (0..(self.count as usize).min(EXCEPTION_PORT_SLOTS))
+            .map(|i| ExceptionPortEntry {
+                mask: self.masks[i],
+                handler: self.handlers[i],
+                behavior: self.behaviors[i],
+                flavor: self.flavors[i],
+            })
+            .collect()
+    }
+}
+
+/// Read the exception ports of `task` for the types in `mask`.
+///
+/// The returned handlers are send rights the caller now owns (release them with
+/// `mach_port_deallocate`).
+#[cfg(target_os = "macos")]
+pub(crate) fn get_exception_ports(
+    task: mach_port_t,
+    mask: exception_mask_t,
+) -> std::result::Result<Vec<ExceptionPortEntry>, kern_return_t>
+{
+    let mut arrays = ExceptionPortArrays::new();
+    // SAFETY: every array has `count` writable slots and outlives the call.
+    let kr = unsafe {
+        task_get_exception_ports(
+            task,
+            mask,
+            arrays.masks.as_mut_ptr(),
+            &mut arrays.count,
+            arrays.handlers.as_mut_ptr(),
+            arrays.behaviors.as_mut_ptr(),
+            arrays.flavors.as_mut_ptr(),
+        )
+    };
+    if kr == KERN_SUCCESS { Ok(arrays.entries()) } else { Err(kr) }
+}
+
+/// The exception ports a task had before the backend installed its handler.
+///
+/// Holds a send right for every saved handler and releases them when dropped;
+/// [`restore`](Self::restore) puts the ports back first.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub(crate) struct SavedExceptionPorts
+{
+    entries: Vec<ExceptionPortEntry>,
+}
+
+#[cfg(target_os = "macos")]
+impl SavedExceptionPorts
+{
+    /// Install `port` as the handler of `task` for `mask` with `task_swap_exception_ports`,
+    /// returning the ports it replaced.
+    pub(crate) fn install(
+        task: mach_port_t,
+        mask: exception_mask_t,
+        port: mach_port_t,
+        behavior: exception_behavior_t,
+        flavor: thread_state_flavor_t,
+    ) -> std::result::Result<Self, kern_return_t>
+    {
+        let mut arrays = ExceptionPortArrays::new();
+        // SAFETY: every array has `count` writable slots and outlives the call.
+        let kr = unsafe {
+            task_swap_exception_ports(
+                task,
+                mask,
+                port,
+                behavior,
+                flavor,
+                arrays.masks.as_mut_ptr(),
+                &mut arrays.count,
+                arrays.handlers.as_mut_ptr(),
+                arrays.behaviors.as_mut_ptr(),
+                arrays.flavors.as_mut_ptr(),
+            )
+        };
+        if kr == KERN_SUCCESS {
+            Ok(Self {
+                entries: arrays.entries(),
+            })
+        } else {
+            Err(kr)
+        }
+    }
+
+    /// Put the saved exception ports back on `task` with `task_set_exception_ports`,
+    /// one call per saved group. Failures are logged; the rights are released on drop.
+    pub(crate) fn restore(&self, task: mach_port_t)
+    {
+        for entry in &self.entries {
+            // SAFETY: `task` is a valid task send right and `entry.handler` a send right
+            // this value owns (or NULL/DEAD); the call copies the right.
+            let kr = unsafe { task_set_exception_ports(task, entry.mask, entry.handler, entry.behavior, entry.flavor) };
+            if kr != KERN_SUCCESS {
+                warn!(
+                    "Failed to restore the exception port for mask {:#x}: task_set_exception_ports returned {kr}",
+                    entry.mask
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SavedExceptionPorts
+{
+    fn drop(&mut self)
+    {
+        for entry in &self.entries {
+            deallocate_right(entry.handler);
+        }
+    }
 }
 
 /// Get the thread state flavor for the given architecture.
@@ -185,26 +414,21 @@ pub(crate) fn stop_event_from_exception(
 
 /// Main exception handling loop that receives Mach exceptions.
 ///
-/// This function runs in a separate thread and continuously receives
-/// exception messages from the Mach kernel via `mach_msg()`. When an
-/// exception is received, it:
+/// This function runs in a separate thread and receives exception messages from the
+/// kernel via `mach_msg()`. For each stop it:
 ///
-/// 1. Suspends the whole task (`task_suspend`) and counts the suspend
-/// 2. Reads the raw pc of the thread for a breakpoint
-/// 3. Marks the exception as held and sends the [`StopEvent`] to `events`
-/// 4. Waits for a command from the backend
-/// 5. Sends an exception reply via `send_exception_reply()`
+/// 1. Blocks until a message arrives, decodes it and reads the raw pc of the thread for a
+///    breakpoint
+/// 2. Under the shared lock: suspends the whole task (`task_suspend`, counted once),
+///    drains every other message already queued on the port without blocking, marks the
+///    exceptions as held and queues one [`StopEvent`] per message
+/// 3. Waits for a command from the backend
+/// 4. On [`ExceptionLoopCommand::Continue`], replies to every held message, queues a
+///    failed reply as an `Err` for the next `wait`, and goes back to receiving
 ///
-/// The loop exits on [`ExceptionLoopCommand::Shutdown`] (replying first, so the thread
-/// can continue after a detach) or when the exception port is destroyed.
-///
-/// ## Mach Message Protocol
-///
-/// The loop uses `mach_msg()` with `MACH_RCV_MSG` to receive exception
-/// messages. Each message contains:
-/// - Exception type (breakpoint, bad access, etc.)
-/// - Thread port
-/// - Exception codes
+/// The loop exits on [`ExceptionLoopCommand::Shutdown`] (replying to the held and
+/// queued messages first, so the threads can continue after a detach) or when the
+/// exception port is destroyed.
 ///
 /// See:
 /// - [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
@@ -216,89 +440,85 @@ pub(crate) fn run_exception_loop(
     commands: mpsc::Receiver<ExceptionLoopCommand>,
     shared: Arc<Mutex<ExceptionSharedState>>,
     architecture: Architecture,
-    events: mpsc::Sender<StopEvent>,
+    events: mpsc::Sender<LoopEvent>,
+    faults: ReplyFaultInjector,
 )
 {
     loop {
-        let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
-        let recv_size = std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t;
-
-        let kr = unsafe {
-            mach_msg(
-                buffer.as_mut_ptr() as *mut mach_msg_header_t,
-                MACH_RCV_MSG | MACH_RCV_LARGE,
-                0,
-                recv_size,
-                exception_port,
-                MACH_MSG_TIMEOUT_NONE,
-                MACH_PORT_NULL,
-            )
-        };
-
-        if kr != MACH_MSG_SUCCESS {
-            if kr == mach2::message::MACH_RCV_PORT_DIED || kr == mach2::message::MACH_RCV_INVALID_NAME {
+        let buffer = match receive_exception(exception_port, false) {
+            Ok(buffer) => buffer,
+            Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
                 debug!("Mach exception port closed, exiting handler loop");
                 break;
             }
+            Err(_) => continue,
+        };
+        let Some(first) = decode_request(&buffer) else {
             continue;
-        }
-
-        // SAFETY: mach_msg succeeded, so the buffer holds a complete message; the read is
-        // unaligned-safe and the buffer is larger than the request.
-        let message = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const MachExceptionRaiseRequest) };
-        let thread_port = message.thread.name as thread_act_t;
-        let code = message.code;
-        let codes = [code[0], code[1]];
-        let exception_type = message.exception;
-
-        // The faulting thread is blocked in the kernel until the reply, so its registers
-        // can be read before the task is suspended.
-        let pc = if exception_type == EXC_BREAKPOINT as exception_type_t {
-            match crate::task::read_registers_for_port(architecture, thread_port) {
-                Ok(registers) => Some(registers.pc.value()),
-                Err(err) => {
-                    error!("Failed to read the pc of a breakpoint stop: {err}");
-                    None
-                }
-            }
-        } else {
-            None
         };
 
-        let event = stop_event_from_exception(exception_type, ThreadId::from(u64::from(thread_port)), pc, codes);
+        let mut held = Vec::new();
         {
-            // Stop every thread, mark the exception as held and queue the event in one
-            // step under the lock, so a concurrent resume or interrupt sees either none
-            // or all of this stop.
+            // Stop every thread, collect every message of this stop, mark the exceptions
+            // as held and queue the events in one step under the lock, so a concurrent
+            // resume or interrupt sees either none or all of this stop.
             let mut state = lock_shared(&shared);
+            // SAFETY: `task` is the send right the backend holds for as long as this
+            // loop runs.
             let kr = unsafe { task_suspend(task) };
             if kr == KERN_SUCCESS {
                 state.suspends += 1;
             } else {
                 error!("task_suspend failed while handling a Mach exception: {kr}");
             }
+
+            let mut stops = vec![hold_exception(&first, architecture)];
+            // `task_suspend` returned, so threads that raised an exception at the same
+            // moment have queued their messages: take them without blocking.
+            while let Ok(buffer) = receive_exception(exception_port, true) {
+                if let Some(request) = decode_request(&buffer) {
+                    stops.push(hold_exception(&request, architecture));
+                }
+            }
+            if stops.len() > 1 {
+                debug!("{} threads stopped at once", stops.len());
+            }
+
             state.pending_exception = true;
-            if let Err(err) = events.send(event) {
-                warn!("Failed to send stop event from Mach loop: {err}");
+            for (exception, event) in stops {
+                held.push(exception);
+                if let Err(err) = events.send(Ok(event)) {
+                    warn!("Failed to send stop event from Mach loop: {err}");
+                }
             }
         }
 
-        let command = commands.recv();
-        let header = message.Head;
-        let reply = send_exception_reply(&header).map_err(|err| err.to_string());
-        lock_shared(&shared).pending_exception = false;
-        if let Err(err) = &reply {
-            error!("Failed to send Mach exception reply: {err}");
-        }
-        match command {
+        match commands.recv() {
             Ok(ExceptionLoopCommand::Continue(ack)) => {
-                let failed = reply.is_err();
-                let _ = ack.send(reply);
-                if failed {
-                    break;
+                let failures: Vec<BackendError> = held
+                    .iter()
+                    .filter_map(|exception| reply_to_held(exception, &faults).err())
+                    .collect();
+                {
+                    let mut state = lock_shared(&shared);
+                    state.pending_exception = false;
+                    for failure in failures {
+                        error!("{failure}");
+                        if let Err(err) = events.send(Err(failure)) {
+                            warn!("Failed to queue a reply failure from Mach loop: {err}");
+                        }
+                    }
                 }
+                let _ = ack.send(());
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
+                for exception in &held {
+                    if let Err(err) = send_exception_reply(&exception.header) {
+                        error!("Failed to reply to a held Mach exception on shutdown: mach_msg returned {err:#x}");
+                    }
+                    deallocate_right(exception.thread);
+                }
+                lock_shared(&shared).pending_exception = false;
                 reply_to_queued_exceptions(exception_port);
                 break;
             }
@@ -306,36 +526,165 @@ pub(crate) fn run_exception_loop(
     }
 }
 
+/// Receive one message from `exception_port`: block until one arrives, or with
+/// `poll`, return `Err(MACH_RCV_TIMED_OUT)` at once when none is queued.
+#[cfg(target_os = "macos")]
+fn receive_exception(exception_port: mach_port_t, poll: bool) -> std::result::Result<ReceiveBuffer, mach_msg_return_t>
+{
+    let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
+    // No `MACH_RCV_LARGE`: an oversized message (never an exception request, which is
+    // far smaller than the buffer) is destroyed instead of staying queued and spinning
+    // the loop.
+    let (options, timeout) = if poll {
+        (MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0)
+    } else {
+        (MACH_RCV_MSG, MACH_MSG_TIMEOUT_NONE)
+    };
+    // SAFETY: the buffer is writable for `size_of::<ReceiveBuffer>()` bytes and outlives
+    // the call; the kernel writes at most that many.
+    let kr = unsafe {
+        mach_msg(
+            buffer.as_mut_ptr().cast::<mach_msg_header_t>(),
+            options,
+            0,
+            std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t,
+            exception_port,
+            timeout,
+            MACH_PORT_NULL,
+        )
+    };
+    if kr == MACH_MSG_SUCCESS {
+        // SAFETY: zeroed is a valid bit pattern for a byte array, and the kernel wrote a
+        // complete message into it.
+        Ok(unsafe { buffer.assume_init() })
+    } else {
+        Err(kr)
+    }
+}
+
+/// Decode a received message as a `mach_exception_raise` request.
+///
+/// Anything else (another message id, or a request without its two port descriptors) is
+/// destroyed, releasing every right it carries, and `None` is returned.
+#[cfg(target_os = "macos")]
+fn decode_request(buffer: &ReceiveBuffer) -> Option<MachExceptionRaiseRequest>
+{
+    // SAFETY: the buffer holds a complete message and is larger than the request; the
+    // read is unaligned-safe.
+    let request = unsafe { std::ptr::read_unaligned(buffer.0.as_ptr().cast::<MachExceptionRaiseRequest>()) };
+    let header = request.Head;
+    let body = request.msgh_body;
+    let is_exception = header.msgh_id == MACH_EXCEPTION_RAISE_ID
+        && header.msgh_bits & MACH_MSGH_BITS_COMPLEX != 0
+        && body.msgh_descriptor_count == 2;
+    if is_exception {
+        return Some(request);
+    }
+    warn!("Ignoring unexpected Mach message id {} on the exception port", header.msgh_id);
+    let mut copy = ReceiveBuffer(buffer.0);
+    // SAFETY: `copy` holds the received message, which owns its rights; destroying it
+    // releases them once.
+    unsafe { mach_msg_destroy(copy.0.as_mut_ptr().cast::<mach_msg_header_t>()) };
+    None
+}
+
+/// Turn a decoded request into a held exception and its stop event.
+///
+/// Reads the pc of the faulting thread for a breakpoint (the thread is blocked in the
+/// kernel until the reply), then releases the task right the message carried. The thread
+/// right is kept until the reply.
+#[cfg(target_os = "macos")]
+fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architecture) -> (HeldException, StopEvent)
+{
+    let thread_port = request.thread.name as thread_act_t;
+    let code = request.code;
+    let codes = [code[0], code[1]];
+    let exception_type = request.exception;
+
+    let pc = if exception_type == EXC_BREAKPOINT as exception_type_t {
+        match crate::task::read_registers_for_port(architecture, thread_port) {
+            Ok(registers) => Some(registers.pc.value()),
+            Err(err) => {
+                error!("Failed to read the pc of a breakpoint stop: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    deallocate_right(request.task.name);
+
+    let event = stop_event_from_exception(exception_type, ThreadId::from(u64::from(thread_port)), pc, codes);
+    (
+        HeldException {
+            header: request.Head,
+            thread: thread_port,
+        },
+        event,
+    )
+}
+
+/// Reply to a held exception on resume and release its thread right.
+///
+/// With a failure injected through [`ReplyFaultInjector`], the reply is reported as
+/// failed although it is still sent, so the thread does not stay blocked forever.
+#[cfg(target_os = "macos")]
+fn reply_to_held(exception: &HeldException, faults: &ReplyFaultInjector) -> BackendResult<()>
+{
+    let injected = faults.take();
+    let sent = send_exception_reply(&exception.header);
+    deallocate_right(exception.thread);
+    let failure = match sent {
+        Err(kr) => Some((kr, "")),
+        Ok(()) if injected => Some((MACH_SEND_INVALID_DEST, " (injected by fail_next_exception_reply)")),
+        Ok(()) => None,
+    };
+    match failure {
+        None => Ok(()),
+        Some((kr, note)) => Err(BackendError::Os {
+            code: i64::from(kr),
+            message: format!(
+                "failed to reply to the Mach exception of thread {}: mach_msg returned {kr:#x}{note}; the thread may stay \
+                 blocked",
+                exception.thread
+            ),
+        }),
+    }
+}
+
+/// Release one send right of this task, ignoring `MACH_PORT_NULL` and `MACH_PORT_DEAD`.
+#[cfg(target_os = "macos")]
+fn deallocate_right(name: mach_port_t)
+{
+    if name == MACH_PORT_NULL || name == MACH_PORT_DEAD {
+        return;
+    }
+    // SAFETY: the caller owns one user reference of `name`, released exactly once here.
+    let kr = unsafe { crate::ffi::mach_port_deallocate(mach_task_self(), name) };
+    if kr != KERN_SUCCESS {
+        warn!("mach_port_deallocate({name}) failed: {kr}");
+    }
+}
+
 /// Reply to every exception message still queued on `exception_port`, without blocking.
 ///
-/// The loop holds one exception at a time; other threads that raised an exception in
-/// the meantime wait in the port's queue. On shutdown they must be answered too:
-/// destroying the port with a message queued makes the kernel treat the exception as
-/// unhandled, which would kill a target that a detach is supposed to leave running.
+/// Threads that raised an exception after the loop collected its last stop wait in the
+/// port's queue. On shutdown they must be answered too: destroying the port with a
+/// message queued makes the kernel treat the exception as unhandled, which would kill a
+/// target that a detach is supposed to leave running. The rights each message carries
+/// are released.
 #[cfg(target_os = "macos")]
 fn reply_to_queued_exceptions(exception_port: mach_port_t)
 {
-    loop {
-        let mut buffer = MaybeUninit::<ReceiveBuffer>::zeroed();
-        let kr = unsafe {
-            mach_msg(
-                buffer.as_mut_ptr() as *mut mach_msg_header_t,
-                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                0,
-                std::mem::size_of::<ReceiveBuffer>() as mach_msg_size_t,
-                exception_port,
-                0,
-                MACH_PORT_NULL,
-            )
+    while let Ok(buffer) = receive_exception(exception_port, true) {
+        let Some(request) = decode_request(&buffer) else {
+            continue;
         };
-        if kr != MACH_MSG_SUCCESS {
-            break;
+        if let Err(kr) = send_exception_reply(&request.Head) {
+            error!("Failed to reply to a queued Mach exception: mach_msg returned {kr:#x}");
         }
-        // SAFETY: mach_msg succeeded, so the buffer starts with a complete header.
-        let header = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const mach_msg_header_t) };
-        if let Err(err) = send_exception_reply(&header) {
-            error!("Failed to reply to a queued Mach exception: {err}");
-        }
+        deallocate_right(request.thread.name);
+        deallocate_right(request.task.name);
     }
 }
 
@@ -347,11 +696,14 @@ fn reply_to_queued_exceptions(exception_port: mach_port_t)
 ///
 /// Uses `mach_msg()` with `MACH_SEND_MSG` to send the reply. In a received message the
 /// header's `msgh_remote_port` holds the kernel's send-once reply right, so that is where
-/// the reply goes; its id is the request id plus 100.
+/// the reply goes; its id is the request id plus 100. The send consumes that right. When
+/// the send fails with `MACH_SEND_INVALID_DEST` or `MACH_SEND_TIMED_OUT`, `mach_msg`
+/// leaves the reply (and its right) with the caller, so the reply is destroyed here, as
+/// `mach_msg_server` does.
 ///
 /// See: [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
 #[cfg(target_os = "macos")]
-fn send_exception_reply(request: &mach_msg_header_t) -> Result<()>
+fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), kern_return_t>
 {
     let mut reply = __Reply__exception_raise_t {
         Head: mach_msg_header_t {
@@ -362,10 +714,12 @@ fn send_exception_reply(request: &mach_msg_header_t) -> Result<()>
             msgh_voucher_port: MACH_PORT_NULL,
             msgh_id: request.msgh_id + 100,
         },
+        // SAFETY: `NDR_record` is an immutable static provided by libsystem.
         NDR: unsafe { NDR_record },
         RetCode: KERN_SUCCESS,
     };
 
+    // SAFETY: `reply` is a complete, correctly sized message that outlives the call.
     let kr = unsafe {
         mach_msg(
             &mut reply.Head,
@@ -379,7 +733,12 @@ fn send_exception_reply(request: &mach_msg_header_t) -> Result<()>
     };
 
     if kr != MACH_MSG_SUCCESS {
-        return Err(DebuggerError::ResumeFailed(format!("mach_msg reply failed: {}", kr)));
+        if kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_TIMED_OUT {
+            // SAFETY: the send did not consume the message, so it still owns its reply
+            // right; destroying it releases that right once.
+            unsafe { mach_msg_destroy(&mut reply.Head) };
+        }
+        return Err(kr);
     }
 
     Ok(())

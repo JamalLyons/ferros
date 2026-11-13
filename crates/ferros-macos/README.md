@@ -14,8 +14,11 @@ The target is traced with `ptrace(PT_ATTACHEXC)`: signals are reported as stops 
 be passed on or suppressed on resume, and exit is detected with a kqueue watcher that
 reaps the process and reports `Exited` or `Killed` through `wait`.
 
-Known gaps, fixed by later tasks: single-step is unsupported (T07, issue #33); `images`
-reports only the main executable (issue #34).
+`resume` honours every thread action: a `Step` thread executes one instruction (arm64
+hardware single-step, `MDSCR_EL1.SS`) and stops with `SingleStep`, while `Suspend`
+threads stay suspended with their held exceptions and signals unanswered.
+
+Known gap, fixed by a later task: `images` reports only the main executable (issue #34).
 
 All Mach FFI and all `unsafe` code in the workspace lives in this crate; `ferros-core`
 holds no OS-specific code. The crate is macOS-only: on any other OS it compiles as an

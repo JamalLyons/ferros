@@ -1,5 +1,9 @@
 //! Threads fixture program.
 //!
+//! An optional first argument is a number of milliseconds to keep running after both
+//! workers have exited (default 0), for tests that need a live process whose worker
+//! threads are gone.
+//!
 //! Functions:
 //! - `main`
 //! - `worker_body`
@@ -46,4 +50,6 @@ fn main()
     let res2 = handle2.join().expect("worker 2 panicked");
     let sum = std::hint::black_box(res1.wrapping_add(res2)); // BREAK: after_join
     println!("threads finished: {sum}");
+    let hold_ms = std::env::args().nth(1).and_then(|arg| arg.parse::<u64>().ok()).unwrap_or(0);
+    thread::sleep(Duration::from_millis(hold_ms));
 }

@@ -20,7 +20,7 @@ use crate::error::{DebuggerError, Result};
 
 impl Session
 {
-    fn arch(&self) -> Result<&'static dyn Arch>
+    pub(super) fn arch(&self) -> Result<&'static dyn Arch>
     {
         Ok(arch::for_architecture(self.backend.architecture())?)
     }
@@ -183,7 +183,7 @@ impl Session
         self.breakpoints.get(id).ok_or(DebuggerError::BreakpointIdNotFound(id.raw()))
     }
 
-    fn mark_disabled(&mut self, id: BreakpointId)
+    pub(super) fn mark_disabled(&mut self, id: BreakpointId)
     {
         if let Some(entry) = self.breakpoints.get_mut(id) {
             entry.info.state = BreakpointState::Disabled;
@@ -192,7 +192,7 @@ impl Session
     }
 
     /// Write a software breakpoint's saved original bytes back to memory.
-    fn restore_original(&mut self, entry: &BreakpointEntry) -> Result<()>
+    pub(super) fn restore_original(&mut self, entry: &BreakpointEntry) -> Result<()>
     {
         if let BreakpointPayload::Software { original_bytes } = &entry.payload {
             self.backend.write_memory(entry.info.address, original_bytes)?;
@@ -216,6 +216,66 @@ impl Session
         for entry in inserted {
             self.restore_original(&entry)?;
             self.mark_disabled(entry.info.id);
+        }
+        Ok(())
+    }
+}
+
+// Compute overlaps in u128 so a range near the address-space end cannot wrap.
+fn overlap(
+    address: crate::types::Address,
+    len: usize,
+    base: crate::types::Address,
+    size: usize,
+) -> Option<(usize, usize, usize)>
+{
+    let a = u128::from(address.value());
+    let b = u128::from(base.value());
+    let start = a.max(b);
+    let end = (a + len as u128).min(b + size as u128);
+    (start < end).then(|| ((start - a) as usize, (start - b) as usize, (end - start) as usize))
+}
+
+impl Session
+{
+    pub(super) fn overlay_originals(&self, address: crate::types::Address, data: &mut [u8])
+    {
+        for info in self.breakpoints.list().into_iter().filter(|info| info.enabled) {
+            if let Some(BreakpointEntry {
+                payload: BreakpointPayload::Software { original_bytes },
+                ..
+            }) = self.breakpoints.get(info.id)
+                && let Some((offset, original, len)) = overlap(address, data.len(), info.address, original_bytes.len())
+            {
+                data[offset..offset + len].copy_from_slice(&original_bytes[original..original + len]);
+            }
+        }
+    }
+
+    pub(super) fn write_through_breakpoints(&mut self, address: crate::types::Address, data: &[u8]) -> Result<()>
+    {
+        let mut written = data.to_vec();
+        let mut updates = Vec::new();
+        for info in self.breakpoints.list() {
+            let Some(mut entry) = self.breakpoints.get(info.id).cloned() else {
+                continue;
+            };
+            if let BreakpointPayload::Software { original_bytes } = &mut entry.payload
+                && let Some((offset, original, len)) = overlap(address, data.len(), info.address, original_bytes.len())
+            {
+                original_bytes[original..original + len].copy_from_slice(&data[offset..offset + len]);
+                if info.enabled {
+                    let trap = self.arch()?.trap_instruction();
+                    written[offset..offset + len].copy_from_slice(&trap[original..original + len]);
+                }
+                updates.push(entry);
+            }
+        }
+        self.backend.write_memory(address, &written)?;
+        for entry in updates {
+            if let Some(stored) = self.breakpoints.get_mut(entry.info.id) {
+                *stored = entry;
+            }
         }
         Ok(())
     }

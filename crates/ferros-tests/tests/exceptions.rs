@@ -150,7 +150,7 @@ fn simultaneous_breakpoints_on_two_threads_are_both_reported()
             let first = expect_breakpoint(&mut d, address, "the first worker's stop");
             // No resume: anything reported now belongs to the same stop.
             let second = d.wait(Some(Duration::ZERO)).expect("wait(0) after the first stop");
-            // Resuming from the trap would hit it again (T07, issue #33): remove it first.
+            // Only the simultaneous stop matters here: remove the breakpoint before going on.
             d.remove_breakpoint(id).expect("remove_breakpoint");
             match second {
                 Some(StopEvent::Breakpoint { thread, pc }) => {
@@ -237,7 +237,8 @@ fn repeated_stops_do_not_grow_the_debuggers_ports()
             if stop == WARMUP_STOPS {
                 baseline = Some(measure());
             }
-            // Step off the trap without stepping (T07): disable, run, interrupt, re-arm.
+            // Leave the trap with an extra interrupt stop (disable, run, interrupt, re-arm), so
+            // each loop adds stops of more than one kind to the port measurement.
             d.disable_breakpoint(id).expect("disable_breakpoint");
             d.resume().expect("resume with the breakpoint disabled");
             interrupt(&mut d);

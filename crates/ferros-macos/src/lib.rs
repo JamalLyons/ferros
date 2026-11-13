@@ -27,9 +27,18 @@
 //!   before it reports a Mach exception, so every thread is stopped when `wait` returns an
 //!   event. Threads that raised exceptions at the same moment are reported together: one
 //!   event each, queued for `wait` before the target runs again. `EXC_BREAKPOINT` is
-//!   reported as `StopEvent::Breakpoint` with the raw pc; faults become
+//!   reported as `StopEvent::Breakpoint` with the raw pc, or as `StopEvent::SingleStep`
+//!   when its codes are those of a completed hardware step; faults become
 //!   `StopEvent::Signal`. A failed exception reply is returned by the next `wait` as
 //!   `BackendError::Os`, and stops keep being reported.
+//! - **Resume** honours every `ThreadAction`. `Step` sets the arm64 hardware single-step
+//!   bit (`MDSCR_EL1.SS`) of the thread, which then executes one instruction and stops
+//!   with `StopEvent::SingleStep`. `Suspend` keeps the thread `thread_suspend`ed while the
+//!   others run, and its held exception (and held signal) stays unanswered until a later
+//!   resume lets it run. The next stop `wait` delivers ends that resume: the per-thread
+//!   suspends are balanced and every single-step bit is cleared, so a step that did not
+//!   complete is cancelled; `detach`, `kill` and drop balance them too. `Step` is not
+//!   implemented on x86-64 (`BackendError::Unsupported`).
 //! - **Exception ports**: attaching saves the target's exception ports and detaching
 //!   restores them. The port rights each exception message carries are released.
 //!   [`diagnostics`] lets tests check both.
@@ -47,8 +56,6 @@
 //!
 //! ## Known gaps
 //!
-//! - T07 (issue #33): single-step (`ThreadAction::Step`) returns
-//!   `BackendError::Unsupported`, and so does keeping individual threads suspended.
 //! - Issue #34: shared libraries are not enumerated by `images`.
 //!
 //! This is the only crate in the workspace that talks to an operating-system API
@@ -124,6 +131,7 @@
 //! - `thread_get_state()`: Read thread registers (declared ourselves - not in mach2)
 //! - `thread_set_state()`: Write thread registers
 //! - `task_suspend()` / `task_resume()`: Stop and continue the whole task
+//! - `thread_suspend()` / `thread_resume()`: Keep single threads suspended during a resume
 //! - `task_swap_exception_ports()` / `mach_msg()`: Receive exceptions (`task_set_exception_ports()`
 //!   restores the saved ports on detach)
 //! - `posix_spawn()`: Launch processes with `POSIX_SPAWN_START_SUSPENDED` flag

@@ -390,6 +390,8 @@ version = "0.0.0"
 dependencies = [
  "ferros-core",
  "ferros-macos",
+ "object 0.38.0",
+ "rustc-demangle",
 ]
 
 [[package]]

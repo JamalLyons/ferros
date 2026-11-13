@@ -15,7 +15,8 @@ The crate defines five fixture binaries:
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
 - `ferros-fixture-loop_counter`: Iterates a counter in a loop with small sleeps, printing the final count.
 - `ferros-fixture-nested_calls`: Executes nested non-inlined function calls and prints the computed result.
-- `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier.
+- `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
+  first argument keeps the process running that many milliseconds after both workers exit.
 
 ## Marker Convention
 
@@ -89,9 +90,8 @@ fn resume_runs_hello()
   `/dev/null`); background threads tail them, and the directory is removed when the `Debuggee`
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
-  with a comment naming the issue: `tests/breakpoints.rs` (continuing past a breakpoint,
-  issue #33), and `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL sent from outside
-  while a stop is held, issue #56).
+  with a comment naming the issue: `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL
+  sent from outside while a stop is held, issue #56).
 - `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.
@@ -99,6 +99,16 @@ fn resume_runs_hello()
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+- `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
+  driven through `d.session_mut().backend_mut()`. It finds fixture functions with
+  `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
+  executable's Mach-O symbol table (no DWARF) and adds the image slide.
+- `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
+  counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
+  breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
+  drop. `Session::read_memory` hides traps, so raw bytes are read through
+  `session.backend_mut().read_memory`.
+- `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe
   `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the

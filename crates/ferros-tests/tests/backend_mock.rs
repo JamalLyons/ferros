@@ -120,3 +120,45 @@ fn breakpoint_step_exit_records_exact_calls()
     );
     assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(trap));
 }
+
+#[test]
+fn detach_cleanup_error_clears_session_but_ordinary_error_keeps_it_stopped()
+{
+    use ferros_core::backend::BackendError;
+    use ferros_core::backend::mock::MockCallKind;
+    use ferros_core::{BreakpointRequest, Session, SessionState};
+
+    for teardown in [false, true] {
+        let mock = scripted_process();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        session
+            .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
+            .expect("breakpoint");
+        let error = if teardown {
+            BackendError::DetachCleanup("restore failed".into())
+        } else {
+            BackendError::Os {
+                code: 1,
+                message: "detach refused".into(),
+            }
+        };
+        mock.fail_next(MockCallKind::Detach, error.clone());
+        let returned = session.detach().expect_err("injected detach error");
+        assert!(matches!(returned, ferros_core::error::DebuggerError::Backend(ref actual) if *actual == error));
+        if teardown {
+            assert_eq!(session.state(), SessionState::NotStarted);
+            assert_eq!(mock.state(), MockState::NoProcess);
+            assert_eq!(session.pid(), None);
+            assert_eq!(session.ownership(), None);
+            assert_eq!(session.selected_thread(), None);
+            assert!(session.breakpoints().is_empty());
+            session.launch(&LaunchSpec::new("/bin/prog")).expect("reuse session");
+        } else {
+            assert_eq!(session.state(), SessionState::Stopped);
+            assert_eq!(mock.state(), MockState::Stopped);
+            assert!(session.breakpoints().iter().all(|bp| !bp.enabled));
+            session.detach().expect("retry detach");
+        }
+    }
+}

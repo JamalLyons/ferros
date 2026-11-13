@@ -610,3 +610,140 @@ fn ordinary_signals_do_not_release_a_signal_stop()
         }
     });
 }
+
+/// #58 L-1: replying and resuming fail independently. The second error remains
+/// queued exactly once; neither failure may leave the Session claiming to run.
+#[test]
+fn reply_and_task_resume_failure_are_reported_once_each()
+{
+    harness::run(|t| {
+        let backend = MacOSBackend::new().expect("backend");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("loop_counter"), &["100000"], backend);
+        d.resume().expect("resume");
+        signal(d.pid().0, "-USR1");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("signal stop"),
+            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+        ));
+        faults.fail_next_exception_reply();
+        faults.fail_next_task_resume();
+        let first = d.resume().expect_err("task_resume failure");
+        assert!(first.to_string().contains("task_resume"), "{first}");
+        assert_eq!(d.state(), SessionState::Stopped);
+        let second = d.resume().expect_err("queued reply failure");
+        assert!(second.to_string().contains("reply"), "{second}");
+        assert_eq!(d.state(), SessionState::Stopped);
+        d.resume().expect("both errors consumed; retry runs");
+        d.interrupt().expect("interrupt after recovery");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("later stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+    });
+}
+
+/// #58 L-3/L-5: an error after teardown must still clear the Session, and the
+/// target's actual exception handlers must be restored by the safe injection hook.
+#[test]
+fn restore_failure_is_reported_after_detach_and_session_can_be_reused()
+{
+    harness::run(|t| {
+        let backend = MacOSBackend::new().expect("backend");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("loop_counter"), &["100000"], backend);
+        faults.fail_next_exception_port_restore();
+        let error = d.detach().expect_err("restore failure");
+        assert!(
+            matches!(error, ferros_core::error::DebuggerError::Backend(BackendError::DetachCleanup(ref message))
+            if message.contains("restore exception ports"))
+        );
+        assert_eq!(d.state(), SessionState::NotStarted);
+        assert_eq!(d.session().pid(), None);
+        assert_eq!(d.ownership(), None);
+        assert!(d.breakpoints().is_empty());
+        // The guard retains the detached child's reaping claim independently of a
+        // later process being launched in the same Session.
+        d.launch(&LaunchSpec::new(fixture!("hello").path())).expect("reuse session");
+        d.resume().expect("resume new child");
+        assert_eq!(d.wait(Some(TIMEOUT)).expect("new exit"), Some(StopEvent::Exited { code: 0 }));
+    });
+}
+
+#[test]
+fn detach_resumes_a_target_stopped_before_attach()
+{
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
+        signal(target.pid().0, "-STOP");
+        let deadline = Instant::now() + TIMEOUT;
+        while !process_state(target.pid().0).contains('T') {
+            assert!(Instant::now() < deadline, "target never stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        session.attach(target.pid()).expect("attach stopped target");
+        session.detach().expect("detach resumes even a previously stopped target");
+        let deadline = Instant::now() + TIMEOUT;
+        while process_state(target.pid().0).contains('T') {
+            assert!(Instant::now() < deadline, "detach left target stopped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
+#[test]
+fn detach_sigcont_is_visible_to_a_signal_handler()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("signal_handler"));
+        d.resume().expect("run handler setup");
+        assert!(d.wait_for_stdout("ready", TIMEOUT));
+        d.interrupt().expect("interrupt");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        d.detach().expect("detach");
+        assert!(d.wait_for_stdout("continued", TIMEOUT), "SIGCONT handler was not invoked");
+    });
+}
+
+/// #58 B-7: the harness's shared handle must never wait again after the backend
+/// reaped its child, while detached children are reaped by the guard that owns them.
+#[test]
+fn harness_reaping_claim_is_consumed_by_the_actual_reaper()
+{
+    const CASES: &[&str] = &["exit", "kill", "drop", "detach", "failed detach"];
+    harness::run(|t| {
+        for &case in CASES {
+            let backend = MacOSBackend::new().expect("backend");
+            let cleanup = backend.child_cleanup();
+            let faults = backend.reply_fault_injector();
+            let mut d = t.launch_with_backend(&fixture!("loop_counter"), &["1"], backend);
+            let pid = d.pid().0;
+            assert!(!cleanup.reap().expect("backend still owns the child"));
+            match case {
+                "exit" => {
+                    d.resume().expect("resume");
+                    assert_eq!(d.wait(Some(TIMEOUT)).expect("exit"), Some(StopEvent::Exited { code: 0 }));
+                    assert!(!cleanup.reap().expect("watcher already reaped"));
+                }
+                "kill" => {
+                    d.kill().expect("kill");
+                    assert!(!cleanup.reap().expect("kill already reaped"));
+                }
+                "detach" => d.detach().expect("detach"),
+                "failed detach" => {
+                    faults.fail_next_exception_port_restore();
+                    d.detach().expect_err("restore error");
+                }
+                "drop" => {}
+                _ => unreachable!(),
+            }
+            drop(d);
+            assert_reaped(pid);
+            assert!(!cleanup.reap().expect("guard consumed detached claim"), "{case}");
+        }
+    });
+}

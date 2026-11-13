@@ -242,15 +242,108 @@ impl LaunchManager
     }
 }
 
-/// Reap a detached launch child after a test harness has ended it by its unique tag.
+/// Reaping ownership for one launched child. A PID alone never grants a wait.
 ///
-/// This never sends a signal. It is safe if the backend already reaped the child:
-/// waitpid then returns ECHILD. A still-running child is left alone after two seconds.
+/// The backend owns it while tracing, and detach transfers it to harness cleanup.
+/// Clones share the same state; a terminal parent wait consumes it exactly once.
 #[doc(hidden)]
-pub fn reap_detached_child(pid: ferros_core::types::ProcessId)
+#[derive(Clone, Debug, Default)]
+pub struct ChildCleanup(std::sync::Arc<std::sync::Mutex<ChildState>>);
+
+#[derive(Debug, Default)]
+struct ChildState
 {
-    if let Err(err) = reap_child(pid.0 as libc::pid_t, std::time::Duration::from_secs(2)) {
-        tracing::warn!("test cleanup could not reap detached child {}: {err}", pid.0);
+    pid: Option<libc::pid_t>,
+    detached: bool,
+    remaining: usize,
+}
+
+impl ChildCleanup
+{
+    pub(crate) fn launched(&self, pid: libc::pid_t)
+    {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ChildState {
+            pid: Some(pid),
+            detached: false,
+            remaining: 1,
+        };
+    }
+
+    pub(crate) fn traced(&self)
+    {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remaining = 2;
+    }
+
+    /// Called by the sole watcher after each terminal wait. The first wait hands a
+    /// traced child back to its parent; the second consumes the launch parent's claim.
+    pub(crate) fn terminal_wait(&self) -> bool
+    {
+        let mut child = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        child.remaining = child.remaining.saturating_sub(1);
+        if child.remaining == 0 {
+            child.pid = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn reaped(&self)
+    {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pid = None;
+    }
+
+    pub(crate) fn detach(&self, still_traced: bool)
+    {
+        let mut child = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        child.detached = true;
+        if !still_traced {
+            // PT_DETACH removes the tracer claim; only the parent's wait remains.
+            child.remaining = 1;
+        }
+    }
+
+    /// Reap only if detach transferred an unreaped child to this handle. Returns
+    /// false without calling waitpid when the backend owns it or already reaped it.
+    ///
+    /// # Errors
+    /// Returns an OS error if waiting fails or the child does not exit within two seconds.
+    pub fn reap(&self) -> ferros_core::backend::BackendResult<bool>
+    {
+        let mut child = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pid) = child.pid.filter(|_| child.detached) else {
+            return Ok(false);
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut status = 0;
+            // SAFETY: detach transferred this child's unreaped parent claim to us.
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result == pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+                child.remaining -= 1;
+                if child.remaining == 0 {
+                    child.pid = None;
+                    return Ok(true);
+                }
+            }
+            if result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ECHILD) {
+                    child.pid = None;
+                    return Ok(true);
+                }
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(crate::task::backend_error(err.into()));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ferros_core::backend::BackendError::Os {
+                    code: i64::from(libc::ETIMEDOUT),
+                    message: format!("timed out reaping detached child {pid}"),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -281,5 +374,27 @@ pub(crate) fn reap_child(pid: libc::pid_t, timeout: std::time::Duration) -> ferr
         if result <= 0 {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests
+{
+    use super::ChildCleanup;
+
+    #[test]
+    fn only_detach_transfers_an_unreaped_child()
+    {
+        let child = ChildCleanup::default();
+        assert!(!child.reap().expect("empty handle"));
+        child.launched(123);
+        child.traced();
+        assert!(!child.reap().expect("backend owns child"));
+        assert!(!child.terminal_wait());
+        assert!(child.terminal_wait());
+        child.detach(false);
+        // Even after detach, a reaped child cannot authorize a wait on its old pid.
+        assert!(!child.reap().expect("already reaped"));
+        assert!(!child.clone().reap().expect("clone shares consumption"));
     }
 }

@@ -9,12 +9,13 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines five fixture binaries:
+The crate defines six fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
 - `ferros-fixture-loop_counter`: Iterates a counter in a loop with small sleeps, printing the final count.
 - `ferros-fixture-nested_calls`: Executes nested non-inlined function calls and prints the computed result.
+- `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit.
 
@@ -132,3 +133,10 @@ timeouts, Session diagnostics and image refresh, and two distinct ASLR launches.
 The Cargo-build test uses an isolated temporary package and keeps its object files
 until `dsymutil` finishes. It launches no debuggee. Real launches use the normal
 harness and verify both the main function and the reported library header addresses.
+
+Lifecycle hardening (#58) covers detach's documented SIGCONT side effect, including a
+previously job-control-stopped target; restore errors after teardown; independent reply
+and task-resume failures; and reaping ownership across exit, kill, drop and detach.
+The harness uses a shared `ChildCleanup` handle: only a detached, unreaped child grants
+permission to wait. The real failed Mach-send cleanup is tested with isolated ports in
+`ferros-macos`, without launching a fixture.

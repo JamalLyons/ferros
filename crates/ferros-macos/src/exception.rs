@@ -91,8 +91,8 @@ use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::message::{
     MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_MSGH_BITS_COMPLEX,
     MACH_RCV_INVALID_NAME, MACH_RCV_MSG, MACH_RCV_PORT_DIED, MACH_RCV_TIMEOUT, MACH_SEND_INVALID_DEST, MACH_SEND_MSG,
-    MACH_SEND_TIMED_OUT, mach_msg, mach_msg_body_t, mach_msg_destroy, mach_msg_header_t, mach_msg_port_descriptor_t,
-    mach_msg_return_t, mach_msg_size_t, mach_msg_type_number_t,
+    mach_msg, mach_msg_body_t, mach_msg_destroy, mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_return_t,
+    mach_msg_size_t, mach_msg_type_number_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;
@@ -155,7 +155,12 @@ pub(crate) fn lock_shared(shared: &Mutex<ExceptionSharedState>) -> std::sync::Mu
 /// see there. Not part of the supported API.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
-pub struct ReplyFaultInjector(Arc<AtomicBool>);
+pub struct ReplyFaultInjector
+{
+    reply: Arc<AtomicBool>,
+    pub(crate) resume: Arc<AtomicBool>,
+    restore: Arc<AtomicBool>,
+}
 
 impl ReplyFaultInjector
 {
@@ -164,13 +169,25 @@ impl ReplyFaultInjector
     /// See [`MacOSBackend::fail_next_exception_reply`](crate::MacOSBackend::fail_next_exception_reply).
     pub fn fail_next_exception_reply(&self)
     {
-        self.0.store(true, Ordering::SeqCst);
+        self.reply.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail the next task resume before calling the kernel; the task stays suspended.
+    pub fn fail_next_task_resume(&self)
+    {
+        self.resume.store(true, Ordering::SeqCst);
+    }
+
+    /// Report failure for the next exception-port restore, after really restoring it.
+    pub fn fail_next_exception_port_restore(&self)
+    {
+        self.restore.store(true, Ordering::SeqCst);
     }
 
     /// Consume a pending injected failure.
     fn take(&self) -> bool
     {
-        self.0.swap(false, Ordering::SeqCst)
+        self.reply.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -402,19 +419,29 @@ impl SavedExceptionPorts
     }
 
     /// Put the saved exception ports back on `task` with `task_set_exception_ports`,
-    /// one call per saved group. Failures are logged; the rights are released on drop.
-    pub(crate) fn restore(&self, task: mach_port_t)
+    /// one call per saved group. Every group is attempted even if an earlier one fails;
+    /// the rights are released on drop. The test hook still restores the real handlers.
+    pub(crate) fn restore(&self, task: mach_port_t, faults: &ReplyFaultInjector) -> BackendResult<()>
     {
+        let mut failures = Vec::new();
         for entry in &self.entries {
             // SAFETY: `task` is a valid task send right and `entry.handler` a send right
             // this value owns (or NULL/DEAD); the call copies the right.
             let kr = unsafe { task_set_exception_ports(task, entry.mask, entry.handler, entry.behavior, entry.flavor) };
             if kr != KERN_SUCCESS {
-                warn!(
-                    "Failed to restore the exception port for mask {:#x}: task_set_exception_ports returned {kr}",
-                    entry.mask
-                );
+                failures.push(format!("mask {:#x}: task_set_exception_ports returned {kr}", entry.mask));
             }
+        }
+        if faults.restore.swap(false, Ordering::SeqCst) {
+            failures.push("exception-port restore failed (injected)".into());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::Os {
+                code: -1,
+                message: format!("failed to restore exception ports: {}", failures.join("; ")),
+            })
         }
     }
 }
@@ -969,9 +996,10 @@ fn reply_to_request(request: &MachExceptionRaiseRequest)
 /// Uses `mach_msg()` with `MACH_SEND_MSG` to send the reply. In a received message the
 /// header's `msgh_remote_port` holds the kernel's send-once reply right, so that is where
 /// the reply goes; its id is the request id plus 100. The send consumes that right. When
-/// the send fails with `MACH_SEND_INVALID_DEST` or `MACH_SEND_TIMED_OUT`, `mach_msg`
+/// the send fails with `MACH_SEND_INVALID_DEST`, `mach_msg`
 /// leaves the reply (and its right) with the caller, so the reply is destroyed here, as
-/// `mach_msg_server` does.
+/// `mach_msg_server` does. `MACH_SEND_TIMED_OUT` is unreachable: this send does
+/// not request `MACH_SEND_TIMEOUT` (the timeout argument alone does not enable it).
 ///
 /// See: [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
 #[cfg(target_os = "macos")]
@@ -1005,7 +1033,7 @@ fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), 
     };
 
     if kr != MACH_MSG_SUCCESS {
-        if kr == MACH_SEND_INVALID_DEST || kr == MACH_SEND_TIMED_OUT {
+        if kr == MACH_SEND_INVALID_DEST {
             // SAFETY: the send did not consume the message, so it still owns its reply
             // right; destroying it releases that right once.
             unsafe { mach_msg_destroy(&mut reply.Head) };
@@ -1020,6 +1048,75 @@ fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), 
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn restore_reports_every_failed_group()
+    {
+        use mach2::exception_types::{EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXCEPTION_DEFAULT};
+
+        let saved = SavedExceptionPorts {
+            entries: [EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE]
+                .into_iter()
+                .map(|mask| ExceptionPortEntry {
+                    mask,
+                    handler: MACH_PORT_NULL,
+                    behavior: EXCEPTION_DEFAULT as exception_behavior_t,
+                    flavor: 0,
+                })
+                .collect(),
+        };
+        // A null task forces a real kernel error for every group. No port rights
+        // are created; restoration must attempt and report both groups.
+        let error = saved
+            .restore(MACH_PORT_NULL, &ReplyFaultInjector::default())
+            .expect_err("invalid task");
+        let message = error.to_string();
+        for entry in &saved.entries {
+            assert!(message.contains(&format!("mask {:#x}:", entry.mask)), "{message}");
+        }
+    }
+
+    /// No exception or fixture needed: a destroyed receive port leaves the extracted
+    /// reply right as a dead name. Failed sending must release that name's reference.
+    #[test]
+    fn genuine_invalid_destination_releases_reply_right()
+    {
+        use mach2::mach_port::{mach_port_allocate, mach_port_destroy, mach_port_extract_right};
+        use mach2::message::MACH_MSG_TYPE_MAKE_SEND_ONCE;
+        use mach2::port::MACH_PORT_RIGHT_RECEIVE;
+
+        let task = unsafe { mach_task_self() };
+        let mut receive = MACH_PORT_NULL;
+        let mut reply = MACH_PORT_NULL;
+        let mut kind = 0;
+        unsafe {
+            assert_eq!(mach_port_allocate(task, MACH_PORT_RIGHT_RECEIVE, &mut receive), KERN_SUCCESS);
+            assert_eq!(
+                mach_port_extract_right(task, receive, MACH_MSG_TYPE_MAKE_SEND_ONCE, &mut reply, &mut kind),
+                KERN_SUCCESS
+            );
+            assert_eq!(mach_port_destroy(task, receive), KERN_SUCCESS);
+        }
+        let mut port_type = 0;
+        assert_eq!(
+            unsafe { crate::ffi::mach_port_type(task, reply, &mut port_type) },
+            KERN_SUCCESS
+        );
+        let request = mach_msg_header_t {
+            msgh_bits: 0,
+            msgh_size: 0,
+            msgh_remote_port: reply,
+            msgh_local_port: MACH_PORT_NULL,
+            msgh_voucher_port: MACH_PORT_NULL,
+            msgh_id: MACH_EXCEPTION_RAISE_ID,
+        };
+        assert_eq!(send_exception_reply(&request), Err(MACH_SEND_INVALID_DEST));
+        assert_ne!(
+            unsafe { crate::ffi::mach_port_type(task, reply, &mut port_type) },
+            KERN_SUCCESS,
+            "failed send leaked the reply's dead-name reference"
+        );
+    }
 
     const THREAD: u64 = 0x1403;
 

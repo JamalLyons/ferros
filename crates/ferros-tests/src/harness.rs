@@ -309,6 +309,7 @@ impl TestContext
             .stdout(StdioSpec::Path(capture.stdout_path()))
             .stderr(StdioSpec::Path(capture.stderr_path()));
 
+        let child_cleanup = backend.child_cleanup();
         let mut session = Session::new(Box::new(backend));
 
         self.shared.tracked().push(Tracked {
@@ -348,6 +349,7 @@ impl TestContext
         let stderr = OutputBuffer::spawn_reader(capture.stderr_path());
         let guard = Debuggee {
             session,
+            child_cleanup,
             pid,
             tag,
             stdout,
@@ -522,6 +524,7 @@ impl LaunchWatchdog
 /// Cleanup logs any process that remains and never panics.
 pub struct Debuggee
 {
+    child_cleanup: ferros_macos::launch::ChildCleanup,
     session: Session,
     pid: ProcessId,
     tag: String,
@@ -621,7 +624,9 @@ impl Drop for Debuggee
         kill_debuggee(&self.tag);
         // Detaching a launched target transfers execution ownership but we are still
         // its Unix parent. Reap it after the tag sweep, without signalling a stale pid.
-        ferros_macos::launch::reap_detached_child(self.pid);
+        if let Err(err) = self.child_cleanup.reap() {
+            eprintln!("ferros-tests: detached child cleanup failed: {err}");
+        }
         if !process_is_gone(self.pid.0) {
             eprintln!("ferros-tests: cleanup left pid {} present", self.pid.0);
         }

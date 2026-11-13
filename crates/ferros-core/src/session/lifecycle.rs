@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::{ProcessOwnership, SIGKILL, Session, SessionState};
 use crate::arch;
-use crate::backend::{LaunchSpec, ResumeRequest, StopEvent};
+use crate::backend::{BackendError, LaunchSpec, ResumeRequest, StopEvent};
 use crate::error::{DebuggerError, Result};
 use crate::types::ProcessId;
 
@@ -72,7 +72,8 @@ impl Session
     /// Remove every inserted trap, then release the process, which keeps running.
     ///
     /// Each inserted software breakpoint gets its original bytes back first; the
-    /// backend knows nothing about them. Afterwards the session is
+    /// backend knows nothing about them. On macOS this also resumes a target stopped
+    /// before attach and may invoke its `SIGCONT` handler. Afterwards the session is
     /// [`SessionState::NotStarted`] and the breakpoint table is empty.
     ///
     /// # Errors
@@ -81,17 +82,23 @@ impl Session
     /// while running, or the backend's error. If restoring a trap fails, the process is
     /// not detached: breakpoints already restored are left disabled, the others stay
     /// inserted, and the session stays stopped. If the backend's `detach` fails, every
-    /// breakpoint is left disabled and the session stays stopped.
+    /// breakpoint is left disabled and the session stays stopped, except for
+    /// [`BackendError::DetachCleanup`]: local teardown completed, so the session is
+    /// cleared and becomes [`SessionState::NotStarted`] while returning the error.
     pub fn detach(&mut self) -> Result<()>
     {
         self.require_stopped()?;
         self.restore_all_traps()?;
-        self.backend.detach()?;
+        let detached = match self.backend.detach() {
+            Err(err @ BackendError::DetachCleanup(_)) => Err(err),
+            Err(err) => return Err(err.into()),
+            Ok(()) => Ok(()),
+        };
         self.clear_process();
         self.state = SessionState::NotStarted;
         self.ownership = None;
         self.last_stop = None;
-        Ok(())
+        detached.map_err(Into::into)
     }
 
     /// Continue every thread; the session becomes [`SessionState::Running`].

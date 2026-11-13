@@ -39,11 +39,13 @@
 //!
 //! An illegal call returns [`BackendError::InvalidState`].
 //!
-//! ## Errors never change the state
+//! ## Errors and state
 //!
 //! The state changes only when `launch`, `attach`, `resume`, `detach` or `kill` returns
 //! `Ok`, or when `wait` returns an event. A call that returns an error, whichever
-//! variant, leaves the backend in the state it was in:
+//! variant, leaves the backend in the state it was in, except
+//! [`BackendError::DetachCleanup`]: detach has completed local teardown and moved to
+//! *NoProcess*, but could not fully release the target or restore its handlers.
 //!
 //! - `resume` is all or nothing. If the OS fails part-way, the backend stops the threads
 //!   it had already resumed before returning the error, and the target is still *Stopped*.
@@ -162,6 +164,9 @@ pub trait Backend: Send
     /// Release the target, which keeps running afterwards; the backend returns to
     /// *NoProcess*.
     ///
+    /// On macOS this resumes even a target stopped before attach and sends a `SIGCONT`
+    /// visible to the target's signal handler, to undo the private detach `SIGSTOP`.
+    ///
     /// Stop events still queued for [`wait`](Self::wait) are discarded, and so are
     /// signals the backend is holding (see [`ResumeRequest::signals`]).
     ///
@@ -175,7 +180,10 @@ pub trait Backend: Send
     /// - [`BackendError::InvalidState`] with no process, or while the target is running.
     /// - [`BackendError::NotFound`] if the process has already died; the backend stays
     ///   *Stopped* until `wait` returns the terminal event or `kill` is called.
-    /// - [`BackendError::Os`] if the OS refuses to detach.
+    /// - [`BackendError::Os`] if the OS refuses to detach before teardown begins.
+    /// - [`BackendError::DetachCleanup`] if local teardown completed with failures;
+    ///   the backend is *NoProcess*. The target may still be traced or stopped, or
+    ///   retain an exception handler that could not be restored.
     fn detach(&mut self) -> BackendResult<()>;
 
     /// Terminate and reap the target; the backend returns to *NoProcess*.

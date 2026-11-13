@@ -1,6 +1,6 @@
 //! Process lifecycle: launch, attach, detach, resume and wait.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{ProcessOwnership, SIGKILL, Session, SessionState};
 use crate::arch;
@@ -106,13 +106,21 @@ impl Session
     /// program never sees it. Use [`resume_with_signal`](Self::resume_with_signal) to pass
     /// it on.
     ///
-    /// Known gap (T07, issue #33): resuming from a breakpoint stop does not step over the
-    /// trap first.
+    /// Every thread whose pc is at an enabled software breakpoint is stepped over,
+    /// one at a time in thread-list order, before continuing all threads. This also
+    /// applies when the thread did not hit the breakpoint (for example a breakpoint
+    /// added at its pc), matching GDB. Disabled and removed breakpoints are skipped.
+    /// Internal step stops are hidden by [`wait`](Self::wait); only real breakpoint
+    /// events increment hit counts. A passed signal goes on its thread's step if it
+    /// steps over, otherwise on the final continue.
     ///
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, or the backend's error (the session then stays stopped).
+    /// A failed initial step start restores the removed trap before returning the
+    /// error; if that restoration also fails, the breakpoint is disabled and its
+    /// restoration error is returned.
     pub fn resume(&mut self) -> Result<()>
     {
         self.resume_request(ResumeRequest::continue_all())
@@ -138,10 +146,11 @@ impl Session
     fn resume_request(&mut self, request: ResumeRequest) -> Result<()>
     {
         self.require_stopped()?;
+        self.interrupt_requested = false;
         if let Some(event) = self.backend.wait(Some(Duration::ZERO))? {
             self.deferred = Some(event);
         } else {
-            self.backend.resume(&request)?;
+            self.start_continue(request)?;
         }
         self.state = SessionState::Running;
         self.last_stop = None;
@@ -163,7 +172,11 @@ impl Session
     {
         match self.state {
             SessionState::Stopped => Ok(()),
-            SessionState::Running => self.backend.interrupt().map_err(Into::into),
+            SessionState::Running => {
+                self.backend.interrupt()?;
+                self.interrupt_requested = self.step_plan.is_some();
+                Ok(())
+            }
             SessionState::NotStarted | SessionState::Exited => Err(DebuggerError::NotAttached),
         }
     }
@@ -208,29 +221,68 @@ impl Session
     /// carries the mapped pc, and a hit is recorded on an enabled breakpoint at that
     /// address.
     ///
+    /// Internal breakpoint step completions are consumed within this call. The timeout
+    /// covers the whole sequence; a timeout leaves it running for the next `wait`.
+    /// Other stops restore the trap and abandon the sequence; terminal events discard
+    /// it without touching memory. If an interrupt races an internal completion, that
+    /// completion becomes [`StopEvent::Interrupted`] and execution is not continued.
+    /// If starting a later step or the final continue fails, the session is stopped,
+    /// threads are refreshed, and `last_stop` is `None`. If restoring a trap fails,
+    /// that breakpoint is left disabled and the same error-state rule applies.
+    ///
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotRunning`] as
-    /// described above, or the backend's error (the state does not change).
+    /// described above, or the backend's error. A failed backend wait leaves the state
+    /// unchanged; failures after an internal stop follow the stopped-state rule above.
     pub fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<StopEvent>>
     {
         self.require_process()?;
-        let event = match self.state {
-            SessionState::Running => match self.deferred.take() {
-                Some(event) => Some(event),
-                None => self.backend.wait(timeout)?,
-            },
-            _ => match timeout {
-                Some(_) => self.backend.wait(timeout)?,
-                None => Some(self.backend.wait(Some(Duration::ZERO))?.ok_or(DebuggerError::NotRunning)?),
-            },
-        };
-        Ok(event.map(|event| self.handle_stop(event)))
+        let started = Instant::now();
+        let mut first = true;
+        loop {
+            let remaining = if first {
+                timeout
+            } else {
+                timeout.map(|limit| limit.saturating_sub(started.elapsed()))
+            };
+            first = false;
+            let event = match self.state {
+                SessionState::Running => match self.deferred.take() {
+                    Some(event) => Some(event),
+                    None => self.backend.wait(remaining)?,
+                },
+                _ => match timeout {
+                    Some(_) => self.backend.wait(remaining)?,
+                    None => Some(self.backend.wait(Some(Duration::ZERO))?.ok_or(DebuggerError::NotRunning)?),
+                },
+            };
+            let Some(event) = event else {
+                return Ok(None);
+            };
+            match self.finish_step(event) {
+                Ok(Some(event)) => return Ok(Some(self.handle_stop(event))),
+                Ok(None) => {
+                    self.interrupt_requested = false;
+                    if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                        return Ok(None);
+                    }
+                }
+                Err(error) => {
+                    self.interrupt_requested = false;
+                    self.state = SessionState::Stopped;
+                    self.sync_threads(None);
+                    self.last_stop = None;
+                    return Err(error);
+                }
+            }
+        }
     }
 
     /// Apply a stop event to the session and return it as the caller sees it.
     fn handle_stop(&mut self, event: StopEvent) -> StopEvent
     {
+        self.interrupt_requested = false;
         if event.is_terminal() {
             self.clear_process();
             self.state = SessionState::Exited;

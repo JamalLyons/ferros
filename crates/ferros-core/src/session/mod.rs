@@ -15,7 +15,7 @@
 //! ## State machine
 //!
 //! ```text
-//!  NotStarted --launch/attach--> Stopped --resume/resume_with_signal--> Running
+//!  NotStarted --launch/attach--> Stopped --resume/step_instruction--> Running
 //!      ^                          ^  |                                    |
 //!      |                          |  |   wait returns a non-terminal event (e.g. after interrupt)
 //!      |                          +--|------------------------------------+
@@ -28,7 +28,7 @@
 //! | Call                                                       | NotStarted / Exited | Stopped             | Running        |
 //! |------------------------------------------------------------|---------------------|---------------------|----------------|
 //! | `launch`, `attach`                                         | yes                 | `AlreadyAttached`   | `AlreadyAttached` |
-//! | `detach`, `resume`, `resume_with_signal`                   | `NotAttached`       | yes                 | `NotStopped`   |
+//! | `detach`, `resume`, `resume_with_signal`, `step_instruction` | `NotAttached`       | yes                 | `NotStopped`   |
 //! | `interrupt`                                                | `NotAttached`       | yes (no-op)         | yes            |
 //! | `kill`                                                     | `NotAttached`       | yes                 | yes            |
 //! | `threads`, `select_thread`, registers, memory, regions     | `NotAttached`       | yes                 | `NotStopped`   |
@@ -40,7 +40,9 @@
 //! | `state`, `pid`, `architecture`, `last_stop`, `breakpoints` | yes                 | yes                 | yes            |
 //!
 //! Each error in the table is a [`DebuggerError`] variant and is returned before the
-//! backend is called. A call that fails leaves the session in the state it was in.
+//! backend is called. A call that fails leaves the session in the state it was in, except when
+//! `wait` has consumed an internal step stop before a later backend operation fails.
+//! In that case the session is stopped with no last stop.
 //!
 //! - After `launch` or `attach` the first thread is selected and [`Session::last_stop`]
 //!   is `None` (the initial stop has no event).
@@ -62,18 +64,6 @@
 //! most [`DROP_STOP_TIMEOUT`]). Drop ignores failures; call [`Session::kill`] or
 //! [`Session::detach`] to end a session deliberately and see errors.
 //! [`Session::ownership`] tells which rule applies.
-//!
-//! ## Known gaps
-//!
-//! These are deliberate for now and are fixed by later tasks:
-//!
-//! - T07 (issue #33): [`Session::resume`] from a breakpoint stop just continues. It does
-//!   not step over the trap, so the thread hits the same trap again.
-//! - T07 (issue #33): [`Session::read_memory`] returns memory as it is, including the
-//!   trap bytes of inserted breakpoints.
-//! - T07 (issue #33): [`Session::write_memory`] over an inserted trap bypasses the
-//!   breakpoint table (the saved original bytes are not updated).
-//! - T07 (issue #33): `Session` has no `step_instruction` yet.
 
 #![forbid(unsafe_code)]
 
@@ -81,6 +71,7 @@ mod breakpoints;
 mod images;
 mod lifecycle;
 mod stack;
+mod stepping;
 #[cfg(test)]
 mod tests;
 
@@ -124,6 +115,8 @@ pub struct Session
     last_stop: Option<StopEvent>,
     /// A stop event drained from the backend by `resume`, returned by the next `wait`.
     deferred: Option<StopEvent>,
+    step_plan: Option<stepping::StepPlan>,
+    interrupt_requested: bool,
     breakpoints: BreakpointStore,
     symbols: SymbolCache,
     /// Images (path, load address) already given to the symbol cache, loaded or not.
@@ -179,6 +172,8 @@ impl Drop for Session
     /// errors.
     fn drop(&mut self)
     {
+        self.step_plan = None;
+        self.interrupt_requested = false;
         match (self.ownership, self.state) {
             (Some(ProcessOwnership::Launched), SessionState::Stopped) => {
                 let _ = self.restore_all_traps();
@@ -259,6 +254,8 @@ impl Session
             selected: None,
             last_stop: None,
             deferred: None,
+            step_plan: None,
+            interrupt_requested: false,
             breakpoints: BreakpointStore::new(),
             symbols: SymbolCache::new(),
             loaded_images: HashSet::new(),
@@ -380,6 +377,8 @@ impl Session
         self.threads.clear();
         self.selected = None;
         self.deferred = None;
+        self.step_plan = None;
+        self.interrupt_requested = false;
         self.breakpoints.drain();
     }
 
@@ -482,8 +481,8 @@ impl Session
 
     /// Read `len` bytes at `address`.
     ///
-    /// The bytes are returned as they are in the target, including the trap bytes of
-    /// inserted breakpoints (known gap, T07).
+    /// Enabled software traps are hidden by their saved original bytes, including
+    /// partial overlaps at either end of the requested range.
     ///
     /// # Errors
     ///
@@ -492,14 +491,16 @@ impl Session
     pub fn read_memory(&mut self, address: Address, len: usize) -> Result<Vec<u8>>
     {
         self.require_stopped()?;
-        Ok(self.backend.read_memory(address, len)?)
+        let mut data = self.backend.read_memory(address, len)?;
+        self.overlay_originals(address, &mut data);
+        Ok(data)
     }
 
     /// Write `data` at `address`.
     ///
-    /// The write goes straight to the target. Overwriting an inserted breakpoint's trap
-    /// bypasses the breakpoint table: removing or disabling that breakpoint later
-    /// writes its saved original bytes back over `data`.
+    /// Software breakpoints keep their traps armed and save the overlapping bytes
+    /// of `data` as their new original bytes. Disabled breakpoints also update their
+    /// saved bytes. If the backend write fails, the table is unchanged.
     ///
     /// # Errors
     ///
@@ -507,7 +508,7 @@ impl Session
     pub fn write_memory(&mut self, address: Address, data: &[u8]) -> Result<()>
     {
         self.require_stopped()?;
-        Ok(self.backend.write_memory(address, data)?)
+        self.write_through_breakpoints(address, data)
     }
 
     /// List the target's mapped memory regions.

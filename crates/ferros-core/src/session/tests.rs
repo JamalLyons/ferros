@@ -246,6 +246,7 @@ fn assert_all_refused(session: &mut Session, expect: fn(&DebuggerError) -> bool,
     let checks: Vec<(&str, Option<DebuggerError>)> = vec![
         ("detach", session.detach().err()),
         ("resume", session.resume().err()),
+        ("step_instruction", session.step_instruction(T1).err()),
         ("threads", session.threads().err()),
         ("select_thread", session.select_thread(T1).err()),
         ("read_registers", session.read_registers().err()),
@@ -511,6 +512,8 @@ fn resume_drains_pending_events_first()
         mock.take_calls(),
         [
             MockCall::Wait(Some(Duration::ZERO)),
+            MockCall::ReadRegisters(T1),
+            MockCall::ReadRegisters(T2),
             MockCall::Resume(ResumeRequest::continue_all())
         ]
     );
@@ -777,7 +780,6 @@ fn backend_mut_bypasses_the_table()
 /// T07 (issue #33): continuing from a breakpoint stop must first step the stopped thread
 /// over the trap with the original instruction restored.
 #[test]
-#[ignore = "T07: resume does not step over the trap yet (issue #33)"]
 fn resume_from_breakpoint_steps_over_the_trap()
 {
     let mock = process();
@@ -786,7 +788,8 @@ fn resume_from_breakpoint_steps_over_the_trap()
             thread: T1,
             pc: Address::new(BP),
         })
-        .set_pc(T1, Address::new(BP)),
+        .set_pc(T1, Address::new(BP))
+        .expect_resume(ResumeRequest::continue_all()),
     );
     mock.script(
         MockStop::new(StopEvent::SingleStep { thread: T1 })
@@ -804,7 +807,6 @@ fn resume_from_breakpoint_steps_over_the_trap()
 
 /// T07 (issue #33): reads through the session should show the original bytes, not traps.
 #[test]
-#[ignore = "T07: read_memory returns trap bytes (issue #33)"]
 fn read_memory_hides_trap_bytes()
 {
     let mock = process();
@@ -1226,3 +1228,6 @@ fn wait_with_timeout_while_running_and_nothing_happens_stays_running()
     assert_eq!(session.wait(Some(Duration::from_millis(200))).expect("wait"), None);
     assert_eq!(session.state(), SessionState::Running);
 }
+
+#[path = "tests/stepping.rs"]
+mod stepping;

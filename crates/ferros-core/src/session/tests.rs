@@ -777,7 +777,7 @@ fn backend_mut_bypasses_the_table()
     assert_eq!(session.backend().architecture(), Architecture::Arm64);
 }
 
-/// T07 (issue #33): continuing from a breakpoint stop must first step the stopped thread
+/// Continuing from a breakpoint stop must first step the stopped thread
 /// over the trap with the original instruction restored.
 #[test]
 fn resume_from_breakpoint_steps_over_the_trap()
@@ -805,7 +805,7 @@ fn resume_from_breakpoint_steps_over_the_trap()
     assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
 }
 
-/// T07 (issue #33): reads through the session should show the original bytes, not traps.
+/// Reads through the session show the original bytes, not traps.
 #[test]
 fn read_memory_hides_trap_bytes()
 {

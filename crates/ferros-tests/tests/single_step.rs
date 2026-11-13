@@ -236,6 +236,65 @@ fn stepping_one_thread_keeps_the_others_suspended()
     });
 }
 
+/// Number of threads of process `pid`, as `ps -M` lists them (one line per thread after
+/// the header).
+fn thread_count(pid: u32) -> usize
+{
+    let output = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps -M");
+    String::from_utf8_lossy(&output.stdout).lines().count().saturating_sub(1)
+}
+
+/// A step request naming a thread that has exited since the backend last listed the
+/// threads fails with `NotFound` and leaves the target stopped, instead of suspending
+/// every live thread with nothing to step.
+#[test]
+fn stepping_an_exited_thread_is_not_found()
+{
+    harness::run(|t| {
+        let fixture = fixture!("threads");
+        // Keep the process alive for a while after both workers exit.
+        let mut d = t.launch_with_args(&fixture, &["20000"]);
+        let pid = d.pid().0;
+        let worker_body = function_address(&mut d, &fixture, "worker_body");
+        let original = plant_trap(&mut d, worker_body);
+        let (worker, _) = run_to_trap(&mut d, worker_body);
+        backend(&mut d)
+            .write_memory(worker_body, &original)
+            .expect("restore the original bytes");
+        // The backend's thread list now includes the worker.
+        assert!(backend(&mut d).threads().expect("threads").contains(&worker));
+
+        // Let both workers finish, then stop the process again without listing threads.
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert!(
+            d.wait_for_stdout("threads finished", STOP_TIMEOUT),
+            "the workers never finished"
+        );
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while thread_count(pid) > 1 {
+            assert!(Instant::now() < deadline, "the worker threads never went away");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        backend(&mut d).interrupt().expect("interrupt");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt") {
+            Some(StopEvent::Interrupted { .. }) => {}
+            other => panic!("expected the interrupt stop, got {other:?}"),
+        }
+
+        match backend(&mut d).resume(&ResumeRequest::step(worker)) {
+            Err(BackendError::NotFound(_)) => {}
+            other => panic!("stepping the exited worker {worker:?} must be NotFound, got {other:?}"),
+        }
+        // The failed resume left the target stopped: registers can still be read.
+        let main = backend(&mut d).threads().expect("threads after the failed resume");
+        assert_eq!(main.len(), 1, "only the main thread should remain: {main:?}");
+        assert!(backend(&mut d).read_registers(main[0]).is_ok());
+    });
+}
+
 /// Detaching after a step leaves an attached process running: it is not left stopped
 /// and runs on to its own exit.
 #[test]

@@ -15,7 +15,8 @@ The crate defines five fixture binaries:
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
 - `ferros-fixture-loop_counter`: Iterates a counter in a loop with small sleeps, printing the final count.
 - `ferros-fixture-nested_calls`: Executes nested non-inlined function calls and prints the computed result.
-- `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier.
+- `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
+  first argument keeps the process running that many milliseconds after both workers exit.
 
 ## Marker Convention
 

@@ -716,6 +716,20 @@ impl MacOSBackend
             return Ok((Vec::new(), Vec::new()));
         }
         self.threads = threads::ThreadManager::refresh_thread_list(self.task, &self.threads).map_err(backend_error)?;
+        // `check_resume_request` checked the named threads against the cached list; a
+        // thread that has exited since is gone from the refreshed one. Planning without it
+        // would suspend every other thread with nothing left to step or run.
+        if let Some((gone, _)) = request
+            .thread_actions
+            .iter()
+            .find(|(thread, _)| !self.threads.iter().any(|&port| u64::from(port) == thread.raw()))
+        {
+            return Err(BackendError::NotFound(format!(
+                "thread {} is not part of process {}",
+                gone.raw(),
+                self.pid.0
+            )));
+        }
         let mut suspend = Vec::new();
         let mut step = Vec::new();
         for &port in &self.threads {

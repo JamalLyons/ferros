@@ -17,6 +17,9 @@ ferros-core = { path = "../ferros-core" }
 # uses it is gated on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 ferros-macos = { path = "../ferros-macos" }
+# `symbols::function_address` reads fixture symbol tables (Mach-O, no DWARF).
+object = { version = "0.38.0", features = ["read", "macho"] }
+rustc-demangle = "0.1"
 
 # Only the tests need the scripted mock backend. Keeping the feature here leaves it out
 # of ordinary workspace builds, so the `ferros` binary is not built with the mock.

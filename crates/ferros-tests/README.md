@@ -99,6 +99,10 @@ fn resume_runs_hello()
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+- `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
+  driven through `d.session_mut().backend_mut()`. It finds fixture functions with
+  `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")`, which reads the
+  executable's Mach-O symbol table (no DWARF) and adds the image slide.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe
   `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the

@@ -491,7 +491,7 @@ fn detach_cleanup_after_starting_step_releases_suspended_threads()
 {
     harness::run_with_timeout(Duration::from_secs(30), |t| {
         for explicit in [false, true] {
-            let target = t.spawn(&fixture!("threads"), &["1000", "1000"]);
+            let mut target = t.spawn(&fixture!("threads"), &["1000", "1000"]);
             let pid = target.pid();
             let deadline = Instant::now() + STOP_TIMEOUT;
             while thread_count(pid.0) < 3 {
@@ -511,7 +511,11 @@ fn detach_cleanup_after_starting_step_releases_suspended_threads()
             }
             drop(session);
             let deadline = Instant::now() + STOP_TIMEOUT;
-            while !process_state(pid.0).starts_with('Z') {
+            loop {
+                if let Some(status) = target.try_wait().expect("query detached child status") {
+                    assert!(status.success(), "detached process failed (explicit: {explicit}): {status}");
+                    break;
+                }
                 assert!(
                     Instant::now() < deadline,
                     "attached process did not finish (explicit: {explicit}): {}",

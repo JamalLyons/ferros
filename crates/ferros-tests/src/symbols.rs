@@ -8,11 +8,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use ferros_core::Address;
+use ferros_core::{Address, Session};
 use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
 
 use crate::Fixture;
-use crate::harness::Debuggee;
 
 /// Runtime address of the first instruction of the fixture function `name`.
 ///
@@ -27,10 +26,12 @@ use crate::harness::Debuggee;
 /// the slide of the running image:
 ///
 /// ```text
-/// runtime = load address of the main executable (first entry of `d.images()`)
+/// runtime = load address of the main executable (first entry of `session.images()`)
 ///         + (symbol vmaddr - vmaddr of the `__TEXT` segment)
 /// ```
 ///
+/// `session` is any stopped session on that fixture: a harness `Debuggee` (through
+/// deref, `function_address(&mut d, ..)`) or a `Session` attached to a spawned fixture.
 /// The offset is cached per fixture and function, so later launches only pay for the
 /// `images` call. Mark the function `#[inline(never)]` in the fixture, or it may have no
 /// symbol of its own.
@@ -40,11 +41,11 @@ use crate::harness::Debuggee;
 /// Panics if the session is not stopped (`images` fails) or reports no image, if the
 /// executable cannot be read or parsed, has no `__TEXT` segment, or if no text symbol, or
 /// more than one at different addresses, has that name.
-pub fn function_address(d: &mut Debuggee, fixture: &Fixture, name: &str) -> Address
+pub fn function_address(session: &mut Session, fixture: &Fixture, name: &str) -> Address
 {
     static OFFSETS: OnceLock<Mutex<HashMap<(PathBuf, String), u64>>> = OnceLock::new();
 
-    let images = d.images().expect("images");
+    let images = session.images().expect("images");
     let main = images.first().expect("the main executable image");
     let load_address = main.load_address.value();
 

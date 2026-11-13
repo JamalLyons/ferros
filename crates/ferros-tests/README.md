@@ -89,9 +89,8 @@ fn resume_runs_hello()
   `/dev/null`); background threads tail them, and the directory is removed when the `Debuggee`
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
-  with a comment naming the issue: `tests/breakpoints.rs` (continuing past a breakpoint,
-  issue #33), and `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL sent from outside
-  while a stop is held, issue #56).
+  with a comment naming the issue: `tests/lifecycle.rs` / `tests/exceptions.rs` (a SIGKILL
+  sent from outside while a stop is held, issue #56).
 - `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.
@@ -101,8 +100,15 @@ fn resume_runs_hello()
   hard-coding line numbers.
 - `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
-  `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")`, which reads the
+  `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
   executable's Mach-O symbol table (no DWARF) and adds the image slide.
+- `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
+  counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
+  breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
+  drop. `Session::read_memory` hides traps, so raw bytes are read through
+  `session.backend_mut().read_memory`. `resume` only starts a step over a breakpoint; `wait`
+  finishes it and continues, so always `wait` after resuming.
+- `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe
   `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the

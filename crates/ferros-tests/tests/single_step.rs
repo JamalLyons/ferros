@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use ferros_core::{Address, Backend, BackendError, ResumeRequest, Session, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::MacOSBackend;
+use ferros_tests::arm64::{Flow, TRAP, flow};
 use ferros_tests::harness::{self, Debuggee};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture};
@@ -27,9 +28,6 @@ const SIGUSR1: i32 = 30;
 
 /// Instructions stepped in the stepping tests.
 const STEPS: usize = 8;
-
-/// The arm64 `brk #0` the engine plants (`Arch::trap_instruction`).
-const TRAP: [u8; 4] = [0x00, 0x00, 0x20, 0xD4];
 
 /// The session's backend.
 fn backend(d: &mut Debuggee) -> &mut dyn Backend
@@ -91,44 +89,6 @@ fn step(d: &mut Debuggee, thread: ThreadId) -> StopEvent
         .wait(Some(STOP_TIMEOUT))
         .expect("wait for the step")
         .expect("a stop after the step")
-}
-
-/// Where control goes after an arm64 instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Flow
-{
-    /// Not a branch: the next instruction.
-    Next,
-    /// `B` or `BL`: always this target.
-    Direct(u64),
-    /// `B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`: this target or the next instruction.
-    Conditional(u64),
-    /// A branch to a register (`BR`, `BLR`, `RET`, ...): anywhere.
-    Indirect,
-}
-
-/// Sign-extend the low `bits` bits of `value`.
-fn sign_extend(value: u32, bits: u32) -> i64
-{
-    let shift = 64 - bits;
-    (i64::from(value) << shift) >> shift
-}
-
-/// Decode the control flow of the instruction `insn` at `pc`.
-fn flow(pc: u64, insn: u32) -> Flow
-{
-    let target = |offset: i64| pc.wrapping_add_signed(offset * 4);
-    if insn & 0x7C00_0000 == 0x1400_0000 {
-        Flow::Direct(target(sign_extend(insn & 0x03FF_FFFF, 26)))
-    } else if insn & 0xFF00_0010 == 0x5400_0000 || insn & 0x7E00_0000 == 0x3400_0000 {
-        Flow::Conditional(target(sign_extend((insn >> 5) & 0x7_FFFF, 19)))
-    } else if insn & 0x7E00_0000 == 0x3600_0000 {
-        Flow::Conditional(target(sign_extend((insn >> 5) & 0x3FFF, 14)))
-    } else if insn & 0xFE00_0000 == 0xD600_0000 {
-        Flow::Indirect
-    } else {
-        Flow::Next
-    }
 }
 
 /// Step `thread` [`STEPS`] times from where it is: every stop must be its `SingleStep`,

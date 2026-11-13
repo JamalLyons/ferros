@@ -11,10 +11,14 @@ We’re excited that you’re interested in contributing! This document outlines
 Its goal is to provide a first-class debugging experience that understands Rust’s unique semantics — ownership, lifetimes, and MIR.
 
 Our architecture includes:
-- `ferros-core`: Low-level debugger engine and process control.
-- `ferros-cli`: Command-line interface.
-- `ferros-dap`: Debug Adapter Protocol integration.
-- `ferros-mir`: MIR-level interpretation and analysis.
+- `crates/ferros`: Command-line interface.
+- `crates/ferros-core`: Portable debugging engine (Session, policy, arch, symbols, breakpoints; zero OS-specific code).
+- `crates/ferros-macos`: macOS implementation (Mach APIs, posix_spawn, exception handling, task ports).
+- `crates/ferros-tests`: Integration test suite, test harness, and fixture binaries.
+- `crates/ferros-utils`: Shared utilities, structured logging (`tracing`).
+- `crates/ferros-mir`: MIR-level interpretation and analysis (reserved for future compiler integration).
+- `crates/ferros-protocol`: Communication protocol and remote debugging (reserved for future protocol support).
+- `crates/ferros-ui`: Terminal User Interface (currently parked and excluded from workspace while being rebuilt).
 
 ---
 
@@ -22,16 +26,17 @@ Our architecture includes:
 
 Before contributing, make sure you have the following installed:
 
-- 🦀 [Rust toolchain](https://www.rust-lang.org/tools/install) (latest stable)
+- 🦀 [Rust toolchain](https://www.rust-lang.org/tools/install): nightly channel (pinned automatically by [`rust-toolchain.toml`](./rust-toolchain.toml) with `rustfmt` and `clippy`)
 - 🧱 `cargo` and `rustup`
 - 🧪 [Git](https://git-scm.com/)
-- 🧮 For Linux development: `gcc`, `make`, `libc-dev`, and access to `ptrace`
-- 🧑‍💻 Optional for IDE integration: VS Code or Neovim + DAP extensions
+- ⚡ [`just`](https://github.com/casey/just) task runner (`brew install just` or `cargo install just`)
+- 🍏 macOS (Apple Silicon arm64) for debugging real targets; Linux and Windows are planned
 
 To verify your setup:
 ```bash
 rustc --version
 cargo --version
+just --version
 ```
 
 ---
@@ -44,19 +49,24 @@ cargo --version
    cd ferros
    ```
 
-2. **Create a new branch**
+2. **Run setup**
+   ```bash
+   just setup
+   ```
+   Or manually build the workspace:
+   ```bash
+   cargo build --workspace
+   ```
+
+3. **Create a new branch**
    ```bash
    git checkout -b feature/my-feature
    ```
 
-3. **Build the project**
-   ```bash
-   cargo build
-   ```
-
 4. **Run the tests**
    ```bash
-   cargo test
+   just test              # Unit tests
+   just test-integration  # Integration tests (runs signed fixtures)
    ```
 
 ---
@@ -65,15 +75,23 @@ cargo --version
 
 ```
 ferros/
- ├─ ferros-core/      # Core engine and process control
- ├─ ferros-cli/       # Command-line interface
- ├─ ferros-dap/       # Debug Adapter Protocol integration
- ├─ ferros-mir/       # MIR interpretation layer
- ├─ docs/             # Developer and user documentation
- ├─ examples/         # Test binaries for debugging
- ├─ .github/          # CI, issue templates, and workflows
- ├─ Cargo.toml        # Workspace configuration
- └─ ROADMAP.md        # Project goals and milestones
+ ├─ crates/
+ │   ├─ ferros/           # Command-line interface
+ │   ├─ ferros-core/      # Portable debugging engine (Session, policy, arch, symbols; no OS code)
+ │   ├─ ferros-macos/     # macOS implementation (Mach APIs, exception ports, task_for_pid)
+ │   ├─ ferros-mir/       # MIR integration & analysis (reserved for future compiler integration)
+ │   ├─ ferros-protocol/  # Communication & remote debugging protocol (reserved)
+ │   ├─ ferros-tests/     # Integration test suite, harness, and fixture programs
+ │   ├─ ferros-ui/        # Terminal User Interface (parked while being rebuilt)
+ │   └─ ferros-utils/     # Shared logging (tracing) and utility helpers
+ ├─ docs/                 # Architecture and design documentation
+ ├─ scripts/              # CI test runner and platform boundary checker
+ ├─ website/              # Ferros landing page and simulation
+ ├─ Cargo.toml            # Workspace manifest
+ ├─ JustFile              # Development task runner recipes
+ ├─ rust-toolchain.toml   # Pinned nightly toolchain
+ ├─ AGENTS.md             # Contributor and agent guidance
+ └─ ROADMAP.md            # Project goals and milestones
 ```
 
 ---
@@ -88,7 +106,7 @@ You can contribute in many ways:
 - 🧾 **Improve docs:** Clarify, expand, or add new documentation.
 - 🧩 **Refactor:** Improve code structure, readability, or performance.
 
-Check [ROADMAP.md](./ROADMAP.md) for ideas on what to work on — many items are marked as `good first issue`.
+Check [ROADMAP.md](./ROADMAP.md) for ideas on what to work on.
 
 ---
 
@@ -98,34 +116,51 @@ Ferros follows **Rust’s standard style guidelines** enforced by `rustfmt` and 
 
 Before committing:
 ```bash
-cargo fmt --all
-cargo clippy -- -D warnings
+just fmt-check
+just lint
+just check-boundary
 ```
 
-### Additional Guidelines
-- Prefer explicit types where clarity helps.
-- Document public functions with Rustdoc comments (`///`).
-- Avoid unsafe code unless absolutely necessary — and document why it’s safe.
-- Write tests for new functionality where applicable.
-- Keep PRs small and focused (ideally < 300 lines of diff).
+### Safety & Platform Boundary Guidelines
+- **Zero Unsafe in Core**: `unsafe_code = "forbid"` is set across the workspace and `crates/ferros-core` declares `#![forbid(unsafe_code)]`.
+- **Platform Boundary**: `crates/ferros-core` contains no operating-system dependencies (`mach2`, `libproc`, `libc`, platform crates) and no `cfg(target_os)`. OS code belongs exclusively in platform crates (`crates/ferros-macos`).
+- **Factory Isolation**: The CLI names platform crates only in `crates/ferros/src/platform.rs`.
+- **Documented APIs**: Document public functions with Rustdoc comments (`///`).
+- Keep PRs small and focused.
+
+### Verification Checklist Before Submitting a PR
+Ensure all five verification checks pass:
+1. `just fmt-check` — Code formatting matches `rustfmt.toml`
+2. `just lint` — Clippy passes with warnings denied
+3. `just test` — Workspace unit tests and doctests pass
+4. `just test-integration` — Real process integration tests pass
+5. `just check-boundary` — Platform boundary integrity is maintained
 
 ---
 
 ## 🧪 Testing
 
-All new code should include tests when applicable.
+All new code should include tests when applicable. Every engine change should land with a test that exercises it.
 
-Run all tests:
-```bash
-cargo test
-```
+- **Run unit tests and doctests** (requires no special permissions):
+  ```bash
+  just test
+  # or: cargo test --workspace --exclude ferros-tests --all-features
+  ```
 
-Run tests for a specific crate:
-```bash
-cargo test -p ferros-core
-```
+- **Run integration tests** (launches real fixture processes):
+  ```bash
+  just test-integration
+  # or: cargo test -p ferros-tests
+  ```
+  On arm64 macOS, `scripts/cargo-test-runner.sh` automatically signs the test executable with `crates/ferros-macos/ferros.entitlements` (`com.apple.security.cs.debugger`). No `sudo` is required.
 
-Integration tests are stored under `/tests` and `/examples`.
+- **Run tests for an individual crate**:
+  ```bash
+  just test-crate ferros-core
+  ```
+
+- **Integration test fixtures**: Fixture source files are in `crates/ferros-tests/fixtures/` and integration tests are in `crates/ferros-tests/tests/`.
 
 ---
 
@@ -133,9 +168,10 @@ Integration tests are stored under `/tests` and `/examples`.
 
 - Write **clear, descriptive commit messages**:
   ```
-  feat(core): add DWARF parser for symbol resolution
-  fix(cli): handle SIGTRAP signals gracefully
-  docs: update architecture overview
+  feat(core): step over software breakpoints and hide traps in memory
+  feat(macos): single-step threads and keep others suspended on resume
+  fix(core): clear process ownership on exit
+  docs: describe platform boundary and update architecture guide
   ```
 
 - Follow the [Conventional Commits](https://www.conventionalcommits.org/) style:
@@ -148,7 +184,7 @@ Integration tests are stored under `/tests` and `/examples`.
 
 - Each PR should:
   - Reference related issues (`Closes #42`).
-  - Pass CI and all tests.
+  - Pass CI and all 5 verification checks.
   - Include relevant documentation updates.
 
 ---
@@ -158,7 +194,6 @@ Integration tests are stored under `/tests` and `/examples`.
 - Discussions happen in **GitHub Issues** and **Discussions** tabs.
 - Be respectful and constructive — follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
 - Use threads for focused discussions.
-- Large design changes should start as **RFCs** in `/rfcs`.
 
 ---
 
@@ -167,20 +202,29 @@ Integration tests are stored under `/tests` and `/examples`.
 1. Commit your changes:
    ```bash
    git add .
-   git commit -m "feat(core): implement ptrace attach/detach"
+   git commit -m "feat(core): add watchpoint tracking"
    ```
 
-2. Push your branch:
+2. Run the verification checks:
+   ```bash
+   just fmt-check
+   just lint
+   just test
+   just test-integration
+   just check-boundary
+   ```
+
+3. Push your branch:
    ```bash
    git push origin feature/my-feature
    ```
 
-3. Open a Pull Request on GitHub:
+4. Open a Pull Request on GitHub:
    - Use a clear title and description.
    - Link to related issues or roadmap items.
    - Ensure CI passes before requesting review.
 
-4. Wait for review and make requested changes.
+5. Wait for review and make requested changes.
 
 ---
 

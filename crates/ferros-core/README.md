@@ -53,5 +53,5 @@ session.detach()?;
 - ✅ Memory region enumeration
 - ✅ Thread enumeration
 - ✅ Software breakpoints (insert, remove, hit counts)
-- ⏳ Stepping over breakpoints and single-step execution (T07, issue #33)
+- ✅ Stepping over breakpoints and single-step execution (issue #33)
 - ✅ Process exit detection, signal pass-through, interrupt and kill

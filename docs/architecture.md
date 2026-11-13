@@ -89,13 +89,14 @@ ferros/
 │   ├── ferros/          # Command-line interface
 │   ├── ferros-core/     # Portable debugging engine (no OS-specific code)
 │   ├── ferros-macos/    # macOS implementation (Mach APIs)
-│   ├── ferros-mir/      # MIR integration & analysis
-│   ├── ferros-ui/       # Terminal User Interface (TUI)
-│   ├── ferros-protocol/ # Communication layer (future)
-│   └── ferros-utils/     # Shared utilities & helpers
+│   ├── ferros-tests/    # Integration test suite, harness, and fixtures
+│   ├── ferros-utils/    # Shared utilities & structured logging
+│   ├── ferros-mir/      # MIR integration & analysis (reserved)
+│   ├── ferros-protocol/ # Communication & remote protocol (reserved)
+│   └── ferros-ui/       # Terminal User Interface (parked while being rebuilt)
 ```
 
-Each crate has a specific responsibility and can be used independently or together. The workspace configuration is defined in the root [`Cargo.toml`](../../Cargo.toml).
+Each crate has a specific responsibility and can be used independently or together. The workspace configuration is defined in the root [`Cargo.toml`](../Cargo.toml).
 
 ---
 
@@ -103,43 +104,46 @@ Each crate has a specific responsibility and can be used independently or togeth
 
 ### ferros (CLI)
 
-**Location**: [`crates/ferros/`](../../crates/ferros/)
+**Location**: [`crates/ferros/`](../crates/ferros/)
 
-The `ferros` crate provides the command-line interface for the debugger. It's the entry point for users and handles command parsing, logging initialization, and routing to either headless operations or the TUI.
+The `ferros` crate provides the command-line interface for the debugger. It is the entry point for users and handles command parsing, logging initialization, and routing commands to `Session`.
 
 #### Main Entry Point
 
-The main function in [`crates/ferros/src/main.rs`](../../crates/ferros/src/main.rs) handles:
+The main function in [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs) handles:
 
-1. **Command Parsing**: Uses `clap` to parse command-line arguments
-2. **Logging Initialization**: Sets up logging based on CLI flags or environment variables
-3. **Mode Selection**: Chooses between headless mode (CLI-only) or TUI mode (interactive)
-4. **Async Runtime**: Spawns a Tokio runtime for TUI operations
+1. **Command Parsing**: Uses `clap` to parse command-line arguments and subcommands
+2. **Logging Initialization**: Sets up `tracing` structured logging based on CLI flags (`--log-level`, `--log-format`) or environment variables
+3. **Mode Normalization**: Normalizes non-headless attach and launch to headless mode while the interactive TUI is being rebuilt
+4. **Command Execution**: Calls `run_command` to drive `Session` through the platform backend
 
 #### Command Structure
 
 The CLI supports several commands:
 
-- **`attach <pid>`**: Attach to a running process
-- **`launch <program> [args...]`**: Launch a new process under debugger control
-- **`registers`**: Display CPU registers (future - requires state management)
-- **`memory <address> [length]`**: Read memory from process (future)
-- **`threads`**: List all threads (future)
-- **`suspend`/`resume`**: Control process execution (future)
-- **`info`**: Show debugger information
+- **`attach <pid> [--headless]`**: Attach to a running process
+- **`launch <program> [args...] [--headless]`**: Launch a new process under debugger control
+- **`registers`**: Display CPU registers (requires persistent session)
+- **`memory <address> [--length <N>]`**: Read memory from process
+- **`regions`**: List memory regions of the target process
+- **`threads`**: List all threads
+- **`suspend`/`resume`**: Control process execution
+- **`detach`**: Detach from the target process
+- **`info`**: Show target status, architecture, and debugger information
+- **`find-logs`**: Print the path to the Ferros log directory
 
 #### Key Code References
 
-- **Main entry point**: [`crates/ferros/src/main.rs:81`](../crates/ferros/src/main.rs#L81)
-- **Command definitions**: [`crates/ferros/src/main.rs:30-79`](../crates/ferros/src/main.rs#L30-L79)
-- **Async command handler**: [`crates/ferros/src/main.rs:164-230`](../crates/ferros/src/main.rs#L164-L230)
-- **Headless command handler**: [`crates/ferros/src/main.rs:232-358`](../crates/ferros/src/main.rs#L232-L358)
+- **Main entry point**: [`crates/ferros/src/main.rs:86`](../crates/ferros/src/main.rs#L86)
+- **Command definitions**: [`crates/ferros/src/main.rs:33-84`](../crates/ferros/src/main.rs#L33-L84)
+- **Command execution**: [`crates/ferros/src/main.rs:145-212`](../crates/ferros/src/main.rs#L145-L212)
+- **Debugger info printer**: [`crates/ferros/src/main.rs:214-234`](../crates/ferros/src/main.rs#L214-L234)
 
 #### Design Decisions
 
-- **Separation of concerns**: CLI parsing is separate from debugging logic
-- **Async-first**: TUI mode uses async/await for non-blocking operations
-- **Logging flexibility**: Supports both file and console logging with different formats
+- **Separation of concerns**: CLI parsing is separate from debugging engine logic
+- **Platform abstraction**: CLI only names the platform backend in `crates/ferros/src/platform.rs`
+- **Logging flexibility**: Supports file and console logging in pretty and JSON formats
 
 ---
 
@@ -158,6 +162,7 @@ ferros-core/src/
 │   ├── mod.rs          # State machine, thread selection, registers, memory
 │   ├── lifecycle.rs    # launch, attach, detach, resume, wait
 │   ├── breakpoints.rs  # Software breakpoint table
+│   ├── stepping.rs     # Resumable, serial software-breakpoint step-overs
 │   ├── stack.rs        # Stack traces and symbolication
 │   └── images.rs       # Loading the backend's image list into the symbol cache
 ├── backend/            # Backend trait (mechanism), StopEvent, LaunchSpec, MockBackend
@@ -423,7 +428,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 ### Launching a Process
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:182-223`](../crates/ferros/src/main.rs#L182-L223)
+2. **CLI parses command**: [`crates/ferros/src/main.rs:158-188`](../crates/ferros/src/main.rs#L158-L188)
 3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
 4. **Launch process**: `session.launch()` spawns process in suspended state
 5. **Show information**: the headless CLI prints the state, threads and memory regions while the process is stopped at entry
@@ -432,30 +437,30 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 ### Attaching to a Process
 
 1. **User invokes**: `ferros attach <pid>`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:167-180`](../crates/ferros/src/main.rs#L167-L180)
+2. **CLI parses command**: [`crates/ferros/src/main.rs:148-157`](../crates/ferros/src/main.rs#L148-L157)
 3. **Create backend**: `create_backend()` supplies the platform mechanism
-4. **Attach to process**: `session.attach(pid)` gets Mach port (macOS) or uses ptrace (Linux)
-5. **Start TUI**: Interactive debugging session begins
+4. **Attach to process**: `session.attach(pid)` gets Mach task port (macOS) or uses ptrace (Linux)
+5. **Show information & detach**: while the interactive front end is being rebuilt, the CLI prints target state, threads, and memory regions, then detaches
 
 ### Reading Registers
 
-1. **User presses key** in TUI to view registers
-2. **TUI calls**: `session.read_registers()`
+1. **User or UI requests registers**: via `session.read_registers()`
+2. **Session delegates**: reads register state for the selected or target thread via `Backend::read_registers(thread)`
 3. **Platform implementation**: 
-   - macOS: `thread_get_state()` with appropriate flavor
-   - Linux: `ptrace(PTRACE_GETREGS)`
+   - macOS: `thread_get_state()` with `ARM_THREAD_STATE64` (or x86 flavor)
+   - Linux: `ptrace(PTRACE_GETREGSET)` / `PTRACE_GETREGS` (planned)
 4. **Return registers**: `Registers` struct with all CPU registers
-5. **TUI renders**: Register values in a table
+5. **Session exposes**: `registers.pc`, general-purpose registers, floating-point and vector registers
 
 ### Breakpoint Flow
 
-1. **User requests breakpoint**: Via CLI or TUI
+1. **User requests breakpoint**: Via CLI or API
 2. **Create request**: `BreakpointRequest::Software { address }`
 3. **Add breakpoint**: `session.add_breakpoint(request)`
 4. **Session installs**: reads the original instruction with `Backend::read_memory`, writes the trap from `Arch::trap_instruction` with `Backend::write_memory`, and stores the original bytes in its table
 5. **Process hits breakpoint**: the kernel delivers an exception to the backend, which stops every thread
-6. **Session receives event**: `Session::wait` returns `StopEvent::Breakpoint { thread, pc }` and records the hit
-7. **TUI updates**: Shows breakpoint hit, allows inspection
+6. **Session receives event**: `Session::wait` returns `StopEvent::Breakpoint { thread, pc }` and records the hit; memory reads through `Session::read_memory` transparently hide the trap bytes
+7. **Step over on resume**: `Session::resume` coordinates serial step-over (`stepping.rs`), restoring the original bytes, executing one instruction via hardware single-step while keeping other threads suspended, re-arming the trap, and resuming execution
 
 ---
 

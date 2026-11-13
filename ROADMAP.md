@@ -1,19 +1,24 @@
 # Ferros Debugger Roadmap
 
-_Last updated: 2026-11-11_
+_Last updated: 2026-11-13_
 
-**Status:** nothing below is ticked because no item is covered by a test yet. Items are only ticked once a test exercises them. Several of these have code in `ferros-core` that is untested and unverified. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26).
+**Status:** Items are ticked once a test exercises them. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26).
 
-**Verified today (manually, not by tests):** the workspace builds; a binary ad-hoc signed with `crates/ferros-macos/ferros.entitlements` can launch a program suspended on macOS, obtain its task port, read thread and memory-region counts, resume, and detach without `sudo`.
-
+**Verified today by automated tests (`crates/ferros-tests`):**
+- **Process control & lifecycle**: launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (`tests/lifecycle.rs`, `tests/smoke.rs`).
+- **Stop handling loop**: Mach exception port loop event pump surfaces asynchronous stops (`StopEvent` for breakpoints, signals, exits) to `Session::wait` without polling (`tests/exceptions.rs`, `tests/lifecycle.rs`).
+- **Software breakpoints**: software breakpoints (`BRK`), hit counting, enable/disable/remove, trap-hiding on memory reads, trap cleanup on drop/detach, and serial step-overs on resume (`tests/breakpoints.rs`).
+- **Single-stepping**: hardware single-step (`MDSCR_EL1.SS`) and per-thread stepping while keeping other threads suspended (`tests/single_step.rs`).
+- **Platform boundary**: strict isolation between portable engine (`ferros-core` has `#![forbid(unsafe_code)]` and zero OS dependencies) and platform backend (`ferros-macos`), verified by `scripts/check-boundary.sh` and `tests/platform_boundary.rs`.
 
 This list captures concrete work needed to reach feature parity with production debuggers such as LLDB, GDB, Delve, and rr, with a focus on complete Rust language support. Items are grouped by subsystem to clarify ownership.
 
 ## ferros-core (debugger engine)
 
-- [ ] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason`.
+- [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason` (verified on macOS by `tests/exceptions.rs` and `tests/lifecycle.rs`).
 - [ ] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
-- [ ] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts).
+- [x] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts) and transparent trap hiding in memory reads (verified on macOS arm64 by `tests/breakpoints.rs`).
+- [x] **Single-step execution:** Implement single-step execution and per-thread stepping while keeping other threads suspended, plus automatic step-over on resume (verified by `tests/single_step.rs` and `tests/breakpoints.rs`).
 - [ ] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code.
 - [ ] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
 - [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
@@ -21,8 +26,8 @@ This list captures concrete work needed to reach feature parity with production 
 - [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
 - [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping.
 - [ ] **Remote/recording support:** Define a `ferros-protocol` transport (TCP/Unix socket) plus optional record/replay support (rr-style) so sessions can be remote or deterministic.
-- [ ] **Cross-platform parity:** Implement `LinuxDebugger` (ptrace + /proc) and `WindowsDebugger` (DbgHelp/DbgEng) so the `Debugger` factory stops erroring on non-macOS hosts and we can debug on the same platforms that LLDB/GDB support by default.
-- [ ] **Testing & safety:** Add integration tests for attach/launch against fixture binaries across architectures, and fuzz Mach/ptrace bindings to keep parity with production debuggers’ reliability.
+- [ ] **Cross-platform parity:** Implement `LinuxBackend` (ptrace + /proc) and `WindowsBackend` (DbgHelp/DbgEng) implementing the `Backend` trait so we can debug on the same platforms that LLDB/GDB support by default.
+- [ ] **Testing & safety:** Add integration tests for attach/launch against fixture binaries across architectures (macOS arm64 verified in `crates/ferros-tests`; Linux/Windows and fuzzing planned).
 
 ## ferros (CLI experience)
 

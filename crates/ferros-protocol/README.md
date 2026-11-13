@@ -1,33 +1,20 @@
 # ferros-protocol
 
-Communication layer between Ferros debugger and frontend.
+Communication layer between the Ferros debugger core and frontend clients.
 
-## Overview
+## Status
 
-`ferros-protocol` defines the structured communication protocol used between the Ferros debugger backend and frontend clients, enabling:
+`ferros-protocol` is currently an empty workspace member reserved for future protocol and remote debugging support. No code has been implemented in this crate yet.
 
-- Remote debugging capabilities
-- Structured message passing
-- Protocol versioning for backward compatibility
-- Efficient serialization (JSON or binary formats)
+## Planned Scope
 
-## Usage
+When implemented, `ferros-protocol` will define structured communication schemas between the `ferros-core` debugging engine and external clients (CLI, TUI, IDEs, remote daemons):
 
-Add `ferros-protocol` to your `Cargo.toml`:
-
-```toml
-[dependencies]
-ferros-protocol = "0.0.0"
-```
-
-## Features
-
-- Structured message definitions
-- Serialization support (JSON, MessagePack)
-- Protocol versioning
-- Remote debugging protocol
+- Structured event and command serialization (JSON and binary formats)
+- Debug Adapter Protocol (DAP) compatibility for VS Code and other editors
+- Remote debugging over TCP or Unix domain sockets
+- Multi-client and daemon session management
 
 ## License
 
 Licensed under the Apache License, Version 2.0. See the [repository](https://github.com/jamallyons/ferros) for details.
-

@@ -173,7 +173,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 ├── task.rs             # MacOSBackend: impl Backend
 ├── exception.rs        # Mach exception port loop, stop events
 ├── launch.rs           # posix_spawn with LaunchSpec
-├── images.rs           # Backend::images (main executable only for now)
+├── images.rs           # Backend::images (target dyld image list)
 ├── memory.rs
 ├── threads.rs
 ├── breakpoints.rs      # Hardware breakpoints and watchpoints (not on Session)
@@ -243,6 +243,31 @@ The `symbols` module provides symbol resolution, DWARF parsing, and type introsp
 - **`BinaryImage`**: Represents a loaded binary and its DWARF sections
 
 **Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../crates/ferros-core/src/symbols/mod.rs)
+
+Debug information is discovered in this order: embedded DWARF, an adjacent
+`<executable>.dSYM` with matching UUID and architecture, a validated UUID/architecture
+cache entry, then `dsymutil`. Companion member names are not used as identity.
+Generated DWARF is validated before an atomic cache publication, with a 30-second
+per-tool deadline and cleanup on failure. The cache defaults to
+`$XDG_CACHE_HOME/ferros/debuginfo`, or `$HOME/.cache/ferros/debuginfo`, falling back to
+the temporary directory when neither variable is set. `DebugInfoOptions` configures
+these locations, tool selection (including disabling it), and the deadline through
+`SymbolCache::with_debug_info_options` or the Session builder of the same name.
+
+`Session::symbolicate` returns `DebuggerError::NoDebugInfo` for a mapped image without
+usable debug information, with `split-debuginfo` and `dsymutil` remedies. Stack traces
+remain best effort and can return raw frames. Debug-map object files must still exist
+for `dsymutil` to succeed on an unpacked Cargo build; Ferros does not parse them itself.
+
+The macOS backend reads `TASK_DYLD_INFO` and the stopped target's dyld image array.
+Before dyld initializes that array at the initial suspended launch stop, it locates
+only the main executable's mapped header so pre-execution breakpoints still work.
+Session combines loader header addresses with executable segment metadata for checked
+runtime/file virtual-address conversions, excludes `__PAGEZERO` and segment gaps, and
+prunes unloaded images on refresh. External DWARF never supplies runtime layout or
+`__eh_frame`. Images present only in the system shared cache can be enumerated without
+loading their debug information; system-library debug symbols remain out of scope.
+
 
 #### Type System
 

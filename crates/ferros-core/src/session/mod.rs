@@ -75,8 +75,6 @@ mod stepping;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, StopEvent};
@@ -128,8 +126,8 @@ pub struct Session
     carried_signals: Vec<(ThreadId, i32)>,
     breakpoints: BreakpointStore,
     symbols: SymbolCache,
-    /// Images (path, load address) already given to the symbol cache, loaded or not.
-    loaded_images: HashSet<(PathBuf, u64)>,
+    /// Live executable mappings and their symbol-loading state.
+    loaded_images: Vec<images::SessionImage>,
 }
 
 /// How the session got its process, which decides what dropping the session does.
@@ -280,7 +278,7 @@ impl Session
             carried_signals: Vec::new(),
             breakpoints: BreakpointStore::new(),
             symbols: SymbolCache::new(),
-            loaded_images: HashSet::new(),
+            loaded_images: Vec::new(),
         }
     }
 

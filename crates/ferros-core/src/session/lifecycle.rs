@@ -6,7 +6,6 @@ use super::{ProcessOwnership, SIGKILL, Session, SessionState};
 use crate::arch;
 use crate::backend::{LaunchSpec, ResumeRequest, StopEvent};
 use crate::error::{DebuggerError, Result};
-use crate::symbols::SymbolCache;
 use crate::types::ProcessId;
 
 impl Session
@@ -24,8 +23,8 @@ impl Session
     fn begin_process(&mut self, pid: ProcessId)
     {
         self.clear_process();
-        // Images of an earlier process may sit at other addresses: start a fresh cache.
-        self.symbols = SymbolCache::new();
+        // Earlier images may sit at other addresses; retain discovery options, not mappings.
+        self.symbols.retain_images(&[]);
         self.loaded_images.clear();
         self.pid = Some(pid);
         self.state = SessionState::Stopped;

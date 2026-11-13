@@ -1514,12 +1514,11 @@ impl Backend for MacOSBackend
         get_memory_regions(self.task).map_err(backend_error)
     }
 
-    /// The main executable only, for now (see [`crate::images`]).
+    /// The executable and libraries reported by the target loader (see [`crate::images`]).
     fn images(&mut self) -> BackendResult<Vec<LoadedImage>>
     {
         self.require_stopped("images")?;
-        let regions = get_memory_regions(self.task).map_err(backend_error)?;
-        images::loaded_images(self.task, self.pid, &regions).map_err(backend_error)
+        images::loaded_images(self.task, self.pid).map_err(backend_error)
     }
 
     fn architecture(&self) -> Architecture

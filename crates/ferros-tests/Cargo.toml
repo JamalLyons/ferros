@@ -24,6 +24,7 @@ rustc-demangle = "0.1"
 # Only the tests need the scripted mock backend. Keeping the feature here leaves it out
 # of ordinary workspace builds, so the `ferros` binary is not built with the mock.
 [dev-dependencies]
+serde_json = "1.0"
 ferros-core = { path = "../ferros-core", features = ["test-util"] }
 
 # Fixture programs. `test = false`: they have no unit tests, so cargo should not build

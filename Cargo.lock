@@ -392,6 +392,7 @@ dependencies = [
  "ferros-macos",
  "object 0.38.0",
  "rustc-demangle",
+ "serde_json",
 ]
 
 [[package]]

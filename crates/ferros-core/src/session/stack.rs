@@ -55,11 +55,27 @@ impl Session
         let registers = self.backend.read_registers(thread)?;
         self.load_images()?;
 
+        // Missing symbols never prevent returning raw stack frames.
+        let _ = self.load_symbols_for_address(registers.pc);
         let architecture = self.backend.architecture();
-        let memory = BackendMemory {
-            backend: RefCell::new(self.backend.as_mut()),
-        };
-        StackUnwinder::new(architecture, &self.symbols, &memory).unwind(thread, &registers, max_frames)
+        // Each successful load marks one live image as attempted. Thus this loop
+        // terminates after at most the live image count, even when a caller's newly
+        // available CFI reveals further images that the frame-pointer pass missed.
+        loop {
+            let frames = {
+                let memory = BackendMemory {
+                    backend: RefCell::new(self.backend.as_mut()),
+                };
+                StackUnwinder::new(architecture, &self.symbols, &memory).unwind(thread, &registers, max_frames)?
+            };
+            let mut added = false;
+            for frame in &frames {
+                added |= self.load_symbols_for_address(frame.pc).unwrap_or(false);
+            }
+            if !added {
+                return Ok(frames);
+            }
+        }
     }
 
     /// Map `address` to function names and source locations.
@@ -69,11 +85,13 @@ impl Session
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
-    /// while running, or the backend's error from listing images.
+    /// while running, the backend's enumeration error, or [`DebuggerError::NoDebugInfo`]
+    /// when the owning image has no usable DWARF.
     pub fn symbolicate(&mut self, address: Address) -> Result<Option<Symbolication>>
     {
         self.require_stopped()?;
         self.load_images()?;
+        self.load_symbols_for_address(address)?;
         Ok(self.symbols.symbolicate(address))
     }
 }

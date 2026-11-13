@@ -67,6 +67,19 @@ pub enum DebuggerError
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// No usable embedded or UUID-matched companion debug information was found.
+    #[error(
+        "No debug information for {path}: {detail}. Build with debug symbols and split-debuginfo = \"packed\", or \
+         install/run dsymutil to generate a matching dSYM"
+    )]
+    NoDebugInfo
+    {
+        /// Executable whose symbols were requested.
+        path: std::path::PathBuf,
+        /// Discovery or generation failure.
+        detail: String,
+    },
+
     /// Failed to attach to a process
     ///
     /// This is a general error for attachment failures that don't fit

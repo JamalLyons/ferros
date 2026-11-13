@@ -30,6 +30,7 @@
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
 pub mod cache;
+pub mod debuginfo;
 pub mod demangle;
 pub mod extractor;
 pub mod image;
@@ -41,5 +42,6 @@ pub(crate) type OwnedDwarf = Dwarf<OwnedReader>;
 
 // Re-exports
 pub use cache::{SymbolCache, SymbolFrame, Symbolication};
+pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
-pub use image::{BinaryImage, ImageDescriptor, ImageId};
+pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping};

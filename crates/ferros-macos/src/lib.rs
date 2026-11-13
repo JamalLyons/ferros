@@ -52,7 +52,7 @@
 //!   bytes with `write_memory`, which makes code pages writable for the write. Hardware
 //!   breakpoints and watchpoints are not part of the `Backend` interface; the unverified
 //!   helpers in [`breakpoints`] program debug registers directly.
-//! - **Images**: only the main executable is reported (see [`images`]).
+//! - **Images**: the main executable and dyld-loaded libraries are reported (see [`images`]).
 //!
 //! ## Known gaps
 //!

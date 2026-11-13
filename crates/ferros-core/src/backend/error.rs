@@ -26,6 +26,11 @@ pub enum BackendError
     #[error("unsupported: {0}")]
     Unsupported(String),
 
+    /// Detach completed local teardown despite a failure. The backend is *NoProcess*;
+    /// the target may not have been fully released. Retrying detach is invalid.
+    #[error("detach teardown completed with errors: {0}")]
+    DetachCleanup(String),
+
     /// Any other operating-system failure, carrying the raw OS code and message.
     #[error("OS error {code}: {message}")]
     Os

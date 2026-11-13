@@ -56,3 +56,8 @@ test = false
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "ferros-fixture-signal_handler"
+path = "fixtures/signal_handler.rs"
+test = false

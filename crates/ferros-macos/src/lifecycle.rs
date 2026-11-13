@@ -57,6 +57,7 @@ impl ExitWatcher
         pid: pid_t,
         shared: Arc<Mutex<ExceptionSharedState>>,
         events: mpsc::Sender<LoopEvent>,
+        child_cleanup: Option<crate::launch::ChildCleanup>,
     ) -> BackendResult<Self>
     {
         // SAFETY: kqueue takes no arguments and returns a new owned descriptor.
@@ -83,7 +84,7 @@ impl ExitWatcher
         let thread = thread::Builder::new()
             .name("ferros-exit".into())
             .spawn(move || {
-                let result = watch(queue, pid, &shared, &events, &cancellation);
+                let result = watch(queue, pid, &shared, &events, &cancellation, child_cleanup.as_ref());
                 if let Err(err) = &result {
                     let _ = events.send(Err(err.clone()));
                 }
@@ -127,6 +128,7 @@ fn watch(
     shared: &Mutex<ExceptionSharedState>,
     events: &mpsc::Sender<LoopEvent>,
     cancel: &mpsc::Receiver<()>,
+    child_cleanup: Option<&crate::launch::ChildCleanup>,
 ) -> BackendResult<()>
 {
     loop {
@@ -174,6 +176,14 @@ fn watch(
                         signal: libc::WTERMSIG(status),
                     }
                 };
+                // A launch child has a tracer status and a parent status. Stop
+                // immediately after the final terminal wait, before the now-reusable
+                // pid can name another child.
+                if child_cleanup.is_some_and(crate::launch::ChildCleanup::terminal_wait) {
+                    let _state = lock_shared(shared);
+                    let _ = events.send(Ok(stop));
+                    return Ok(());
+                }
                 terminal = Some(stop);
                 // Darwin first hands a traced zombie back to its original parent,
                 // even when that parent is us. A second wait reaps our launch child.
@@ -183,6 +193,9 @@ fn watch(
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
                 && let Some(stop) = terminal.take()
             {
+                if let Some(child) = child_cleanup {
+                    child.reaped();
+                }
                 let _state = lock_shared(shared);
                 let _ = events.send(Ok(stop));
                 return Ok(());

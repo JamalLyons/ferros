@@ -224,3 +224,36 @@ pub fn exception_ports(pid: ProcessId) -> Result<ExceptionPorts>
             .collect(),
     })
 }
+
+/// Signal-handler observation used by the SIGCONT integration fixture. The handler
+/// only performs a lock-free atomic store; printing happens on the fixture's main thread.
+static SIGCONT_OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn observe_sigcont(_: libc::c_int)
+{
+    SIGCONT_OBSERVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install the integration fixture's SIGCONT observer in the calling process.
+/// Not part of the supported API.
+///
+/// # Errors
+/// Returns the OS error if the handler could not be installed.
+#[doc(hidden)]
+pub fn install_sigcont_observer() -> std::io::Result<()>
+{
+    // SAFETY: the static handler has C ABI and performs only a lock-free atomic store.
+    if unsafe { libc::signal(libc::SIGCONT, observe_sigcont as *const () as libc::sighandler_t) } == libc::SIG_ERR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the fixture's SIGCONT handler has run. Not part of the supported API.
+#[doc(hidden)]
+#[must_use]
+pub fn sigcont_observed() -> bool
+{
+    SIGCONT_OBSERVED.load(std::sync::atomic::Ordering::Relaxed)
+}

@@ -262,6 +262,7 @@ pub struct MacOSBackend
     state: BackendState,
     /// Whether this backend spawned the target (and so reaps it on `kill`).
     launched: bool,
+    child_cleanup: launch::ChildCleanup,
     /// Whether PT_ATTACHEXC has established tracing.
     traced: bool,
     /// Sole owner of waitpid while tracing.
@@ -296,6 +297,15 @@ pub struct MacOSBackend
 
 impl MacOSBackend
 {
+    /// A cleanup handle for the next launch, shared with the backend's sole reaper.
+    /// Not part of the supported API. Obtain it before moving the backend into a session.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn child_cleanup(&self) -> launch::ChildCleanup
+    {
+        self.child_cleanup.clone()
+    }
+
     /// Create a new macOS backend with no process.
     ///
     /// ## Example
@@ -322,6 +332,7 @@ impl MacOSBackend
             architecture: Architecture::current(),
             state: BackendState::NoProcess,
             launched: false,
+            child_cleanup: launch::ChildCleanup::default(),
             traced: false,
             exit_watcher: None,
             exception_port: MACH_PORT_NULL,
@@ -509,7 +520,7 @@ impl MacOSBackend
         self.peeked = None;
 
         if let Err(err) = self.start_exception_handler() {
-            self.stop_exception_handler(true);
+            let _ = self.stop_exception_handler(true);
             self.release_ports();
             return Err(err);
         }
@@ -554,7 +565,7 @@ impl MacOSBackend
     {
         use tracing::info;
 
-        self.stop_exception_handler(true);
+        let _ = self.stop_exception_handler(true);
 
         if self.task == MACH_PORT_NULL {
             return Ok(());
@@ -633,11 +644,12 @@ impl MacOSBackend
     /// exceptions go to their old handlers; without it (the process is being killed) the
     /// saved rights are only released. Held exceptions are then replied to, so their
     /// threads can continue once the task is resumed. Queued stop events are discarded.
-    fn stop_exception_handler(&mut self, restore: bool)
+    fn stop_exception_handler(&mut self, restore: bool) -> BackendResult<()>
     {
+        let mut restored = Ok(());
         if let Some(saved) = self.saved_exception_ports.take() {
             if restore && self.task != MACH_PORT_NULL {
-                saved.restore(self.task);
+                restored = saved.restore(self.task, &self.reply_faults);
             }
             drop(saved);
         }
@@ -670,6 +682,10 @@ impl MacOSBackend
         // The loop answers what it holds before it exits; this only catches exceptions
         // left behind by a loop that never ran.
         exception::release_held_exceptions(&mut lock_shared(&self.exception_state));
+        if let Err(err) = &restored {
+            tracing::warn!("{err}");
+        }
+        restored
     }
 
     /// Balance every `thread_suspend` of the last resume with `thread_resume`.
@@ -816,6 +832,7 @@ impl MacOSBackend
         self.threads.clear();
         self.pid = ProcessId(0);
         self.launched = false;
+        self.child_cleanup = launch::ChildCleanup::default();
         self.traced = false;
         self.state = BackendState::NoProcess;
         self.memory_cache.clear();
@@ -843,6 +860,9 @@ impl MacOSBackend
         lock_shared(&self.exception_state).internal_stop = Some(ready);
         self.ptrace(ffi::ptrace_requests::PT_ATTACHEXC, 0, 0)?;
         self.traced = true;
+        if self.launched {
+            self.child_cleanup.traced();
+        }
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "ptrace attach SIGSTOP did not arrive within 5s".into(),
@@ -870,6 +890,7 @@ impl MacOSBackend
             self.pid.0 as libc::pid_t,
             Arc::clone(&self.exception_state),
             self.events_tx.as_ref().expect("handler started").clone(),
+            self.launched.then(|| self.child_cleanup.clone()),
         )?);
         Ok(())
     }
@@ -938,8 +959,8 @@ impl MacOSBackend
     /// The teardown always runs, even when ending the trace fails (for example the
     /// private SIGSTOP never arrives because another stop won the race): skipping it
     /// would leak the handler thread, its port and the task rights and leave the target
-    /// suspended. In that case `PT_DETACH` is still attempted and the first error is
-    /// returned afterwards.
+    /// suspended. In that case `PT_DETACH` is still attempted. Failures from tracing
+    /// and handler restoration are returned together as `DetachCleanup` afterwards.
     fn detach_target(&mut self) -> BackendResult<()>
     {
         // Before the private SIGSTOP: the kernel could otherwise pick a thread that is
@@ -947,12 +968,18 @@ impl MacOSBackend
         // of a released process may be left single-stepping either.
         self.undo_thread_actions();
         let traced = self.stop_tracing();
-        if traced.is_err() && self.traced {
-            let _ = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
-            self.traced = false;
-        }
+        let fallback = if traced.is_err() && self.traced {
+            let result = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
+            if result.is_ok() {
+                self.traced = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
         self.exit_watcher = None;
-        self.stop_exception_handler(true);
+        self.child_cleanup.detach(self.traced);
+        let restored = self.stop_exception_handler(true);
         self.release_suspends();
         if traced.is_ok() {
             // The handler answered the private SIGSTOP exception after PT_DETACH, so the
@@ -975,7 +1002,16 @@ impl MacOSBackend
             }
         }
         self.release_ports();
-        traced
+        let failures: Vec<_> = [traced, fallback, restored]
+            .into_iter()
+            .filter_map(|result| result.err())
+            .map(|err| err.to_string())
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(BackendError::DetachCleanup(failures.join("; ")))
+        }
     }
 
     fn invalid_state(&self, what: &str) -> BackendError
@@ -1042,7 +1078,7 @@ impl MacOSBackend
         }
         if event.is_terminal() {
             self.exit_watcher = None;
-            self.stop_exception_handler(false);
+            let _ = self.stop_exception_handler(false);
             self.release_ports();
         } else {
             self.state = BackendState::Stopped;
@@ -1141,6 +1177,7 @@ impl Backend for MacOSBackend
             return Err(backend_error(err));
         }
         self.launched = true;
+        self.child_cleanup.launched(pid);
         self.state = BackendState::Stopped;
         if let Err(err) = self.start_tracing() {
             self.kill().map_err(|cleanup| BackendError::Os {
@@ -1169,7 +1206,7 @@ impl Backend for MacOSBackend
             if self.traced {
                 let _ = self.detach_target();
             } else {
-                self.stop_exception_handler(true);
+                let _ = self.stop_exception_handler(true);
                 self.release_suspends();
                 self.release_ports();
             }
@@ -1226,12 +1263,13 @@ impl Backend for MacOSBackend
         // Threads kept suspended by a resume in flight are let go too, so nothing of
         // ours holds a thread back from exiting.
         self.release_thread_suspends();
-        self.stop_exception_handler(false);
+        let _ = self.stop_exception_handler(false);
         self.release_suspends();
         if let Some(watcher) = &self.exit_watcher {
             watcher.wait(KILL_REAP_TIMEOUT)?;
         } else if self.launched {
             launch::reap_child(pid, KILL_REAP_TIMEOUT)?;
+            self.child_cleanup.reaped();
         }
         self.exit_watcher = None;
         self.release_ports();
@@ -1304,6 +1342,8 @@ impl Backend for MacOSBackend
     /// A reply that fails does not fail the resume: the next `wait` reports it. If any
     /// other step fails, what was done is undone (`thread_resume`, single-step bits
     /// cleared, the suspend count restored) and the target stays *Stopped*.
+    /// If both a reply and `task_resume` fail, resume returns the latter error while the
+    /// reply error stays queued for `wait` (or the session's next resume) exactly once.
     ///
     /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
     /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
@@ -1425,7 +1465,11 @@ impl Backend for MacOSBackend
 
         self.memory_cache.clear();
         for done in 0..count {
-            let kr = unsafe { task_resume(self.task) };
+            let kr = if self.reply_faults.resume.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                mach2::kern_return::KERN_FAILURE
+            } else {
+                unsafe { task_resume(self.task) }
+            };
             if kr != KERN_SUCCESS {
                 // Delivering a fatal soft signal can destroy the task as soon as its
                 // exception is answered, before task_resume reaches the kernel. Resume
@@ -1561,7 +1605,7 @@ impl Drop for MacOSBackend
     {
         if self.state == BackendState::NoProcess {
             self.exit_watcher = None;
-            self.stop_exception_handler(false);
+            let _ = self.stop_exception_handler(false);
             self.release_ports();
             return;
         }
@@ -1574,7 +1618,7 @@ impl Drop for MacOSBackend
                 let _ = watcher.wait(KILL_REAP_TIMEOUT);
             }
             self.exit_watcher = None;
-            self.stop_exception_handler(false);
+            let _ = self.stop_exception_handler(false);
             self.release_ports();
         } else if let Err(err) = self.detach_target() {
             tracing::error!("backend drop could not detach: {err}");

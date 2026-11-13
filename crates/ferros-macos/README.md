@@ -35,3 +35,20 @@ entitlement in `ferros.entitlements`:
 ```sh
 codesign --entitlements crates/ferros-macos/ferros.entitlements --force --sign - target/debug/ferros
 ```
+
+## Detach failures and signal behavior
+
+Detach resumes the target even if it was job-control stopped before attach. Its private
+SIGSTOP is undone with SIGCONT, which a target's SIGCONT handler can observe. Held user
+signals are discarded.
+
+If ending tracing or restoring exception ports fails, teardown still attempts every
+cleanup step. Explicit detach returns `BackendError::DetachCleanup` after releasing local
+resources; both backend and Session then have no process. This error does not guarantee
+that the target was fully released or that all its handlers were restored. Failures
+before teardown leave the session stopped. Drop logs restore failures because it cannot
+return an error.
+
+If replying to an exception and resuming the task both fail, resume returns the task
+resume error and stays stopped. The reply error remains queued once for wait, or for the
+next Session resume's initial event drain.

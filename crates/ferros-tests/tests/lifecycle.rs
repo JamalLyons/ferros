@@ -302,12 +302,8 @@ fn kill_attached_process_reaps_and_discards_events()
 
 /// A process killed from outside while the session holds its signal stop (the faulting
 /// thread waits for the exception reply) still dies and is reported as killed.
-// Known gap, found in the review of the PR for issue #32: a SIGKILL sent from outside
-// while the session holds an exception stop (a thread waits in the kernel for the
-// exception reply and the task is suspended) does not take effect until the debugger
-// resumes, kills, detaches or drops the session. Darwin raises no exception for it and
-// kqueue's NOTE_SIGNAL does not say which signal arrived, so the backend cannot tell it
-// apart. Issue #56 fixes it.
+// A held Unix-signal reply still defers external SIGKILL. Preserving signal
+// suppression/replacement without that reply remains unresolved in issue #56.
 #[test]
 #[ignore = "external SIGKILL during a held signal stop is deferred until resume (issue #56)"]
 fn external_kill_while_a_signal_stop_is_held_is_reported()
@@ -499,5 +495,33 @@ fn released_processes_run_to_completion()
             d.wait_for_stdout("final count: 100", EXIT_TIMEOUT),
             "the detached launched process did not run to completion"
         );
+    });
+}
+
+/// Other signals must never let user code run while the signal stop is held (#56).
+#[test]
+fn ordinary_signals_do_not_release_a_signal_stop()
+{
+    harness::run(|t| {
+        for other in "-USR2 -TERM -CONT -STOP".split_whitespace() {
+            let mut d = t.launch_with_args(&fixture!("loop_counter"), &["25", "--progress"]);
+            let pid = d.pid().0;
+            // Queue the signal before any fixture code runs.
+            signal(pid, "-USR1");
+            d.resume().expect("resume to the signal");
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("signal stop"),
+                Some(StopEvent::Signal { signal: SIGUSR1, .. })
+            ));
+            signal(pid, other);
+            assert!(
+                !d.wait_for_stdout("tick:", Duration::from_millis(400)),
+                "fixture ran after {other} during a signal stop"
+            );
+            assert!(!harness::process_is_gone(pid), "fixture died after {other}");
+            assert_eq!(d.state(), SessionState::Stopped);
+            d.kill().expect("kill after the signal-stop guard");
+            assert_reaped(pid);
+        }
     });
 }

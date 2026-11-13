@@ -16,7 +16,9 @@ reaps the process and reports `Exited` or `Killed` through `wait`.
 
 `resume` honours every thread action: a `Step` thread executes one instruction (arm64
 hardware single-step, `MDSCR_EL1.SS`) and stops with `SingleStep`, while `Suspend`
-threads stay suspended with their held exceptions and signals unanswered.
+threads stay suspended and retain any unanswered Unix signal replies. Hardware
+exception replies are sent while the task remains suspended, allowing external SIGKILL
+at breakpoint stops. SIGKILL during a held Unix signal stop remains deferred (issue #56).
 
 Known gap, fixed by a later task: `images` reports only the main executable (issue #34).
 

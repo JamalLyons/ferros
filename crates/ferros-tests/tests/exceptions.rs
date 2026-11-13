@@ -259,7 +259,7 @@ fn repeated_stops_do_not_grow_the_debuggers_ports()
 }
 
 /// A failed exception reply is returned as an error by the next `wait`, the session keeps
-/// running, and later stops are still reported.
+/// stopped, and later stops are still reported.
 #[test]
 fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
 {
@@ -274,12 +274,9 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
         let id = d
             .add_breakpoint(BreakpointRequest::Software { address })
             .expect("add_breakpoint at tick_body");
+        faults.fail_next_exception_reply();
         d.resume().expect("resume");
         expect_breakpoint(&mut d, address, "the first breakpoint stop");
-
-        faults.fail_next_exception_reply();
-        d.disable_breakpoint(id).expect("disable_breakpoint");
-        d.resume().expect("resume does not fail because the reply failed");
         match d.wait(Some(STOP_TIMEOUT)) {
             Err(err) => assert!(
                 err.to_string().contains("reply"),
@@ -287,7 +284,9 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
             ),
             Ok(event) => panic!("expected the reply failure from wait, got {event:?}"),
         }
-        assert_eq!(d.state(), SessionState::Running, "an error from wait changed the state");
+        assert_eq!(d.state(), SessionState::Stopped, "an error from wait changed the state");
+        d.disable_breakpoint(id).expect("disable_breakpoint");
+        d.resume().expect("resume after the reply failure");
 
         // Stops are still reported: an interrupt, then a breakpoint stop again.
         interrupt(&mut d);
@@ -299,17 +298,9 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
     });
 }
 
-/// A process killed from outside while the session holds its breakpoint stop (the
-/// faulting thread waits for the exception reply and the task is suspended) still dies,
-/// and the next `wait` reports it as killed.
-// Known gap, found in the review of the PR for issue #32: a SIGKILL sent from outside
-// while the session holds an exception stop (a thread waits in the kernel for the
-// exception reply and the task is suspended) does not take effect until the debugger
-// resumes, kills, detaches or drops the session. Darwin raises no exception for it and
-// kqueue's NOTE_SIGNAL does not say which signal arrived, so the backend cannot tell it
-// apart. Issue #56 fixes it.
+/// A process killed from outside while the session holds its breakpoint stop still
+/// dies before the client calls `wait`; the next `wait` reports it as killed.
 #[test]
-#[ignore = "external SIGKILL during a held breakpoint stop is deferred until resume (issue #56)"]
 fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
 {
     let _serial = serial();
@@ -337,5 +328,36 @@ fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
             Some(StopEvent::Killed { signal: 9 })
         );
         assert_eq!(d.state(), SessionState::Exited);
+    });
+}
+
+/// Other signals must never let user code run while the breakpoint stop is held (#56).
+#[test]
+fn ordinary_signals_do_not_release_a_breakpoint_stop()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        for other in "-USR2 -TERM -CONT -STOP".split_whitespace() {
+            let fixture = fixture!("loop_counter");
+            let mut d = t.launch_with_args(&fixture, &["25", "--progress"]);
+            let pid = d.pid().0;
+            let address = marker_address(&mut d, &fixture, "tick_body");
+            d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+            d.resume().expect("resume");
+            expect_breakpoint(&mut d, address, "the breakpoint stop");
+            let status = std::process::Command::new("/bin/kill")
+                .args([other, &pid.to_string()])
+                .status()
+                .expect("signal");
+            assert!(status.success());
+            assert!(
+                !d.wait_for_stdout("tick:", Duration::from_millis(400)),
+                "fixture ran after {other} during a breakpoint stop"
+            );
+            assert!(!harness::process_is_gone(pid), "fixture died after {other}");
+            assert_eq!(d.state(), SessionState::Stopped);
+            assert_eq!(d.read_registers().expect("registers").pc, address);
+            d.kill().expect("kill");
+        }
     });
 }

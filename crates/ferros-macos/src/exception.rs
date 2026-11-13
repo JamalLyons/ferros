@@ -22,8 +22,29 @@
 //! reports one event per message. It counts one suspend per stop in
 //! [`ExceptionSharedState::suspends`], keeps every message of the stop (each faulting
 //! thread waits for its reply), and queues the events on a channel that `wait` receives
-//! from, all under the shared lock. Resuming replies to every held message and then
+//! from, all under the shared lock. Resuming replies to the held messages and then
 //! balances the suspends with `task_resume`.
+//!
+//! ## Kept exceptions
+//!
+//! A resume can keep threads suspended (`ThreadAction::Suspend`, for example while
+//! another thread single-steps). The held exceptions of those threads are *kept*: they
+//! stay unanswered in [`ExceptionSharedState::held`] while the target runs, so their
+//! threads cannot move, and a kept soft-signal exception stays in
+//! [`ExceptionSharedState::soft_signals`], so a later resume can still pass or discard
+//! its signal. A kept exception is answered by the first later resume that lets its
+//! thread run (by the loop when that resume ends a stop it is waiting on, or by the
+//! backend itself when the loop is blocked receiving), and on shutdown, including when
+//! the loop exits because its port was destroyed. Kept exceptions never set
+//! [`ExceptionSharedState::pending_exception`], which means only "the loop is waiting
+//! for a command".
+//!
+//! ## Single-step
+//!
+//! A thread that completes a hardware single-step raises `EXC_BREAKPOINT` with codes
+//! `[EXC_ARM_BREAKPOINT, 0]`; a `brk` raises it with `[EXC_ARM_BREAKPOINT, pc]`, and no
+//! trap can be at address 0. [`stop_event_from_exception`] reports the first as
+//! `StopEvent::SingleStep` and the second as `StopEvent::Breakpoint`.
 //!
 //! ## Port rights
 //!
@@ -91,9 +112,15 @@ pub(crate) struct ExceptionSharedState
     /// Number of `task_suspend` calls the backend holds on the task and has not yet
     /// balanced with `task_resume` (the launch or attach stop, exception stops, interrupts).
     pub suspends: u32,
-    /// Whether the loop holds exception messages whose threads wait for a reply.
+    /// Whether the loop has reported a stop and waits for a command (it holds that
+    /// stop's exception messages). Kept exceptions alone never set it, so while the
+    /// target runs it is `false` until the loop reports the next exception stop.
     pub pending_exception: bool,
-    /// Soft-signal exceptions held by the loop, whose ports remain owned until reply.
+    /// Every exception message held unanswered: the current stop's, and the kept ones
+    /// of threads a resume left suspended. Each thread waits in the kernel for its reply.
+    pub(crate) held: Vec<HeldException>,
+    /// Threads of the held soft-signal exceptions (current or kept), whose ports remain
+    /// owned until reply.
     pub soft_signals: Vec<thread_act_t>,
     /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
     pub internal_stop: Option<mpsc::Sender<()>>,
@@ -171,8 +198,8 @@ struct MachExceptionRaiseRequest
 struct ReceiveBuffer([u8; 1024]);
 
 /// An exception message the loop holds: its thread waits in the kernel for the reply.
-#[cfg(target_os = "macos")]
-struct HeldException
+#[derive(Debug)]
+pub(crate) struct HeldException
 {
     /// Header of the request; `msgh_remote_port` is the send-once reply right.
     header: mach_msg_header_t,
@@ -186,10 +213,19 @@ struct HeldException
 #[derive(Debug)]
 pub(crate) enum ExceptionLoopCommand
 {
-    /// Reply to every held exception. `()` is sent back once every reply was attempted; a
-    /// reply that failed is queued as an `Err` on the event channel before that.
-    Continue(mpsc::Sender<()>),
-    /// Reply to the held exceptions, if any, answer the queued ones, and exit the loop.
+    /// Reply to every held exception except those of the threads in `keep`, which stay
+    /// held (see [`answer_held_exceptions`]). `()` is sent back on `ack` once every reply
+    /// was attempted; a reply that failed is queued as an `Err` on the event channel
+    /// before that.
+    Continue
+    {
+        /// Receives `()` once the replies were attempted.
+        ack: mpsc::Sender<()>,
+        /// Threads whose held exceptions must stay unanswered (they stay suspended).
+        keep: Vec<thread_act_t>,
+    },
+    /// Reply to every held exception (kept ones included), answer the queued ones, and
+    /// exit the loop.
     Shutdown,
 }
 
@@ -379,9 +415,12 @@ pub(crate) fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
 ///
 /// ## Exception Types
 ///
-/// - `EXC_BREAKPOINT` -> `StopEvent::Breakpoint` with the raw `pc` (not rewound; on
-///   arm64 it already points at the `brk`, and the engine maps it with
-///   `Arch::pc_after_trap`)
+/// - `EXC_BREAKPOINT` with codes `[EXC_ARM_BREAKPOINT, 0]` -> `StopEvent::SingleStep`:
+///   XNU's `handle_sw_step_debug` (`osfmk/arm64/sleh.c`) raises exactly these codes when
+///   a hardware single-step completes. (On x86-64, `EXC_I386_SGL` is also 1.)
+/// - any other `EXC_BREAKPOINT` -> `StopEvent::Breakpoint` with the raw `pc` (not rewound;
+///   on arm64 it already points at the `brk`, whose codes are `[EXC_ARM_BREAKPOINT, pc]`,
+///   and the engine maps it with `Arch::pc_after_trap`)
 /// - `EXC_BAD_ACCESS` -> `StopEvent::Signal(SIGSEGV)`
 /// - `EXC_BAD_INSTRUCTION` -> `StopEvent::Signal(SIGILL)`
 /// - `EXC_ARITHMETIC` -> `StopEvent::Signal(SIGFPE)`
@@ -398,6 +437,7 @@ pub(crate) fn stop_event_from_exception(
 {
     let signal = |signal| StopEvent::Signal { thread, signal };
     match exception as u32 {
+        EXC_BREAKPOINT if codes == [EXC_ARM_BREAKPOINT, 0] => StopEvent::SingleStep { thread },
         EXC_BREAKPOINT => match pc {
             Some(pc) => StopEvent::Breakpoint {
                 thread,
@@ -423,6 +463,65 @@ pub(crate) fn stop_event_from_exception(
 /// Unix signal exception code from `<mach/exception_types.h>`.
 pub(crate) const EXC_SOFT_SIGNAL: i64 = 0x10003;
 
+/// `EXC_ARM_BREAKPOINT` from `<mach/arm/exception.h>`: the code of every arm64
+/// `EXC_BREAKPOINT` (a `brk`, a hardware breakpoint, or a completed single-step).
+pub(crate) const EXC_ARM_BREAKPOINT: i64 = 1;
+
+/// Answer every held exception whose thread is not in `keep`, and keep the others.
+///
+/// Called under the shared lock, by the exception loop when a resume ends the stop it is
+/// waiting on, and by the backend itself when a resume lets kept threads run while the
+/// loop is blocked receiving. Each answered message's thread right is released once,
+/// after its reply; a failed reply is queued as an `Err` on `events` (unless the process
+/// is dead). Soft signals of answered exceptions are dropped from
+/// [`ExceptionSharedState::soft_signals`]; those of kept exceptions stay, so a later
+/// resume can still pass or discard them. The caller has already issued `PT_THUPDATE`
+/// for the answered soft-signal exceptions.
+#[cfg(target_os = "macos")]
+pub(crate) fn answer_held_exceptions(
+    state: &mut ExceptionSharedState,
+    keep: &[thread_act_t],
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+    task: mach_port_t,
+)
+{
+    let (kept, answer): (Vec<HeldException>, Vec<HeldException>) = std::mem::take(&mut state.held)
+        .into_iter()
+        .partition(|exception| keep.contains(&exception.thread));
+    for exception in &answer {
+        let Err(failure) = reply_to_held(exception, faults) else {
+            continue;
+        };
+        if state.dead || crate::lifecycle::task_is_dead(task) {
+            continue;
+        }
+        error!("{failure}");
+        if let Err(err) = events.send(Err(failure)) {
+            warn!("Failed to queue a reply failure from Mach loop: {err}");
+        }
+    }
+    state
+        .soft_signals
+        .retain(|port| kept.iter().any(|exception| exception.thread == *port));
+    state.held = kept;
+}
+
+/// Answer every held exception, kept ones included, and release their thread rights
+/// (shutdown paths). Clears `pending_exception` and `soft_signals`.
+#[cfg(target_os = "macos")]
+pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
+{
+    for exception in std::mem::take(&mut state.held) {
+        if let Err(err) = send_exception_reply(&exception.header) {
+            error!("Failed to reply to a held Mach exception on shutdown: mach_msg returned {err:#x}");
+        }
+        deallocate_right(exception.thread);
+    }
+    state.pending_exception = false;
+    state.soft_signals.clear();
+}
+
 /// Main exception handling loop that receives Mach exceptions.
 ///
 /// This function runs in a separate thread and receives exception messages from the
@@ -434,12 +533,13 @@ pub(crate) const EXC_SOFT_SIGNAL: i64 = 0x10003;
 ///    drains every other message already queued on the port without blocking, marks the
 ///    exceptions as held and queues one [`StopEvent`] per message
 /// 3. Waits for a command from the backend
-/// 4. On [`ExceptionLoopCommand::Continue`], replies to every held message, queues a
-///    failed reply as an `Err` for the next `wait`, and goes back to receiving
+/// 4. On [`ExceptionLoopCommand::Continue`], replies to every held message except the
+///    kept ones (see [`answer_held_exceptions`]), queues a failed reply as an `Err` for
+///    the next `wait`, and goes back to receiving
 ///
 /// The loop exits on [`ExceptionLoopCommand::Shutdown`] (replying to the held and
 /// queued messages first, so the threads can continue after a detach) or when the
-/// exception port is destroyed.
+/// exception port is destroyed (replying to the kept messages it still holds).
 ///
 /// See:
 /// - [mach_msg(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_msg/)
@@ -502,7 +602,6 @@ pub(crate) fn run_exception_loop(
             continue;
         }
 
-        let mut held = Vec::new();
         {
             // Stop every thread, collect every message of this stop, mark the exceptions
             // as held and queue the events in one step under the lock, so a concurrent
@@ -534,7 +633,7 @@ pub(crate) fn run_exception_loop(
                 if matches!(event, StopEvent::Signal { .. }) && exception.soft_signal {
                     state.soft_signals.push(exception.thread);
                 }
-                held.push(exception);
+                state.held.push(exception);
                 if matches!(
                     event,
                     StopEvent::Signal {
@@ -556,44 +655,25 @@ pub(crate) fn run_exception_loop(
         }
 
         match commands.recv() {
-            Ok(ExceptionLoopCommand::Continue(ack)) => {
-                let failures: Vec<BackendError> = held
-                    .iter()
-                    .filter_map(|exception| reply_to_held(exception, &faults).err())
-                    .collect();
+            Ok(ExceptionLoopCommand::Continue { ack, keep }) => {
                 {
                     let mut state = lock_shared(&shared);
+                    answer_held_exceptions(&mut state, &keep, &faults, &events, task);
                     state.pending_exception = false;
-                    state.soft_signals.clear();
-                    for failure in failures {
-                        if state.dead || crate::lifecycle::task_is_dead(task) {
-                            continue;
-                        }
-                        error!("{failure}");
-                        if let Err(err) = events.send(Err(failure)) {
-                            warn!("Failed to queue a reply failure from Mach loop: {err}");
-                        }
-                    }
                 }
                 let _ = ack.send(());
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(_) => {
-                for exception in &held {
-                    if let Err(err) = send_exception_reply(&exception.header) {
-                        error!("Failed to reply to a held Mach exception on shutdown: mach_msg returned {err:#x}");
-                    }
-                    deallocate_right(exception.thread);
-                }
-                {
-                    let mut state = lock_shared(&shared);
-                    state.pending_exception = false;
-                    state.soft_signals.clear();
-                }
+                release_held_exceptions(&mut lock_shared(&shared));
                 reply_to_queued_exceptions(exception_port);
                 break;
             }
         }
     }
+    // The port was destroyed while the loop was blocked receiving: exceptions kept for
+    // suspended threads are still held. Answer them, so those threads are not left
+    // blocked in the kernel, and release their rights.
+    release_held_exceptions(&mut lock_shared(&shared));
 }
 
 /// Receive one message from `exception_port`: block until one arrives, or with
@@ -813,4 +893,77 @@ fn send_exception_reply(request: &mach_msg_header_t) -> std::result::Result<(), 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    const THREAD: u64 = 0x1403;
+
+    fn event(exception: u32, pc: Option<u64>, codes: [i64; 2]) -> StopEvent
+    {
+        stop_event_from_exception(exception as exception_type_t, ThreadId::from(THREAD), pc, codes)
+    }
+
+    #[test]
+    fn completed_single_step_is_a_single_step_stop()
+    {
+        // What `handle_sw_step_debug` raises; the pc is irrelevant.
+        assert_eq!(
+            event(EXC_BREAKPOINT, Some(0x1_0000_0aac), [EXC_ARM_BREAKPOINT, 0]),
+            StopEvent::SingleStep {
+                thread: ThreadId::from(THREAD)
+            }
+        );
+        assert_eq!(
+            event(EXC_BREAKPOINT, None, [EXC_ARM_BREAKPOINT, 0]),
+            StopEvent::SingleStep {
+                thread: ThreadId::from(THREAD)
+            }
+        );
+    }
+
+    #[test]
+    fn brk_is_a_breakpoint_stop_at_the_raw_pc()
+    {
+        // A `brk` carries its own address as the second code.
+        assert_eq!(
+            event(EXC_BREAKPOINT, Some(0x1_0000_0aa8), [EXC_ARM_BREAKPOINT, 0x1_0000_0aa8]),
+            StopEvent::Breakpoint {
+                thread: ThreadId::from(THREAD),
+                pc: Address::from(0x1_0000_0aa8),
+            }
+        );
+        // Any other breakpoint code is a breakpoint too, never a step.
+        assert!(matches!(
+            event(EXC_BREAKPOINT, Some(0x40), [2, 0]),
+            StopEvent::Breakpoint { .. }
+        ));
+        assert!(matches!(
+            event(EXC_BREAKPOINT, None, [EXC_ARM_BREAKPOINT, 0x40]),
+            StopEvent::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn other_exceptions_keep_their_mapping()
+    {
+        let thread = ThreadId::from(THREAD);
+        assert_eq!(
+            event(EXC_BAD_ACCESS, None, [1, 0]),
+            StopEvent::Signal {
+                thread,
+                signal: libc::SIGSEGV
+            }
+        );
+        assert_eq!(
+            event(EXC_SOFTWARE, None, [EXC_SOFT_SIGNAL, i64::from(libc::SIGUSR1)]),
+            StopEvent::Signal {
+                thread,
+                signal: libc::SIGUSR1
+            }
+        );
+    }
 }

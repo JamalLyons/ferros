@@ -25,6 +25,21 @@
 //! `detach` and `kill` balance it with `task_resume`. Threads that stop at the same time
 //! form one stop: one suspend, one event per thread.
 //!
+//! ## Per-thread actions
+//!
+//! `resume` honours every [`ThreadAction`]. Before the target runs it `thread_suspend`s
+//! every thread whose action is `Suspend` and sets the hardware single-step bit
+//! (`MDSCR_EL1.SS`, see [`crate::registers::set_single_step`]) of every thread whose
+//! action is `Step`; the held exceptions of the suspended threads stay unanswered (see
+//! the exception module's "Kept exceptions"). When `wait` delivers the next stop, the
+//! whole task is `task_suspend`ed by the exception loop, so the backend balances its
+//! `thread_suspend`s with `thread_resume` and clears the single-step bit of every thread
+//! it asked to step: a step that did not complete is cancelled, as the contract says,
+//! and a later plain continue cannot single-step by surprise. Every teardown path
+//! (`detach`, `kill`, drop, the rollback of a failed `resume`) balances them too;
+//! `detach` does it before it raises its private SIGSTOP, so that signal cannot be
+//! taken by a thread that is still suspended.
+//!
 //! ## Exception ports
 //!
 //! Attaching installs the backend's handler with `task_swap_exception_ports` and keeps
@@ -270,6 +285,12 @@ pub struct MacOSBackend
     peeked: Option<LoopEvent>,
     /// Cached memory pages for repeated reads; cleared whenever the target may run.
     memory_cache: MemoryCache,
+    /// Threads the last resume `thread_suspend`ed (action `Suspend`), each once; balanced
+    /// with `thread_resume` when the next stop is delivered and on every teardown path.
+    suspended_threads: Vec<thread_act_t>,
+    /// Threads whose single-step bit the last resume set (action `Step`); the bit is
+    /// cleared when the next stop is delivered and on teardown.
+    stepping_threads: Vec<thread_act_t>,
 }
 
 impl MacOSBackend
@@ -312,6 +333,8 @@ impl MacOSBackend
             events_rx: None,
             peeked: None,
             memory_cache: MemoryCache::new(),
+            suspended_threads: Vec::new(),
+            stepping_threads: Vec::new(),
         })
     }
 
@@ -361,8 +384,8 @@ impl MacOSBackend
 
     /// Suspend a specific thread with `thread_suspend()` (unverified).
     ///
-    /// The [`Backend`] interface does not expose per-thread suspension yet; this is kept
-    /// for later use and bypasses the backend's state tracking.
+    /// This bypasses the backend's state tracking: [`Backend::resume`] with
+    /// [`ThreadAction::Suspend`] is the supported way to keep threads suspended.
     ///
     /// ## Errors
     ///
@@ -645,7 +668,102 @@ impl MacOSBackend
         self.events_tx = None;
         self.events_rx = None;
         self.peeked = None;
-        lock_shared(&self.exception_state).pending_exception = false;
+        // The loop answers what it holds before it exits; this only catches exceptions
+        // left behind by a loop that never ran.
+        exception::release_held_exceptions(&mut lock_shared(&self.exception_state));
+    }
+
+    /// Balance every `thread_suspend` of the last resume with `thread_resume`.
+    ///
+    /// A failure (the thread has exited, or the process is gone) is ignored.
+    fn release_thread_suspends(&mut self)
+    {
+        for port in std::mem::take(&mut self.suspended_threads) {
+            // SAFETY: `port` is a thread right this backend holds (it is in `threads`);
+            // the call only balances the suspend this backend added.
+            let kr = unsafe { ffi::thread_resume(port) };
+            if kr != KERN_SUCCESS {
+                tracing::debug!("thread_resume({port}) failed with {kr}; the thread may have exited");
+            }
+        }
+    }
+
+    /// Clear the single-step bit of every thread the last resume asked to step.
+    ///
+    /// Clearing an already clear bit (the kernel clears it when the step completes) is
+    /// harmless; a failure (the thread has exited) is ignored.
+    fn clear_step_bits(&mut self)
+    {
+        for port in std::mem::take(&mut self.stepping_threads) {
+            if let Err(err) = crate::registers::set_single_step(port, false) {
+                tracing::debug!("clearing the single-step bit of thread {port} failed: {err}");
+            }
+        }
+    }
+
+    /// The threads `request` suspends and steps, in that order.
+    ///
+    /// A request whose actions are all `Continue` names none and needs no thread list;
+    /// otherwise the list is refreshed, so the default action covers every current thread.
+    fn plan_thread_actions(&mut self, request: &ResumeRequest) -> BackendResult<(Vec<thread_act_t>, Vec<thread_act_t>)>
+    {
+        let all_continue = request.default_action == ThreadAction::Continue
+            && request
+                .thread_actions
+                .iter()
+                .all(|(_, action)| *action == ThreadAction::Continue);
+        if all_continue {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        self.threads = threads::ThreadManager::refresh_thread_list(self.task, &self.threads).map_err(backend_error)?;
+        let mut suspend = Vec::new();
+        let mut step = Vec::new();
+        for &port in &self.threads {
+            match request.action_for(ThreadId::from(u64::from(port))) {
+                ThreadAction::Continue => {}
+                ThreadAction::Suspend => suspend.push(port),
+                ThreadAction::Step => step.push(port),
+            }
+        }
+        Ok((suspend, step))
+    }
+
+    /// `thread_suspend` every thread in `suspend` and set the single-step bit of every
+    /// thread in `step`, recording both. On failure everything done is undone and the
+    /// error returned.
+    fn apply_thread_actions(&mut self, suspend: &[thread_act_t], step: &[thread_act_t]) -> BackendResult<()>
+    {
+        // Normally balanced already, when the stop that made the target *Stopped* was
+        // delivered.
+        self.release_thread_suspends();
+        self.clear_step_bits();
+        for &port in suspend {
+            // SAFETY: `port` is a thread right this backend holds; the suspend is recorded
+            // and balanced exactly once by `release_thread_suspends`.
+            let kr = unsafe { ffi::thread_suspend(port) };
+            if kr != KERN_SUCCESS {
+                self.release_thread_suspends();
+                return Err(mach_error(kr, &format!("thread_suspend of thread {port} failed")));
+            }
+            self.suspended_threads.push(port);
+        }
+        for &port in step {
+            self.stepping_threads.push(port);
+            if let Err(err) = crate::registers::set_single_step(port, true) {
+                self.clear_step_bits();
+                self.release_thread_suspends();
+                return Err(backend_error(err));
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo [`apply_thread_actions`](Self::apply_thread_actions) (the rollback of a failed
+    /// resume, and teardown).
+    fn undo_thread_actions(&mut self)
+    {
+        self.release_thread_suspends();
+        self.clear_step_bits();
     }
 
     /// Balance every `task_suspend` the backend holds with `task_resume`, ignoring
@@ -661,9 +779,14 @@ impl MacOSBackend
     }
 
     /// Deallocate the task and thread ports and forget the process.
+    ///
+    /// Thread suspends and single-step bits still recorded are balanced first, while the
+    /// thread ports are still held (failures, for a dead process, are ignored).
     fn release_ports(&mut self)
     {
         use tracing::debug;
+
+        self.undo_thread_actions();
 
         unsafe {
             debug!("Deallocating {} thread ports", self.threads.len());
@@ -721,7 +844,7 @@ impl MacOSBackend
         self.exception_commands
             .as_ref()
             .expect("handler started")
-            .send(ExceptionLoopCommand::Continue(ack))
+            .send(ExceptionLoopCommand::Continue { ack, keep: Vec::new() })
             .map_err(|_| BackendError::Os {
                 code: -1,
                 message: "attach reply channel closed".into(),
@@ -806,6 +929,10 @@ impl MacOSBackend
     /// returned afterwards.
     fn detach_target(&mut self) -> BackendResult<()>
     {
+        // Before the private SIGSTOP: the kernel could otherwise pick a thread that is
+        // still `thread_suspend`ed to take it, and the detach would time out. No thread
+        // of a released process may be left single-stepping either.
+        self.undo_thread_actions();
         let traced = self.stop_tracing();
         if traced.is_err() && self.traced {
             let _ = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
@@ -882,9 +1009,17 @@ impl MacOSBackend
     /// last enumeration) is added now, while the exception loop still holds the message's
     /// right to it: the backend's own right keeps the port name, which is the
     /// [`ThreadId`], valid after the loop releases its right on resume.
+    ///
+    /// A non-terminal stop ends the resume before it: the whole task is `task_suspend`ed,
+    /// so the `thread_suspend`s of that resume are balanced now, and the single-step bit
+    /// of every thread it asked to step is cleared (cancelling a step that did not
+    /// complete).
     fn deliver(&mut self, event: StopEvent) -> StopEvent
     {
         self.memory_cache.clear();
+        if !event.is_terminal() {
+            self.undo_thread_actions();
+        }
         if let Some(thread) = event.thread()
             && let Ok(port) = thread_act_t::try_from(thread.raw())
             && !self.threads.contains(&port)
@@ -911,18 +1046,19 @@ impl MacOSBackend
     }
 
     /// Check `request` against what this backend supports.
+    ///
+    /// Every action is supported. A signal must name a thread holding a soft-signal
+    /// exception that does not stay suspended (`Unsupported` otherwise), and a thread
+    /// named in `thread_actions` must exist (`NotFound` otherwise).
     fn check_resume_request(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
-        let unsupported = |action: ThreadAction| match action {
-            ThreadAction::Continue => None,
-            ThreadAction::Step => Some(BackendError::Unsupported(
-                "single-step is not implemented yet (T07, issue #33)".to_string(),
-            )),
-            ThreadAction::Suspend => Some(BackendError::Unsupported(
-                "keeping individual threads suspended is not implemented yet".to_string(),
-            )),
-        };
         for (thread, signal) in &request.signals {
+            if request.action_for(*thread) == ThreadAction::Suspend {
+                return Err(BackendError::Unsupported(format!(
+                    "a signal cannot be passed to thread {} while it stays suspended",
+                    thread.raw()
+                )));
+            }
             if !lock_shared(&self.exception_state)
                 .soft_signals
                 .iter()
@@ -936,14 +1072,8 @@ impl MacOSBackend
                 return Err(BackendError::Unsupported(format!("invalid signal {signal}")));
             }
         }
-        if let Some(err) = unsupported(request.default_action) {
-            return Err(err);
-        }
-        for (thread, action) in &request.thread_actions {
+        for (thread, _) in &request.thread_actions {
             self.thread_port(*thread)?;
-            if let Some(err) = unsupported(*action) {
-                return Err(err);
-            }
         }
         Ok(())
     }
@@ -1080,6 +1210,9 @@ impl Backend for MacOSBackend
         }
 
         // The process is dying: its exception ports need no restoring, only releasing.
+        // Threads kept suspended by a resume in flight are let go too, so nothing of
+        // ours holds a thread back from exiting.
+        self.release_thread_suspends();
         self.stop_exception_handler(false);
         self.release_suspends();
         if let Some(watcher) = &self.exit_watcher {
@@ -1144,15 +1277,25 @@ impl Backend for MacOSBackend
         }
     }
 
-    /// Continue every thread: reply to the held exceptions, if any, then `task_resume`
-    /// once per suspend the backend holds.
+    /// Resume the target as `request` describes, in this order:
     ///
-    /// A reply that fails does not fail the resume: the next `wait` reports it. The resume
-    /// fails only if the exception handler does not answer at all.
+    /// 1. `thread_suspend` every thread whose action is `Suspend` and set the single-step
+    ///    bit (`MDSCR_EL1.SS`) of every thread whose action is `Step`;
+    /// 2. reply to the held exceptions of the threads that run (`Continue` or `Step`);
+    ///    those of `Suspend`ed threads stay held, and so do their signals;
+    /// 3. `task_resume` once per suspend the backend holds.
     ///
-    /// Held Unix signals are suppressed unless named in `request.signals`.
-    /// `Step` (T07, issue #33), per-thread `Suspend`, and signal injection without
-    /// a held soft-signal exception return [`BackendError::Unsupported`].
+    /// A step that completes is reported by `wait` as [`StopEvent::SingleStep`]. Whatever
+    /// stop `wait` reports next, the `thread_suspend`s are then balanced and every
+    /// single-step bit set here is cleared (see `deliver`).
+    ///
+    /// A reply that fails does not fail the resume: the next `wait` reports it. If any
+    /// other step fails, what was done is undone (`thread_resume`, single-step bits
+    /// cleared, the suspend count restored) and the target stays *Stopped*.
+    ///
+    /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
+    /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
+    /// exception, returns [`BackendError::Unsupported`]; so does `Step` on x86-64.
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         use tracing::info;
@@ -1164,12 +1307,13 @@ impl Backend for MacOSBackend
             ));
         }
         self.check_resume_request(request)?;
+        let (suspend, step) = self.plan_thread_actions(request)?;
         // The exception loop queues a stop event under this lock, together with its
         // suspend and the held-exception flag. Checking the queue under the same lock
         // means a stop is either fully visible here (and the resume is refused) or has
         // not happened yet.
         let shared_state = Arc::clone(&self.exception_state);
-        let (count, pending) = {
+        let (count, pending, held) = {
             let mut shared = lock_shared(&shared_state);
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
@@ -1177,28 +1321,50 @@ impl Backend for MacOSBackend
                     "resume is not allowed while stop events are pending; drain them with wait".to_string(),
                 ));
             }
-            (std::mem::take(&mut shared.suspends), shared.pending_exception)
+            (
+                std::mem::take(&mut shared.suspends),
+                shared.pending_exception,
+                !shared.held.is_empty(),
+            )
         };
-        let restore = |backend: &Self, count: u32| lock_shared(&backend.exception_state).suspends += count;
+        let restore = |backend: &mut Self, count: u32| {
+            backend.undo_thread_actions();
+            lock_shared(&backend.exception_state).suspends += count;
+        };
 
-        if pending {
+        // Suspend and arm the threads before any of them can run.
+        if let Err(err) = self.apply_thread_actions(&suspend, &step) {
+            restore(self, count);
+            return Err(err);
+        }
+
+        if pending || held {
+            // Only the exceptions answered now get their signal decided; a kept one (its
+            // thread stays suspended) keeps its signal held for a later resume.
             let signals = lock_shared(&self.exception_state).soft_signals.clone();
-            for port in signals {
-                let signal = request
-                    .signals
-                    .iter()
-                    .find(|(thread, _)| thread.raw() == u64::from(port))
-                    .map_or(0, |(_, signal)| *signal);
+            for port in signals.into_iter().filter(|port| !suspend.contains(port)) {
+                let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
                 if let Err(err) = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, signal) {
                     restore(self, count);
                     return Err(err);
                 }
             }
+        }
+        if !pending && held {
+            // Only kept exceptions are held and the loop is blocked receiving: answer
+            // those of the threads that run now from here, under the lock.
+            if let Some(events) = self.events_tx.clone() {
+                let mut shared = lock_shared(&self.exception_state);
+                exception::answer_held_exceptions(&mut shared, &suspend, &self.reply_faults, &events, self.task);
+            }
+        }
+        if pending {
             let (ack_tx, ack_rx) = mpsc::channel();
+            let keep = suspend.clone();
             let sent = self
                 .exception_commands
                 .as_ref()
-                .is_some_and(|tx| tx.send(ExceptionLoopCommand::Continue(ack_tx)).is_ok());
+                .is_some_and(|tx| tx.send(ExceptionLoopCommand::Continue { ack: ack_tx, keep }).is_ok());
             let replied = if sent {
                 ack_rx
                     .recv_timeout(EXCEPTION_REPLY_TIMEOUT)

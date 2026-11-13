@@ -1,6 +1,7 @@
 //! # macOS Debug Register Manipulation
 //!
-//! Functions to read/write CPU debug registers for hardware breakpoints.
+//! Functions to read/write CPU debug registers for hardware breakpoints, watchpoints
+//! and hardware single-step ([`set_single_step`]).
 //!
 //! This module provides low-level access to CPU debug registers used for hardware
 //! breakpoints. Unlike general-purpose registers (see [arm64](arm64) and [x86_64](x86_64)),
@@ -198,6 +199,76 @@ pub fn clear_watchpoint(thread: thread_act_t, slot: u32) -> Result<()>
     #[cfg(target_arch = "aarch64")]
     {
         clear_wp_arm64(thread, slot)
+    }
+}
+
+/// The software-step bit of `MDSCR_EL1` (bit 0, `SS`).
+#[cfg(target_arch = "aarch64")]
+const MDSCR_EL1_SS: u64 = 1;
+
+/// Set (`enabled`) or clear the hardware single-step bit of `thread`.
+///
+/// On arm64 this reads `ARM_DEBUG_STATE64` (flavor 15) with `thread_get_state`, sets or
+/// clears `MDSCR_EL1.SS` (bit 0) and writes the state back with `thread_set_state`,
+/// keeping the thread's hardware breakpoints and watchpoints. XNU also sets or clears
+/// `PSTATE.SS` in the thread's saved user state, so once the thread next returns to
+/// user mode it executes exactly one instruction and then takes a software-step
+/// exception. The kernel (`handle_sw_step_debug` in `osfmk/arm64/sleh.c`) clears the bit
+/// again before it raises `EXC_BREAKPOINT` with codes `[EXC_ARM_BREAKPOINT, 0]`, which
+/// the exception loop reports as `StopEvent::SingleStep`.
+///
+/// The thread must be stopped (suspended, or the whole task suspended). Clearing a bit
+/// that is already clear is harmless.
+///
+/// ## Errors
+///
+/// - `MachError` if `thread_get_state()` or `thread_set_state()` fails (for example the
+///   thread has exited).
+/// - `InvalidArgument` on x86-64, where single-step is not implemented.
+pub fn set_single_step(thread: thread_act_t, enabled: bool) -> Result<()>
+{
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (thread, enabled);
+        Err(DebuggerError::InvalidArgument(
+            "single-step is not supported on x86-64 macOS".to_string(),
+        ))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `state` is a correctly sized, writable `ARM_DEBUG_STATE64` buffer of
+        // `count` natural_t words that outlives both calls; `thread` is a thread send
+        // right the caller holds.
+        unsafe {
+            let mut state = ArmDebugState64::default();
+            let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+            let kr = ffi::thread_get_state(
+                thread,
+                constants::ARM_DEBUG_STATE64,
+                (&raw mut state).cast::<natural_t>(),
+                &mut count,
+            );
+            if kr != KERN_SUCCESS {
+                return Err(DebuggerError::from(MachError::from(kr)));
+            }
+
+            if enabled {
+                state.mdscr_el1 |= MDSCR_EL1_SS;
+            } else {
+                state.mdscr_el1 &= !MDSCR_EL1_SS;
+            }
+
+            let kr = ffi::thread_set_state(
+                thread,
+                constants::ARM_DEBUG_STATE64,
+                (&raw const state).cast::<natural_t>(),
+                constants::ARM_DEBUG_STATE64_COUNT,
+            );
+            if kr != KERN_SUCCESS {
+                return Err(DebuggerError::from(MachError::from(kr)));
+            }
+        }
+        Ok(())
     }
 }
 

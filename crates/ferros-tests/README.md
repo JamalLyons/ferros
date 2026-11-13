@@ -106,8 +106,7 @@ fn resume_runs_hello()
   counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
   breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
   drop. `Session::read_memory` hides traps, so raw bytes are read through
-  `session.backend_mut().read_memory`. `resume` only starts a step over a breakpoint; `wait`
-  finishes it and continues, so always `wait` after resuming.
+  `session.backend_mut().read_memory`.
 - `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe

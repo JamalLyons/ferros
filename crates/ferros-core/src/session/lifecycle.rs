@@ -110,9 +110,14 @@ impl Session
     /// one at a time in thread-list order, before continuing all threads. This also
     /// applies when the thread did not hit the breakpoint (for example a breakpoint
     /// added at its pc), matching GDB. Disabled and removed breakpoints are skipped.
-    /// Internal step stops are hidden by [`wait`](Self::wait); only real breakpoint
-    /// events increment hit counts. A passed signal goes on its thread's step if it
-    /// steps over, otherwise on the final continue.
+    /// `resume` performs these steps itself, waiting at most
+    /// [`STEP_OVER_TIMEOUT`](super::STEP_OVER_TIMEOUT) for each, and then continues, so
+    /// the program runs whether or not the caller calls [`wait`](Self::wait). A step that
+    /// does not complete in time (its thread is blocked) is left running and
+    /// [`wait`](Self::wait) finishes the sequence. Internal step stops are never reported;
+    /// any other event that arrives during a step is returned by the next `wait`, and so is
+    /// a backend `wait` error. Only real breakpoint events increment hit counts. A passed
+    /// signal goes on its thread's step if it steps over, otherwise on the final continue.
     ///
     /// # Errors
     ///
@@ -120,7 +125,9 @@ impl Session
     /// while running, or the backend's error (the session then stays stopped).
     /// A failed initial step start restores the removed trap before returning the
     /// error; if that restoration also fails, the breakpoint is disabled and its
-    /// restoration error is returned.
+    /// restoration error is returned. If a later step or the final continue fails to start
+    /// after an internal step completed, the session is stopped (threads refreshed,
+    /// [`last_stop`](Self::last_stop) `None`) and that error is returned.
     pub fn resume(&mut self) -> Result<()>
     {
         self.resume_request(ResumeRequest::continue_all())
@@ -154,7 +161,7 @@ impl Session
         }
         self.state = SessionState::Running;
         self.last_stop = None;
-        Ok(())
+        self.drive_step_overs()
     }
 
     /// Ask a running process to stop; returns immediately.
@@ -196,7 +203,11 @@ impl Session
     pub fn kill(&mut self) -> Result<StopEvent>
     {
         self.require_process()?;
-        self.backend.kill()?;
+        // A terminal event `resume` already took from the backend means the backend has
+        // no process left to kill.
+        if !self.deferred.as_ref().is_some_and(StopEvent::is_terminal) {
+            self.backend.kill()?;
+        }
         self.clear_process();
         self.state = SessionState::Exited;
         self.ownership = None;
@@ -247,6 +258,11 @@ impl Session
                 timeout.map(|limit| limit.saturating_sub(started.elapsed()))
             };
             first = false;
+            if self.state == SessionState::Running
+                && let Some(error) = self.deferred_error.take()
+            {
+                return Err(error);
+            }
             let event = match self.state {
                 SessionState::Running => match self.deferred.take() {
                     Some(event) => Some(event),

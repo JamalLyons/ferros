@@ -134,6 +134,41 @@ impl Session
         Ok(())
     }
 
+    /// Drive the step-overs started by `resume` until the final continue is issued, so the
+    /// program runs without the caller calling `wait`.
+    ///
+    /// Each step is awaited for at most [`STEP_OVER_TIMEOUT`](super::STEP_OVER_TIMEOUT);
+    /// on a timeout the sequence is left to [`wait`](Self::wait). Another event (the step
+    /// did not complete) or a backend `wait` error is kept for the next `wait`. A failure
+    /// to start the next step or the final continue stops the session, as in `wait`.
+    pub(super) fn drive_step_overs(&mut self) -> Result<()>
+    {
+        while self.step_plan.as_ref().is_some_and(|plan| plan.final_request.is_some()) {
+            let event = match self.backend.wait(Some(super::STEP_OVER_TIMEOUT)) {
+                Ok(Some(event)) => event,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    self.deferred_error = Some(error.into());
+                    return Ok(());
+                }
+            };
+            match self.finish_step(event) {
+                Ok(None) => {}
+                Ok(Some(event)) => {
+                    self.deferred = Some(event);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.state = SessionState::Stopped;
+                    self.sync_threads(None);
+                    self.last_stop = None;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// None means an internal completion was consumed and execution resumed.
     pub(super) fn finish_step(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
     {

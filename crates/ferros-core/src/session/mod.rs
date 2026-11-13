@@ -117,6 +117,9 @@ pub struct Session
     deferred: Option<StopEvent>,
     step_plan: Option<stepping::StepPlan>,
     interrupt_requested: bool,
+    /// A backend `wait` error met while `resume` drove a step-over, returned by the
+    /// next `wait`.
+    deferred_error: Option<DebuggerError>,
     breakpoints: BreakpointStore,
     symbols: SymbolCache,
     /// Images (path, load address) already given to the symbol cache, loaded or not.
@@ -197,6 +200,13 @@ impl Drop for Session
     }
 }
 
+/// How long [`Session::resume`] waits for each internal single-step over a breakpoint
+/// before it returns and leaves the rest of the sequence to [`Session::wait`].
+///
+/// One instruction normally completes at once; the limit only matters when the stepped
+/// thread is blocked (for example in a system call) while the other threads are suspended.
+pub const STEP_OVER_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How long dropping a session that is running an attached process waits for the
 /// interrupt to stop it before detaching anyway.
 pub const DROP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -256,6 +266,7 @@ impl Session
             deferred: None,
             step_plan: None,
             interrupt_requested: false,
+            deferred_error: None,
             breakpoints: BreakpointStore::new(),
             symbols: SymbolCache::new(),
             loaded_images: HashSet::new(),
@@ -379,6 +390,7 @@ impl Session
         self.deferred = None;
         self.step_plan = None;
         self.interrupt_requested = false;
+        self.deferred_error = None;
         self.breakpoints.drain();
     }
 

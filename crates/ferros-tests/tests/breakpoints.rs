@@ -241,14 +241,18 @@ fn continue_past_breakpoint_runs_to_completion()
         run_to(&mut d, main);
         assert_eq!(hits(&d, id), 1);
 
-        // `resume` only starts the step over the trap; `wait` finishes it and continues,
-        // so the exit is awaited before the output is checked.
-        run_to_exit(&mut d);
+        // `resume` itself steps over the trap and continues: the program runs and prints
+        // before anyone calls `wait`.
+        d.resume().expect("resume past the breakpoint");
         assert!(
             d.wait_for_stdout("hello from ferros fixture", Duration::from_secs(10)),
-            "fixture output never arrived after continuing; stdout: {:?}, stderr: {:?}",
+            "fixture output never arrived after continuing (without wait); stdout: {:?}, stderr: {:?}",
             d.stdout(),
             d.stderr()
+        );
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("wait for the exit"),
+            Some(StopEvent::Exited { code: 0 })
         );
     });
 }

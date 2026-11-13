@@ -38,7 +38,9 @@ fn step_over_is_hidden_and_hits_are_only_real_events()
     step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     hit(&mock, BP);
     session.resume().unwrap();
-    assert_eq!(peek(&mock, BP), original(BP));
+    // `resume` finished the step over and continued: the trap is back already.
+    assert_eq!(peek(&mock, BP), TRAP);
+    assert!(session.step_plan.is_none());
     assert_eq!(
         session.wait(None).unwrap(),
         Some(StopEvent::Breakpoint {
@@ -241,8 +243,10 @@ fn interrupt_aborts_step_over()
 fn interrupt_losing_to_single_step_reports_interrupted()
 {
     let (mock, mut session, _) = at_breakpoint();
-    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    // Nothing scripted yet: the step does not complete within `resume`, so the plan stays.
     session.resume().unwrap();
+    assert!(session.step_plan.is_some());
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     // MockBackend always lets interrupt win. Set the policy flag to exercise the
     // other contract-permitted outcome without changing the backend implementation.
     session.interrupt_requested = true;
@@ -352,8 +356,8 @@ fn initial_step_start_failures_restore_trap_and_stay_stopped()
 fn final_continue_failure_is_stopped_without_last_stop()
 {
     let (mock, mut session, _) = at_breakpoint();
-    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     session.resume().unwrap();
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     mock.fail_next(
         MockCallKind::Resume,
         BackendError::Os {
@@ -390,13 +394,14 @@ fn timeout_between_serial_steps_preserves_the_next_step()
     let (mock, mut session, _) = at_breakpoint();
     session.write_registers_for(T2, &regs_at(BP)).unwrap();
     step(&mock, T1, BP + 4, ResumeRequest::step(T1));
-    step(&mock, T2, BP + 4, ResumeRequest::step(T2));
-    hit(&mock, BP2);
+    // T1's step completes inside `resume`, T2's does not arrive in time.
     session.resume().unwrap();
     assert_eq!(session.wait(Some(Duration::ZERO)).unwrap(), None);
     assert_eq!(session.state(), SessionState::Running);
     assert!(session.step_plan.is_some());
     assert_eq!(peek(&mock, BP), original(BP));
+    step(&mock, T2, BP + 4, ResumeRequest::step(T2));
+    hit(&mock, BP2);
     assert!(matches!(session.wait(None).unwrap(), Some(StopEvent::Breakpoint { .. })));
     assert_eq!(peek(&mock, BP), TRAP);
 }
@@ -405,8 +410,8 @@ fn timeout_between_serial_steps_preserves_the_next_step()
 fn rearm_failure_disables_breakpoint_and_stops_session()
 {
     let (mock, mut session, id) = at_breakpoint();
-    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     session.resume().unwrap();
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     mock.fail_next(
         MockCallKind::WriteMemory,
         BackendError::Os {
@@ -419,4 +424,36 @@ fn rearm_failure_disables_breakpoint_and_stops_session()
     assert!(session.last_stop().is_none());
     assert!(!session.breakpoint_info(id).unwrap().enabled);
     assert_eq!(peek(&mock, BP), original(BP));
+}
+
+#[test]
+fn resume_finishes_the_step_over_and_continues_without_wait()
+{
+    let (mock, mut session, _) = at_breakpoint();
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
+    session.resume().unwrap();
+    // No `wait` yet: the program already runs past the breakpoint.
+    assert_eq!(session.state(), SessionState::Running);
+    assert!(session.step_plan.is_none());
+    assert_eq!(peek(&mock, BP), TRAP);
+    assert_eq!(mock.state(), MockState::Running);
+    assert_eq!(mock.calls().last(), Some(&MockCall::Resume(ResumeRequest::continue_all())));
+}
+
+#[test]
+fn terminal_event_during_resume_is_reported_and_kill_still_works()
+{
+    for kill in [false, true] {
+        let (mock, mut session, _) = at_breakpoint();
+        mock.script(MockStop::new(StopEvent::Exited { code: 3 }).expect_resume(ResumeRequest::step(T1)));
+        session.resume().unwrap();
+        assert_eq!(session.state(), SessionState::Running);
+        if kill {
+            assert_eq!(session.kill().unwrap(), StopEvent::Killed { signal: SIGKILL });
+        } else {
+            assert_eq!(session.wait(None).unwrap(), Some(StopEvent::Exited { code: 3 }));
+        }
+        assert_eq!(session.state(), SessionState::Exited);
+        assert_eq!(mock.state(), MockState::NoProcess);
+    }
 }

@@ -218,7 +218,10 @@ impl Session
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, or the backend's error (the
-    /// state and the breakpoint table do not change).
+    /// state and the breakpoint table do not change), except
+    /// [`BackendError::KillCleanup`]: local teardown completed, so the session becomes
+    /// [`SessionState::Exited`] and clears its process and breakpoints while returning
+    /// the error. No terminal stop is fabricated when death/reaping was not confirmed.
     pub fn kill(&mut self) -> Result<StopEvent>
     {
         self.require_process()?;
@@ -231,10 +234,18 @@ impl Session
             self.last_stop = Some(event.clone());
             return Ok(event);
         }
-        self.backend.kill()?;
+        let killed = match self.backend.kill() {
+            Err(err @ BackendError::KillCleanup(_)) => Err(err),
+            Err(err) => return Err(err.into()),
+            Ok(()) => Ok(()),
+        };
         self.clear_process();
         self.state = SessionState::Exited;
         self.ownership = None;
+        if let Err(err) = killed {
+            self.last_stop = None;
+            return Err(err.into());
+        }
         let event = StopEvent::Killed { signal: SIGKILL };
         self.last_stop = Some(event.clone());
         Ok(event)

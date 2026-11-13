@@ -44,8 +44,9 @@
 //! The state changes only when `launch`, `attach`, `resume`, `detach` or `kill` returns
 //! `Ok`, or when `wait` returns an event. A call that returns an error, whichever
 //! variant, leaves the backend in the state it was in, except
-//! [`BackendError::DetachCleanup`]: detach has completed local teardown and moved to
-//! *NoProcess*, but could not fully release the target or restore its handlers.
+//! [`BackendError::DetachCleanup`] and [`BackendError::KillCleanup`]: local teardown
+//! completed and moved to *NoProcess*, but target release, death or reaping could not
+//! be fully confirmed. Cleanup errors cannot be retried against that process.
 //!
 //! - `resume` is all or nothing. If the OS fails part-way, the backend stops the threads
 //!   it had already resumed before returning the error, and the target is still *Stopped*.
@@ -200,7 +201,9 @@ pub trait Backend: Send
     ///
     /// - [`BackendError::InvalidState`] with no process.
     /// - [`BackendError::PermissionDenied`] if the OS refuses to terminate it.
-    /// - [`BackendError::Os`] for any other failure.
+    /// - [`BackendError::Os`] if termination fails before teardown begins.
+    /// - [`BackendError::KillCleanup`] if local teardown completed but death or reaping
+    ///   could not be confirmed; the backend is *NoProcess*.
     fn kill(&mut self) -> BackendResult<()>;
 
     /// Block until the target stops and return exactly one event.

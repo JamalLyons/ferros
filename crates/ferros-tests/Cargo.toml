@@ -61,3 +61,13 @@ workspace = true
 name = "ferros-fixture-signal_handler"
 path = "fixtures/signal_handler.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-signal_tracing"
+path = "fixtures/signal_tracing.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-thread_signals"
+path = "fixtures/thread_signals.rs"
+test = false

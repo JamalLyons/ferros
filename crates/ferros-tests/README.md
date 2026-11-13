@@ -9,13 +9,17 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines six fixture binaries:
+The crate defines eight fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
 - `ferros-fixture-loop_counter`: Iterates a counter in a loop with small sleeps, printing the final count.
 - `ferros-fixture-nested_calls`: Executes nested non-inlined function calls and prints the computed result.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
+- `ferros-fixture-signal_tracing`: Keeps two threads alive and acknowledges SIGUSR1 through
+  files in a test-owned directory (macOS).
+- `ferros-fixture-thread_signals`: Two workers raise thread-directed SIGUSR1 independently and report
+  which worker handlers ran, for selective delivery and retained-stop races (macOS).
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit.
 
@@ -96,6 +100,11 @@ fn resume_runs_hello()
   including a signal deferred behind a breakpoint (issue #56). Client signal replies
   are answered early under task suspension; delivery decisions remain logical stops
   until resume requeues the selected signal on its original thread.
+- `tests/signal_tracing.rs` covers selective per-thread signal delivery and a late exception published
+  between resume lock sections, as well as private ptrace handshake races (#57): application signals
+  arriving before or with the attach/detach SIGSTOP, and dropping a running backend or session
+  whose signal stop is already pending. A one-shot diagnostic hook forces actual kernel signal
+  requests into the two handshake orderings; the drop cases use naturally pending signals.
 - `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.
@@ -142,3 +151,7 @@ and task-resume failures; and reaping ownership across exit, kill, drop and deta
 The harness uses a shared `ChildCleanup` handle: only a detached, unreaped child grants
 permission to wait. The real failed Mach-send cleanup is tested with isolated ports in
 `ferros-macos`, without launching a fixture.
+
+- `tests/exit_watcher.rs` covers a competing debugger thread reaping a tracee before
+  its exit watcher (#57): errors remain observable after death and across repeated
+  waits, and kill teardown releases backend resources and clears Session ownership.

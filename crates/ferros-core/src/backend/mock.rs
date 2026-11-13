@@ -676,7 +676,7 @@ impl MockBackend
 
     /// Make the next call of `kind` fail with `error`, after it is recorded and before
     /// anything else happens (the state does not change, except `DetachCleanup` on
-    /// `Detach`, which ends the process). Several failures can be queued;
+    /// `Detach` and `KillCleanup` on `Kill`, which end the process). Several failures can be queued;
     /// each is used once.
     pub fn fail_next(&self, kind: MockCallKind, error: BackendError)
     {
@@ -787,7 +787,12 @@ impl Backend for MockBackend
     fn kill(&mut self) -> BackendResult<()>
     {
         let mut inner = self.lock();
-        inner.begin(MockCall::Kill)?;
+        if let Err(err) = inner.begin(MockCall::Kill) {
+            if matches!(err, BackendError::KillCleanup(_)) && inner.state != MockState::NoProcess {
+                inner.end_process();
+            }
+            return Err(err);
+        }
         inner.require_process("kill")?;
         inner.end_process();
         Ok(())

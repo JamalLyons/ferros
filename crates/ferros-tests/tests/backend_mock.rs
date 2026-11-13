@@ -162,3 +162,42 @@ fn detach_cleanup_error_clears_session_but_ordinary_error_keeps_it_stopped()
         }
     }
 }
+
+#[test]
+fn kill_cleanup_error_clears_session_but_ordinary_error_preserves_it()
+{
+    use ferros_core::backend::BackendError;
+    use ferros_core::backend::mock::MockCallKind;
+    use ferros_core::{BreakpointRequest, Session, SessionState};
+
+    for teardown in [false, true] {
+        let mock = scripted_process();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        session
+            .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
+            .expect("breakpoint");
+        let error = if teardown {
+            BackendError::KillCleanup("reaping failed".into())
+        } else {
+            BackendError::PermissionDenied("kill refused".into())
+        };
+        mock.fail_next(MockCallKind::Kill, error);
+        session.kill().expect_err("injected kill failure");
+        if teardown {
+            assert_eq!(session.state(), SessionState::Exited);
+            assert_eq!(mock.state(), MockState::NoProcess);
+            assert_eq!(session.pid(), None);
+            assert_eq!(session.ownership(), None);
+            assert_eq!(session.selected_thread(), None);
+            assert_eq!(session.last_stop(), None);
+            assert!(session.breakpoints().is_empty());
+            session.launch(&LaunchSpec::new("/bin/prog")).expect("reuse session");
+        } else {
+            assert_eq!(session.state(), SessionState::Stopped);
+            assert_eq!(mock.state(), MockState::Stopped);
+            assert!(session.breakpoints().iter().all(|bp| bp.enabled));
+            session.kill().expect("retry kill");
+        }
+    }
+}

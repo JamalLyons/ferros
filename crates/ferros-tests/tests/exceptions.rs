@@ -40,7 +40,10 @@ fn marker_address(d: &mut Debuggee, fixture: &Fixture, marker: &str) -> Address
     static OFFSETS: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
 
     let images = d.images().expect("images");
-    let main = images.first().expect("the main executable image");
+    let main = images
+        .iter()
+        .find(|image| image.path == fixture.path())
+        .expect("the main executable image");
     let load_address = main.load_address.value();
     let key = (fixture.name().to_owned(), marker.to_owned());
     let offsets = OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -55,23 +58,14 @@ fn marker_address(d: &mut Debuggee, fixture: &Fixture, marker: &str) -> Address
         .iter()
         .find(|region| region.contains(main.load_address) && region.is_executable())
         .unwrap_or_else(|| panic!("no executable region holds the image at {}", main.load_address));
-    // The DWARF is in the fixture's dSYM bundle, whose Mach-O has the executable's
-    // segment layout, so it maps with the executable's load address.
-    // It holds one file, named after the crate rather than the binary.
-    let dwarf_dir = fixture.dsym_path().join("Contents/Resources/DWARF");
-    let dwarf = std::fs::read_dir(&dwarf_dir)
-        .and_then(|mut entries| entries.next().transpose())
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| panic!("no DWARF file in {}", dwarf_dir.display()))
-        .path();
+    // The executable supplies the runtime layout; its matching dSYM is discovered.
     let mut symbols = SymbolCache::new();
     symbols
         .load_image(ImageDescriptor {
-            path: dwarf.clone(),
+            path: fixture.path().to_path_buf(),
             load_address,
         })
-        .unwrap_or_else(|err| panic!("load the fixture's symbols from {}: {err}", dwarf.display()));
+        .unwrap_or_else(|err| panic!("load the fixture's symbols: {err}"));
 
     let found = (text.start.value()..text.end.value()).step_by(4).find(|&address| {
         symbols.symbolicate(Address::from(address)).is_some_and(|symbolication| {

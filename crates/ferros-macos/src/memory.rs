@@ -774,8 +774,14 @@ fn region_for_address(task: mach_port_t, addr: Address) -> Result<Option<RegionI
                 ))));
             }
 
+            if target > addr.value() {
+                return Ok(None);
+            }
             if info.is_submap != 0 {
                 depth += 1;
+                // The kernel replaced target with the enclosing submap's start.
+                // Descend at the original query, not the first region in that submap.
+                target = addr.value();
                 continue;
             }
 

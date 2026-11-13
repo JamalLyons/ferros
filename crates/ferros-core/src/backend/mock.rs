@@ -630,6 +630,12 @@ impl MockBackend
         self
     }
 
+    /// Replace the live loader image list (for load/unload and relocation tests).
+    pub fn set_images(&self, images: Vec<LoadedImage>)
+    {
+        self.lock().images = images;
+    }
+
     /// Enqueue one stop, delivered by the `wait` after a future `resume`.
     pub fn script(&self, stop: MockStop)
     {

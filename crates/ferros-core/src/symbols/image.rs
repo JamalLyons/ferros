@@ -35,6 +35,7 @@ use object::{Object, ObjectSection, ObjectSegment};
 use once_cell::sync::OnceCell;
 
 use super::cache::{SymbolFrame, Symbolication};
+use super::debuginfo::{self, DebugInfoOptions};
 use super::demangle::make_symbol_name;
 use super::extractor::{TypeExtractor, TypeSummary};
 use super::{OwnedDwarf, OwnedReader};
@@ -67,9 +68,113 @@ pub struct ImageDescriptor
     pub path: PathBuf,
     /// Load address where the binary is mapped in the debuggee's address space
     ///
-    /// This is the base address where the binary's `__TEXT` segment (or equivalent)
-    /// is loaded at runtime. Used to compute address relocation.
+    /// This is the runtime address of the binary's header (reported by the loader),
+    /// corresponding to file offset zero. Used to compute address relocation.
     pub load_address: u64,
+}
+
+/// Checked address translation for the executable's mapped segments.
+///
+/// This contains no DWARF and can therefore be used even for stripped images.
+/// `load_address` names the runtime Mach-O header; the corresponding file virtual
+/// address comes from the segment covering file offset zero, excluding `__PAGEZERO`.
+#[derive(Debug, Clone)]
+pub struct ImageMapping
+{
+    file_base: u64,
+    load_address: u64,
+    segments: Vec<(u64, u64, u64)>,
+}
+
+impl ImageMapping
+{
+    /// Read an executable's segment layout without discovering debug information.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable/malformed files or overflowing mappings.
+    pub fn parse(descriptor: &ImageDescriptor) -> Result<Self>
+    {
+        let bytes = fs::read(&descriptor.path)?;
+        let file = object::File::parse(&*bytes)
+            .map_err(|error| DebuggerError::InvalidArgument(format!("invalid image: {error}")))?;
+        Self::from_file(&file, descriptor.load_address)
+    }
+
+    fn from_file(file: &object::File<'_>, load_address: u64) -> Result<Self>
+    {
+        let file_base = file
+            .segments()
+            .find(|segment| segment.file_range().0 == 0 && segment.file_range().1 != 0)
+            .map(|segment| segment.address())
+            .ok_or_else(|| DebuggerError::InvalidArgument("image has no segment covering its header".into()))?;
+        let mut mapping = Self {
+            file_base,
+            load_address,
+            segments: Vec::new(),
+        };
+        for segment in file.segments() {
+            if segment.name().ok().flatten() == Some("__PAGEZERO") || segment.size() == 0 {
+                continue;
+            }
+            let address = segment.address();
+            let runtime = mapping
+                .relocate(address)
+                .ok_or_else(|| DebuggerError::InvalidArgument("image relocation overflows address space".into()))?;
+            address
+                .checked_add(segment.size())
+                .and_then(|_| runtime.checked_add(segment.size()))
+                .ok_or_else(|| DebuggerError::InvalidArgument("image segment overflows address space".into()))?;
+            mapping.segments.push((address, runtime, segment.size()));
+        }
+        Ok(mapping)
+    }
+
+    fn relocate(&self, address: u64) -> Option<u64>
+    {
+        u64::try_from(i128::from(address) + i128::from(self.load_address) - i128::from(self.file_base)).ok()
+    }
+
+    fn runtime_range(&self) -> (u64, u64)
+    {
+        (
+            self.load_address,
+            self.segments
+                .iter()
+                .map(|&(_, start, size)| start + size)
+                .max()
+                .unwrap_or(self.load_address),
+        )
+    }
+
+    /// Whether the runtime address lies in an actual mapped segment.
+    pub fn contains(&self, address: Address) -> bool
+    {
+        self.file_address(address).is_some()
+    }
+
+    /// Convert a runtime address to a file virtual address, excluding segment gaps.
+    pub fn file_address(&self, address: Address) -> Option<u64>
+    {
+        self.segments.iter().find_map(|&(file, runtime, size)| {
+            address
+                .value()
+                .checked_sub(runtime)
+                .filter(|offset| *offset < size)
+                .and_then(|offset| file.checked_add(offset))
+        })
+    }
+
+    /// Convert a file virtual address to a runtime address, excluding segment gaps.
+    pub fn runtime_address(&self, address: u64) -> Option<Address>
+    {
+        self.segments.iter().find_map(|&(file, runtime, size)| {
+            address
+                .checked_sub(file)
+                .filter(|offset| *offset < size)
+                .and_then(|offset| runtime.checked_add(offset))
+                .map(Address::new)
+        })
+    }
 }
 
 /// Unique identifier for a binary image.
@@ -227,8 +332,7 @@ pub struct BinaryImage
     path: PathBuf,
     architecture: Architecture,
     endian: RunTimeEndian,
-    slide: i64,
-    runtime_range: (u64, u64),
+    mapping: ImageMapping,
     debug_sections: HashMap<&'static str, Arc<[u8]>>,
     eh_frame: Option<SectionBlob>,
     eh_frame_hdr: Option<SectionBlob>,
@@ -242,7 +346,7 @@ pub struct BinaryImage
 
 impl BinaryImage
 {
-    pub(crate) fn parse(desc: ImageDescriptor) -> Result<Self>
+    pub(crate) fn parse(desc: ImageDescriptor, options: &DebugInfoOptions) -> Result<Self>
     {
         let bytes = fs::read(&desc.path)?;
         let data = Arc::<[u8]>::from(bytes);
@@ -261,78 +365,26 @@ impl BinaryImage
             _ => Architecture::Unknown("unknown"),
         };
 
-        let text_segment = file
-            .segments()
-            .find(|segment| {
-                if let Ok(Some(name)) = segment.name() {
-                    name == "__TEXT" || name == ".text"
-                } else {
-                    false
-                }
-            })
-            .ok_or_else(|| DebuggerError::InvalidArgument(format!("{} missing __TEXT segment", desc.path.display())))?;
-
-        let text_vmaddr = text_segment.address();
-        let mut max_addr = text_vmaddr;
-        for segment in file.segments() {
-            let start = segment.address();
-            let end = start.saturating_add(segment.size());
-            max_addr = max_addr.max(end);
-        }
-
-        let size = max_addr.saturating_sub(text_vmaddr);
-        let runtime_start = desc.load_address;
-        let runtime_end = runtime_start.saturating_add(size);
-        let slide = desc.load_address as i64 - text_vmaddr as i64;
+        let mapping = ImageMapping::from_file(&file, desc.load_address)?;
+        let debug_bytes = debuginfo::discover(&desc.path, &data, options)?;
+        let debug_file = object::File::parse(&*debug_bytes)
+            .map_err(|err| DebuggerError::InvalidArgument(format!("failed to parse DWARF: {err}")))?;
 
         let mut sections = HashMap::new();
-        let mut debug_info_size = 0;
-        let mut debug_line_size = 0;
         for (canonical, aliases) in DWARF_SECTIONS {
-            let data = load_section_bytes(&file, aliases)?;
-            if *canonical == ".debug_info" {
-                debug_info_size = data.len();
-            }
-            if *canonical == ".debug_line" {
-                debug_line_size = data.len();
-            }
-            if !data.is_empty() {
-                use tracing::debug;
-                debug!("Loaded DWARF section {} ({} bytes)", canonical, data.len());
-            }
-            sections.insert(*canonical, data);
-        }
-
-        if debug_info_size == 0 || debug_line_size == 0 {
-            use tracing::warn;
-            warn!(
-                "Binary {} missing critical DWARF sections: .debug_info={} bytes, .debug_line={} bytes. Build with debug \
-                 symbols!",
-                desc.path.display(),
-                debug_info_size,
-                debug_line_size
-            );
-        } else {
-            use tracing::info;
-            info!(
-                "Binary {} has DWARF debug information (.debug_info: {} bytes, .debug_line: {} bytes)",
-                desc.path.display(),
-                debug_info_size,
-                debug_line_size
-            );
+            sections.insert(*canonical, load_section_bytes(&debug_file, aliases)?);
         }
 
         let eh_frame = load_section_blob(&file, &[".eh_frame", "__eh_frame"])?;
         let eh_frame_hdr = load_section_blob(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?;
-        let debug_frame = load_section_blob(&file, &[".debug_frame", "__debug_frame"])?;
+        let debug_frame = load_section_blob(&debug_file, &[".debug_frame", "__debug_frame"])?;
 
         Ok(Self {
             id: ImageId::from_parts(&desc.path, desc.load_address),
             path: desc.path,
             architecture,
             endian,
-            slide,
-            runtime_range: (runtime_start, runtime_end),
+            mapping,
             debug_sections: sections,
             eh_frame,
             eh_frame_hdr,
@@ -345,7 +397,7 @@ impl BinaryImage
 
     pub(crate) fn runtime_range(&self) -> (u64, u64)
     {
-        self.runtime_range
+        self.mapping.runtime_range()
     }
 
     /// Get the pointer size in bytes for this image's architecture.
@@ -379,11 +431,7 @@ impl BinaryImage
 
     pub(crate) fn relocated_address(&self, vmaddr: u64) -> u64
     {
-        if self.slide >= 0 {
-            vmaddr.saturating_add(self.slide as u64)
-        } else {
-            vmaddr.saturating_sub((-self.slide) as u64)
-        }
+        self.mapping.relocate(vmaddr).unwrap_or(0)
     }
 
     pub(crate) fn eh_frame_section(&self) -> Option<(u64, &[u8])>
@@ -501,8 +549,7 @@ impl BinaryImage
     /// ```
     pub fn contains(&self, address: Address) -> bool
     {
-        let addr = address.value();
-        addr >= self.runtime_range.0 && addr < self.runtime_range.1
+        self.mapping.contains(address)
     }
 
     /// Convert a runtime address to a file address (link-time address).
@@ -538,16 +585,13 @@ impl BinaryImage
     /// ```
     pub fn file_address(&self, address: Address) -> Option<u64>
     {
-        let value = address.value();
-        if !self.contains(address) {
-            return None;
-        }
+        self.mapping.file_address(address)
+    }
 
-        if self.slide >= 0 {
-            value.checked_sub(self.slide as u64)
-        } else {
-            value.checked_add((-self.slide) as u64)
-        }
+    /// Convert a file virtual address within a mapped segment to a runtime address.
+    pub fn runtime_address(&self, address: u64) -> Option<Address>
+    {
+        self.mapping.runtime_address(address)
     }
 
     fn dwarf(&self) -> Result<&OwnedDwarf>
@@ -785,5 +829,85 @@ impl BinaryImage
             cache.insert(summary.name.clone(), summary.clone());
         }
         Ok(Some(summary))
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests
+{
+    use super::*;
+
+    fn macho_segments() -> Vec<u8>
+    {
+        let segments = [
+            ("__PAGEZERO", 0_u64, 0x1_0000_0000_u64, 0_u64, 0_u64),
+            ("__HEADER", 0x1_0000_0000, 0x1000, 0, 248),
+            ("__DATA", 0x1_0000_2000, 0x1000, 0x1000, 0),
+        ];
+        let mut bytes = vec![0; 32 + 72 * 3];
+        bytes[0..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&216_u32.to_le_bytes());
+        for (index, (name, address, size, file_offset, file_size)) in segments.into_iter().enumerate() {
+            let command = &mut bytes[32 + 72 * index..32 + 72 * (index + 1)];
+            command[0..4].copy_from_slice(&0x19_u32.to_le_bytes());
+            command[4..8].copy_from_slice(&72_u32.to_le_bytes());
+            command[8..8 + name.len()].copy_from_slice(name.as_bytes());
+            command[24..32].copy_from_slice(&address.to_le_bytes());
+            command[32..40].copy_from_slice(&size.to_le_bytes());
+            command[40..48].copy_from_slice(&file_offset.to_le_bytes());
+            command[48..56].copy_from_slice(&file_size.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn mapping_uses_header_segment_excludes_pagezero_and_rejects_overflow()
+    {
+        let bytes = macho_segments();
+        let file = object::File::parse(&*bytes).unwrap();
+        let mapping = ImageMapping::from_file(&file, 0x1000).unwrap();
+        assert_eq!(mapping.file_address(Address::new(0x1020)), Some(0x1_0000_0020));
+        assert_eq!(mapping.runtime_address(0x1_0000_2020), Some(Address::new(0x3020)));
+        assert_eq!(mapping.runtime_address(0), None);
+        assert_eq!(mapping.runtime_address(0x1_0000_1000), None);
+        assert!(ImageMapping::from_file(&file, u64::MAX - 0x100).is_err());
+    }
+
+    #[test]
+    fn translations_respect_each_segment_and_gaps_in_both_directions()
+    {
+        let mapping = ImageMapping {
+            file_base: 0x1_0000_0000,
+            load_address: 0x1_1000_0000,
+            segments: vec![(0x1_0000_0000, 0x1_1000_0000, 0x1000), (0x1_0000_2000, 0x1_1000_2000, 0x1000)],
+        };
+        assert_eq!(mapping.runtime_address(0x1_0000_0020), Some(Address::new(0x1_1000_0020)));
+        assert_eq!(mapping.file_address(Address::new(0x1_1000_2020)), Some(0x1_0000_2020));
+        assert_eq!(mapping.runtime_address(0x1_0000_1000), None);
+        assert_eq!(mapping.file_address(Address::new(0x1_1000_1000)), None);
+        assert_eq!(mapping.runtime_address(0), None);
+        assert_eq!(mapping.file_address(Address::new(0)), None);
+        assert_eq!(mapping.file_address(Address::new(0x1_1000_3000)), None);
+    }
+
+    #[test]
+    fn relocation_checks_overflow_and_supports_negative_slide()
+    {
+        let mapping = ImageMapping {
+            file_base: 0x1_0000_0000,
+            load_address: 0x1000,
+            segments: vec![],
+        };
+        assert_eq!(mapping.relocate(0x1_0000_0040), Some(0x1040));
+        assert_eq!(mapping.relocate(0), None);
+        let mapping = ImageMapping {
+            file_base: 0,
+            load_address: u64::MAX - 10,
+            segments: vec![],
+        };
+        assert_eq!(mapping.relocate(11), None);
     }
 }

@@ -102,7 +102,7 @@ fn resume_runs_hello()
 - `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
-  executable's Mach-O symbol table (no DWARF) and adds the image slide.
+  executable's Mach-O symbol table (no DWARF) and translates through the Session image mapping.
 - `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
   counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
   breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
@@ -121,3 +121,13 @@ harness. It drives `ferros_core::backend::mock::MockBackend`, an in-memory, scri
 enabled through the `test-util` feature, to prove the portable `Backend` trait and the mock work
 from outside `ferros-core`. With nothing to launch it needs no entitlement, no fixtures and no
 `#![cfg(target_os = "macos")]` gate.
+
+
+## Debug-info regressions
+
+`tests/debuginfo.rs` checks matching and mismatched dSYMs, a standalone plain-Cargo
+build with the default unpacked profile, validated cache reuse, tool failures and
+timeouts, Session diagnostics and image refresh, and two distinct ASLR launches.
+The Cargo-build test uses an isolated temporary package and keeps its object files
+until `dsymutil` finishes. It launches no debuggee. Real launches use the normal
+harness and verify both the main function and the reported library header addresses.

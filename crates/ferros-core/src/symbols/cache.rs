@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::debuginfo::DebugInfoOptions;
 use super::extractor::TypeSummary;
 use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use crate::error::{DebuggerError, Result};
@@ -91,6 +92,7 @@ pub struct SymbolFrame
 pub struct SymbolCache
 {
     images: HashMap<ImageId, Arc<BinaryImage>>,
+    debug_info_options: DebugInfoOptions,
 }
 
 impl SymbolCache
@@ -99,7 +101,34 @@ impl SymbolCache
     #[must_use]
     pub fn new() -> Self
     {
-        Self { images: HashMap::new() }
+        Self::default()
+    }
+
+    /// Create a cache with explicit debug-info discovery options.
+    #[must_use]
+    pub fn with_debug_info_options(debug_info_options: DebugInfoOptions) -> Self
+    {
+        Self {
+            images: HashMap::new(),
+            debug_info_options,
+        }
+    }
+
+    /// Drop metadata for images no longer reported by the loader.
+    pub fn retain_images(&mut self, descriptors: &[ImageDescriptor])
+    {
+        let ids: std::collections::HashSet<_> = descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                let path = if descriptor.path.is_absolute() {
+                    descriptor.path.clone()
+                } else {
+                    descriptor.path.canonicalize().ok()?
+                };
+                Some(ImageId::from_parts(&path, descriptor.load_address))
+            })
+            .collect();
+        self.images.retain(|id, _| ids.contains(id));
     }
 
     /// Load a binary image and parse its DWARF sections.
@@ -141,10 +170,13 @@ impl SymbolCache
         }
 
         #[allow(clippy::arc_with_non_send_sync)]
-        let image = Arc::new(BinaryImage::parse(ImageDescriptor {
-            path: canonical,
-            load_address: descriptor.load_address,
-        })?);
+        let image = Arc::new(BinaryImage::parse(
+            ImageDescriptor {
+                path: canonical,
+                load_address: descriptor.load_address,
+            },
+            &self.debug_info_options,
+        )?);
         self.images.insert(id, image.clone());
         Ok(image)
     }

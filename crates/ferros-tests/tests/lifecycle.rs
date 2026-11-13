@@ -299,3 +299,34 @@ fn kill_attached_process_reaps_and_discards_events()
         }
     });
 }
+
+/// A process killed from outside while the session holds its signal stop (the faulting
+/// thread waits for the exception reply) still dies and is reported as killed.
+// Known gap, found in the review of the PR for issue #32: a SIGKILL sent from outside
+// while the session holds an exception stop (a thread waits in the kernel for the
+// exception reply and the task is suspended) does not take effect until the debugger
+// resumes, kills, detaches or drops the session. Darwin raises no exception for it and
+// kqueue's NOTE_SIGNAL does not say which signal arrived, so the backend cannot tell it
+// apart. The follow-up issue that fixes it is named in that PR.
+#[test]
+#[ignore = "external SIGKILL during a held signal stop is deferred until resume (follow-up to #32)"]
+fn external_kill_while_a_signal_stop_is_held_is_reported()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("loop_counter"));
+        let pid = d.pid().0;
+        d.resume().expect("resume");
+        signal(pid, "-USR1");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("signal stop"),
+            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+        ));
+        signal(pid, "-9");
+        assert_reaped(pid);
+        assert_eq!(
+            d.wait(Some(TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_eq!(d.state(), SessionState::Exited);
+    });
+}

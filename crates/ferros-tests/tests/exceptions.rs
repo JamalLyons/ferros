@@ -303,3 +303,44 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
         d.remove_breakpoint(id).expect("remove_breakpoint");
     });
 }
+
+/// A process killed from outside while the session holds its breakpoint stop (the
+/// faulting thread waits for the exception reply and the task is suspended) still dies,
+/// and the next `wait` reports it as killed.
+// Known gap, found in the review of the PR for issue #32: a SIGKILL sent from outside
+// while the session holds an exception stop (a thread waits in the kernel for the
+// exception reply and the task is suspended) does not take effect until the debugger
+// resumes, kills, detaches or drops the session. Darwin raises no exception for it and
+// kqueue's NOTE_SIGNAL does not say which signal arrived, so the backend cannot tell it
+// apart. The follow-up issue that fixes it is named in that PR.
+#[test]
+#[ignore = "external SIGKILL during a held breakpoint stop is deferred until resume (follow-up to #32)"]
+fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
+{
+    let _serial = serial();
+    harness::run_with_timeout(Duration::from_secs(60), |t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+        let pid = d.pid().0;
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        d.add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at tick_body");
+        d.resume().expect("resume");
+        expect_breakpoint(&mut d, address, "the breakpoint stop");
+
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .expect("run /bin/kill");
+        assert!(status.success(), "kill -9 {pid} failed: {status}");
+        assert!(
+            harness::wait_until_gone(pid, STOP_TIMEOUT),
+            "pid {pid} survived kill -9 while its breakpoint stop was held"
+        );
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+        assert_eq!(d.state(), SessionState::Exited);
+    });
+}

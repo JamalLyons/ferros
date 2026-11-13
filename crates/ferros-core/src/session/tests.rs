@@ -908,6 +908,20 @@ fn ownership_follows_launch_attach_detach_and_kill()
     assert_eq!(session.ownership(), Some(ProcessOwnership::Attached));
     session.detach().expect("detach");
     assert_eq!(session.ownership(), None);
+
+    // A terminal event ends ownership too, for a launched and an attached process.
+    for attach in [false, true] {
+        mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+        if attach {
+            session.attach(ProcessId(77)).expect("attach");
+        } else {
+            session.launch(&spec()).expect("launch");
+        }
+        session.resume().expect("resume");
+        session.wait(None).expect("wait");
+        assert_eq!(session.state(), SessionState::Exited);
+        assert_eq!(session.ownership(), None, "attach = {attach}");
+    }
 }
 
 #[test]

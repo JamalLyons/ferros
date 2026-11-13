@@ -376,6 +376,7 @@ impl Session
     fn clear_process(&mut self)
     {
         self.pid = None;
+        self.ownership = None;
         self.threads.clear();
         self.selected = None;
         self.deferred = None;

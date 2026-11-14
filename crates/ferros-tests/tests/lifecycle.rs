@@ -535,6 +535,17 @@ fn process_state(pid: u32) -> String
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+/// Removes captured output even if spawning or PID discovery panics.
+struct ReleaseOutput(std::path::PathBuf);
+
+impl Drop for ReleaseOutput
+{
+    fn drop(&mut self)
+    {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// A fixture started through `/bin/sh`, so its parent is the shell and not this test
 /// process: attaching reparents it to the debugger and detaching hands it back, as for a
 /// process started from a terminal. The shell waits for it, so the shell exits when the
@@ -543,7 +554,7 @@ struct Grandchild
 {
     shell: std::process::Child,
     pid: u32,
-    output_path: std::path::PathBuf,
+    output_path: ReleaseOutput,
 }
 
 impl Grandchild
@@ -557,6 +568,7 @@ impl Grandchild
             SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos()
         ));
         let output = fs::File::create_new(&output_path).expect("create release output");
+        let output_path = ReleaseOutput(output_path);
         let shell = Command::new("/bin/sh")
             .arg("-c")
             // Not just `"$@"`: the shell would exec the fixture instead of waiting for it.
@@ -569,10 +581,17 @@ impl Grandchild
             .stderr(output)
             .spawn()
             .expect("spawn /bin/sh");
+        // Install cleanup before PID discovery can fail. Zero means undiscovered;
+        // Drop then finds children by this shell's PID rather than signalling PID 0.
+        let mut target = Self {
+            shell,
+            pid: 0,
+            output_path,
+        };
         let deadline = Instant::now() + TIMEOUT;
         let pid = loop {
             let output = Command::new("/usr/bin/pgrep")
-                .args(["-P", &shell.id().to_string()])
+                .args(["-P", &target.shell.id().to_string()])
                 .output()
                 .expect("pgrep");
             if let Some(pid) = String::from_utf8_lossy(&output.stdout)
@@ -584,7 +603,8 @@ impl Grandchild
             assert!(Instant::now() < deadline, "the shell did not start the fixture");
             std::thread::sleep(Duration::from_millis(10));
         };
-        Self { shell, pid, output_path }
+        target.pid = pid;
+        target
     }
 
     /// Capture both processes before Drop kills them. A live fixture with `T` or
@@ -599,9 +619,10 @@ impl Grandchild
         let mut snapshot = format!("ps status={}:\n{}", ps.status, String::from_utf8_lossy(&ps.stdout));
         write!(
             snapshot,
-            "\nMach (task suspend count, thread suspend counts): {:?}\nfixture output: {}",
+            "\nMach snapshot: {:?}\nexception ports: {:?}\nfixture output: {}",
             diagnostics::process_suspend_counts(ProcessId::from(self.pid)),
-            fs::read_to_string(&self.output_path).unwrap_or_else(|error| error.to_string()),
+            diagnostics::exception_ports(ProcessId::from(self.pid)),
+            fs::read_to_string(&self.output_path.0).unwrap_or_else(|error| error.to_string()),
         )
         .expect("write diagnostic string");
         snapshot
@@ -613,7 +634,11 @@ impl Grandchild
     {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = self.shell.try_wait().expect("wait for release parent") {
+            if let Some(status) = self
+                .shell
+                .try_wait()
+                .unwrap_or_else(|error| panic!("wait for release parent: {error}; {}", self.diagnostics()))
+            {
                 return Some(status);
             }
             if Instant::now() >= deadline {
@@ -628,10 +653,15 @@ impl Drop for Grandchild
 {
     fn drop(&mut self)
     {
-        let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
+        if self.pid == 0 {
+            let _ = Command::new("/usr/bin/pkill")
+                .args(["-KILL", "-P", &self.shell.id().to_string()])
+                .status();
+        } else {
+            let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
+        }
         let _ = self.shell.kill();
         let _ = self.shell.wait();
-        let _ = fs::remove_file(&self.output_path);
     }
 }
 
@@ -697,7 +727,7 @@ fn released_processes_run_to_completion()
                 _ => unreachable!(),
             }
             let released = Instant::now();
-            eprintln!("{case}: release took {:?}", released.duration_since(started));
+            eprintln!("{case}: attach/release took {:?}", released.duration_since(started));
             // Not left job-control stopped. (`ps` state is reliable here: the target
             // was not launched suspended.) The shell would not show it: it continues a
             // stopped child itself.

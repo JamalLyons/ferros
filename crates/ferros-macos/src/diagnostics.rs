@@ -391,6 +391,24 @@ pub fn single_step_enabled(thread: ferros_core::ThreadId) -> Result<bool>
 #[doc(hidden)]
 pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
 {
+    thread_basic_state(thread).map(|info| info.suspend_count)
+}
+
+/// A thread's basic Mach scheduling state, sampled without suspending it. Tests only.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ThreadBasicState
+{
+    /// Per-thread suspend count, excluding task suspensions.
+    pub suspend_count: i32,
+    /// Mach THREAD_BASIC_INFO run_state.
+    pub run_state: i32,
+    /// Mach THREAD_BASIC_INFO flags.
+    pub flags: i32,
+}
+
+fn thread_basic_state(thread: ferros_core::ThreadId) -> Result<ThreadBasicState>
+{
     // `struct thread_basic_info`: user_time and system_time (two time_value_t pairs),
     // then cpu_usage, policy, run_state, flags, suspend_count and sleep_time.
     const THREAD_BASIC_INFO: libc::natural_t = 3;
@@ -408,7 +426,22 @@ pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
             "thread_info returned {count} words, too few for suspend_count"
         )));
     }
-    Ok(info[SUSPEND_COUNT])
+    Ok(ThreadBasicState {
+        suspend_count: info[SUSPEND_COUNT],
+        run_state: info[6],
+        flags: info[7],
+    })
+}
+
+/// Independent task and per-thread samples; errors preserve other successful samples.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ProcessSuspendCounts
+{
+    /// Task suspend count, including any BSD job-control suspension.
+    pub task: Result<i32>,
+    /// Per-thread samples, or the thread-enumeration error.
+    pub threads: Result<Vec<Result<ThreadBasicState>>>,
 }
 
 /// Snapshot task and per-thread suspend counts without attaching or stopping the
@@ -416,9 +449,10 @@ pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
 /// Counts are sampled separately and can change while the process runs. Tests only.
 ///
 /// # Errors
-/// Returns an error if the process exits, permission is denied, or Mach info fails.
+/// Returns an error if the task port cannot be acquired. Individual sampling errors
+/// are retained in the snapshot.
 #[doc(hidden)]
-pub fn process_suspend_counts(pid: ProcessId) -> Result<(i32, Vec<i32>)>
+pub fn process_suspend_counts(pid: ProcessId) -> Result<ProcessSuspendCounts>
 {
     use mach2::task::task_info;
     use mach2::task_info::{MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info};
@@ -429,27 +463,34 @@ pub fn process_suspend_counts(pid: ProcessId) -> Result<(i32, Vec<i32>)>
     if kr != KERN_SUCCESS {
         return Err(DebuggerError::from(MachError::from(kr)));
     }
-    let result = (|| {
+    let result = {
         let mut info = mach_task_basic_info::default();
         let mut count = MACH_TASK_BASIC_INFO_COUNT;
         // SAFETY: `info` holds MACH_TASK_BASIC_INFO_COUNT words and outlives the call.
         let kr = unsafe { task_info(task, MACH_TASK_BASIC_INFO, (&raw mut info).cast(), &mut count) };
-        if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
-        }
-        let threads = crate::threads::ThreadManager::refresh_thread_list(task, &[])?;
-        let counts: Result<Vec<_>> = threads
-            .iter()
-            .map(|&port| thread_suspend_count(ferros_core::ThreadId::from(u64::from(port))))
-            .collect();
-        for port in threads {
-            // SAFETY: refresh_thread_list returned one owned send right per entry.
-            unsafe {
-                let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+        let task_count = if kr == KERN_SUCCESS {
+            Ok(info.suspend_count)
+        } else {
+            Err(DebuggerError::from(MachError::from(kr)))
+        };
+        let counts = crate::threads::ThreadManager::refresh_thread_list(task, &[]).map(|threads| {
+            let counts = threads
+                .iter()
+                .map(|&port| thread_basic_state(ferros_core::ThreadId::from(u64::from(port))))
+                .collect();
+            for port in threads {
+                // SAFETY: refresh_thread_list returned one owned send right per entry.
+                unsafe {
+                    let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+                }
             }
-        }
-        counts.map(|counts| (info.suspend_count, counts))
-    })();
+            counts
+        });
+        Ok(ProcessSuspendCounts {
+            task: task_count,
+            threads: counts,
+        })
+    };
     // SAFETY: release the task_for_pid send right exactly once, on all paths.
     unsafe {
         let _ = ffi::mach_port_deallocate(mach_task_self(), task);

@@ -1,6 +1,7 @@
 [package]
 name = "ferros"
 version = "0.0.0"
+rust-version.workspace = true
 edition = "2024"
 description = "A Rust-native debugger with hybrid MIR and system-level introspection."
 license = "Apache-2.0"
@@ -19,8 +20,23 @@ ferros-utils = { path = "../ferros-utils" }
 [target.'cfg(target_os = "macos")'.dependencies]
 ferros-macos = { path = "../ferros-macos" }
 
-[lints]
-workspace = true
+# The workspace lints, copied because Cargo cannot inherit `workspace.lints` and
+# override one entry. Keep in sync with the root Cargo.toml. The only difference:
+# `cargo test` wrongly reports the dev-dependency `ctrlc` (used only by
+# examples/test_target.rs) as unused, so `unused_dependencies` is allowed here.
+[lints.rust]
+unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+rust_2024_incompatible_pat = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+nursery = { level = "allow", priority = -1 }
+cargo = { level = "warn", priority = -2 }
+multiple_crate_versions = { level = "allow", priority = -1 }
+
+[lints.cargo]
+unused_dependencies = "allow"
 
 [dev-dependencies]
 ctrlc = "3.4"

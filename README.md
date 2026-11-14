@@ -38,7 +38,7 @@ Ferros aims to be a Rust-aware debugger: ownership, lifetimes, and MIR-level und
 
 Ferros is **early and actively developed**. What is verified today:
 
-- The workspace builds cleanly on nightly Rust (Edition 2024).
+- The workspace targets Rust 1.100.0 (Edition 2024); formatting uses nightly rustfmt.
 - **Process lifecycle & control**: On macOS arm64, launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (verified by `tests/lifecycle.rs` and `tests/smoke.rs`).
 - **Mach exception loop**: Queueing simultaneous stops, exception port rights lifecycle, port restoration on detach, and signal delivery (verified by `tests/exceptions.rs`).
 - **Single-stepping**: Hardware single-step (`MDSCR_EL1.SS`), per-thread single-stepping while other threads remain suspended (verified by `tests/single_step.rs`).
@@ -83,7 +83,7 @@ cargo run -p ferros -- launch --headless <program> [args...]
 
 ### Requirements
 
-- **Rust**: Edition 2024; the nightly toolchain is selected automatically by [`rust-toolchain.toml`](./rust-toolchain.toml)
+- **Rust**: 1.100.0 or newer, Edition 2024; version 1.100.0 is selected automatically by [`rust-toolchain.toml`](./rust-toolchain.toml)
 - **macOS** (Apple Silicon is what CI and development use): the only supported platform today
 - **Linux / Windows**: not implemented
 

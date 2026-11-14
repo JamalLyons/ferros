@@ -16,7 +16,7 @@ Ferros is a Rust-native debugger built as a workspace of multiple crates. Each c
 ## Code Style & Formatting
 
 ### Formatting Rules
-- Always run `cargo fmt --all` before committing
+- Always run `just fmt` (`cargo +nightly fmt --all`) before committing
 - Follow the project's `rustfmt.toml`
 
 ### Linting Rules
@@ -234,7 +234,7 @@ refactor(mir): simplify MIR block traversal
 ## Build & Development Workflow
 
 ### Before Committing
-1. Run `cargo fmt --all`
+1. Run `just fmt` (`cargo +nightly fmt --all`)
 2. Run `cargo clippy --all -- -D warnings`
 3. Run `cargo test --workspace --all-features`
 4. Run `cargo doc --workspace --no-deps` to check documentation
@@ -245,13 +245,13 @@ refactor(mir): simplify MIR block traversal
 - `cargo test` - Run all tests
 - `cargo test -p <crate>` - Run tests for specific crate
 - `cargo clippy` - Run linter
-- `cargo fmt` - Format code
+- `just fmt` - Format code (nightly rustfmt)
 - `cargo doc --open` - Build and open documentation
 
 ## Code Review Checklist
 
 When reviewing code, check for:
-- ✅ Follows formatting rules (`cargo fmt`)
+- ✅ Follows formatting rules (`just fmt-check`)
 - ✅ Passes clippy (`cargo clippy`)
 - ✅ All tests pass
 - ✅ Public APIs are documented

@@ -4,7 +4,7 @@
 Ferros is a Rust debugger designed for macOS arm64. The repository is organized as a Cargo workspace with the following crate layout: `crates/ferros` provides the command-line interface; `crates/ferros-core` implements the portable debugging engine and holds no OS-specific code; `crates/ferros-macos` implements it for macOS with Mach process control primitives; `crates/ferros-tests` contains fixture binaries and integration test harnesses; `crates/ferros-utils` provides shared utilities; `crates/ferros-mir` and `crates/ferros-protocol` are workspace members reserved for future compiler IR and protocol support (currently empty); and `crates/ferros-ui` is parked and excluded from the workspace.
 
 ## Toolchain
-The project uses the nightly Rust toolchain pinned by `rust-toolchain.toml` with the `rustfmt` and `clippy` components. The task runner for development and CI tasks is `just`.
+The project builds and tests with Rust/Cargo 1.100.0, pinned by `rust-toolchain.toml`, with the `clippy` component. Formatting uses `cargo +nightly fmt` for the unstable options in `rustfmt.toml`. The task runner for development and CI tasks is `just`.
 
 ## Build
 Compile all workspace crates:

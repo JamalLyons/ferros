@@ -4,15 +4,15 @@
 //! reporting.
 #![cfg(target_os = "macos")]
 
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ferros_core::symbols::ImageDescriptor;
-use ferros_core::{Address, BreakpointRequest, Session, SessionState, StopEvent, SymbolCache, ThreadId};
+use ferros_core::{Address, BreakpointRequest, ResumeRequest, Session, SessionState, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
+use ferros_tests::control::ControlDir;
+use ferros_tests::fixture;
 use ferros_tests::harness::{self, Debuggee};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::symbols::marker_address;
 
 /// How long a test waits for a stop after resuming or interrupting.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,62 +27,6 @@ fn serial() -> MutexGuard<'static, ()>
 {
     static SERIAL: Mutex<()> = Mutex::new(());
     SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Address of the first instruction of the line marked `marker` in `fixture`'s source.
-///
-/// The session has no `file:line` breakpoints, so this symbolicates (with the fixture's
-/// dSYM) every instruction of the main executable's text region and picks the lowest address attributed to that
-/// line (by any frame, so a call site of an inlined function counts). The offset from
-/// the image's load address is cached, because later launches only differ by the slide.
-fn marker_address(d: &mut Debuggee, fixture: &Fixture, marker: &str) -> Address
-{
-    static OFFSETS: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
-
-    let images = d.images().expect("images");
-    let main = images
-        .iter()
-        .find(|image| image.path == fixture.path())
-        .expect("the main executable image");
-    let load_address = main.load_address.value();
-    let key = (fixture.name().to_owned(), marker.to_owned());
-    let offsets = OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(offset) = offsets.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-        return Address::from(load_address + offset);
-    }
-
-    let line = fixture.marker_line(marker);
-    let source_name = format!("{}.rs", fixture.name());
-    let regions = d.memory_regions().expect("memory_regions");
-    let text = regions
-        .iter()
-        .find(|region| region.contains(main.load_address) && region.is_executable())
-        .unwrap_or_else(|| panic!("no executable region holds the image at {}", main.load_address));
-    // The executable supplies the runtime layout; its matching dSYM is discovered.
-    let mut symbols = SymbolCache::new();
-    symbols
-        .load_image(ImageDescriptor {
-            path: fixture.path().to_path_buf(),
-            load_address,
-        })
-        .unwrap_or_else(|err| panic!("load the fixture's symbols: {err}"));
-
-    let found = (text.start.value()..text.end.value()).step_by(4).find(|&address| {
-        symbols.symbolicate(Address::from(address)).is_some_and(|symbolication| {
-            symbolication.frames.iter().any(|frame| {
-                frame
-                    .location
-                    .as_ref()
-                    .is_some_and(|location| location.line == Some(line) && location.file.ends_with(&source_name))
-            })
-        })
-    });
-    let address = found.unwrap_or_else(|| panic!("no instruction for {source_name}:{line} (marker {marker})"));
-    offsets
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, address - load_address);
-    Address::from(address)
 }
 
 /// Wait for the next stop and require a breakpoint stop at `address`; returns its thread.
@@ -408,59 +352,66 @@ fn ordinary_signals_do_not_release_a_breakpoint_stop()
     });
 }
 
-/// Exercise stepping while another thread's breakpoint exception remains held. The
-/// simultaneous stop is a scheduling race, so retry rather than pretend it is guaranteed.
+/// Hold one worker's exception while admitting the second through its own gate.
+/// The first worker's retained right must survive every step-over of the second.
 #[test]
 fn kept_exception_rights_do_not_grow_during_steps()
 {
     let _serial = serial();
-    harness::run_with_timeout(Duration::from_secs(120), |t| {
-        let fixture = fixture!("threads");
-        for _ in 0..SIMULTANEOUS_TRIALS {
-            let mut d = t.launch(&fixture);
-            let address = marker_address(&mut d, &fixture, "worker_body");
-            d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
-            d.resume().expect("resume");
-            let first = expect_breakpoint(&mut d, address, "first worker");
-            let second = d.wait(Some(Duration::ZERO)).expect("drain");
-            if !matches!(second, Some(StopEvent::Breakpoint { thread, pc }) if thread != first && pc == address) {
-                continue;
-            }
-            let registers = d.session_mut().read_registers_for(first).expect("breakpoint registers");
-            assert_eq!(registers.pc, address);
-            let measure = || {
-                (
-                    diagnostics::port_name_count().expect("names"),
-                    diagnostics::send_right_references().expect("references"),
-                )
-            };
-            d.step_instruction(first).expect("warmup step");
+    harness::run(|t| {
+        let control = ControlDir::new();
+        let fixture = fixture!("step_races");
+        let mut d = t.launch_with_args(&fixture, &[control.path().to_str().expect("control path")]);
+        let address = marker_address(&mut d, &fixture, "step_site");
+        d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+        control.release("run-0");
+        d.resume().expect("run first worker");
+        let held = expect_breakpoint(&mut d, address, "first worker");
+        assert_eq!(d.wait(Some(Duration::ZERO)).expect("drain"), None);
+        control.release("run-1");
+        d.session_mut()
+            .backend_mut()
+            .resume(&ResumeRequest::continue_all().with_thread(held, ThreadAction::Suspend))
+            .expect("retain first worker and run second");
+        let stepped = expect_breakpoint(&mut d, address, "second worker");
+        assert_ne!(held, stepped);
+        let held_refs = diagnostics::send_right_count(u32::try_from(held.raw()).expect("port")).expect("held refs");
+        assert!(held_refs >= 2, "no exception right retained for first worker: {held_refs}");
+        let registers = d.session_mut().read_registers_for(stepped).expect("registers");
+        let measure = || {
+            (
+                diagnostics::port_name_count().expect("names"),
+                diagnostics::send_right_references().expect("references"),
+            )
+        };
+        d.step_instruction(stepped).expect("warmup step");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("step"),
+            Some(StopEvent::SingleStep { thread: stepped })
+        );
+        let (names, refs) = measure();
+        for _ in 0..12 {
+            d.session_mut().write_registers_for(stepped, &registers).expect("rewind");
+            d.step_instruction(stepped).expect("step with retained exception");
             assert_eq!(
                 d.wait(Some(STOP_TIMEOUT)).expect("step"),
-                Some(StopEvent::SingleStep { thread: first })
+                Some(StopEvent::SingleStep { thread: stepped })
             );
-            let (names, refs) = measure();
-            for _ in 0..12 {
-                // Revisit the trapped instruction to exercise repeated step-overs.
-                d.session_mut().write_registers_for(first, &registers).expect("rewind");
-                d.step_instruction(first).expect("step with other exception kept");
-                assert_eq!(
-                    d.wait(Some(STOP_TIMEOUT)).expect("step"),
-                    Some(StopEvent::SingleStep { thread: first })
-                );
-            }
-            let (after_names, after_refs) = measure();
-            assert!(
-                after_names as u64 <= names as u64 + PORT_TOLERANCE,
-                "port names grew: {names} -> {after_names}"
+            assert_eq!(
+                diagnostics::send_right_count(u32::try_from(held.raw()).expect("port")).expect("held refs"),
+                held_refs,
+                "first worker's retained exception right changed"
             );
-            assert!(
-                after_refs <= refs + PORT_TOLERANCE,
-                "send rights grew: {refs} -> {after_refs}"
-            );
-            return;
         }
-        panic!("no simultaneous breakpoint stops in {SIMULTANEOUS_TRIALS} trials");
+        let (after_names, after_refs) = measure();
+        assert!(
+            after_names as u64 <= names as u64 + PORT_TOLERANCE,
+            "port names grew: {names} -> {after_names}"
+        );
+        assert!(
+            after_refs <= refs + PORT_TOLERANCE,
+            "send rights grew: {refs} -> {after_refs}"
+        );
     });
 }
 

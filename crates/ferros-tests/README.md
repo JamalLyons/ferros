@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines ten fixture binaries:
+The crate defines eleven fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -20,6 +20,11 @@ The crate defines ten fixture binaries:
   files in a test-owned directory (macOS).
 - `ferros-fixture-thread_signals`: Two workers raise thread-directed SIGUSR1 independently and report
   which worker handlers ran, for selective delivery and retained-stop races (macOS).
+- `ferros-fixture-step_races`: Two workers wait behind independent file gates before
+  entering `step_site` (marker `step_site`). Each can raise its own SIGUSR1 afterwards.
+  A fixture-side observer publishes the handler bitset on request; an exit gate releases
+  both workers. Used to retain one exception while admitting the other worker, to observe
+  carried-signal delivery, and to keep attached workers alive throughout teardown checks.
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).
@@ -162,14 +167,61 @@ permission to wait. The real failed Mach-send cleanup is tested with isolated po
   its exit watcher (#57): errors remain observable after death and across repeated
   waits, and kill teardown releases backend resources and clears Session ownership.
 
-Stepping race coverage: `single_step.rs` races a real interrupt against a requested
-instruction step and accepts either reported winner; scheduling does not guarantee that
-both orderings occur. A separate bounded test requires a pending signal to beat a real
-step, then checks that continuing produces no stray stop. The session
-unit tests script an interrupt before internal step completion and separately force the
-interrupt-policy flag when completion wins. They also script a simultaneous late
-`SingleStep` after another event and verify it is discarded before continuing; that
-precise simultaneous ordering remains mock-only. `new_threads_can_run_after_suspend_snapshot`
+Stepping race coverage (#71) uses controlled native orderings, with real macOS process
+control and real kernel exception messages:
+
+- `exceptions::kept_exception_rights_do_not_grow_during_steps` opens the first worker's
+  gate, retains its breakpoint record with `Suspend`, then opens the second worker's
+  gate. It checks that the first worker keeps an extra send-right reference during
+  repeated step-overs of the second, while total names and send references stay stable.
+  It never needs simultaneous traps or another launch.
+- `single_step::breakpoint_cancels_a_real_step_without_a_stray_step_stop` steps a planted
+  `brk`: the synchronous breakpoint precedes instruction completion. Immediately after
+  `wait`, before any resume, MDSCR_EL1.SS is clear and every per-thread suspend count is
+  zero. A plain continue produces no stray step. This replaces the former SIGUSR1 trial
+  loop: sending a signal while stopped cannot force it to reach the stepping thread
+  before that thread completes an instruction. Signal cancellation with that exact
+  ordering is not claimed; signal retention/delivery is covered natively below.
+- `single_step::interrupt_precedes_a_real_instruction_step` pauses publication of a real
+  step exception, queues an interrupt first, and requires `Interrupted`. It checks the
+  same immediate cleanup, then releases and observes the late real completion below
+  Session before continuing without a stray step.
+- `single_step::late_real_internal_step_is_dropped_after_abandonment` pauses publication
+  of the internal step-over's real completion until the one-second Session drive times
+  out. An interrupt abandons the plan; after release, publication is acknowledged and
+  Session must silently consume the late `SingleStep`, without any intervening resume.
+- `single_step::event_batched_with_real_internal_step_is_reported_before_resume` uses a
+  narrowly armed hook: once a real step exception arrives, it queues SIGUSR1 to a peer,
+  temporarily balances that peer's one thread suspension, receives its real signal
+  exception, then restores the suspension. Both kernel events are published together.
+  Session must report the signal, leave the stepping pc at the decoded successor of the
+  marker instruction, and keep every thread stopped. The hook synthesizes no `StopEvent`
+  and is inactive when unarmed.
+- `single_step::retained_signal_survives_abandoned_real_step_over_or_is_explicitly_dropped`
+  retains worker 1's real thread-directed SIGUSR1 while worker 0 is at a breakpoint.
+  Publication of worker 0's internal completion is paused and an interrupt abandons
+  that step-over. The next `resume_with_signal` runs worker 1's handler (bitset 2).
+  Plain `resume` suppresses it (bitset 0), and a subsequent `resume_with_signal` proves
+  the decision was discarded permanently. Both branches acknowledge worker progress
+  before requesting the handler snapshot.
+- `single_step::detach_cleanup_after_starting_step_releases_suspended_threads` directly
+  observes peer suspend counts of one while a real completion is publication-paused,
+  then covers both attached Session drop and explicit interrupt/wait/detach, requiring
+  a successful child exit. `backend_drop_releases_directly_observed_step_suspends`
+  drops an attached backend without calling `wait`, independently testing teardown's
+  cleanup rather than relying on Session's stop delivery. Public `detach` still
+  requires a stopped session.
+
+The four Session mock tests for late abandoned steps, pending events alongside step
+completion, and delivery/drop of carried signals remain as fast, isolated complements;
+these orderings now also have native coverage above. The completion-winning interrupt
+policy branch (`interrupt_requested` with a completed internal step), and scripted
+backend failure paths remain unit-test coverage rather than claims about the native
+scenarios above. The separate, non-stepping
+`simultaneous_breakpoints_on_two_threads_are_both_reported` test still uses bounded
+launch attempts; it is not used as setup or evidence for the retained-rights test.
+
+`new_threads_can_run_after_suspend_snapshot`
 is the original regression for that snapshot: a thread created after resume now stays
 stopped until a later continue, including across a single-step of its pthread entry.
 Other threads stay suspended while that entry instruction is restored. A launch that
@@ -181,12 +233,3 @@ and on the executable entry survive the backend's traps there, and `read_memory`
 original instruction under a trap. A step from the launch stop followed by a continue
 holds nothing. With the `workqueue` fixture, a reused workqueue thread told to `Continue`
 runs its second work item instead of being held.
-
-Draining events alongside an internal completion and carrying signals from an abandoned
-step-over also retain deterministic session mock tests. Real kernel scheduling cannot
-guarantee these exact message orderings; the mock tests force each ordering without
-adding production hooks that synthesize kernel events. The real-process tests complement
-these checks with actual interrupts, signal cancellation, and retained breakpoint replies.
-For attached processes, the detach regression starts a step and covers both direct drop
-(which stops and detaches internally) and explicit interrupt/wait/detach; public `detach`
-continues to require a stopped session.

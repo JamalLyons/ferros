@@ -669,3 +669,13 @@ unsafe extern "C" {
     /// `kind` must point to writable storage for one mach_port_type_t.
     pub fn mach_port_type(task: libc::mach_port_t, name: libc::mach_port_t, kind: *mut libc::c_uint) -> libc::kern_return_t;
 }
+
+unsafe extern "C" {
+    /// Read a Mach thread information flavor into a caller-owned integer buffer.
+    pub fn thread_info(
+        thread: thread_act_t,
+        flavor: natural_t,
+        info: *mut c_int,
+        count: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
+}

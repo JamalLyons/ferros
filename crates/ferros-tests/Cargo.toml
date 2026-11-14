@@ -84,3 +84,8 @@ test = false
 name = "ferros-fixture-workqueue"
 path = "fixtures/workqueue.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-step_races"
+path = "fixtures/step_races.rs"
+test = false

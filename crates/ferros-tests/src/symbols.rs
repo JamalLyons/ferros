@@ -1,4 +1,4 @@
-//! Fixture symbol lookup from the Mach-O symbol table (macOS only).
+//! Fixture function lookup from Mach-O symbols and source-marker lookup from DWARF.
 //!
 //! The engine has no `function` breakpoints yet, and resolving a source marker needs the
 //! fixture's DWARF. A function's entry address only needs the executable's symbol table,
@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use ferros_core::{Address, Session};
+use ferros_core::symbols::ImageDescriptor;
+use ferros_core::{Address, Session, SymbolCache};
 use object::{Object, ObjectSymbol, SymbolKind};
 
 use crate::Fixture;
@@ -91,4 +92,64 @@ fn symbol_address(fixture: &Fixture, name: &str) -> u64
         );
     };
     *address
+}
+
+/// Address of the first instruction of the line marked `marker` in `fixture`'s source.
+///
+/// The session has no `file:line` breakpoints, so this symbolicates (with the fixture's
+/// dSYM) every instruction of the main executable's text region and picks the lowest address attributed to that
+/// line (by any frame, so a call site of an inlined function counts). The offset from
+/// the image's load address is cached, because later launches only differ by the slide.
+///
+/// # Panics
+/// Panics if the marker, image, executable region or matching DWARF instruction is
+/// missing, or if the session cannot read image or memory-region information.
+pub fn marker_address(d: &mut Session, fixture: &Fixture, marker: &str) -> Address
+{
+    static OFFSETS: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+
+    let images = d.images().expect("images");
+    let main = images
+        .iter()
+        .find(|image| image.path == fixture.path())
+        .expect("the main executable image");
+    let load_address = main.load_address.value();
+    let key = (fixture.name().to_owned(), marker.to_owned());
+    let offsets = OFFSETS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(offset) = offsets.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+        return Address::from(load_address + offset);
+    }
+
+    let line = fixture.marker_line(marker);
+    let source_name = format!("{}.rs", fixture.name());
+    let regions = d.memory_regions().expect("memory_regions");
+    let text = regions
+        .iter()
+        .find(|region| region.contains(main.load_address) && region.is_executable())
+        .unwrap_or_else(|| panic!("no executable region holds the image at {}", main.load_address));
+    // The executable supplies the runtime layout; its matching dSYM is discovered.
+    let mut symbols = SymbolCache::new();
+    symbols
+        .load_image(ImageDescriptor {
+            path: fixture.path().to_path_buf(),
+            load_address,
+        })
+        .unwrap_or_else(|err| panic!("load the fixture's symbols: {err}"));
+
+    let found = (text.start.value()..text.end.value()).step_by(4).find(|&address| {
+        symbols.symbolicate(Address::from(address)).is_some_and(|symbolication| {
+            symbolication.frames.iter().any(|frame| {
+                frame
+                    .location
+                    .as_ref()
+                    .is_some_and(|location| location.line == Some(line) && location.file.ends_with(&source_name))
+            })
+        })
+    });
+    let address = found.unwrap_or_else(|| panic!("no instruction for {source_name}:{line} (marker {marker})"));
+    offsets
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, address - load_address);
+    Address::from(address)
 }

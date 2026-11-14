@@ -242,14 +242,15 @@ pub trait Backend: Send
     /// execute application code until a later resume allows it to run. The backend holds
     /// it at the first instruction of `libsystem_pthread`'s `_thread_start` or
     /// `_start_wqthread` and that instruction runs when the thread is next allowed to.
-    /// Until dyld publishes that library the entries are not mapped, so the resume
-    /// installs no traps; a thread created in that same resume is outside this
-    /// guarantee. Once the library is published, a failure to install the traps fails
-    /// the resume and leaves the target stopped. While a held thread executes that
-    /// restored instruction, every other thread stays suspended. A breakpoint at
-    /// either instruction is held as a new thread and is not reported separately.
-    /// `ThreadAction::Step` as the default action, and a thread created at any other
-    /// address, are outside this guarantee.
+    /// If dyld has not published that library yet, the resume breakpoints the
+    /// executable entry and arms the pthread entries there, before that
+    /// instruction runs. A failure to install either trap fails a resume that
+    /// would otherwise let a thread continue. While a held thread executes the
+    /// restored entry, every other thread stays suspended, including when that
+    /// thread is single-stepped. A software breakpoint at either pthread
+    /// instruction is reported, and the newborn stays suspended.
+    /// `ThreadAction::Step` as the default action, and a thread created at any
+    /// other address, are outside this guarantee.
     ///
     /// # Preconditions
     ///

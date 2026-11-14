@@ -37,12 +37,12 @@
 //!   others run. When that is the default and some thread runs, a thread created during
 //!   the resume is held at `_thread_start` or `_start_wqthread` in `libsystem_pthread`
 //!   until a later resume lets it execute that first instruction. Continuing every
-//!   thread removes those traps. Before dyld publishes the library the resume installs
-//!   no traps, because those entries are not mapped yet, and a thread created in that
-//!   same resume is outside the guarantee. Once the library is published, failure to
-//!   install the traps fails the resume. While a held thread executes the restored
-//!   entry, every other thread stays suspended. A breakpoint on that instruction is
-//!   held as a newborn and is not reported to the client.
+//!   thread removes those traps. Before dyld publishes the library the resume
+//!   breakpoints the executable entry and arms the pthread entries there, before
+//!   that instruction runs. Failing to install a required trap fails the resume.
+//!   While a held thread executes the restored entry, every other thread stays
+//!   suspended. A software breakpoint on a pthread entry is reported, and the
+//!   newborn stays suspended.
 //!   A suspended thread's stop record and any held Unix signal reply remain until a later
 //!   resume lets it run; hardware exception replies are sent while the task is stopped. The next stop `wait` delivers ends that resume: the per-thread
 //!   suspends are balanced and every single-step bit is cleared, so a step that did not
@@ -67,8 +67,8 @@
 //!
 //! ## Known gaps
 //!
-//! - New-thread suspension covers arm64 `libsystem_pthread` entries only, and only after
-//!   dyld has published that image. `images` walks the full dyld list.
+//! - New-thread suspension covers arm64 `libsystem_pthread` entries only. Before
+//!   that image is published, the executable entry arms them once dyld has mapped it.
 //!
 //! This is the only crate in the workspace that talks to an operating-system API
 //! and the only one allowed to use `unsafe` (for raw Mach FFI); `ferros-core` holds

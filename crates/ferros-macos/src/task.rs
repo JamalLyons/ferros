@@ -45,12 +45,14 @@
 //! during that resume is held at the first instruction of `libsystem_pthread`'s
 //! `_thread_start` or `_start_wqthread` until a later resume lets it execute that
 //! instruction. Continuing every thread removes those traps first. If dyld has not
-//! published the library yet, the resume installs no traps, and a thread created in
-//! that same resume is outside the guarantee. Once the library is published, failing
-//! to install the traps fails the resume. While a held thread executes the restored
-//! entry instruction, every other thread stays suspended. A breakpoint on that
-//! instruction is held as a newborn and is not reported. `ThreadAction::Step` as
-//! the default, and any thread started at another address, are outside this guarantee.
+//! published the library yet, the resume breakpoints the executable entry and
+//! arms the pthread entries there, before that instruction runs. Failing to
+//! install a required trap fails the resume. While a held thread executes the
+//! restored entry instruction, every other thread stays suspended, including
+//! across a requested single-step of that thread. A software breakpoint on a
+//! pthread entry is reported and the newborn stays suspended. `ThreadAction::Step`
+//! as the default, and any thread started at another address, are outside this
+//! guarantee.
 //!
 //! ## Exception ports
 //!
@@ -838,20 +840,57 @@ impl MacOSBackend
                 tracing::debug!("clearing a birth step-off bit of thread {port} failed: {err}");
             }
         }
-        self.thaw_birth_freeze();
+        if let Err(err) = self.thaw_birth_freeze() {
+            tracing::error!("{err}");
+        }
     }
 
     /// Balance `thread_suspend`s taken so other threads cannot pass a disarmed birth site.
-    fn thaw_birth_freeze(&mut self)
+    ///
+    /// A thread that is already dead is dropped. Any other failure puts the port back
+    /// so a later thaw can retry it.
+    fn thaw_birth_freeze(&mut self) -> std::result::Result<(), String>
     {
-        for port in lock_shared(&self.exception_state).birth.take_frozen() {
+        let ports = lock_shared(&self.exception_state).birth.take_frozen();
+        let mut resumed = Vec::new();
+        let mut failed = Vec::new();
+        for port in ports {
             // SAFETY: `port` was suspended by `prepare_birth_step_off` and is a thread
-            // right this backend holds. Failure means the thread or task is already gone.
+            // right this backend holds.
             let kr = unsafe { ffi::thread_resume(port) };
-            if kr != KERN_SUCCESS {
-                tracing::debug!("thread_resume of a birth step-off freeze {port} failed: {kr}");
+            if kr == mach2::kern_return::KERN_SUCCESS
+                || kr == mach2::kern_return::KERN_INVALID_NAME
+                || kr == mach2::kern_return::KERN_TERMINATED
+            {
+                resumed.push(port);
+            } else {
+                failed.push(port);
             }
         }
+        let owned = lock_shared(&self.exception_state).birth.take_owned(&resumed);
+        for port in owned {
+            // SAFETY: this drops the extra send right taken when the exception loop
+            // froze the thread. A dead name has already lost that right.
+            unsafe {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        let mut shared = lock_shared(&self.exception_state);
+        for port in failed {
+            shared.birth.freeze(port);
+        }
+        Err("thread_resume of a birth step-off freeze failed".into())
+    }
+
+    /// A continue can map `libsystem_pthread` in this resume. A step cannot.
+    fn birth_cover_required(&self, request: &ResumeRequest) -> bool
+    {
+        self.threads
+            .iter()
+            .any(|port| request.action_for(ThreadId::from(u64::from(*port))) == ThreadAction::Continue)
     }
 
     /// Arm or remove new-thread traps to match `request`, before any thread runs.
@@ -875,7 +914,10 @@ impl MacOSBackend
         }
         {
             let mut shared = lock_shared(&self.exception_state);
-            match shared.birth.arm(self.task, self.pid) {
+            match shared
+                .birth
+                .arm(self.task, self.pid, &self.threads, self.birth_cover_required(request))
+            {
                 Ok(()) => {}
                 Err(crate::birth::BirthInstallError::Unsupported(message)) => {
                     return Err(BackendError::Unsupported(message));
@@ -888,21 +930,30 @@ impl MacOSBackend
         // A previous step-off may have kept peers frozen after a failed restore.
         // The trap is armed again now (or there is nothing to protect), so those
         // suspends must not outlive this resume.
-        self.thaw_birth_freeze();
+        self.thaw_birth_freeze()
+            .map_err(|message| BackendError::Os { code: -1, message })?;
         self.memory_cache.clear();
         Ok(())
     }
 
     fn disarm_birth(&mut self) -> BackendResult<()>
     {
-        let result = lock_shared(&self.exception_state)
-            .birth
-            .disarm(self.task)
-            .map_err(|message| BackendError::Os { code: -1, message });
+        let threads = self.threads.clone();
+        let result = {
+            let mut shared = lock_shared(&self.exception_state);
+            shared.birth.clear_notifier_hardware(&threads);
+            shared
+                .birth
+                .disarm(self.task)
+                .map_err(|message| BackendError::Os { code: -1, message })
+        };
         if result.is_ok() {
             // Original instructions are back, so a freeze from a step-off no longer
             // protects an open entry.
-            self.thaw_birth_freeze();
+            if let Err(err) = self.thaw_birth_freeze() {
+                self.memory_cache.clear();
+                return Err(BackendError::Os { code: -1, message: err });
+            }
         }
         self.memory_cache.clear();
         result
@@ -1445,6 +1496,14 @@ impl MacOSBackend
         self.memory_cache.invalidate_range(address, data.len());
         result
     }
+
+    /// Keep an engine breakpoint on a birth trap without replacing the saved instruction.
+    fn birth_engine_write(&mut self, address: Address, data: &[u8]) -> Option<[u8; 4]>
+    {
+        let word: [u8; 4] = data.try_into().ok()?;
+        let mut shared = lock_shared(&self.exception_state);
+        shared.birth.note_engine_write(address.value(), &word)
+    }
 }
 
 impl Backend for MacOSBackend
@@ -1908,6 +1967,9 @@ impl Backend for MacOSBackend
     fn write_memory(&mut self, address: Address, data: &[u8]) -> BackendResult<()>
     {
         self.require_stopped("write_memory")?;
+        if let Some(word) = self.birth_engine_write(address, data) {
+            return self.write_target_memory(address, &word).map_err(backend_error);
+        }
         self.write_target_memory(address, data).map_err(backend_error)
     }
 

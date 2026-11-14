@@ -798,6 +798,146 @@ fn second_thread_created_during_birth_step_off_stays_at_the_trap()
     });
 }
 
+/// A resume that starts before dyld has published pthread still holds the new thread.
+#[test]
+fn thread_created_before_pthread_is_published_stays_at_the_trap()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let images = backend(&mut d).images().expect("images");
+        assert!(
+            images
+                .iter()
+                .all(|image| image.path.file_name().is_none_or(|name| name != "libsystem_pthread.dylib")),
+            "pthread was already published at the launch stop: {images:?}"
+        );
+        let main = backend(&mut d).threads().expect("threads")[0];
+        backend(&mut d)
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(main, ThreadAction::Continue))
+            .expect("resume from the entry stop");
+        assert!(
+            !d.wait_for_stdout("new worker ran", BIRTH_QUIET),
+            "a thread ran before pthread's entry was trapped, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "dyld's image notifier was delivered to the client"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        let newborn = backend(&mut d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| *id != main)
+            .expect("dyld ran without creating a thread");
+        let pc = pc_of(&mut d, newborn);
+        assert_eq!(instruction_at(&mut d, pc), BRK, "new thread is not held on a trap at {pc}");
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert!(
+            d.wait_for_stdout("workers finished", STOP_TIMEOUT),
+            "the held thread never finished, stdout: {}",
+            d.stdout()
+        );
+    });
+}
+
+/// An engine breakpoint on the pthread entry is reported, and the newborn does not run.
+#[test]
+fn breakpoint_on_pthread_entry_is_reported()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (creator, _suspended, newborn) = hold_new_thread(&mut d, &fixture);
+        let pc = pc_of(&mut d, newborn);
+        backend(&mut d)
+            .write_memory(pc, &TRAP)
+            .expect("mark the entry as an engine breakpoint");
+        backend(&mut d)
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+            .expect("resume creator");
+        let event = backend(&mut d)
+            .wait(Some(STOP_TIMEOUT))
+            .expect("wait")
+            .expect("the entry breakpoint");
+        assert!(
+            matches!(event, StopEvent::Breakpoint { pc: hit, .. } if hit == pc),
+            "expected a breakpoint at {pc}, got {event:?}"
+        );
+        assert!(
+            !d.stdout().contains("second worker ran"),
+            "the breakpoint thread ran: {}",
+            d.stdout()
+        );
+    });
+}
+
+/// A requested step of the held entry keeps the creator from starting another thread.
+#[test]
+fn user_step_of_birth_entry_keeps_the_creator_stopped()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (creator, _suspended, newborn) = stop_before_second_spawn(&mut d, &fixture);
+        let creator_pc = pc_of(&mut d, creator);
+        backend(&mut d)
+            .resume(
+                &ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(creator, ThreadAction::Continue)
+                    .with_thread(newborn, ThreadAction::Step),
+            )
+            .expect("step the newborn and continue the creator");
+        let event = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait").expect("step stop");
+        assert_eq!(event, StopEvent::SingleStep { thread: newborn });
+        assert!(
+            !d.stdout().contains("second worker ran"),
+            "creator ran during the step: {}",
+            d.stdout()
+        );
+        assert_eq!(pc_of(&mut d, creator), creator_pc, "the creator moved during the step");
+    });
+}
+
+/// A failed suspend of the newborn leaves it stopped and does not run its body.
+#[test]
+fn failed_birth_suspend_does_not_let_the_new_thread_run()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], debugger);
+        let (creator, _suspended) = stop_before_second_thread(&mut d, &fixture);
+        faults.fail_next_birth_suspend();
+        backend(&mut d)
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+            .expect("resume creator");
+        assert!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).is_err(),
+            "the failed thread_suspend was not reported"
+        );
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        assert!(!d.stdout().contains("new worker ran"), "the newborn ran: {}", d.stdout());
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert!(
+            d.wait_for_stdout("workers finished", STOP_TIMEOUT),
+            "the process stayed stuck after the failed suspend, stdout: {}",
+            d.stdout()
+        );
+    });
+}
+
 /// A resume that fails after the birth traps are installed leaves the target stopped and runnable.
 #[test]
 fn failed_birth_resume_can_still_continue()
@@ -883,6 +1023,59 @@ fn detach_releases_a_held_new_thread_and_the_process_finishes()
             assert!(
                 Instant::now() < deadline,
                 "detached process did not finish: {}",
+                process_state(pid.0)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+}
+
+/// Dropping an attached session while a newborn is held detaches and lets it finish.
+#[test]
+fn drop_releases_a_held_new_thread_and_the_process_finishes()
+{
+    harness::run_with_timeout(Duration::from_secs(30), |t| {
+        let fixture = fixture!("spawn_thread");
+        let mut target = t.spawn(&fixture, &["pause=4000"]);
+        let pid = target.pid();
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            match session.attach(pid) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(err) => panic!("attach failed: {err}"),
+            }
+        }
+        let address = function_address(&mut session, &fixture, "spawn_later");
+        let original = {
+            let bytes = session.read_memory(address, TRAP.len()).expect("read");
+            session.write_memory(address, &TRAP).expect("trap");
+            bytes
+        };
+        session.resume().expect("run to spawn_later");
+        let creator = match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
+            Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+            other => panic!("expected the spawn_later breakpoint, got {other:?}"),
+        };
+        session.write_memory(address, &original).expect("restore");
+        session
+            .backend_mut()
+            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+            .expect("hold new threads");
+        std::thread::sleep(BIRTH_QUIET);
+        session.backend_mut().interrupt().expect("interrupt the hold");
+        assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
+        drop(session);
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            if let Some(status) = target.try_wait().expect("status") {
+                assert!(status.success(), "dropped session left a failing process: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dropped session did not let the process finish: {}",
                 process_state(pid.0)
             );
             std::thread::sleep(Duration::from_millis(20));

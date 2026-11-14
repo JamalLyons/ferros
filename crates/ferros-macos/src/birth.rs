@@ -11,16 +11,17 @@
 //! first and does not single-step.
 //!
 //! Addresses come from the loaded image's own slice (UUID, CPU type, and CPU subtype).
-//! Before dyld has published `libsystem_pthread`, those entries are not mapped, so the
-//! resume installs no traps. A thread created in that same resume is outside the
-//! guarantee. Once the image is published, failing to install the traps fails the
-//! resume. A breakpoint at an armed entry is held as a newborn and is not reported
-//! to the client.
+//! Before dyld has published `libsystem_pthread`, the resume breakpoints the
+//! executable entry and arms those pthread entries when that entry is reached,
+//! before the original instruction runs. A one-instruction step may resume when
+//! the entry cannot be located yet. Once the image is published, failing to
+//! install the traps fails the resume. A software breakpoint at an armed entry
+//! is reported to the client, and that newborn stays suspended.
 
 use std::fs;
 
 use ferros_core::backend::StopEvent;
-use ferros_core::types::{Address, ProcessId};
+use ferros_core::types::{Address, Arm64Register, ProcessId, RegisterId};
 use libc::{mach_port_t, thread_act_t};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
@@ -57,6 +58,10 @@ struct BirthSite
     address: u64,
     original: [u8; 4],
     armed: bool,
+    /// The engine planted a software breakpoint on this instruction.
+    client_breakpoint: bool,
+    /// Newborns are held here. The dyld image notifier is not an entry.
+    entry: bool,
 }
 
 /// Traps and holds for threads created while the default action is `Suspend`.
@@ -75,6 +80,12 @@ pub(crate) struct BirthPolicy
     /// Threads suspended so they cannot execute a birth site while its original
     /// instruction is temporarily restored. Released once the trap is armed again.
     frozen: Vec<thread_act_t>,
+    /// Send rights taken for threads frozen from the exception loop, released on thaw.
+    owned: Vec<thread_act_t>,
+    /// Address of the one-shot executable-entry breakpoint.
+    notifier_pc: Option<u64>,
+    /// Debug-register slot kept so an older hardware watch can still be cleared.
+    notifier_slot: Option<u32>,
 }
 
 impl BirthPolicy
@@ -84,14 +95,66 @@ impl BirthPolicy
         self.active
     }
 
-    /// A `brk` at an armed birth site. Hardware single-step uses different codes and
-    /// is never reported as [`StopEvent::Breakpoint`].
+    /// A `brk` at an armed pthread entry that the engine did not also breakpoint.
+    /// Hardware single-step uses different codes and is never reported as
+    /// [`StopEvent::Breakpoint`].
     pub(crate) fn is_birth_breakpoint(&self, event: &StopEvent) -> bool
+    {
+        self.matching_entry(event, false)
+    }
+
+    /// A `brk` at an armed pthread entry where the engine also has a breakpoint.
+    /// The newborn is still held, and the stop is reported.
+    pub(crate) fn is_reported_birth(&self, event: &StopEvent) -> bool
+    {
+        self.matching_entry(event, true)
+    }
+
+    /// Dyld calling `_lldb_image_notifier`. The image list may now contain pthread.
+    pub(crate) fn is_notifier(&self, event: &StopEvent) -> bool
     {
         let StopEvent::Breakpoint { pc, .. } = event else {
             return false;
         };
-        self.active && self.sites.iter().any(|site| site.armed && site.address == pc.value())
+        self.notifier_pc == Some(pc.value())
+    }
+
+    fn matching_entry(&self, event: &StopEvent, client_breakpoint: bool) -> bool
+    {
+        let StopEvent::Breakpoint { pc, .. } = event else {
+            return false;
+        };
+        self.active
+            && self.sites.iter().any(|site| {
+                site.entry && site.armed && site.client_breakpoint == client_breakpoint && site.address == pc.value()
+            })
+    }
+
+    pub(crate) fn armed_addresses(&self) -> Vec<u64>
+    {
+        self.sites
+            .iter()
+            .filter(|site| site.entry && site.armed)
+            .map(|site| site.address)
+            .collect()
+    }
+
+    /// A 4-byte write exactly on an armed trap.
+    ///
+    /// Returns the bytes that must remain in memory (`brk`) when this policy handles
+    /// the write.
+    pub(crate) fn note_engine_write(&mut self, address: u64, bytes: &[u8; 4]) -> Option<[u8; 4]>
+    {
+        let site = self.sites.iter_mut().find(|site| site.armed && site.address == address)?;
+        if *bytes == BRK {
+            site.client_breakpoint = true;
+        } else if *bytes == site.original {
+            site.client_breakpoint = false;
+        } else {
+            site.original = *bytes;
+            site.client_breakpoint = false;
+        }
+        Some(BRK)
     }
 
     pub(crate) fn is_step_off(&self, event: &StopEvent) -> bool
@@ -100,11 +163,6 @@ impl BirthPolicy
             return false;
         };
         self.step_off.iter().any(|port| u64::from(*port) == thread.raw())
-    }
-
-    pub(crate) fn armed_addresses(&self) -> Vec<u64>
-    {
-        self.sites.iter().filter(|site| site.armed).map(|site| site.address).collect()
     }
 
     pub(crate) fn hold(&mut self, thread: thread_act_t)
@@ -150,21 +208,97 @@ impl BirthPolicy
         std::mem::take(&mut self.frozen)
     }
 
-    /// Install traps when they are not already armed. Symbols are resolved once
-    /// the pthread image is published. Before that, pthread entries are not mapped,
-    /// so a suspend resume proceeds with no traps and the policy stays inactive.
-    pub(crate) fn arm(&mut self, task: mach_port_t, pid: ProcessId) -> Result<(), BirthInstallError>
+    pub(crate) fn take_owned(&mut self, resumed: &[thread_act_t]) -> Vec<thread_act_t>
     {
-        if self.sites.is_empty() {
-            self.sites = resolve_sites(task, pid)?;
+        let mut dropped = Vec::new();
+        self.owned.retain(|port| {
+            if resumed.contains(port) {
+                dropped.push(*port);
+                false
+            } else {
+                true
+            }
+        });
+        dropped
+    }
+
+    /// Install traps when they are not already armed.
+    ///
+    /// `require_cover` is set when some thread will `Continue`. A one-instruction
+    /// step may resume before dyld is locatable; a continue may not.
+    pub(crate) fn arm(
+        &mut self,
+        task: mach_port_t,
+        pid: ProcessId,
+        threads: &[thread_act_t],
+        require_cover: bool,
+    ) -> Result<(), BirthInstallError>
+    {
+        let _ = threads;
+        if !self.sites.iter().any(|site| site.entry) {
+            self.sites.extend(resolve_sites(task, pid)?);
         }
-        if self.sites.is_empty() {
-            self.active = false;
+        if self.sites.iter().any(|site| site.entry) {
+            self.clear_notifier_hardware(threads);
+            self.forget_notifier();
+            self.patch_unarmed(task)?;
+            self.active = true;
             return Ok(());
         }
+        if !self.sites.iter().any(|site| !site.entry)
+            && let Some(bridge) = resolve_main_entry(task, pid)?
+        {
+            self.notifier_pc = Some(bridge.address);
+            self.sites.push(bridge);
+        }
+        if self.sites.iter().any(|site| !site.entry) {
+            self.patch_unarmed_bridge(task)?;
+            self.active = true;
+            return Ok(());
+        }
+        if require_cover {
+            return Err(BirthInstallError::Unsupported(
+                "libsystem_pthread is not loaded and the executable entry is unavailable; new threads cannot be suspended"
+                    .into(),
+            ));
+        }
+        self.active = false;
+        Ok(())
+    }
+
+    /// Arm pthread entries if dyld has published them, and drop the notifier.
+    ///
+    /// Returns whether entries are now armed.
+    pub(crate) fn install_entries(
+        &mut self,
+        task: mach_port_t,
+        pid: ProcessId,
+        notifier: thread_act_t,
+    ) -> Result<bool, BirthInstallError>
+    {
+        if !self.sites.iter().any(|site| site.entry) {
+            let mut entries = resolve_sites(task, pid)?;
+            if entries.is_empty()
+                && let Some(load) = pthread_load_in_notification(task, notifier)
+            {
+                entries = resolve_pthread_at(task, load)?;
+            }
+            self.sites.extend(entries);
+        }
+        if !self.sites.iter().any(|site| site.entry) {
+            return Ok(false);
+        }
+        self.retire_notifier(task)?;
+        self.patch_unarmed(task)?;
+        self.active = true;
+        Ok(true)
+    }
+
+    fn patch_unarmed(&mut self, task: mach_port_t) -> Result<(), BirthInstallError>
+    {
         let mut newly_armed: Vec<usize> = Vec::new();
         for index in 0..self.sites.len() {
-            if self.sites[index].armed {
+            if self.sites[index].armed || !self.sites[index].entry {
                 continue;
             }
             if let Err(err) = patch(task, self.sites[index].address, &BRK) {
@@ -180,17 +314,68 @@ impl BirthPolicy
             self.sites[index].armed = true;
             newly_armed.push(index);
         }
-        self.active = true;
         Ok(())
     }
 
-    /// Put every original instruction back. A later suspend resume may arm the same sites.
+    fn retire_notifier(&mut self, task: mach_port_t) -> Result<(), BirthInstallError>
+    {
+        let Some(index) = self.sites.iter().position(|site| !site.entry) else {
+            return Ok(());
+        };
+        if self.sites[index].armed {
+            let address = self.sites[index].address;
+            let original = self.sites[index].original;
+            patch(task, address, &original).map_err(BirthInstallError::Os)?;
+        }
+        self.sites.remove(index);
+        Ok(())
+    }
+
+    fn patch_unarmed_bridge(&mut self, task: mach_port_t) -> Result<(), BirthInstallError>
+    {
+        for index in 0..self.sites.len() {
+            if self.sites[index].entry || self.sites[index].armed {
+                continue;
+            }
+            patch(task, self.sites[index].address, &BRK).map_err(BirthInstallError::Os)?;
+            self.sites[index].armed = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_notifier_hardware(&mut self, threads: &[thread_act_t])
+    {
+        let Some(slot) = self.notifier_slot.take() else {
+            return;
+        };
+        for &thread in threads {
+            if let Err(err) = crate::registers::clear_hardware_breakpoint(thread, slot) {
+                tracing::debug!("clearing the image-notifier breakpoint on {thread} failed: {err}");
+            }
+        }
+        if let Some(site) = self.sites.iter_mut().find(|site| !site.entry) {
+            site.armed = false;
+        }
+    }
+
+    pub(crate) fn bridge_address(&self) -> Option<u64>
+    {
+        self.notifier_pc
+    }
+
+    pub(crate) fn forget_notifier(&mut self)
+    {
+        self.notifier_pc = None;
+        self.sites.retain(|site| site.entry);
+    }
+
+    /// Put every original pthread instruction back. A later suspend resume may arm again.
     pub(crate) fn disarm(&mut self, task: mach_port_t) -> Result<(), String>
     {
         self.active = false;
         let mut failure = None;
         for site in &mut self.sites {
-            if !site.armed {
+            if !site.armed || !site.entry {
                 continue;
             }
             match patch(task, site.address, &site.original) {
@@ -261,6 +446,118 @@ fn patch(task: mach_port_t, address: u64, bytes: &[u8; 4]) -> Result<(), String>
     }
 }
 
+fn pthread_load_in_notification(task: mach_port_t, thread: thread_act_t) -> Option<u64>
+{
+    let registers = crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread).ok()?;
+    let count = registers.get(RegisterId::Arm64(Arm64Register::X(1)))?;
+    let infos = registers.get(RegisterId::Arm64(Arm64Register::X(2)))?;
+    if count == 0 || count > 4096 || infos == 0 {
+        return None;
+    }
+    for index in 0..count {
+        let record = infos.checked_add(index.checked_mul(24)?)?;
+        let bytes = read_target(task, record, 16).ok()?;
+        if bytes.len() < 16 {
+            return None;
+        }
+        let load = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let path = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        if path_ends_with_pthread(task, path) {
+            return Some(load);
+        }
+    }
+    None
+}
+
+fn path_ends_with_pthread(task: mach_port_t, address: u64) -> bool
+{
+    let Ok(bytes) = read_target(task, address, 128) else {
+        return false;
+    };
+    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    bytes[..end].ends_with(b"libsystem_pthread.dylib")
+}
+
+fn resolve_pthread_at(task: mach_port_t, load: u64) -> Result<Vec<BirthSite>, BirthInstallError>
+{
+    let identity = image_identity(task, load).map_err(BirthInstallError::Os)?;
+    if identity.cputype != CPU_TYPE_ARM64 {
+        return Ok(Vec::new());
+    }
+    let file_bytes = fs::read("/usr/lib/system/libsystem_pthread.dylib")
+        .map_err(|err| BirthInstallError::Os(format!("reading libsystem_pthread failed: {err}")))?;
+    let slice = matching_slice(&file_bytes, &identity).map_err(BirthInstallError::Os)?;
+    sites_from_slice(task, slice, load)
+}
+
+fn resolve_main_entry(task: mach_port_t, pid: ProcessId) -> Result<Option<BirthSite>, BirthInstallError>
+{
+    let images = crate::images::loaded_images(task, pid).map_err(|err| {
+        BirthInstallError::Os(format!(
+            "dyld image list is unreadable ({err}); new threads cannot be suspended"
+        ))
+    })?;
+    let Some(image) = images.first() else {
+        return Ok(None);
+    };
+    let load = image.load_address.value();
+    let header = read_target(task, load, 32).map_err(BirthInstallError::Os)?;
+    if header.len() < 32 || u32::from_le_bytes(header[..4].try_into().expect("magic")) != MH_MAGIC_64 {
+        return Ok(None);
+    }
+    let ncmds = u32::from_le_bytes(header[16..20].try_into().expect("ncmds")) as usize;
+    let sizeofcmds = u32::from_le_bytes(header[20..24].try_into().expect("sizeofcmds")) as usize;
+    if sizeofcmds > MAX_COMMANDS {
+        return Err(BirthInstallError::Os(format!(
+            "executable load commands are {sizeofcmds} bytes"
+        )));
+    }
+    let bytes = read_target(task, load, 32 + sizeofcmds).map_err(BirthInstallError::Os)?;
+    let entryoff = main_entryoff(&bytes, ncmds, sizeofcmds).map_err(BirthInstallError::Os)?;
+    let Some(address) = load.checked_add(entryoff) else {
+        return Err(BirthInstallError::Os("executable entry overflows".into()));
+    };
+    let original = read_word(task, address).map_err(BirthInstallError::Os)?;
+    Ok(Some(BirthSite {
+        address,
+        original,
+        armed: false,
+        client_breakpoint: original == BRK,
+        entry: false,
+    }))
+}
+
+const LC_MAIN: u32 = 0x8000_0028;
+
+fn main_entryoff(bytes: &[u8], ncmds: usize, sizeofcmds: usize) -> Result<u64, String>
+{
+    let end = 32 + sizeofcmds;
+    if bytes.len() < end {
+        return Err("truncated executable load commands".into());
+    }
+    let mut offset = 32;
+    for _ in 0..ncmds {
+        if offset + 8 > end {
+            return Err("truncated Mach-O load command".into());
+        }
+        let cmd = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("cmd"));
+        let cmdsize = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().expect("cmdsize")) as usize;
+        if cmdsize < 8 || offset + cmdsize > end {
+            return Err("Mach-O load command exceeds the header".into());
+        }
+        if cmd == LC_MAIN {
+            if cmdsize < 16 {
+                return Err("LC_MAIN is truncated".into());
+            }
+            return Ok(u64::from_le_bytes(
+                bytes[offset + 8..offset + 16].try_into().expect("entryoff"),
+            ));
+        }
+        offset += cmdsize;
+    }
+    Err("executable has no LC_MAIN".into())
+}
+
 fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, BirthInstallError>
 {
     let images = crate::images::loaded_images(task, pid).map_err(|err| {
@@ -272,8 +569,8 @@ fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, Bi
         .iter()
         .find(|image| image.path.file_name().is_some_and(|name| name == PTHREAD_FILE))
     else {
-        // pthread_create cannot run until this image is mapped. Leave the policy
-        // inactive so an entry-point step, before dyld publishes the library, still resumes.
+        // pthread is not in the dyld list yet. The caller arms `_lldb_image_notifier`
+        // so the entries can be trapped when dyld publishes the library.
         return Ok(Vec::new());
     };
     let identity = image_identity(task, image.load_address.value()).map_err(BirthInstallError::Os)?;
@@ -287,10 +584,14 @@ fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, Bi
     let file_bytes = fs::read(&image.path)
         .map_err(|err| BirthInstallError::Os(format!("reading {} failed: {err}", image.path.display())))?;
     let slice = matching_slice(&file_bytes, &identity).map_err(BirthInstallError::Os)?;
+    sites_from_slice(task, slice, image.load_address.value())
+}
+
+fn sites_from_slice(task: mach_port_t, slice: &[u8], load: u64) -> Result<Vec<BirthSite>, BirthInstallError>
+{
     let file =
         File::parse(slice).map_err(|err| BirthInstallError::Os(format!("parsing libsystem_pthread failed: {err}")))?;
     let base = file.relative_address_base();
-    let load = image.load_address.value();
     let slide = load
         .checked_sub(base)
         .ok_or_else(|| BirthInstallError::Os(format!("pthread load address {load:#x} is below its image base {base:#x}")))?;
@@ -303,7 +604,8 @@ fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, Bi
         let original = file_instruction(&file, vm)
             .ok_or_else(|| BirthInstallError::Os(format!("{name} has no mapped instruction bytes in libsystem_pthread")))?;
         let live = read_word(task, runtime).map_err(BirthInstallError::Os)?;
-        if live != original {
+        let client_breakpoint = live == BRK;
+        if live != original && !client_breakpoint {
             return Err(BirthInstallError::Os(format!(
                 "{name} at {runtime:#x} is {live:02x?} in the process and {original:02x?} in the loaded slice"
             )));
@@ -312,6 +614,8 @@ fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, Bi
             address: runtime,
             original,
             armed: false,
+            client_breakpoint,
+            entry: true,
         });
     }
     Ok(sites)

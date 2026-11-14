@@ -5,10 +5,11 @@
 //! which every fixture build has.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use ferros_core::symbols::ImageDescriptor;
+use ferros_core::symbols::{ImageDescriptor, ImageMapping};
 use ferros_core::{Address, Session, SymbolCache};
 use object::{Object, ObjectSymbol, SymbolKind};
 
@@ -54,7 +55,22 @@ pub fn function_address(session: &mut Session, fixture: &Fixture, name: &str) ->
     session
         .runtime_address(main, file_address)
         .expect("image mapping")
-        .expect("mapped symbol")
+        .unwrap_or_else(|| {
+            // Keep the failure: these reads explain it rather than supplying a fallback.
+            let current_main = session
+                .images()
+                .map(|images| images.into_iter().find(|image| image.path == main.path));
+            let mapping = ImageMapping::parse(&ImageDescriptor {
+                path: main.path.clone(),
+                load_address: main.load_address.value(),
+            });
+            let direct_address = mapping.as_ref().map(|mapping| mapping.runtime_address(file_address));
+            let mut detail = format!("mapped symbol {name}: file_address={file_address:#x}");
+            write!(detail, ", image={main:?}, current_main={current_main:?}").expect("format image diagnostic");
+            write!(detail, ", on_disk_mapping={mapping:?}, direct_address={direct_address:?}")
+                .expect("format mapping diagnostic");
+            panic!("{detail}");
+        })
 }
 
 /// File virtual address of fixture function `name` from its symbol table.

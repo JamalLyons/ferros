@@ -1,6 +1,7 @@
 //! Process lifecycle through `ferros_core::Session` on the macOS backend.
 #![cfg(target_os = "macos")]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -534,6 +535,17 @@ fn process_state(pid: u32) -> String
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+/// Removes captured output even if spawning or PID discovery panics.
+struct ReleaseOutput(std::path::PathBuf);
+
+impl Drop for ReleaseOutput
+{
+    fn drop(&mut self)
+    {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// A fixture started through `/bin/sh`, so its parent is the shell and not this test
 /// process: attaching reparents it to the debugger and detaching hands it back, as for a
 /// process started from a terminal. The shell waits for it, so the shell exits when the
@@ -542,12 +554,21 @@ struct Grandchild
 {
     shell: std::process::Child,
     pid: u32,
+    output_path: ReleaseOutput,
 }
 
 impl Grandchild
 {
     fn spawn(args: &[&str]) -> Self
     {
+        // Files cannot fill a pipe and delay the very completion being measured.
+        let output_path = std::env::temp_dir().join(format!(
+            "ferros-release-{}-{}.log",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos()
+        ));
+        let output = fs::File::create_new(&output_path).expect("create release output");
+        let output_path = ReleaseOutput(output_path);
         let shell = Command::new("/bin/sh")
             .arg("-c")
             // Not just `"$@"`: the shell would exec the fixture instead of waiting for it.
@@ -556,14 +577,21 @@ impl Grandchild
             .arg(fixture!("loop_counter").path())
             .args(args)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(output.try_clone().expect("clone release output"))
+            .stderr(output)
             .spawn()
             .expect("spawn /bin/sh");
+        // Install cleanup before PID discovery can fail. Zero means undiscovered;
+        // Drop then finds children by this shell's PID rather than signalling PID 0.
+        let mut target = Self {
+            shell,
+            pid: 0,
+            output_path,
+        };
         let deadline = Instant::now() + TIMEOUT;
         let pid = loop {
             let output = Command::new("/usr/bin/pgrep")
-                .args(["-P", &shell.id().to_string()])
+                .args(["-P", &target.shell.id().to_string()])
                 .output()
                 .expect("pgrep");
             if let Some(pid) = String::from_utf8_lossy(&output.stdout)
@@ -575,7 +603,29 @@ impl Grandchild
             assert!(Instant::now() < deadline, "the shell did not start the fixture");
             std::thread::sleep(Duration::from_millis(10));
         };
-        Self { shell, pid }
+        target.pid = pid;
+        target
+    }
+
+    /// Capture both processes before Drop kills them. A live fixture with `T` or
+    /// nonzero Mach counts differs from a zombie or a parent that has not reaped it.
+    fn diagnostics(&self) -> String
+    {
+        let ps = Command::new("/bin/ps")
+            .args(["-o", "pid=,ppid=,stat=,etime=,time=,wchan=,command=", "-p"])
+            .arg(format!("{},{}", self.pid, self.shell.id()))
+            .output()
+            .expect("release diagnostic ps");
+        let mut snapshot = format!("ps status={}:\n{}", ps.status, String::from_utf8_lossy(&ps.stdout));
+        write!(
+            snapshot,
+            "\nMach snapshot: {:?}\nexception ports: {:?}\nfixture output: {}",
+            diagnostics::process_suspend_counts(ProcessId::from(self.pid)),
+            diagnostics::exception_ports(ProcessId::from(self.pid)),
+            fs::read_to_string(&self.output_path.0).unwrap_or_else(|error| error.to_string()),
+        )
+        .expect("write diagnostic string");
+        snapshot
     }
 
     /// Whether the fixture (and so the shell) exited by itself within `timeout`, with
@@ -584,7 +634,11 @@ impl Grandchild
     {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(Some(status)) = self.shell.try_wait() {
+            if let Some(status) = self
+                .shell
+                .try_wait()
+                .unwrap_or_else(|error| panic!("wait for release parent: {error}; {}", self.diagnostics()))
+            {
                 return Some(status);
             }
             if Instant::now() >= deadline {
@@ -599,7 +653,13 @@ impl Drop for Grandchild
 {
     fn drop(&mut self)
     {
-        let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
+        if self.pid == 0 {
+            let _ = Command::new("/usr/bin/pkill")
+                .args(["-KILL", "-P", &self.shell.id().to_string()])
+                .status();
+        } else {
+            let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
+        }
         let _ = self.shell.kill();
         let _ = self.shell.wait();
     }
@@ -630,9 +690,10 @@ fn released_processes_run_to_completion()
 
     harness::run_with_timeout(Duration::from_secs(120), |t| {
         for &case in CASES {
-            let mut target = Grandchild::spawn(&[SHORT_LOOP]);
+            let mut target = Grandchild::spawn(&[SHORT_LOOP, "--progress"]);
             let pid = ProcessId::from(target.pid);
             let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            let started = Instant::now();
             session.attach(pid).expect("attach");
             match case {
                 "detach" => session.detach().expect("detach"),
@@ -665,6 +726,8 @@ fn released_processes_run_to_completion()
                 }
                 _ => unreachable!(),
             }
+            let released = Instant::now();
+            eprintln!("{case}: attach/release took {:?}", released.duration_since(started));
             // Not left job-control stopped. (`ps` state is reliable here: the target
             // was not launched suspended.) The shell would not show it: it continues a
             // stopped child itself.
@@ -672,14 +735,24 @@ fn released_processes_run_to_completion()
                 let stat = process_state(target.pid);
                 assert!(
                     !stat.starts_with('T'),
-                    "{case}: the released process is stopped (state {stat})"
+                    "{case}: the released process is stopped (state {stat}); {}",
+                    target.diagnostics()
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let status = target
-                .ran_to_completion(EXIT_TIMEOUT)
-                .unwrap_or_else(|| panic!("{case}: the released process did not run to completion"));
-            assert!(status.success(), "{case}: the released process exited with {status}");
+            let status = target.ran_to_completion(EXIT_TIMEOUT).unwrap_or_else(|| {
+                panic!(
+                    "{case}: no completion after {:?}; {}",
+                    released.elapsed(),
+                    target.diagnostics()
+                )
+            });
+            eprintln!("{case}: completed {:?} after release", released.elapsed());
+            assert!(
+                status.success(),
+                "{case}: the released process exited with {status}; {}",
+                target.diagnostics()
+            );
         }
 
         // A launched process released with detach also runs to completion.
@@ -687,7 +760,9 @@ fn released_processes_run_to_completion()
         d.detach().expect("detach a launched process");
         assert!(
             d.wait_for_stdout("final count: 100", EXIT_TIMEOUT),
-            "the detached launched process did not run to completion"
+            "the detached launched process did not run to completion: state/Mach={:?}, stdout/stderr={:?}",
+            (process_state(d.pid().0), diagnostics::process_suspend_counts(d.pid())),
+            (d.stdout(), d.stderr())
         );
     });
 }

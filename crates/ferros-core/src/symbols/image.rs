@@ -40,6 +40,8 @@ use super::cache::{SymbolFrame, Symbolication};
 use super::debuginfo::{self, DebugInfoOptions};
 use super::demangle::make_symbol_name;
 use super::extractor::{TypeExtractor, TypeSummary};
+use super::functions::FunctionIndex;
+use super::lines::LineIndex;
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation};
@@ -427,6 +429,10 @@ pub struct BinaryImage
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
     context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
     type_cache: RwLock<HashMap<String, Arc<TypeSummary>>>,
+    /// Built on the first source lookup (see `symbols::lines`).
+    line_index: OnceCell<LineIndex>,
+    /// Built on the first function lookup (see `symbols::functions`).
+    function_index: OnceCell<FunctionIndex>,
 }
 
 impl BinaryImage
@@ -477,6 +483,8 @@ impl BinaryImage
             dwarf_cache: OnceCell::new(),
             context_cache: OnceCell::new(),
             type_cache: RwLock::new(HashMap::new()),
+            line_index: OnceCell::new(),
+            function_index: OnceCell::new(),
         })
     }
 
@@ -679,7 +687,19 @@ impl BinaryImage
         self.mapping.runtime_address(address)
     }
 
-    fn dwarf(&self) -> Result<&OwnedDwarf>
+    /// The lazily built line-table index slot, filled by `symbols::lines`.
+    pub(super) fn line_index_cell(&self) -> &OnceCell<LineIndex>
+    {
+        &self.line_index
+    }
+
+    /// The lazily built function index slot, filled by `symbols::functions`.
+    pub(super) fn function_index_cell(&self) -> &OnceCell<FunctionIndex>
+    {
+        &self.function_index
+    }
+
+    pub(super) fn dwarf(&self) -> Result<&OwnedDwarf>
     {
         self.dwarf_cache.get_or_try_init(|| {
             Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))

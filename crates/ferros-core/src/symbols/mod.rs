@@ -9,7 +9,9 @@
 //! - **`cache`**: Symbol cache for binary images and address symbolication
 //! - **`demangle`**: Symbol demangling utilities (Rust, C++)
 //! - **`extractor`**: DWARF type extraction and introspection
+//! - **`functions`**: Function index: function name to entry and post-prologue addresses
 //! - **`image`**: Binary image parsing and DWARF section loading
+//! - **`lines`**: Line-table index: `file:line` to addresses, address to line and ranges
 //!
 //! ## DWARF Sections
 //!
@@ -33,7 +35,9 @@ pub mod cache;
 pub mod debuginfo;
 pub mod demangle;
 pub mod extractor;
+pub mod functions;
 pub mod image;
+pub mod lines;
 pub mod unwind;
 
 // Shared type aliases
@@ -44,4 +48,6 @@ pub(crate) type OwnedDwarf = Dwarf<OwnedReader>;
 pub use cache::{SymbolCache, SymbolFrame, Symbolication};
 pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
+pub use functions::FunctionAddress;
 pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping};
+pub use lines::{AddressLine, LineAddresses, SourceLookupError};

@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use addr2line::Context;
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian, SectionId};
-use object::{Object, ObjectSection, ObjectSegment};
+use object::macho::MachHeader64;
+use object::read::macho::{MachHeader as _, Segment as _};
+use object::{Endianness, Object, ObjectSection, ObjectSegment};
 use once_cell::sync::OnceCell;
 
 use super::cache::{SymbolFrame, Symbolication};
@@ -78,7 +80,11 @@ pub struct ImageDescriptor
 /// This contains no DWARF and can therefore be used even for stripped images.
 /// `load_address` names the runtime Mach-O header; the corresponding file virtual
 /// address comes from the segment covering file offset zero, excluding `__PAGEZERO`.
-#[derive(Debug, Clone)]
+///
+/// [`parse`](Self::parse) reads the layout from the file on disk;
+/// [`from_header`](Self::from_header) reads it from the header and load commands the
+/// loader mapped, which stay valid while the file is replaced or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageMapping
 {
     file_base: u64,
@@ -100,31 +106,100 @@ impl ImageMapping
         Self::from_file(&file, descriptor.load_address)
     }
 
+    /// Read the segment layout from a 64-bit Mach-O header and its load commands, as
+    /// mapped at `load_address` in the target. `header` must start at the header and
+    /// hold at least [`MACH_HEADER_SIZE`](Self::MACH_HEADER_SIZE) plus its `sizeofcmds`
+    /// bytes; see [`header_size`](Self::header_size).
+    ///
+    /// # Errors
+    /// Returns an error for a truncated or malformed header or overflowing mappings.
+    pub fn from_header(header: &[u8], load_address: u64) -> Result<Self>
+    {
+        let invalid = |error: object::Error| DebuggerError::InvalidArgument(format!("invalid image header: {error}"));
+        let mach = MachHeader64::<Endianness>::parse(header, 0).map_err(invalid)?;
+        let endian = mach.endian().map_err(invalid)?;
+        let mut commands = mach.load_commands(endian, header, 0).map_err(invalid)?;
+        let mut segments = Vec::new();
+        while let Some(command) = commands.next().map_err(invalid)? {
+            if let Some((segment, _)) = command.segment_64().map_err(invalid)? {
+                segments.push(SegmentLayout {
+                    is_page_zero: segment.name() == b"__PAGEZERO",
+                    address: segment.vmaddr(endian),
+                    size: segment.vmsize(endian),
+                    file_offset: segment.fileoff(endian),
+                    file_size: segment.filesize(endian),
+                });
+            }
+        }
+        Self::from_segments(&segments, load_address)
+    }
+
+    /// Size of a 64-bit Mach-O header, which precedes its load commands.
+    pub const MACH_HEADER_SIZE: usize = 32;
+
+    /// Largest `sizeofcmds` [`header_size`](Self::header_size) accepts.
+    const MAX_LOAD_COMMANDS_SIZE: usize = 1 << 20;
+
+    /// Bytes [`from_header`](Self::from_header) needs, given the first
+    /// [`MACH_HEADER_SIZE`](Self::MACH_HEADER_SIZE) bytes at the load address.
+    ///
+    /// # Errors
+    /// Returns an error unless `header` starts a 64-bit Mach-O header.
+    pub fn header_size(header: &[u8]) -> Result<usize>
+    {
+        let mach = MachHeader64::<Endianness>::parse(header, 0)
+            .map_err(|error| DebuggerError::InvalidArgument(format!("invalid image header: {error}")))?;
+        let endian = mach
+            .endian()
+            .map_err(|error| DebuggerError::InvalidArgument(format!("invalid image header: {error}")))?;
+        // The size is target-controlled: bound the read before anyone allocates it.
+        usize::try_from(mach.sizeofcmds(endian))
+            .ok()
+            .filter(|&commands| commands <= Self::MAX_LOAD_COMMANDS_SIZE)
+            .map(|commands| commands + Self::MACH_HEADER_SIZE)
+            .ok_or_else(|| DebuggerError::InvalidArgument("image load commands exceed the size limit".into()))
+    }
+
     fn from_file(file: &object::File<'_>, load_address: u64) -> Result<Self>
     {
-        let file_base = file
+        let segments: Vec<_> = file
             .segments()
-            .find(|segment| segment.file_range().0 == 0 && segment.file_range().1 != 0)
-            .map(|segment| segment.address())
+            .map(|segment| SegmentLayout {
+                is_page_zero: segment.name().ok().flatten() == Some("__PAGEZERO"),
+                address: segment.address(),
+                size: segment.size(),
+                file_offset: segment.file_range().0,
+                file_size: segment.file_range().1,
+            })
+            .collect();
+        Self::from_segments(&segments, load_address)
+    }
+
+    fn from_segments(segments: &[SegmentLayout], load_address: u64) -> Result<Self>
+    {
+        let file_base = segments
+            .iter()
+            .find(|segment| segment.file_offset == 0 && segment.file_size != 0)
+            .map(|segment| segment.address)
             .ok_or_else(|| DebuggerError::InvalidArgument("image has no segment covering its header".into()))?;
         let mut mapping = Self {
             file_base,
             load_address,
             segments: Vec::new(),
         };
-        for segment in file.segments() {
-            if segment.name().ok().flatten() == Some("__PAGEZERO") || segment.size() == 0 {
+        for segment in segments {
+            if segment.is_page_zero || segment.size == 0 {
                 continue;
             }
-            let address = segment.address();
+            let address = segment.address;
             let runtime = mapping
                 .relocate(address)
                 .ok_or_else(|| DebuggerError::InvalidArgument("image relocation overflows address space".into()))?;
             address
-                .checked_add(segment.size())
-                .and_then(|_| runtime.checked_add(segment.size()))
+                .checked_add(segment.size)
+                .and_then(|_| runtime.checked_add(segment.size))
                 .ok_or_else(|| DebuggerError::InvalidArgument("image segment overflows address space".into()))?;
-            mapping.segments.push((address, runtime, segment.size()));
+            mapping.segments.push((address, runtime, segment.size));
         }
         Ok(mapping)
     }
@@ -175,6 +250,16 @@ impl ImageMapping
                 .map(Address::new)
         })
     }
+}
+
+/// One segment load command, from a file or from mapped load commands.
+struct SegmentLayout
+{
+    is_page_zero: bool,
+    address: u64,
+    size: u64,
+    file_offset: u64,
+    file_size: u64,
 }
 
 /// Unique identifier for a binary image.
@@ -874,6 +959,25 @@ mod mapping_tests
         assert_eq!(mapping.runtime_address(0), None);
         assert_eq!(mapping.runtime_address(0x1_0000_1000), None);
         assert!(ImageMapping::from_file(&file, u64::MAX - 0x100).is_err());
+    }
+
+    #[test]
+    fn mapped_header_gives_the_file_layout_and_rejects_bad_headers()
+    {
+        let bytes = macho_segments();
+        let file = object::File::parse(&*bytes).unwrap();
+        assert_eq!(ImageMapping::header_size(&bytes).unwrap(), bytes.len());
+        assert_eq!(
+            ImageMapping::from_header(&bytes, 0x1000).unwrap(),
+            ImageMapping::from_file(&file, 0x1000).unwrap()
+        );
+        assert!(ImageMapping::from_header(&bytes[..bytes.len() - 1], 0x1000).is_err());
+        assert!(ImageMapping::from_header(&bytes, u64::MAX - 0x100).is_err());
+        assert!(ImageMapping::header_size(&[0; 32]).is_err());
+        assert!(ImageMapping::header_size(&bytes[..16]).is_err());
+        let mut huge = bytes.clone();
+        huge[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ImageMapping::header_size(&huge).is_err());
     }
 
     #[test]

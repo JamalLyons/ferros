@@ -11,7 +11,10 @@ use crate::types::Address;
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
-    mapping: Option<ImageMapping>,
+    /// The layout read from the image's mapped header, or why it could not be read.
+    /// Mapped memory does not change while the image stays loaded at this address, so
+    /// the result is kept until the loader reports it unloaded or moved.
+    mapping: std::result::Result<ImageMapping, String>,
     attempted: bool,
     no_debug_info: Option<String>,
 }
@@ -50,31 +53,45 @@ impl Session
         Ok(self.loaded_images.iter().find_map(|image| {
             image
                 .mapping
-                .as_ref()?
+                .as_ref()
+                .ok()?
                 .file_address(address)
                 .map(|file| (image.descriptor.path.clone(), file))
         }))
     }
 
     /// Map a file virtual address within a particular loaded image to runtime memory.
-    /// `image` must still be loaded at the supplied load address.
+    /// `image` must still be loaded at the supplied load address; otherwise, or when the
+    /// address is outside the image's mapped segments, the result is `None`.
+    ///
+    /// The layout comes from the Mach-O header the loader mapped, not from the file at
+    /// `image.path`, so a file replaced or removed on disk does not change the result.
     ///
     /// # Errors
-    /// Returns a state error unless stopped, or the backend's enumeration error.
+    /// Returns a state error unless stopped, the backend's enumeration error, or
+    /// [`DebuggerError::ImageMapping`] with the original failure when the image's mapped
+    /// header could not be read or parsed.
     pub fn runtime_address(&mut self, image: &LoadedImage, file_address: u64) -> Result<Option<Address>>
     {
         self.require_stopped()?;
         self.load_images()?;
-        Ok(self.loaded_images.iter().find_map(|entry| {
-            (entry.descriptor.path == image.path && entry.descriptor.load_address == image.load_address.value())
-                .then_some(entry.mapping.as_ref())
-                .flatten()?
-                .runtime_address(file_address)
-        }))
+        let Some(entry) = self.loaded_images.iter().find(|entry| {
+            entry.descriptor.path == image.path && entry.descriptor.load_address == image.load_address.value()
+        }) else {
+            return Ok(None);
+        };
+        match &entry.mapping {
+            Ok(mapping) => Ok(mapping.runtime_address(file_address)),
+            Err(detail) => Err(DebuggerError::ImageMapping {
+                path: entry.descriptor.path.clone(),
+                detail: detail.clone(),
+            }),
+        }
     }
 
-    /// Refresh mappings without requesting DWARF. Missing system-library files (for
-    /// example images present only in the shared cache) are harmless here.
+    /// Refresh mappings without requesting DWARF or reading image files. Images whose
+    /// mapped header has no segment at file offset zero (for example libraries in the
+    /// shared cache) stay unmapped, which is harmless here.
     pub(super) fn load_images(&mut self) -> Result<()>
     {
         let images = match self.backend.images() {
@@ -97,7 +114,7 @@ impl Session
             }) {
                 self.loaded_images.push(previous.swap_remove(index));
             } else {
-                let mapping = ImageMapping::parse(&descriptor).ok();
+                let mapping = self.map_loaded_image(descriptor.load_address);
                 self.loaded_images.push(SessionImage {
                     descriptor,
                     mapping,
@@ -109,6 +126,23 @@ impl Session
         Ok(())
     }
 
+    /// Read the segment layout from the header mapped at `load_address`. Trap bytes are
+    /// irrelevant: breakpoints are never planted in a Mach-O header.
+    fn map_loaded_image(&mut self, load_address: u64) -> std::result::Result<ImageMapping, String>
+    {
+        let address = Address::new(load_address);
+        let header = self
+            .backend
+            .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
+            .map_err(|error| format!("reading the Mach-O header at {address}: {error}"))?;
+        let size = ImageMapping::header_size(&header).map_err(|error| format!("header at {address}: {error}"))?;
+        let header = self
+            .backend
+            .read_memory(address, size)
+            .map_err(|error| format!("reading {size} bytes of load commands at {address}: {error}"))?;
+        ImageMapping::from_header(&header, load_address).map_err(|error| format!("header at {address}: {error}"))
+    }
+
     /// Load only the image needed for a lookup. Cache a typed failure so the diagnostic
     /// survives subsequent requests without repeatedly running dsymutil.
     pub(super) fn load_symbols_for_address(&mut self, address: Address) -> Result<bool>
@@ -116,7 +150,7 @@ impl Session
         let Some(image) = self
             .loaded_images
             .iter_mut()
-            .find(|image| image.mapping.as_ref().is_some_and(|mapping| mapping.contains(address)))
+            .find(|image| image.mapping.as_ref().is_ok_and(|mapping| mapping.contains(address)))
         else {
             return Ok(false);
         };

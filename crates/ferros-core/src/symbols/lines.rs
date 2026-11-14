@@ -18,7 +18,8 @@ use super::image::BinaryImage;
 use super::{OwnedDwarf, OwnedReader};
 use crate::types::Address;
 
-/// Failure to translate a source location to addresses, or to read the line tables.
+/// Failure to translate a source location or a function name to addresses, or to read
+/// the debug info.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SourceLookupError
 {
@@ -60,8 +61,37 @@ pub enum SourceLookupError
         last_line: u32,
     },
 
-    /// The image's DWARF line tables could not be loaded or parsed.
-    #[error("failed to read line tables: {0}")]
+    /// A function name is empty or malformed (an empty `::` segment or unbalanced
+    /// brackets), as rejected by [`BinaryImage::function_addresses`].
+    #[error("invalid function name `{query}`")]
+    InvalidFunctionName
+    {
+        /// The rejected name, as given.
+        query: String,
+    },
+
+    /// No function with code in the image matches the requested name.
+    #[error("no function matching `{query}`")]
+    UnknownFunction
+    {
+        /// The requested name, as given.
+        query: String,
+    },
+
+    /// The requested name matches functions with more than one distinct path, and none of
+    /// those paths equals the whole name.
+    #[error("`{query}` matches more than one function: {}", candidates.join(", "))]
+    AmbiguousFunction
+    {
+        /// The requested name, as given.
+        query: String,
+        /// Every matching normalized path, sorted and distinct.
+        candidates: Vec<String>,
+    },
+
+    /// The image's DWARF line tables or debugging information entries could not be loaded
+    /// or parsed.
+    #[error("failed to read debug info: {0}")]
     DebugInfo(String),
 }
 

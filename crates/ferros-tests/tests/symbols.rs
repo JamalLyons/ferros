@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ferros_core::symbols::{BinaryImage, DebugInfoOptions, ImageDescriptor, SourceLookupError};
+use ferros_core::symbols::{BinaryImage, DebugInfoOptions, FunctionAddress, ImageDescriptor, SourceLookupError};
 use ferros_core::{Address, SymbolCache};
 use ferros_tests::{Fixture, fixture};
-use object::{Object, ObjectSegment};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
 
 /// Every fixture binary. `fixture!` needs a literal name, so the table is written out;
 /// `fixture_table_covers_every_source` keeps it in step with `fixtures/`.
@@ -379,5 +379,251 @@ fn lookups_after_first_load_take_under_a_second()
                 );
             }
         }
+    }
+}
+
+/// `nested_calls` functions and the marker on their first statement.
+const NESTED_FUNCTIONS: &[(&str, &str)] = &[("level_a", "in_a"), ("level_b", "in_b"), ("level_c", "in_c")];
+
+/// Function queries and the demangled symbol-table name of the function they resolve to.
+const SYMBOL_TABLE_FUNCTIONS: &[(&str, &str)] = &[
+    ("shapes::area", "ferros_fixture_symbols::shapes::area"),
+    ("Counter::bump", "<ferros_fixture_symbols::Counter>::bump"),
+    ("with_gap", "ferros_fixture_symbols::with_gap"),
+];
+
+/// Empty or malformed function names.
+const INVALID_FUNCTION_NAMES: &[&str] = &["", "   ", "shapes::", "::area", "a::::b", "area<"];
+
+/// Function queries timed after the index is built (found, ambiguous and unknown).
+const TIMED_FUNCTION_QUERIES: &[&str] = &[
+    "generic_identity",
+    "Counter::bump",
+    "shapes::area",
+    "ferros_fixture_symbols::shapes::area",
+    "with_gap",
+    "fmt",
+    "no_such_function",
+];
+
+/// The single function `name` resolves to in `image`.
+fn one_function(image: &BinaryImage, name: &str) -> FunctionAddress
+{
+    let found = image
+        .function_addresses(name)
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    let [function] = found.as_slice() else {
+        panic!("{name}: expected one function, found {found:#?}");
+    };
+    function.clone()
+}
+
+/// Check the invariants of one resolved function: its entry is inside the function
+/// `function` (by symbolication), and its post-prologue address lies strictly inside it
+/// and is on the line of `marker`.
+///
+/// The line is checked two ways. `function`'s own frame at the post-prologue address
+/// (the outermost frame of that name) must be on the marker line. When the line-table
+/// row there belongs to the fixture source, it must be the marker line too; when the
+/// first statement starts with code inlined from the standard library (`area`'s
+/// `wrapping_mul`), the row names the library file and only the frame check applies.
+fn check_function(fixture: &Fixture, image: &BinaryImage, found: &FunctionAddress, function: &str, marker: &str)
+{
+    let at = format!("{}: {found:?}", fixture.name());
+    let marker_line = fixture.marker_line(marker);
+    let query = source_query(fixture);
+    assert!(
+        in_function(image, found.entry, function),
+        "{at}: entry is not in fn {function}"
+    );
+    assert!(
+        found.entry < found.after_prologue && found.after_prologue < found.end,
+        "{at}: post-prologue address outside the function body"
+    );
+    let line = image
+        .line_at_address(found.after_prologue)
+        .expect("line tables")
+        .unwrap_or_else(|| panic!("{at}: post-prologue address has no line"));
+    if line.file.ends_with(&query) {
+        assert_eq!(line.line, marker_line, "{at}: post-prologue line");
+    }
+    let frames = image.symbolicate(found.after_prologue).expect("symbolicated").frames;
+    let frame = frames
+        .iter()
+        .rev()
+        .find(|frame| {
+            let raw = frame.symbol.raw();
+            let name = rustc_demangle::try_demangle(raw).map_or_else(|_| raw.to_owned(), |name| format!("{name:#}"));
+            last_segment(&name) == function
+        })
+        .unwrap_or_else(|| panic!("{at}: no frame of fn {function}: {frames:#?}"));
+    let location = frame.location.as_ref().expect("frame location");
+    assert!(location.file.ends_with(&query), "{at}: {location:?}");
+    assert_eq!(location.line, Some(marker_line), "{at}: frame line");
+}
+
+/// File virtual address of the defined Mach-O text symbol whose demangled name (without
+/// hash) is `wanted`.
+fn text_symbol(fixture: &Fixture, wanted: &str) -> u64
+{
+    let bytes = fs::read(fixture.path()).expect("read executable");
+    let file = object::File::parse(&*bytes).expect("parse executable");
+    let mut addresses: Vec<u64> = file
+        .symbols()
+        .filter(|symbol| symbol.kind() == SymbolKind::Text && symbol.is_definition())
+        .filter(|symbol| {
+            symbol
+                .name()
+                .ok()
+                .and_then(|raw| rustc_demangle::try_demangle(raw).ok())
+                .is_some_and(|name| format!("{name:#}") == wanted)
+        })
+        .map(|symbol| symbol.address())
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let [address] = addresses.as_slice() else {
+        panic!("expected one text symbol {wanted}, found {addresses:#x?}");
+    };
+    *address
+}
+
+#[test]
+fn generic_function_resolves_to_one_entry_per_instantiation()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+    let found = image.function_addresses("generic_identity").expect("generic_identity");
+    assert_eq!(found.len(), 2, "one per instantiation: {found:#?}");
+    assert!(found[0].entry < found[1].entry, "distinct and sorted: {found:#?}");
+    let names: BTreeSet<&str> = found.iter().map(|function| function.name.as_str()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "ferros_fixture_symbols::generic_identity::<u32>",
+            "ferros_fixture_symbols::generic_identity::<u64>",
+        ])
+    );
+    for function in &found {
+        assert_eq!(function.path, "ferros_fixture_symbols::generic_identity");
+        check_function(&fixture, &image, function, "generic_identity", "in_generic");
+    }
+}
+
+#[test]
+fn methods_module_functions_and_trailing_paths_resolve()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+
+    let bump = one_function(&image, "Counter::bump");
+    assert_eq!(bump.path, "ferros_fixture_symbols::Counter::bump");
+    assert_eq!(bump.name, "<ferros_fixture_symbols::Counter>::bump");
+    check_function(&fixture, &image, &bump, "bump", "in_method");
+    assert_eq!(one_function(&image, "<ferros_fixture_symbols::Counter>::bump"), bump);
+
+    let area = one_function(&image, "ferros_fixture_symbols::shapes::area");
+    assert_eq!(area.path, "ferros_fixture_symbols::shapes::area");
+    for query in ["shapes::area", "area"] {
+        assert_eq!(one_function(&image, query), area, "{query}");
+    }
+    check_function(&fixture, &image, &area, "area", "in_module");
+
+    let gap = one_function(&image, "with_gap");
+    check_function(&fixture, &image, &gap, "with_gap", "before_gap");
+
+    // Only ever inlined: no out-of-line copy, so no entry address.
+    let inlined = image.function_addresses("always_inlined");
+    assert!(
+        matches!(inlined, Err(SourceLookupError::UnknownFunction { .. })),
+        "{inlined:?}"
+    );
+
+    let fixture = fixture!("nested_calls");
+    let image = load(&fixture);
+    for &(function, marker) in NESTED_FUNCTIONS {
+        let found = one_function(&image, function);
+        check_function(&fixture, &image, &found, function, marker);
+    }
+}
+
+#[test]
+fn entry_matches_the_mach_o_symbol_table()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+    // `load` maps the image at its vmaddr, so runtime and file addresses coincide.
+    for &(query, symbol) in SYMBOL_TABLE_FUNCTIONS {
+        let found = one_function(&image, query);
+        assert_eq!(found.entry.value(), text_symbol(&fixture, symbol), "{query}");
+    }
+}
+
+#[test]
+fn main_resolves_to_the_crate_main()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+    let crate_main = one_function(&image, "ferros_fixture_symbols::main");
+    assert!(in_function(&image, crate_main.entry, "main"), "{crate_main:?}");
+    // The C `main` that rustc generates has no DWARF subprogram, and no standard-library
+    // function with code has a path ending in `main`, so `main` matches only the crate's
+    // `main`. Were a function with the whole path `main` present, it would win (the
+    // exact-path rule, covered by the ferros-core unit tests), not be ambiguous.
+    assert_eq!(image.function_addresses("main"), Ok(vec![crate_main]));
+}
+
+#[test]
+fn function_lookup_errors_are_typed()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+
+    let unknown = image.function_addresses("no_such_function");
+    assert!(
+        matches!(&unknown, Err(SourceLookupError::UnknownFunction { query }) if query == "no_such_function"),
+        "{unknown:?}"
+    );
+    // A partial segment does not match.
+    let partial = image.function_addresses("hapes::area");
+    assert!(
+        matches!(partial, Err(SourceLookupError::UnknownFunction { .. })),
+        "{partial:?}"
+    );
+
+    for &query in INVALID_FUNCTION_NAMES {
+        let invalid = image.function_addresses(query);
+        assert!(
+            matches!(invalid, Err(SourceLookupError::InvalidFunctionName { .. })),
+            "{query:?}: {invalid:?}"
+        );
+    }
+
+    // The standard library code in the fixture's DWARF has many `fmt` implementations.
+    let ambiguous = image.function_addresses("fmt");
+    let Err(SourceLookupError::AmbiguousFunction { query, candidates }) = ambiguous else {
+        panic!("expected AmbiguousFunction: {ambiguous:?}");
+    };
+    assert_eq!(query, "fmt");
+    assert!(candidates.len() >= 2, "{candidates:?}");
+    assert!(candidates.iter().all(|path| path.ends_with("::fmt")), "{candidates:?}");
+    assert!(
+        candidates.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted and distinct: {candidates:?}"
+    );
+}
+
+#[test]
+fn function_lookups_after_first_load_take_under_a_second()
+{
+    let limit = Duration::from_secs(1);
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+    // The first lookup builds the index; time every later one.
+    let _ = image.function_addresses("main");
+    for &query in TIMED_FUNCTION_QUERIES {
+        let started = Instant::now();
+        let _ = image.function_addresses(query);
+        assert!(started.elapsed() < limit, "{query} took {:?}", started.elapsed());
     }
 }

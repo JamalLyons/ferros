@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines eleven fixture binaries:
+The crate defines twelve fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -25,6 +25,9 @@ The crate defines eleven fixture binaries:
   A fixture-side observer publishes the handler bitset on request; an exit gate releases
   both workers. Used to retain one exception while admitting the other worker, to observe
   carried-signal delivery, and to keep attached workers alive throughout teardown checks.
+- `ferros-fixture-symbols`: Source-lookup targets read from its dSYM without a process: a generic
+  function instantiated twice, an inherent method, a function in a module, an `#[inline(always)]`
+  function inlined at two call sites, and a comment-only line before marker `after_gap`.
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).

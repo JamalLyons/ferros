@@ -8,3 +8,11 @@
 # no matter which subdirectory cargo is invoked from.
 [target.aarch64-apple-darwin]
 runner = "scripts/cargo-test-runner.sh"
+
+# Dependency cooldown (Cargo 1.100+): the resolver skips crate versions published
+# less than seven days ago, giving the ecosystem time to catch compromised or
+# broken releases. Override a single update with
+# `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update <crate> --precise <ver>`.
+# `cargo install` ignores this setting.
+[registry]
+global-min-publish-age = "7 days"

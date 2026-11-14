@@ -11,6 +11,9 @@ members = [
 exclude = ["crates/ferros-ui"]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.100"
+
 [profile.dev.package.ferros-tests]
 opt-level = 0
 debug = "full"
@@ -33,6 +36,10 @@ nursery = { level = "allow", priority = -1 }
 cargo = { level = "warn", priority = -2 }
 # Allow multiple crate versions (transitive dependencies)
 multiple_crate_versions = { level = "allow", priority = -1 }
+
+# Cargo lints (Rust 1.100+): fail on dependencies no target uses.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
 
 # Workspace dependencies
 [workspace.dependencies]

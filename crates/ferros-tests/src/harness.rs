@@ -975,24 +975,13 @@ fn executable_has_debugger_entitlement() -> Option<bool>
 #[cfg(test)]
 mod tests
 {
+    use std::mem::DropGuard;
     use std::process::Child;
 
     use super::*;
 
-    /// Ends the helper process even when an assertion fails first.
-    struct KillOnDrop(Child);
-
-    impl Drop for KillOnDrop
-    {
-        fn drop(&mut self)
-        {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
     /// A long-running stand-in for a half-launched fixture: `yes` repeats its argument forever.
-    fn spawn_tagged(tag: &str) -> KillOnDrop
+    fn spawn_tagged(tag: &str) -> DropGuard<Child, impl FnOnce(Child)>
     {
         let child = Command::new("/usr/bin/yes")
             .arg(tag)
@@ -1001,7 +990,10 @@ mod tests
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn /usr/bin/yes");
-        KillOnDrop(child)
+        DropGuard::new(child, |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        })
     }
 
     #[test]
@@ -1021,7 +1013,7 @@ mod tests
         // No controller is involved here: the watchdog itself must end the process.
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
-            if let Some(status) = child.0.try_wait().expect("try_wait") {
+            if let Some(status) = child.try_wait().expect("try_wait") {
                 break status;
             }
             assert!(Instant::now() < deadline, "the watchdog did not kill the tagged process");
@@ -1074,7 +1066,7 @@ mod tests
         thread::sleep(Duration::from_millis(600));
         assert!(stalled_rx.try_recv().is_err(), "a disarmed watchdog reported a stall");
         assert!(
-            child.0.try_wait().expect("try_wait").is_none(),
+            child.try_wait().expect("try_wait").is_none(),
             "a disarmed watchdog killed the process"
         );
     }

@@ -48,11 +48,12 @@ install-rust:
     else \
         echo "  ✓ rustup already installed"; \
     fi
+    @rustup toolchain install 1.100.0 --profile minimal --component clippy
     @if ! command -v cargo >/dev/null 2>&1; then \
         echo "  ⚠ cargo not in PATH. Please run: source $HOME/.cargo/env"; \
     fi
 
-# Install nightly toolchain with rustfmt component
+# Install nightly only for the unstable formatting options in rustfmt.toml
 install-nightly:
     @echo ""
     @echo "🌙 Installing nightly toolchain with rustfmt..."
@@ -76,9 +77,9 @@ verify-setup:
     @rustup toolchain list | grep -q nightly || { echo "  ❌ nightly toolchain not found"; exit 1; }
     @echo "  ✓ nightly toolchain installed"
     
-    @echo "Verifying rustfmt..."
-    @cargo fmt --version >/dev/null 2>&1 || { echo "  ❌ rustfmt not found"; exit 1; }
-    @echo "  ✓ rustfmt: $(cargo fmt --version | cut -d' ' -f2)"
+    @echo "Verifying nightly rustfmt..."
+    @cargo +nightly fmt --version >/dev/null 2>&1 || { echo "  ❌ rustfmt not found"; exit 1; }
+    @echo "  ✓ rustfmt: $(cargo +nightly fmt --version | cut -d' ' -f2)"
     
     @echo "Verifying clippy..."
     @cargo clippy --version >/dev/null 2>&1 || { echo "  ⚠ clippy not found (optional)"; exit 0; }
@@ -91,12 +92,12 @@ verify-setup:
 # Format all code
 fmt:
     @echo "🎨 Formatting code..."
-    @cargo fmt --all
+    @cargo +nightly fmt --all
 
 # Check formatting without making changes
 fmt-check:
     @echo "🔍 Checking code formatting..."
-    @cargo fmt --all -- --check
+    @cargo +nightly fmt --all -- --check
 
 # Check the portable platform boundary
 check-boundary:

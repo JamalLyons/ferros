@@ -26,7 +26,7 @@ Our architecture includes:
 
 Before contributing, make sure you have the following installed:
 
-- 🦀 [Rust toolchain](https://www.rust-lang.org/tools/install): nightly channel (pinned automatically by [`rust-toolchain.toml`](./rust-toolchain.toml) with `rustfmt` and `clippy`)
+- 🦀 [Rust toolchain](https://www.rust-lang.org/tools/install): Rust 1.100.0 with `clippy` (pinned automatically by [`rust-toolchain.toml`](./rust-toolchain.toml)), plus a nightly toolchain with `rustfmt` for the unstable options in `rustfmt.toml` (`just install-nightly`)
 - 🧱 `cargo` and `rustup`
 - 🧪 [Git](https://git-scm.com/)
 - ⚡ [`just`](https://github.com/casey/just) task runner (`brew install just` or `cargo install just`)
@@ -89,7 +89,7 @@ ferros/
  ├─ website/              # Ferros landing page and simulation
  ├─ Cargo.toml            # Workspace manifest
  ├─ JustFile              # Development task runner recipes
- ├─ rust-toolchain.toml   # Pinned nightly toolchain
+ ├─ rust-toolchain.toml   # Pinned Rust 1.100.0 toolchain
  ├─ AGENTS.md             # Contributor and agent guidance
  └─ ROADMAP.md            # Project goals and milestones
 ```

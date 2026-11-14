@@ -1,6 +1,7 @@
 [package]
 name = "ferros-utils"
 version = "0.0.0"
+rust-version.workspace = true
 edition = "2024"
 description = "Shared utilities, logging, config, and helpers for Ferros."
 license = "Apache-2.0"
@@ -21,3 +22,7 @@ chrono = "0.4.42"
 # Allow multiple crate versions (needed for tracing-appender which uses thiserror 1.0)
 # Use priority 0 to override the default deny from -D warnings
 multiple_crate_versions = { level = "allow", priority = 0 }
+
+# Cargo lints (Rust 1.100+): fail on dependencies no target uses.
+[lints.cargo]
+unused_dependencies = "deny"

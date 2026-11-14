@@ -50,6 +50,8 @@ jobs:
     - uses: actions/checkout@v5
     - name: Install just
       run: brew install just
+    - name: Install nightly rustfmt
+      run: rustup toolchain install nightly --profile minimal --component rustfmt
     - name: Format check
       run: just fmt-check
     - name: Lint

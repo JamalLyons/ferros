@@ -170,6 +170,7 @@ interrupt-policy flag when completion wins. They also script a simultaneous late
 precise simultaneous ordering remains mock-only. `new_threads_can_run_after_suspend_snapshot`
 is the original regression for that snapshot: a thread created after resume now stays
 stopped until a later continue, including across a single-step of its pthread entry.
+Other threads stay suspended while that entry instruction is restored.
 
 Draining events alongside an internal completion and carrying signals from an abandoned
 step-over also retain deterministic session mock tests. Real kernel scheduling cannot

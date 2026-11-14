@@ -4,14 +4,18 @@
 //! snapshot of `task_threads` cannot keep a thread created after `task_resume` stopped.
 //! Before such a resume, the backend plants a `brk` on the first instruction of
 //! `libsystem_pthread`'s `_thread_start` and `_start_wqthread`. The exception loop
-//! `thread_suspend`s the newborn, answers the breakpoint, and leaves every other thread
-//! running. The original instruction is restored before that thread is allowed to run:
-//! a later continue with the trap still armed single-steps off the site, and a continue
-//! of every thread restores the bytes first.
+//! `thread_suspend`s the newborn and answers the breakpoint. The original instruction
+//! is restored before that thread is allowed to run. Every other thread stays
+//! suspended until that instruction has completed and the trap is back, so none of
+//! them can pass the restored entry. A continue of every thread restores the bytes
+//! first and does not single-step.
 //!
 //! Addresses come from the loaded image's own slice (UUID, CPU type, and CPU subtype).
-//! Before dyld has published `libsystem_pthread`, a resume that needs this policy fails
-//! instead of falling back to the snapshot.
+//! Before dyld has published `libsystem_pthread`, those entries are not mapped, so the
+//! resume installs no traps. A thread created in that same resume is outside the
+//! guarantee. Once the image is published, failing to install the traps fails the
+//! resume. A breakpoint at an armed entry is held as a newborn and is not reported
+//! to the client.
 
 use std::fs;
 
@@ -68,6 +72,9 @@ pub(crate) struct BirthPolicy
     /// Threads whose next hardware step only leaves a birth site. That stop is not
     /// reported: the trap is restored and the thread keeps running.
     step_off: Vec<thread_act_t>,
+    /// Threads suspended so they cannot execute a birth site while its original
+    /// instruction is temporarily restored. Released once the trap is armed again.
+    frozen: Vec<thread_act_t>,
 }
 
 impl BirthPolicy
@@ -129,6 +136,18 @@ impl BirthPolicy
     pub(crate) fn clear_step_offs(&mut self) -> Vec<thread_act_t>
     {
         std::mem::take(&mut self.step_off)
+    }
+
+    pub(crate) fn freeze(&mut self, thread: thread_act_t)
+    {
+        if !self.frozen.contains(&thread) {
+            self.frozen.push(thread);
+        }
+    }
+
+    pub(crate) fn take_frozen(&mut self) -> Vec<thread_act_t>
+    {
+        std::mem::take(&mut self.frozen)
     }
 
     /// Install traps when they are not already armed. Symbols are resolved once
@@ -196,26 +215,35 @@ impl BirthPolicy
     }
 
     /// Write `brk` back onto sites nobody still has to execute.
-    pub(crate) fn rearm_except(&mut self, task: mach_port_t, occupied: &[u64])
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failed write. Later sites are still attempted.
+    pub(crate) fn rearm_except(&mut self, task: mach_port_t, occupied: &[u64]) -> Result<(), String>
     {
         if !self.active {
-            return;
+            return Ok(());
         }
+        let mut failure = None;
         for site in &mut self.sites {
             if site.armed || occupied.contains(&site.address) {
                 continue;
             }
-            if patch(task, site.address, &BRK).is_ok() {
-                site.armed = true;
-            } else {
-                tracing::error!("failed to restore the new-thread trap at {:#x}", site.address);
+            match patch(task, site.address, &BRK) {
+                Ok(()) => site.armed = true,
+                Err(err) => {
+                    failure.get_or_insert(err);
+                }
             }
         }
+        failure.map_or(Ok(()), Err)
     }
 
     pub(crate) fn rearm_all(&mut self, task: mach_port_t)
     {
-        self.rearm_except(task, &[]);
+        if let Err(err) = self.rearm_except(task, &[]) {
+            tracing::error!("failed to restore the new-thread trap: {err}");
+        }
     }
 }
 

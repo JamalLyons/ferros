@@ -45,8 +45,12 @@
 //! during that resume is held at the first instruction of `libsystem_pthread`'s
 //! `_thread_start` or `_start_wqthread` until a later resume lets it execute that
 //! instruction. Continuing every thread removes those traps first. If dyld has not
-//! published the library yet, the resume fails. `ThreadAction::Step` as the default,
-//! and any thread started at another address, are outside this guarantee.
+//! published the library yet, the resume installs no traps, and a thread created in
+//! that same resume is outside the guarantee. Once the library is published, failing
+//! to install the traps fails the resume. While a held thread executes the restored
+//! entry instruction, every other thread stays suspended. A breakpoint on that
+//! instruction is held as a newborn and is not reported. `ThreadAction::Step` as
+//! the default, and any thread started at another address, are outside this guarantee.
 //!
 //! ## Exception ports
 //!
@@ -825,12 +829,27 @@ impl MacOSBackend
         }
     }
 
-    /// Clear hardware steps that were only leaving a birth trap.
+    /// Clear hardware steps that were only leaving a birth trap, and release threads
+    /// frozen for that step.
     fn clear_birth_step_offs(&mut self)
     {
         for port in lock_shared(&self.exception_state).birth.clear_step_offs() {
             if let Err(err) = crate::registers::set_single_step(port, false) {
                 tracing::debug!("clearing a birth step-off bit of thread {port} failed: {err}");
+            }
+        }
+        self.thaw_birth_freeze();
+    }
+
+    /// Balance `thread_suspend`s taken so other threads cannot pass a disarmed birth site.
+    fn thaw_birth_freeze(&mut self)
+    {
+        for port in lock_shared(&self.exception_state).birth.take_frozen() {
+            // SAFETY: `port` was suspended by `prepare_birth_step_off` and is a thread
+            // right this backend holds. Failure means the thread or task is already gone.
+            let kr = unsafe { ffi::thread_resume(port) };
+            if kr != KERN_SUCCESS {
+                tracing::debug!("thread_resume of a birth step-off freeze {port} failed: {kr}");
             }
         }
     }
@@ -888,12 +907,17 @@ impl MacOSBackend
 
     /// A runnable thread parked on an armed birth trap must execute the original
     /// instruction. With the trap still required, that is one hardware step.
+    ///
+    /// The restored instruction is process-wide. Every other thread is
+    /// `thread_suspend`ed until the trap is written back, so a creator running in
+    /// the same resume cannot start another thread through the open entry.
     fn prepare_birth_step_off(&mut self, suspend: &[thread_act_t]) -> BackendResult<()>
     {
         if !lock_shared(&self.exception_state).birth.is_active() {
             return Ok(());
         }
         let runnable: Vec<thread_act_t> = self.threads.iter().copied().filter(|port| !suspend.contains(port)).collect();
+        let mut leaving = Vec::new();
         for port in runnable {
             let pc = read_registers_for_port(self.architecture, port)
                 .map_err(backend_error)?
@@ -910,6 +934,30 @@ impl MacOSBackend
             if !user_step {
                 lock_shared(&self.exception_state).birth.note_step_off(port);
                 crate::registers::set_single_step(port, true).map_err(backend_error)?;
+            }
+            leaving.push(port);
+        }
+        if !leaving.is_empty() {
+            let mut frozen = Vec::new();
+            for &port in &self.threads {
+                if suspend.contains(&port) || leaving.contains(&port) {
+                    continue;
+                }
+                // SAFETY: `port` is a thread right this backend holds. The suspend is
+                // recorded on the birth policy and balanced by `thaw_birth_freeze`.
+                let kr = unsafe { ffi::thread_suspend(port) };
+                if kr != KERN_SUCCESS {
+                    for port in frozen {
+                        // SAFETY: this balances the suspend just taken above.
+                        let _ = unsafe { ffi::thread_resume(port) };
+                    }
+                    return Err(mach_error(kr, &format!("thread_suspend of thread {port} failed")));
+                }
+                frozen.push(port);
+            }
+            let mut shared = lock_shared(&self.exception_state);
+            for port in frozen {
+                shared.birth.freeze(port);
             }
         }
         self.memory_cache.clear();

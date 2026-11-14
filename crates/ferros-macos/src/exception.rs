@@ -189,6 +189,8 @@ pub struct ReplyFaultInjector
     publish_during_resume: Arc<AtomicBool>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
     pub(crate) handshake_requeue: Arc<AtomicBool>,
+    /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
+    birth_step_off_hold: Arc<AtomicU8>,
 }
 
 impl ReplyFaultInjector
@@ -270,6 +272,43 @@ impl ReplyFaultInjector
     pub fn reap_before_exit_watcher(&self)
     {
         self.other_exit_reaper.store(true, Ordering::SeqCst);
+    }
+
+    /// Pause the next birth step-off before the task is suspended. Tests only.
+    ///
+    /// The entry instruction is already restored and other threads are still
+    /// scheduled, unless the backend suspended them for the step-off. The pause
+    /// ends at [`Self::release_birth_step_off`] or after five seconds.
+    pub fn hold_next_birth_step_off(&self)
+    {
+        self.birth_step_off_hold.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether the exception loop is inside [`Self::hold_next_birth_step_off`].
+    #[must_use]
+    pub fn birth_step_off_is_held(&self) -> bool
+    {
+        self.birth_step_off_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Let a held birth step-off suspend the task and restore the trap.
+    pub fn release_birth_step_off(&self)
+    {
+        self.birth_step_off_hold.store(3, Ordering::SeqCst);
+    }
+
+    /// If `relevant` and a test armed [`Self::hold_next_birth_step_off`], pause here.
+    pub(crate) fn pause_for_birth_step_off(&self, relevant: bool)
+    {
+        if !relevant || self.birth_step_off_hold.load(Ordering::SeqCst) != 1 {
+            return;
+        }
+        self.birth_step_off_hold.store(2, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.birth_step_off_hold.load(Ordering::SeqCst) == 2 {
+            assert!(std::time::Instant::now() < deadline, "birth step-off hold was not released");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Consume a pending injected failure.
@@ -839,6 +878,12 @@ pub(crate) fn run_exception_loop(
         }
 
         {
+            // A test can pause after a birth step-off is received and before this
+            // task_suspend. Other threads keep running during that pause unless the
+            // resume already suspended them. Production resumes do not arm the hold.
+            let step_off = lock_shared(&shared).birth.is_step_off(&first.1);
+            faults.pause_for_birth_step_off(step_off);
+
             // Stop every thread, collect every message of this stop, mark the exceptions
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
@@ -876,7 +921,8 @@ pub(crate) fn run_exception_loop(
                 client.push((exception, event));
             }
             // Only birth-policy stops: the newborn is `thread_suspend`ed (or has stepped
-            // off the trap) and every other thread keeps running. Do not publish a stop.
+            // off the trap, which releases threads frozen for that step) and the task
+            // runs again. Do not publish a stop.
             if client.is_empty() {
                 if kr == KERN_SUCCESS {
                     // SAFETY: this balances the `task_suspend` just taken above.
@@ -900,6 +946,7 @@ pub(crate) fn run_exception_loop(
                 }
             }
             state.birth.rearm_all(task);
+            thaw_birth_freeze(&mut state);
 
             state.pending_exception = true;
             faults.pending_stop.store(true, Ordering::SeqCst);
@@ -1023,6 +1070,19 @@ fn decode_request(buffer: &ReceiveBuffer) -> Option<MachExceptionRaiseRequest>
     None
 }
 
+/// Release threads suspended so they could not pass a disarmed birth site.
+fn thaw_birth_freeze(state: &mut ExceptionSharedState)
+{
+    for port in state.birth.take_frozen() {
+        // SAFETY: `prepare_birth_step_off` suspended this tracee thread, and this
+        // call only balances that one suspend.
+        let kr = unsafe { crate::ffi::thread_resume(port) };
+        if kr != KERN_SUCCESS {
+            debug!("thread_resume of a birth step-off freeze {port} failed: {kr}");
+        }
+    }
+}
+
 /// Consume a birth-policy exception without publishing it.
 ///
 /// Returns true when `exception`'s reply has been sent. A held newborn's thread right
@@ -1054,7 +1114,15 @@ fn try_consume_birth(
                 Err(err) => debug!("reading a birth step-off thread {port} failed: {err}"),
             }
         }
-        state.birth.rearm_except(task, &occupied);
+        if let Err(err) = state.birth.rearm_except(task, &occupied) {
+            error!("failed to restore a new-thread trap: {err}");
+            // Leave the exception unanswered so this stop stays with the task
+            // suspended. Continuing would let new threads execute the restored entry.
+            return false;
+        }
+        if state.birth.step_off_threads().is_empty() {
+            thaw_birth_freeze(state);
+        }
         if let Err(err) = reply_to_held(exception, faults) {
             let _ = events.send(Err(err));
         }

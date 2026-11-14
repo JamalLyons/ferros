@@ -657,6 +657,147 @@ fn new_thread_created_during_step_stays_at_the_trap()
     });
 }
 
+/// Releases a birth step-off hold if the test panics while the entry is restored.
+struct ReleaseHold<'a>(&'a ferros_macos::exception::ReplyFaultInjector);
+
+impl Drop for ReleaseHold<'_>
+{
+    fn drop(&mut self)
+    {
+        self.0.release_birth_step_off();
+    }
+}
+
+/// Stop with the creator at `spawn_second`, the first newborn held, and earlier threads recorded.
+fn stop_before_second_spawn(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, Vec<(ThreadId, Address)>, ThreadId)
+{
+    let address = function_address(d, fixture, "spawn_later");
+    let second = function_address(d, fixture, "spawn_second");
+    let original = plant_trap(d, address);
+    let (creator, _) = run_to_trap(d, address);
+    backend(d).write_memory(address, &original).expect("restore spawn_later");
+    let second_original = plant_trap(d, second);
+    let existing = backend(d).threads().expect("threads");
+    let suspended: Vec<_> = existing
+        .into_iter()
+        .filter(|&id| id != creator)
+        .map(|id| (id, pc_of(d, id)))
+        .collect();
+    backend(d)
+        .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+        .expect("resume creator");
+    let hit = backend(d)
+        .wait(Some(STOP_TIMEOUT))
+        .expect("wait for spawn_second")
+        .expect("spawn_second stop");
+    assert_eq!(
+        hit,
+        StopEvent::Breakpoint {
+            thread: creator,
+            pc: second
+        },
+        "expected the creator at spawn_second"
+    );
+    assert_eq!(
+        backend(d).wait(Some(Duration::ZERO)).expect("drain"),
+        None,
+        "the birth trap was delivered with spawn_second"
+    );
+    backend(d)
+        .write_memory(second, &second_original)
+        .expect("restore spawn_second");
+    assert!(
+        !d.stdout().contains("new worker ran") && !d.stdout().contains("second worker ran"),
+        "a worker ran before step-off: {}",
+        d.stdout()
+    );
+    let known: Vec<_> = suspended.iter().map(|(id, _)| *id).chain(std::iter::once(creator)).collect();
+    let newborn = backend(d)
+        .threads()
+        .expect("threads")
+        .into_iter()
+        .find(|id| !known.contains(id))
+        .expect("the first new thread was not enumerated");
+    let newborn_pc = pc_of(d, newborn);
+    assert_eq!(instruction_at(d, newborn_pc), BRK);
+    (creator, suspended, newborn)
+}
+
+/// A creator resumed with a held newborn must not start another thread through the
+/// instruction that step-off temporarily restores.
+#[test]
+fn second_thread_created_during_birth_step_off_stays_at_the_trap()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], debugger);
+        let (creator, suspended, newborn) = stop_before_second_spawn(&mut d, &fixture);
+        faults.hold_next_birth_step_off();
+        let _release = ReleaseHold(&faults);
+        backend(&mut d)
+            .resume(
+                &ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(creator, ThreadAction::Continue)
+                    .with_thread(newborn, ThreadAction::Continue),
+            )
+            .expect("continue creator and newborn");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !faults.birth_step_off_is_held() {
+            assert!(
+                Instant::now() < deadline,
+                "the birth step-off was not held, stdout: {}",
+                d.stdout()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The entry instruction is restored and the stepping thread has already
+        // stopped. Without freezing the creator, this wait is long enough for it
+        // to start the second worker through the open entry.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !d.stdout().contains("second worker ran"),
+            "the second thread ran while the birth entry was restored: {}",
+            d.stdout()
+        );
+        faults.release_birth_step_off();
+        assert!(
+            !d.wait_for_stdout("second worker ran", BIRTH_QUIET),
+            "the second thread ran after the trap was restored, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "the second birth trap was delivered to the client"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        assert_suspended_still(&mut d, &suspended);
+        let known: Vec<_> = suspended
+            .iter()
+            .map(|(id, _)| *id)
+            .chain([creator, newborn])
+            .collect::<Vec<_>>();
+        let second_thread = backend(&mut d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| !known.contains(id))
+            .expect("the second thread was not enumerated");
+        let second_pc = pc_of(&mut d, second_thread);
+        assert_eq!(
+            instruction_at(&mut d, second_pc),
+            BRK,
+            "the second thread is not held on a trap"
+        );
+    });
+}
+
 /// A resume that fails after the birth traps are installed leaves the target stopped and runnable.
 #[test]
 fn failed_birth_resume_can_still_continue()

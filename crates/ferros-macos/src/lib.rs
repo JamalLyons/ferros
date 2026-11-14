@@ -38,9 +38,12 @@
 //!   the resume is held at `_thread_start` or `_start_wqthread` in `libsystem_pthread`
 //!   until a later resume lets it execute that first instruction. Continuing every
 //!   thread removes those traps. Before dyld publishes the library the resume installs
-//!   no traps, because those entries are not mapped yet. Once it has, failure to install
-//!   them fails the resume.
-//!   Its stop record and any held Unix signal reply remain until a later
+//!   no traps, because those entries are not mapped yet, and a thread created in that
+//!   same resume is outside the guarantee. Once the library is published, failure to
+//!   install the traps fails the resume. While a held thread executes the restored
+//!   entry, every other thread stays suspended. A breakpoint on that instruction is
+//!   held as a newborn and is not reported to the client.
+//!   A suspended thread's stop record and any held Unix signal reply remain until a later
 //!   resume lets it run; hardware exception replies are sent while the task is stopped. The next stop `wait` delivers ends that resume: the per-thread
 //!   suspends are balanced and every single-step bit is cleared, so a step that did not
 //!   complete is cancelled; `detach`, `kill` and drop balance them too. `Step` is not

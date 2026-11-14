@@ -1929,8 +1929,9 @@ impl Backend for MacOSBackend
             BackendState::Running => {
                 {
                     let mut shared = lock_shared(&self.exception_state);
-                    // An exception stop is already queued for `wait`: the interrupt lost
-                    // the race and is consumed, as the contract requires.
+                    // An exception stop is already queued for `wait`, or a signal was
+                    // deferred because an earlier interrupt holds the task: the interrupt
+                    // lost the race and is consumed, as the contract requires.
                     if shared.pending_exception {
                         return Ok(());
                     }

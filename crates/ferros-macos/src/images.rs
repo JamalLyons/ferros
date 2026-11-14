@@ -4,6 +4,8 @@
 //! decoded as data, never dereferenced in the debugger. Before dyld's first instruction
 //! its list is empty. Only at that bootstrap stop we locate the executable header in
 //! the kernel's mappings, so callers can still plant breakpoints before running dyld.
+//! Its path comes from the executable's vnode or, once that file is unlinked, from the
+//! exec path the kernel recorded for the process; neither is inferred.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -93,29 +95,76 @@ fn remote_path(task: mach_port_t, mut address: u64) -> Result<PathBuf>
     Err(invalid("unterminated image path"))
 }
 
-pub(crate) fn executable_path(pid: ProcessId) -> Option<PathBuf>
+/// The path of the executable's vnode. It is unavailable once that file is unlinked.
+fn vnode_path(pid: ProcessId) -> Option<PathBuf>
 {
     libproc::libproc::proc_pid::pidpath(pid.0 as i32).ok().map(PathBuf::from)
+}
+
+/// The exec path the kernel stored with the process's arguments (`KERN_PROCARGS2`), as
+/// dyld receives it. Only an absolute path is returned: a relative one would need a
+/// working directory that may have changed since exec.
+fn exec_path(pid: ProcessId) -> Option<PathBuf>
+{
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.0 as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: mib holds three valid ints; a null buffer asks the kernel only for the size.
+    let result = unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) };
+    if result != 0 || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; size];
+    // SAFETY: buffer is writable for size bytes; the kernel writes at most size bytes and
+    // stores the number written in size.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    parse_exec_path(buffer.get(..size)?)
+}
+
+/// `KERN_PROCARGS2` is `argc` (an `int`) followed by the NUL-terminated exec path.
+fn parse_exec_path(procargs: &[u8]) -> Option<PathBuf>
+{
+    let rest = procargs.get(size_of::<libc::c_int>()..)?;
+    let path = &rest[..rest.iter().position(|&byte| byte == 0)?];
+    (path.first() == Some(&b'/')).then(|| PathBuf::from(OsString::from_vec(path.to_vec())))
+}
+
+/// Whether the 64-bit Mach-O header at `address` is the main executable's (`MH_EXECUTE`).
+fn is_executable_header(task: mach_port_t, address: Address) -> bool
+{
+    read_target(task, address, 16)
+        .is_ok_and(|bytes| bytes[..4] == 0xfeed_facf_u32.to_le_bytes() && bytes[12..16] == 2_u32.to_le_bytes())
 }
 
 /// Compatibility for `POSIX_SPAWN_START_SUSPENDED`: dyld has not populated its array.
 /// No inferred slide is used: the actual mapped Mach-O header is returned.
 fn bootstrap_executable(task: mach_port_t, pid: ProcessId) -> Result<Vec<LoadedImage>>
 {
-    let path = executable_path(pid).ok_or_else(|| invalid("cannot locate main executable path"))?;
-    for region in get_memory_regions(task)?.iter().filter(|region| region.is_readable()) {
-        if let Ok(bytes) = read_target(task, region.start, 16)
-            && bytes.len() == 16
-            && bytes[..4] == 0xfeed_facf_u32.to_le_bytes()
-            && bytes[12..16] == 2_u32.to_le_bytes()
-        {
-            return Ok(vec![LoadedImage {
+    let path = vnode_path(pid)
+        .or_else(|| exec_path(pid))
+        .ok_or_else(|| invalid("cannot locate main executable path"))?;
+    get_memory_regions(task)?
+        .iter()
+        .filter(|region| region.is_readable())
+        .find(|region| is_executable_header(task, region.start))
+        .map(|region| {
+            vec![LoadedImage {
                 path,
                 load_address: region.start,
-            }]);
-        }
-    }
-    Err(invalid("loader is uninitialized and the executable header is unavailable"))
+            }]
+        })
+        .ok_or_else(|| invalid("loader is uninitialized and the executable header is unavailable"))
 }
 
 pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<LoadedImage>>
@@ -170,9 +219,8 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
         return Err(invalid("image list changed while reading"));
     }
     // Preserve the existing main-first contract for callers; dyld's order is not an API.
-    if let Some(main) = executable_path(pid)
-        && let Some(index) = images.iter().position(|image| image.path == main)
-    {
+    // The main image is found by its header, so this holds after its file is unlinked.
+    if let Some(index) = images.iter().position(|image| is_executable_header(task, image.load_address)) {
         images.swap(0, index);
     }
     Ok(images)
@@ -193,5 +241,16 @@ mod tests
         header[4..8].copy_from_slice(&2_u32.to_le_bytes());
         header[8..].copy_from_slice(&0x1234_u64.to_le_bytes());
         assert_eq!(array_header(&header).expect("header"), (2, 0x1234));
+    }
+
+    #[test]
+    fn exec_path_is_the_absolute_path_after_argc()
+    {
+        let procargs = |path: &[u8]| [&2_i32.to_ne_bytes()[..], path, b"\0\0\0arg\0"].concat();
+        assert_eq!(parse_exec_path(&procargs(b"/bin/ls")), Some(PathBuf::from("/bin/ls")));
+        assert_eq!(parse_exec_path(&procargs(b"ls")), None);
+        assert_eq!(parse_exec_path(&procargs(b"")), None);
+        assert_eq!(parse_exec_path(b"/no"), None);
+        assert_eq!(parse_exec_path(&[0, 0, 0, 0, b'/', b'x']), None);
     }
 }

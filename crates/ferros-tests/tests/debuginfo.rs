@@ -494,3 +494,28 @@ fn loaded_image_maps_after_its_file_is_removed()
         );
     });
 }
+
+/// Issue #83: at the launch-entry stop dyld has published no images, so the backend
+/// reports the main executable itself. Its path must not depend on the file still
+/// existing: a Cargo command can unlink a running fixture's executable at any time.
+#[test]
+fn bootstrap_main_image_is_reported_after_its_file_is_removed()
+{
+    harness::run(|t| {
+        let scratch = Scratch::new();
+        let directory = fs::canonicalize(&scratch.0).expect("canonical scratch directory");
+        let path = directory.join("ferros-fixture-hello");
+        fs::copy(fixture!("hello").path(), &path).expect("copy the fixture");
+        let header = fs::read(&path).expect("read the copy")[..32].to_vec();
+        let path_text: &'static str = Box::leak(path.to_str().expect("UTF-8 scratch path").into());
+        let mut debuggee = t.launch(&Fixture::from_built("hello", path_text));
+        fs::remove_file(&path).expect("remove the running executable");
+        let images = debuggee.images().expect("images at the bootstrap stop");
+        let main = images.first().expect("the main image");
+        assert_eq!(main.path, path);
+        assert_eq!(
+            debuggee.read_memory(main.load_address, 32).expect("read the mapped header"),
+            header
+        );
+    });
+}

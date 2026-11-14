@@ -710,6 +710,46 @@ fn stack_trace_reads_memory_through_the_backend_and_skips_bad_images()
 }
 
 #[test]
+fn runtime_address_reports_the_original_header_failure_once_read()
+{
+    // Issue #78: an image whose mapped header cannot be parsed is an error naming the
+    // cause, not `Ok(None)`, and the result is kept rather than read again.
+    let image = LoadedImage {
+        path: "/nonexistent/ferros-session-test-image".into(),
+        load_address: Address::new(CODE),
+    };
+    let mock = process().with_image(image.clone());
+    let mut session = launched(&mock);
+    let _ = mock.take_calls();
+    for _ in 0..2 {
+        let error = session
+            .runtime_address(&image, 0x1_0000_0000)
+            .expect_err("unparseable header");
+        let DebuggerError::ImageMapping { path, detail } = &error else {
+            panic!("unexpected error {error}");
+        };
+        assert_eq!(path, &image.path);
+        assert!(detail.contains("Unsupported Mach-O header"), "{detail}");
+    }
+    assert_eq!(
+        mock.take_calls(),
+        [
+            MockCall::Images,
+            MockCall::ReadMemory {
+                address: Address::new(CODE),
+                len: crate::symbols::ImageMapping::MACH_HEADER_SIZE
+            },
+            MockCall::Images
+        ]
+    );
+    let moved = LoadedImage {
+        load_address: Address::new(CODE + 0x1000),
+        ..image
+    };
+    assert_eq!(session.runtime_address(&moved, 0x1_0000_0000).expect("not loaded"), None);
+}
+
+#[test]
 fn stack_trace_ignores_unsupported_image_listing()
 {
     let mock = process();

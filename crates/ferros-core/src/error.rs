@@ -80,6 +80,17 @@ pub enum DebuggerError
         detail: String,
     },
 
+    /// A loaded image's segment layout could not be read from the target, so its file
+    /// addresses cannot be translated. `detail` is the original failure.
+    #[error("Cannot map image {path}: {detail}")]
+    ImageMapping
+    {
+        /// Loader-reported path of the image.
+        path: std::path::PathBuf,
+        /// Why its mapped header could not be read or parsed.
+        detail: String,
+    },
+
     /// Failed to attach to a process
     ///
     /// This is a general error for attachment failures that don't fit

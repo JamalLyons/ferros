@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::backend::mock::MockBackend;
@@ -14,6 +14,7 @@ use ferros_core::symbols::{BinaryImage, DebugInfoOptions, ImageDescriptor, Image
 use ferros_core::{
     Address, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache, ThreadId,
 };
+use ferros_macos::MacOSBackend;
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
@@ -63,6 +64,15 @@ fn descriptor(path: &Path, load_address: u64) -> ImageDescriptor
         path: path.to_path_buf(),
         load_address,
     }
+}
+
+/// Map `path`'s Mach-O header and load commands at `load_address`, as the loader would:
+/// the session reads an image's segment layout from target memory, not from its file.
+fn with_mapped_header(mock: MockBackend, path: &Path, load_address: u64) -> MockBackend
+{
+    let bytes = fs::read(path).expect("read executable");
+    let size = ImageMapping::header_size(&bytes).expect("Mach-O header");
+    mock.with_region(Address::new(load_address), "r-x", &bytes[..size])
 }
 
 /// Read the symbol table independently of the engine's DWARF resolver.
@@ -284,7 +294,7 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
             .expect("runtime");
         let mut registers = Registers::default();
         registers.pc = address;
-        let mock = MockBackend::new()
+        let mock = with_mapped_header(MockBackend::new(), &executable, 0x2_0000_0000)
             .with_thread(ThreadId(1), registers)
             .with_image(LoadedImage {
                 path: executable,
@@ -326,7 +336,9 @@ fn session_refreshes_unloaded_and_relocated_images()
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
-        let mock = MockBackend::new()
+        let mock = MockBackend::new();
+        let mock = with_mapped_header(mock, fixture.path(), first.load_address.value());
+        let mock = with_mapped_header(mock, fixture.path(), second.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(first.clone());
         let mut session = Session::new(Box::new(mock.clone()));
@@ -374,7 +386,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
-        let mock = MockBackend::new()
+        let mock = with_mapped_header(MockBackend::new(), fixture.path(), image.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(image);
         let mut session = Session::new(Box::new(mock));
@@ -423,5 +435,62 @@ fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
             assert_eq!(debuggee.runtime_address(main, file).expect("runtime address"), Some(address));
         }
         assert_ne!(loads[0], loads[1], "the test must exercise different ASLR slides");
+    });
+}
+
+/// Issue #78: every Cargo command, even a fresh one, replaces the uplifted
+/// `target/debug/ferros-fixture-*` file by removing it and creating it again, so a
+/// concurrent `cargo test` can leave the path of a running fixture briefly missing.
+/// Mapping a loaded image must use the Mach-O header the loader mapped, not whatever file
+/// the path names at lookup time. Removing a private copy after it starts, then
+/// attaching as the reported single-step test does, reproduces that window.
+#[test]
+fn loaded_image_maps_after_its_file_is_removed()
+{
+    harness::run(|t| {
+        let scratch = Scratch::new();
+        let directory = fs::canonicalize(&scratch.0).expect("canonical scratch directory");
+        let path = directory.join("ferros-fixture-spawn_thread");
+        fs::copy(fixture!("spawn_thread").path(), &path).expect("copy the fixture");
+        let bytes = fs::read(&path).expect("read the copy");
+        let (file, _) = symbol(&path, "ferros_fixture_spawn_thread::spawn_later");
+        let expected = {
+            let object = object::File::parse(&*bytes).expect("parse the copy");
+            let section = object
+                .sections()
+                .find(|section| (section.address()..section.address() + section.size()).contains(&file))
+                .expect("section holding spawn_later");
+            let (offset, _) = section.file_range().expect("spawn_later is in the file");
+            let start = usize::try_from(offset + file - section.address()).expect("file offset");
+            bytes[start..start + 16].to_vec()
+        };
+        let path_text: &'static str = Box::leak(path.to_str().expect("UTF-8 scratch path").into());
+        let target = t.spawn(&Fixture::from_built("spawn_thread", path_text), &["pause=4000"]);
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        // Attach once the first worker runs: dyld has then published the image list, as
+        // it had in the reported failure, so the main image's path is the loader's.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match session.attach(target.pid()) {
+                Ok(()) if session.threads().expect("threads").len() >= 2 => break,
+                Ok(()) => session.detach().expect("detach before the worker runs"),
+                Err(error) if Instant::now() >= deadline => panic!("attach failed: {error}"),
+                Err(_) => {}
+            }
+            assert!(Instant::now() < deadline, "the fixture's first worker did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        fs::remove_file(&path).expect("remove the running executable");
+        let images = session.images().expect("images");
+        let main = images.iter().find(|image| image.path == path).expect("main image");
+        let address = session
+            .runtime_address(main, file)
+            .expect("image mapping")
+            .expect("spawn_later is mapped while its file is missing");
+        assert_eq!(session.read_memory(address, 16).expect("read spawn_later"), expected);
+        assert_eq!(
+            session.file_address(address).expect("file address"),
+            Some((path.clone(), file))
+        );
     });
 }

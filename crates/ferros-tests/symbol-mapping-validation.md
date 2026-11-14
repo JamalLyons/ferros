@@ -1,6 +1,20 @@
-# Issue #76 followup F2, attempt 1: symbol-mapping investigation
+# Issue #76 followup F2: symbol-mapping investigation
 
-## Outcome
+## Resolution (issue #78)
+
+**Root cause.** Every Cargo command in a target directory, even one with nothing to rebuild, replaces each uplifted `target/debug/ferros-fixture-*` executable: it removes the file and creates it again (new inode, same mtime and contents). A fixture already running keeps its old, now-unlinked image, but its path is briefly missing. `Session::load_images` read each newly seen image's segment layout from that path with `ImageMapping::parse(..).ok()`. A read during the window failed with `ENOENT`, the error was discarded, and `mapping: None` was cached for the image's lifetime, so `runtime_address` returned `Ok(None)`. That is exactly the reported panic (executable path found, text symbol found, `runtime_address` `None`) and explains why only concurrent `cargo test` load produced it.
+
+**Evidence.** In this checkout, `stat -f '%i %m' target/debug/ferros-fixture-spawn_thread` gave inode 140856808 after the initial build, then 140860687 and 140860695 after two further commands with nothing to rebuild (`cargo test -p ferros-tests --no-run`, then `cargo test -p ferros-tests --test single_step --no-run`); the mtime did not change. A reader looping on `open`+`read` of that path while six fresh `cargo test -p ferros-tests --no-run` commands ran made 969,139 reads: 274 failed with `ENOENT`, none returned a partial file. The earlier filesystem sample below (24,664 reads, no errors) was too sparse to land in the window.
+
+**Fix.** The session now reads the segment layout from the Mach-O header and load commands the loader mapped at the image's load address (`ImageMapping::from_header`), which is what is actually executing and does not change while the image stays loaded. No file is read for mapping, nothing is retried, and no slide is guessed. A header that cannot be read or parsed is kept with its original error and reported by `runtime_address` as `DebuggerError::ImageMapping { path, detail }` instead of `Ok(None)`; `Ok(None)` now means only "not loaded at that address" or "outside the mapped segments". The helper's failure-only diagnostics are unchanged.
+
+**Regression.** `debuginfo::loaded_image_maps_after_its_file_is_removed` starts a private copy of `spawn_thread`, attaches once dyld has published its image list (as the reported test does), removes the copy, and requires `runtime_address` for `spawn_later` to return the address whose 16 bytes match the file's code bytes. Before the fix it fails with `spawn_later is mapped while its file is missing` (`Ok(None)`); after it passes. Core unit tests cover header/file layout equality, malformed and oversized headers, and the reported error.
+
+The rest of this document is the first, unresolved attempt, kept as the record of what was ruled out.
+
+## Attempt 1
+
+### Outcome
 
 **Unresolved. The reported `mapped symbol` panic was not reproduced, no actual mapping cause is established, and no relocation or loader behavior is changed.** No retry or timeout increase is proposed. There is no failing-before/passing-after engine regression, so this must not be presented as an engine fix or proof that the original panic is a baseline defect.
 
@@ -9,7 +23,7 @@ Initial clean HEAD matched the requested base exactly: `60bb6e7aefba980fa6bc07d7
 Investigation started at approximately 2026-11-14 14:34 UTC; deadline 15:04 UTC.
 No diagnostics from `687bfb8` or `b873712` were applied; the latter's report and original raw failure were read as evidence only.
 
-## What the original panic establishes
+### What the original panic establishes
 
 `local-evidence/ferros76-stress/full-0-0.log` shows a panic at `symbols.rs:57`, the second expect in `function_address`: `Session::runtime_address` returned `Ok(None)`. The helper had already found the executable path and a defined text symbol, and the backend's image enumeration did not return an error at this call.
 
@@ -17,7 +31,7 @@ The code permits three categories: the second image enumeration no longer matche
 
 Read `AGENTS.md`, test README, backend README, symbol helper, single-step tests, fixture/harness, backend attach/image enumeration and portable mapping/cache code; inspected Justfile, Cargo runner/config and boundary script before running their checks. The legacy `run-test-launch.sh` contains sudo commands; none were executed. No inhibitor, sudo, push, branch switching, PR/issue mutation or other checkout edit.
 
-## Experiments
+### Experiments
 
 Temporary engine instrumentation logged the original parse error for fixture images immediately before the existing `.ok()`; no such fixture error was observed. Missing shared-cache library files were observed and are already intentionally tolerated; they do not establish the cause of this executable lookup failure. A temporary helper panic captured the requested file address, initial descriptor, current loader list and direct on-disk mapping. Instrumentation did not change relocation or retry failed mappings.
 
@@ -37,7 +51,7 @@ links. Per-command arguments, exit statuses and wall times are JSON lines in eac
 - `local-evidence/ferros76-f2-original-suite-stress.py`, summary `local-evidence/ferros76-f2-original-suite-stress-summary.log`, output directory `local-evidence/ferros76-f2-original-suite-stress/`. Original 32-test suite, no probe, failure-only helper diagnostics and temporary parse-error logging. Each stream stopped at any failure.
 - `local-evidence/ferros76-f2-continuous-stress.py`, summary `local-evidence/ferros76-f2-continuous-stress-summary.log`, output directory `local-evidence/ferros76-f2-continuous-stress/`. Original 32-test suite, no source edits during the batch. Continued past unrelated failures so they did not remove concurrent load; would stop a stream on the target mapping panic.
 
-## Separate failures reported to lead
+### Separate failures reported to lead
 
 These are naturally observed failures with unchanged teardown code. They do not explain F2, and no files in their implementation were modified:
 
@@ -51,13 +65,13 @@ These are naturally observed failures with unchanged teardown code. They do not 
 
 Additional natural failures in the sustained batch are listed below from the raw logs. Lead/F3 retain task, exception and signal teardown ownership.
 
-## Final changes and limitations
+### Final changes and limitations
 
 Only the test symbol helper's failure message and this report are intended. The helper still uses Session's mapping and still panics on `None`; additional parsing/image enumeration occurs only to explain that failure, never to return a substitute address. The direct on-disk parse in that panic is a later snapshot; it cannot recover an earlier transient error already discarded by the engine. No engine mapping fix or success-path validation change is claimed. No new integration regression is retained because none failed before a demonstrated engine fix.
 
 The remaining task is to capture an actual occurrence with the original parse error or loader/file-address mismatch, then implement and validate the corresponding fix. Thousands of successful lookups cannot retrospectively attribute the reported panic. Shared Cargo artifacts, source edits in the early exploratory batches, and independent active checkouts affect timing; no universal reliability claim follows from these samples.
 
-## Completed stress counts
+### Completed stress counts
 
 - `stress`: targeted/single-step exit 0: 36; exit 101: 0. Full suite exit 0: 2; exit 101: 2.
 - `suite-stress`: targeted/single-step exit 0: 17; exit 101: 3. Full suite exit 0: 3; exit 101: 2.
@@ -79,7 +93,7 @@ Sustained-batch natural failures (all exit 101):
 
 The sustained batch completed at 2026-11-14 14:51:32 UTC. Its final `pgrep -fl ferros-fixture-` exited 1 with no output. Earlier pgrep output included active fixtures from this and other checkouts; none were killed. Harness-owned guards performed cleanup; no external cleanup command was needed.
 
-## Final verification
+### Final verification
 
 The first verification attempt found Clippy’s 50-byte `large_stack_arrays` limit in the expanded panic formatting. It was corrected by writing the diagnostic in smaller groups; no lint suppression was added. That first `just lint` exited 101 (`local-evidence/ferros76-f2-final-lint.log`). Its other checks passed, but only the following complete rerun is the final-code verification:
 

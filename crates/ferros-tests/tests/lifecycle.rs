@@ -329,6 +329,137 @@ fn replacement_signals_do_not_hide_later_signal_stops()
     });
 }
 
+/// #79: a signal sent while the backend holds the target stopped at entry, after
+/// attach, or at an interrupt, is not published until resume. Published earlier, it
+/// raced the client's resume, which had already drained the queue, and the resume
+/// was refused with stop events pending. Delivery and suppression still apply to it.
+#[test]
+fn signal_sent_while_stopped_is_reported_after_resume()
+{
+    harness::run(|t| {
+        const CASES: &[(&str, bool)] = &[("entry", false), ("entry", true), ("attach", false), ("interrupt", true)];
+        for &(stop, deliver) in CASES {
+            let spawned = (stop == "attach").then(|| t.spawn(&fixture!("loop_counter"), &[]));
+            let mut d = match &spawned {
+                Some(target) => {
+                    let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+                    session.attach(target.pid()).expect("attach");
+                    Err(session)
+                }
+                None => Ok(t.launch(&fixture!("loop_counter"))),
+            };
+            let session: &mut Session = match &mut d {
+                Ok(debuggee) => debuggee,
+                Err(session) => session,
+            };
+            let pid = session.pid().expect("pid").0;
+            if stop == "interrupt" {
+                session.resume().expect("resume before interrupt");
+                session.interrupt().expect("interrupt");
+                assert!(matches!(
+                    session.wait(Some(TIMEOUT)).expect("interrupt stop"),
+                    Some(StopEvent::Interrupted { .. })
+                ));
+            }
+            signal(pid, "-USR1");
+            assert_eq!(
+                session
+                    .backend_mut()
+                    .wait(Some(Duration::from_millis(300)))
+                    .expect("wait while stopped"),
+                None,
+                "{stop}: a signal sent while stopped was published before resume"
+            );
+            session
+                .backend_mut()
+                .resume(&ResumeRequest::continue_all())
+                .unwrap_or_else(|err| panic!("{stop}: resume refused: {err:?}"));
+            let thread = match session.backend_mut().wait(Some(TIMEOUT)).expect("signal stop") {
+                Some(StopEvent::Signal { signal: SIGUSR1, thread }) => thread,
+                other => panic!("{stop}: expected SIGUSR1, got {other:?}"),
+            };
+            assert_eq!(session.backend_mut().wait(Some(Duration::ZERO)).expect("drain"), None);
+            if deliver {
+                session
+                    .backend_mut()
+                    .resume(&ResumeRequest::continue_all().with_signal(thread, SIGUSR1))
+                    .expect("deliver SIGUSR1");
+                assert_eq!(
+                    session.backend_mut().wait(Some(TIMEOUT)).expect("terminal event"),
+                    Some(StopEvent::Killed { signal: SIGUSR1 }),
+                    "{stop}: delivered signal"
+                );
+            } else {
+                session
+                    .backend_mut()
+                    .resume(&ResumeRequest::continue_all())
+                    .expect("suppress SIGUSR1");
+                assert_eq!(
+                    session
+                        .backend_mut()
+                        .wait(Some(Duration::from_millis(150)))
+                        .expect("no duplicate stop"),
+                    None,
+                    "{stop}: suppressed signal stopped again"
+                );
+                assert!(!harness::process_is_gone(pid), "{stop}: suppressed signal killed the target");
+                session.kill().expect("kill");
+            }
+            assert_reaped(pid);
+        }
+    });
+}
+
+/// #79: a signal deferred while stopped is torn down with the session. Kill reaps
+/// the target; detach discards the client decision and lets the process run on, and
+/// `Session::resume` reports the deferred signal as its next stop.
+#[test]
+fn signal_deferred_while_stopped_survives_teardown_and_session_resume()
+{
+    harness::run(|t| {
+        for ending in ["kill", "detach", "session resume"] {
+            let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
+            let pid = target.pid();
+            let backend = MacOSBackend::new().expect("backend");
+            let faults = backend.reply_fault_injector();
+            let mut session = Session::new(Box::new(backend));
+            session.attach(pid).expect("attach");
+            signal(pid.0, "-USR1");
+            assert_eq!(
+                session
+                    .backend_mut()
+                    .wait(Some(Duration::from_millis(300)))
+                    .expect("wait while stopped"),
+                None,
+                "{ending}: a signal sent while stopped was published before resume"
+            );
+            assert!(!faults.has_pending_stop(), "{ending}: deferral reported as a stop");
+            match ending {
+                "kill" => {
+                    session.kill().expect("kill with a deferred signal");
+                    assert_reaped(pid.0);
+                }
+                "detach" => {
+                    session.detach().expect("detach with a deferred signal");
+                    std::thread::sleep(Duration::from_millis(200));
+                    assert!(!harness::process_is_gone(pid.0), "detach delivered the deferred signal");
+                    let stat = process_state(pid.0);
+                    assert!(!stat.starts_with('T'), "detach left the target stopped: {stat}");
+                }
+                _ => {
+                    session.resume().expect("session resume with a deferred signal");
+                    assert!(matches!(
+                        session.wait(Some(TIMEOUT)).expect("signal stop"),
+                        Some(StopEvent::Signal { signal: SIGUSR1, .. })
+                    ));
+                    session.kill().expect("kill");
+                    assert_reaped(pid.0);
+                }
+            }
+        }
+    });
+}
+
 /// Replacement must also refresh the properties of a nonfatal original signal.
 #[test]
 fn held_nonfatal_signal_can_be_replaced_with_a_fatal_signal()

@@ -36,7 +36,9 @@
 //! properties and the loop consumes its one internal stop. Suppression queues
 //! nothing. Thus external SIGKILL can complete even before the client calls `wait`.
 //! Signals arriving during an existing stop are also answered early, but their
-//! logical events are deferred until resume. Private attach/detach SIGSTOP replies
+//! logical events are deferred until resume. That includes the launch, attach and
+//! interrupt stops, which the loop did not report itself: it then awaits Continue
+//! as if it had (#79). Private attach/detach SIGSTOP replies
 //! stay held for their ptrace handshake. During a handshake, competing application
 //! signals are answered without creating client stops or adding task suspends, so
 //! they cannot prevent the private SIGSTOP from arriving. Independent thread rights
@@ -126,8 +128,9 @@ pub(crate) struct ExceptionSharedState
     /// Resume temporarily owns the suspend count while preparing thread actions and
     /// signal decisions. Those suspends remain in force until Continue is acknowledged.
     pub preparing_resume: bool,
-    /// Whether the loop has reported a stop and awaits its Continue command, while
-    /// still servicing the exception port. Kept records alone never set it.
+    /// Whether the loop has reported a stop, or deferred a signal that arrived while
+    /// the backend held the task stopped, and awaits its Continue command, while still
+    /// servicing the exception port. Kept records alone never set it.
     pub pending_exception: bool,
     /// Logical records for the current stop and threads a resume left suspended.
     /// Client exceptions are already replied to; private handshakes retain their reply.
@@ -240,7 +243,8 @@ impl ReplyFaultInjector
         self.handshake_requeue.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the exception loop currently holds a reported stop. Tests only.
+    /// Whether the exception loop currently holds a reported stop. A signal deferred
+    /// while the backend holds the task stopped (#79) does not count. Tests only.
     #[must_use]
     pub fn has_pending_stop(&self) -> bool
     {
@@ -815,7 +819,10 @@ pub(crate) fn run_exception_loop(
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        let mut first = if !pending && !deferred.is_empty() {
+        // A deferred stop that must wait again goes back to the front, keeping the
+        // order in which the signals arrived.
+        let popped = !pending && !deferred.is_empty();
+        let mut first = if popped {
             deferred.pop_front().expect("deferred request")
         } else {
             let buffer = match receive_exception_with_timeout(exception_port, pending.then_some(10)) {
@@ -922,6 +929,29 @@ pub(crate) fn run_exception_loop(
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             faults.stop_publication.store(0, Ordering::SeqCst);
+        }
+        if !pending {
+            // #79: the backend holds the task stopped (after launch, attach or an
+            // interrupt) without a reported stop awaiting Continue. A Unix signal the
+            // kernel raises now was sent while stopped: like one arriving during a
+            // reported stop, answer it early and defer its logical stop until resume.
+            // Publishing it here would race the client's resume, which must refuse a
+            // stop queued after its drain. Once a resume is preparing, a new stop is
+            // still published and refused (G8): its decision cannot be taken yet.
+            let mut state = lock_shared(&shared);
+            if held_quietly(&state) && first.0.soft_signal && !is_internal_stop(&first.1, &state) {
+                let (mut exception, event) = first;
+                if let Err(err) = prepare_stop(&mut exception, pid, &faults) {
+                    let _ = events.send(Err(err));
+                }
+                if popped {
+                    deferred.push_front((exception, event));
+                } else {
+                    deferred.push_back((exception, event));
+                }
+                state.pending_exception = true;
+                continue;
+            }
         }
         if pending {
             // Preserve the next logical stop, but not its kernel reply: otherwise an
@@ -1492,6 +1522,13 @@ fn preserve_handshake_stop(
     }
     deallocate_right(exception.thread);
     result
+}
+
+/// Whether the backend holds the task suspended while stopped, outside a resume and a
+/// private handshake, with no stop of the loop's own awaiting Continue.
+fn held_quietly(state: &ExceptionSharedState) -> bool
+{
+    state.suspends > 0 && !state.preparing_resume && !state.pending_exception && state.handshake_signals.is_none()
 }
 
 fn is_internal_stop(event: &StopEvent, state: &ExceptionSharedState) -> bool

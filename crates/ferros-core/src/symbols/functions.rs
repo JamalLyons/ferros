@@ -57,7 +57,8 @@ pub struct FunctionAddress
     /// Runtime address of the function's first instruction (`DW_AT_low_pc`, or the lowest
     /// start of its `DW_AT_ranges`).
     pub entry: Address,
-    /// Runtime address of the first instruction after the prologue: the first line-table
+    /// Runtime address of the first instruction after the prologue: `entry` when the entry
+    /// row itself is flagged `prologue_end` (no prologue); otherwise the first line-table
     /// row after `entry` and before `end` flagged `prologue_end`; otherwise the first row
     /// after `entry` whose line differs from the entry row's line; otherwise `entry`.
     pub after_prologue: Address,
@@ -81,6 +82,8 @@ pub(crate) struct FunctionIndex
 {
     functions: Vec<FunctionEntry>,
     by_last: HashMap<String, Vec<usize>>,
+    /// Sorted, distinct entry addresses of every indexed function.
+    starts: Vec<u64>,
 }
 
 /// Name attributes of one subprogram DIE.
@@ -189,7 +192,19 @@ impl FunctionIndex
                 by_last.entry(last.clone()).or_default().push(at);
             }
         }
-        Ok(Self { functions, by_last })
+        let mut starts: Vec<u64> = functions.iter().map(|function| function.entry).collect();
+        starts.dedup();
+        Ok(Self {
+            functions,
+            by_last,
+            starts,
+        })
+    }
+
+    /// Sorted, distinct entry addresses (file virtual addresses) of every indexed function.
+    pub(crate) fn starts(&self) -> &[u64]
+    {
+        &self.starts
     }
 
     /// Every function matching `query` (see the module documentation), sorted by entry.
@@ -287,7 +302,12 @@ fn after_prologue(lines: &LineIndex, entry: u64, end: u64) -> u64
     let Some((sequence, at)) = lines.row_at(entry) else {
         return entry;
     };
-    let entry_line = sequence.rows[at].line;
+    let entry_row = sequence.rows[at];
+    // A function without a prologue (optimized leaf code) has `prologue_end` on its entry.
+    if entry_row.address == entry && entry_row.prologue_end {
+        return entry;
+    }
+    let entry_line = entry_row.line;
     let body = || {
         sequence.rows[at + 1..]
             .iter()
@@ -461,7 +481,7 @@ fn dwarf_error(error: gimli::Error) -> SourceLookupError
 impl BinaryImage
 {
     /// The image's function index, built from every compilation unit on first use.
-    fn function_index(&self) -> Result<&FunctionIndex, SourceLookupError>
+    pub(crate) fn function_index(&self) -> Result<&FunctionIndex, SourceLookupError>
     {
         self.function_index_cell().get_or_try_init(|| {
             let dwarf = self
@@ -572,7 +592,11 @@ mod tests
                 .or_default()
                 .push(at);
         }
-        let index = FunctionIndex { functions, by_last };
+        let index = FunctionIndex {
+            functions,
+            by_last,
+            starts: Vec::new(),
+        };
         let entries = |query| {
             index
                 .lookup(query)

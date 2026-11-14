@@ -214,20 +214,73 @@ fn every_marker_resolves_inside_its_function_and_maps_back()
     }
 }
 
+/// Generic markers of the `symbols` fixture and the function each marker is in. Each
+/// function is instantiated for `u64` and `u32`.
+const GENERIC_MARKERS: &[(&str, &str)] = &[
+    ("in_generic", "generic_identity"),
+    // Written on one line, so both copies have rows only for this line, back to back in
+    // one line-table sequence.
+    ("one_line_generic", "one_line_identity"),
+];
+
+/// Demangled names (without hash) of the innermost frame of `name` at `address`.
+fn frame_name(image: &BinaryImage, address: Address, function: &str) -> String
+{
+    let frames = image.symbolicate(address).expect("symbolicated").frames;
+    frames
+        .iter()
+        .map(|frame| {
+            let raw = frame.symbol.raw();
+            rustc_demangle::try_demangle(raw).map_or_else(|_| raw.to_owned(), |name| format!("{name:#}"))
+        })
+        .find(|name| last_segment(name) == function)
+        .unwrap_or_else(|| panic!("{address} is not in fn {function}"))
+}
+
 #[test]
 fn generic_and_inlined_markers_have_one_address_per_copy()
 {
     let fixture = fixture!("symbols");
     let image = load(&fixture);
-    let generic = image
-        .line_addresses("fixtures/symbols.rs", fixture.marker_line("in_generic"))
-        .expect("generic marker");
-    assert_eq!(generic.addresses.len(), 2, "one per instantiation: {generic:?}");
-    assert_ne!(generic.addresses[0], generic.addresses[1]);
+    for &(marker, function) in GENERIC_MARKERS {
+        let found = image
+            .line_addresses("fixtures/symbols.rs", fixture.marker_line(marker))
+            .expect("generic marker");
+        assert_eq!(found.addresses.len(), 2, "{marker}: one per instantiation: {found:?}");
+        let names: BTreeSet<String> = found
+            .addresses
+            .iter()
+            .map(|&address| frame_name(&image, address, function))
+            .collect();
+        assert_eq!(names.len(), 2, "{marker}: each address in its own instantiation: {names:?}");
+        for name in &names {
+            assert!(name.ends_with("::<u64>") || name.ends_with("::<u32>"), "{marker}: {name}");
+        }
+    }
     let inlined = image
         .line_addresses("fixtures/symbols.rs", fixture.marker_line("in_inlined"))
         .expect("inlined marker");
     assert!(inlined.addresses.len() >= 2, "one per call site: {inlined:?}");
+}
+
+#[test]
+fn line_ranges_stay_inside_their_own_function()
+{
+    let fixture = fixture!("symbols");
+    let image = load(&fixture);
+    for &(marker, function) in GENERIC_MARKERS {
+        for instance in image.function_addresses(function).expect("generic function") {
+            let at = image
+                .line_at_address(instance.after_prologue)
+                .expect("line tables")
+                .expect("mapped");
+            assert_eq!(at.line, fixture.marker_line(marker), "{marker}: {instance:?}");
+            for range in &at.ranges {
+                let inside = instance.entry <= range.start && range.end <= instance.end;
+                assert!(inside, "{marker}: range {range:?} leaves {instance:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -312,7 +365,14 @@ fn lookup_errors_are_typed()
 }
 
 /// `symbols` fixture markers whose line ranges are checked.
-const RANGE_MARKERS: &[&str] = &["in_generic", "in_method", "in_module", "in_inlined", "after_gap"];
+const RANGE_MARKERS: &[&str] = &[
+    "in_generic",
+    "one_line_generic",
+    "in_method",
+    "in_module",
+    "in_inlined",
+    "after_gap",
+];
 
 #[test]
 fn address_line_ranges_cover_the_marker_and_map_back()
@@ -325,7 +385,11 @@ fn address_line_ranges_cover_the_marker_and_map_back()
         for &address in &found.addresses {
             let at = image.line_at_address(address).expect("line tables").expect("mapped");
             assert_eq!((at.file.as_str(), at.line), (found.file.as_str(), line), "{marker}");
-            assert!(at.column.is_some(), "{marker}: rustc records columns");
+            // rustc records a column on every row except a function's entry row; a
+            // one-line function's first statement row is its entry.
+            if marker != "one_line_generic" {
+                assert!(at.column.is_some(), "{marker}: rustc records columns");
+            }
             assert!(!at.ranges.is_empty(), "{marker}");
             assert!(at.ranges.iter().any(|range| range.contains(&address)), "{marker}: {at:?}");
             assert!(

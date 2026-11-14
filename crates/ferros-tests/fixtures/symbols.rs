@@ -3,6 +3,7 @@
 //! Functions:
 //! - `main`
 //! - `generic_identity` (generic; instantiated for `u64` and `u32`)
+//! - `one_line_identity` (generic, written on one line; instantiated for `u64` and `u32`)
 //! - `Counter::bump` (inherent method)
 //! - `shapes::area` (inside a module)
 //! - `always_inlined` (`#[inline(always)]`; inlined into `main` at two call sites)
@@ -10,6 +11,7 @@
 //!
 //! Markers:
 //! - `in_generic`
+//! - `one_line_generic`
 //! - `in_method`
 //! - `in_module`
 //! - `in_inlined`
@@ -21,6 +23,12 @@ fn generic_identity<T: Copy>(value: T) -> T
 {
     std::hint::black_box(value) // BREAK: in_generic
 }
+
+// Kept on one line: both instantiations then have rows only for this line, laid out back
+// to back in one line-table sequence.
+#[rustfmt::skip]
+#[inline(never)]
+fn one_line_identity<T: Copy>(value: T) -> T { std::hint::black_box(value) } // BREAK: one_line_generic
 
 struct Counter
 {
@@ -65,6 +73,8 @@ fn main()
 {
     let wide = generic_identity(std::hint::black_box(1_u64));
     let narrow = generic_identity(std::hint::black_box(2_u32));
+    let one_wide = one_line_identity(std::hint::black_box(3_u64));
+    let one_narrow = one_line_identity(std::hint::black_box(4_u32));
     let mut counter = Counter { count: 0 };
     let bumped = counter.bump();
     let area = shapes::area(3, 4);
@@ -73,6 +83,8 @@ fn main()
     let gap = with_gap(5);
     let total = wide
         .wrapping_add(u64::from(narrow))
+        .wrapping_add(one_wide)
+        .wrapping_add(u64::from(one_narrow))
         .wrapping_add(bumped)
         .wrapping_add(area)
         .wrapping_add(second)

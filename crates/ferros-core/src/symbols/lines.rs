@@ -163,13 +163,21 @@ pub(crate) struct LineIndex
     pub(crate) sequences: Vec<LineSequence>,
     /// Per file (same index as `files`): line -> canonical statement file addresses.
     lines: Vec<BTreeMap<u32, Vec<u64>>>,
+    /// Sorted, distinct entry addresses of every concrete function. One line-table sequence
+    /// can hold several functions back to back, so runs and line ranges stop at these.
+    function_starts: Vec<u64>,
 }
 
 impl LineIndex
 {
-    pub(crate) fn build(dwarf: &OwnedDwarf) -> Result<Self, SourceLookupError>
+    /// Index every compilation unit's line program. `function_starts` (sorted, distinct)
+    /// are the entry addresses of the image's concrete functions.
+    pub(crate) fn build(dwarf: &OwnedDwarf, function_starts: Vec<u64>) -> Result<Self, SourceLookupError>
     {
-        let mut index = Self::default();
+        let mut index = Self {
+            function_starts,
+            ..Self::default()
+        };
         let mut paths = HashMap::<String, u32>::new();
         let mut units = dwarf.units();
         while let Some(header) = units.next().map_err(dwarf_error)? {
@@ -237,9 +245,19 @@ impl LineIndex
         index.sequences.sort_by_key(|sequence| (sequence.start, sequence.end));
         index.lines = vec![BTreeMap::new(); index.files.len()];
         for sequence in &index.sequences {
-            index_statements(&mut index.lines, sequence);
+            index_statements(&mut index.lines, sequence, &index.function_starts);
         }
         Ok(index)
+    }
+
+    /// `[start, end)` of the function containing `address`: from the closest function
+    /// entry at or below it to the next entry (unbounded when there is none).
+    fn function_bounds(&self, address: u64) -> Range<u64>
+    {
+        let next = self.function_starts.partition_point(|&start| start <= address);
+        let start = next.checked_sub(1).map_or(0, |at| self.function_starts[at]);
+        let end = self.function_starts.get(next).copied().unwrap_or(u64::MAX);
+        start..end
     }
 
     /// Resolve a user-supplied path to one file index.
@@ -290,15 +308,18 @@ impl LineIndex
 
 /// Record the canonical statement address of every run of rows for one line.
 ///
-/// A run is a maximal stretch of consecutive rows with the same file and line; its
-/// canonical address is its first `is_stmt` row. Rows with line 0 end a run.
-fn index_statements(lines: &mut [BTreeMap<u32, Vec<u64>>], sequence: &LineSequence)
+/// A run is a maximal stretch of consecutive rows with the same file and line within one
+/// function; its canonical address is its first `is_stmt` row. Rows with line 0 end a run,
+/// and a function entry (`function_starts`, sorted) starts a new one, so functions laid
+/// out back to back in one sequence (two instantiations of a one-line generic) each get
+/// their own address.
+fn index_statements(lines: &mut [BTreeMap<u32, Vec<u64>>], sequence: &LineSequence, function_starts: &[u64])
 {
     let mut run: Option<(u32, u32)> = None;
     let mut recorded = false;
     for row in sequence.rows.iter().filter(|row| !row.end_sequence) {
         let key = (row.file, row.line);
-        if run != Some(key) {
+        if run != Some(key) || function_starts.binary_search(&row.address).is_ok() {
             run = Some(key);
             recorded = false;
         }
@@ -378,7 +399,7 @@ impl BinaryImage
             let dwarf = self
                 .dwarf()
                 .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
-            LineIndex::build(dwarf)
+            LineIndex::build(dwarf, self.function_index()?.starts().to_vec())
         })
     }
 
@@ -411,19 +432,24 @@ impl BinaryImage
         let id = index.resolve_file(file)?;
         let path = &index.files[id as usize];
         let lines = &index.lines[id as usize];
-        let Some((&used, addresses)) = lines.range(line..).next() else {
+        // The first line at or after `line` with an address mapped in this image (a line
+        // whose rows all lie outside the image's segments has no code here).
+        let found = lines.range(line..).find_map(|(&used, addresses)| {
+            let mut addresses: Vec<Address> = addresses
+                .iter()
+                .filter_map(|&address| self.runtime_address(address))
+                .collect();
+            addresses.sort_unstable();
+            addresses.dedup();
+            (!addresses.is_empty()).then_some((used, addresses))
+        });
+        let Some((used, addresses)) = found else {
             return Err(SourceLookupError::NoCodeAtOrAfterLine {
                 file: path.clone(),
                 line,
                 last_line: lines.keys().next_back().copied().unwrap_or(0),
             });
         };
-        let mut addresses: Vec<Address> = addresses
-            .iter()
-            .filter_map(|&address| self.runtime_address(address))
-            .collect();
-        addresses.sort_unstable();
-        addresses.dedup();
         Ok(LineAddresses {
             file: path.clone(),
             line: used,
@@ -432,7 +458,9 @@ impl BinaryImage
     }
 
     /// The source line containing `address`, from the line-table row that covers it, and
-    /// every address range of that line in the same line-table sequence.
+    /// every address range of that line in the same line-table sequence and the same
+    /// function (one sequence can hold several functions, such as two instantiations of a
+    /// generic function, that share line numbers).
     ///
     /// Returns `Ok(None)` when the address is outside the image, outside every line-table
     /// sequence, or in a row with no source line (line 0, compiler-generated code).
@@ -453,15 +481,21 @@ impl BinaryImage
         if row.line == 0 {
             return Ok(None);
         }
+        let function = index.function_bounds(file_address);
         let mut ranges: Vec<Range<u64>> = Vec::new();
         for pair in sequence.rows.windows(2) {
             let (start, next) = (pair[0], pair[1]);
-            if start.file != row.file || start.line != row.line || start.address >= next.address {
+            if start.file != row.file
+                || start.line != row.line
+                || start.address >= next.address
+                || !function.contains(&start.address)
+            {
                 continue;
             }
+            let end = next.address.min(function.end);
             match ranges.last_mut() {
-                Some(last) if last.end == start.address => last.end = next.address,
-                _ => ranges.push(start.address..next.address),
+                Some(last) if last.end == start.address => last.end = end,
+                _ => ranges.push(start.address..end),
             }
         }
         let ranges = ranges
@@ -488,6 +522,7 @@ mod tests
             files: paths.iter().map(|path| (*path).to_owned()).collect(),
             sequences: Vec::new(),
             lines: paths.iter().map(|_| BTreeMap::from([(1, vec![0x1000])])).collect(),
+            function_starts: Vec::new(),
         }
     }
 
@@ -547,9 +582,27 @@ mod tests
             ],
         };
         let mut lines = vec![BTreeMap::new()];
-        index_statements(&mut lines, &sequence);
+        index_statements(&mut lines, &sequence, &[]);
         assert_eq!(lines[0].get(&5), Some(&vec![0x4, 0x30]));
         assert_eq!(lines[0].get(&6), Some(&vec![0x10]));
         assert_eq!(lines[0].get(&0), None);
+
+        // A function entry inside a run (two copies of a one-line function laid out back
+        // to back in one sequence) starts a new run.
+        let mut lines = vec![BTreeMap::new()];
+        index_statements(&mut lines, &sequence, &[0x0, 0x8]);
+        assert_eq!(lines[0].get(&5), Some(&vec![0x4, 0x8, 0x30]));
+    }
+
+    #[test]
+    fn function_bounds_split_a_sequence_at_function_entries()
+    {
+        let index = LineIndex {
+            function_starts: vec![0x100, 0x120],
+            ..LineIndex::default()
+        };
+        assert_eq!(index.function_bounds(0x110), 0x100..0x120);
+        assert_eq!(index.function_bounds(0x120), 0x120..u64::MAX);
+        assert_eq!(index.function_bounds(0x10), 0..0x100);
     }
 }

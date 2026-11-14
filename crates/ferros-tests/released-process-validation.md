@@ -1,8 +1,11 @@
-# Issue #76: released-process investigation (partial)
+# Issue #76: initial released-process investigation (partial)
 
-The reported timeout was not reproduced. **No root cause is established, no
-release implementation is changed, and the 15-second exit timeout is unchanged.**
-This report records diagnostic improvements and evidence, not a fix for #76.
+This records the initial diagnostic-only phase at `687bfb8`. The reported timeout
+was not reproduced during that phase. Later loaded investigations naturally
+reproduced the original completion failure and a signal-acknowledgement release
+stall; see [the subsequent release investigation](signal-release-validation.md)
+for the captured physical suspension and backend fix. Common causation across
+every historical symptom remains unproven. The 15-second exit timeout is unchanged.
 
 ## Scope
 

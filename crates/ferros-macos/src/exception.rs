@@ -190,6 +190,7 @@ pub struct ReplyFaultInjector
     step_batch_signal: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
     pub(crate) handshake_requeue: Arc<AtomicBool>,
+    pub(crate) detach_handshake: Arc<AtomicBool>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
@@ -216,6 +217,13 @@ impl ReplyFaultInjector
     pub fn fail_next_exception_port_restore(&self)
     {
         self.restore.store(true, Ordering::SeqCst);
+    }
+
+    /// Fail the next detach handshake after its private signal has arrived, so
+    /// cleanup must use the real fallback PT_DETACH. Tests only.
+    pub fn fail_next_detach_handshake(&self)
+    {
+        self.detach_handshake.store(true, Ordering::SeqCst);
     }
 
     /// Deliver a real SIGUSR1 to another thread when the next private SIGSTOP arrives.

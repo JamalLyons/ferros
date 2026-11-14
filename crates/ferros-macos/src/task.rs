@@ -1199,8 +1199,12 @@ impl MacOSBackend
     /// just a task_suspend, so the backend raises a private SIGSTOP and detaches while its
     /// exception is held. Answering that exception afterwards stops the process for real;
     /// [`detach_target`](Self::detach_target) continues it once the reply is sent.
-    fn stop_tracing(&mut self) -> BackendResult<()>
+    fn stop_tracing(&mut self, private_stop_sent: &mut bool) -> BackendResult<()>
     {
+        let fail_handshake = self
+            .reply_faults
+            .detach_handshake
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
         if !self.traced {
             return Ok(());
         }
@@ -1253,6 +1257,7 @@ impl MacOSBackend
             if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
                 return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
             }
+            *private_stop_sent = true;
         }
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
@@ -1261,8 +1266,20 @@ impl MacOSBackend
             code: -1,
             message: "detach SIGSTOP did not arrive within 5s".into(),
         })?;
+        if fail_handshake {
+            return Err(BackendError::Os {
+                code: -1,
+                message: "injected detach handshake failure".into(),
+            });
+        }
         // PT_DETACH needs the tracee waiting in its signal exception (EBUSY otherwise),
         // so it comes before the reply.
+        self.detach_trace()
+    }
+
+    /// End tracing and account for the kernel resume, including fallback cleanup.
+    fn detach_trace(&mut self) -> BackendResult<()>
+    {
         self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
         // XNU's PT_DETACH clears P_LSIGEXC and calls task_resume while the
         // private signal is waiting. It consumes one of our task suspensions.
@@ -1320,20 +1337,17 @@ impl MacOSBackend
         // released process may be left single-stepping either.
         let birth = self.disarm_birth();
         self.undo_thread_actions();
-        let traced = self.stop_tracing();
-        // Replay errors cannot undo a successful PT_DETACH. In particular they
-        // must not skip the SIGCONT that completes our private-stop cleanup.
-        let replayed = if traced.is_ok() {
-            self.requeue_handshake_signals(false)
+        let mut private_stop_sent = false;
+        let traced = self.stop_tracing(&mut private_stop_sent);
+        let fallback = if traced.is_err() && self.traced {
+            self.detach_trace()
         } else {
             Ok(())
         };
-        let fallback = if traced.is_err() && self.traced {
-            let result = self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0);
-            if result.is_ok() {
-                self.traced = false;
-            }
-            result
+        // Replay and continuation belong to every successful PT_DETACH, including
+        // fallback after a handshake error. Preserve that error in the return value.
+        let replayed = if !self.traced {
+            self.requeue_handshake_signals(false)
         } else {
             Ok(())
         };
@@ -1341,7 +1355,7 @@ impl MacOSBackend
         self.child_cleanup.detach(self.traced);
         let restored = self.stop_exception_handler(true);
         self.release_suspends();
-        if traced.is_ok() {
+        if private_stop_sent && !self.traced {
             // The handler answered the private SIGSTOP exception after PT_DETACH, so the
             // kernel takes the SIGSTOP as an ordinary job-control stop (state `T`) once the
             // thread processes the reply. Wait (bounded) until it has, so the SIGCONT

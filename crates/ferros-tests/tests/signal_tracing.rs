@@ -24,13 +24,15 @@ impl Observer
         std::fs::create_dir(&path).expect("observer directory");
         Self(path)
     }
-    fn wait_released_after_drop(&self, pid: ferros_core::ProcessId)
+    fn wait_released(&self, pid: ferros_core::ProcessId)
     {
         let progress_before = std::fs::read_to_string(self.0.join("progress"));
         let began = Instant::now();
-        // Both handlers must run after release. A missing acknowledgement alone
-        // cannot distinguish signal loss from a task left suspended (#76).
-        while !self.0.join("handled").exists() || !self.0.join("continued").exists() {
+        // Handler acknowledgements alone can precede a late stop. Observe five
+        // subsequent progress advances too, within the same observation deadline.
+        let mut last_progress = None;
+        let mut advances = 0;
+        loop {
             if began.elapsed() >= Duration::from_secs(2) {
                 let state = std::process::Command::new("/bin/ps")
                     .args(["-M", "-o", "pid,ppid,stat,time,command"])
@@ -49,7 +51,21 @@ impl Observer
                 eprintln!("target: {}", String::from_utf8_lossy(&state.stdout));
                 panic!("missing release acknowledgement");
             }
-            std::thread::sleep(Duration::from_millis(1));
+            if self.0.join("handled").exists() && self.0.join("continued").exists() {
+                let progress = std::fs::read_to_string(self.0.join("progress"))
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok());
+                if let Some(progress) = progress {
+                    if last_progress.is_some_and(|last| progress > last) {
+                        advances += 1;
+                        if advances == 5 {
+                            return;
+                        }
+                    }
+                    last_progress = Some(progress);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     fn wait(&self, file: &str)
@@ -107,6 +123,30 @@ fn detach_preserves_a_new_signal_racing_its_private_stop()
             backend.detach().expect("detach despite racing signal");
             assert!(began.elapsed() < Duration::from_secs(2));
             observer.wait("handled");
+        }
+    });
+}
+
+/// A fallback `PT_DETACH` must still account for its resume, preserve racing
+/// application signals, and continue the private job-control stop (#76).
+#[test]
+fn fallback_detach_releases_its_private_stop_and_preserves_racing_signals()
+{
+    use ferros_core::backend::BackendError;
+    harness::run(|t| {
+        for separate in [true, false] {
+            let observer = Observer::new();
+            let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+            observer.wait("ready");
+            let mut backend = MacOSBackend::new().expect("backend");
+            backend.attach(target.pid()).expect("attach");
+            let probe = backend.reply_fault_injector();
+            probe.race_next_private_stop(separate);
+            probe.fail_next_detach_handshake();
+            assert!(matches!(backend.detach(), Err(BackendError::DetachCleanup(_))));
+            // No rescue signal: both handler acknowledgements must come from
+            // fallback cleanup and the signal racing its private stop.
+            observer.wait_released(target.pid());
         }
     });
 }
@@ -181,7 +221,7 @@ fn dropping_a_running_backend_with_a_pending_stop_releases_the_target_promptly()
                 .unwrap()
                 .success()
         );
-        observer.wait_released_after_drop(target.pid());
+        observer.wait_released(target.pid());
     });
 }
 
@@ -222,7 +262,7 @@ fn dropping_a_running_session_with_a_pending_stop_releases_the_target_promptly()
                 .unwrap()
                 .success()
         );
-        observer.wait_released_after_drop(target.pid());
+        observer.wait_released(target.pid());
     });
 }
 

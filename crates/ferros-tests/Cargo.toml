@@ -89,3 +89,8 @@ test = false
 name = "ferros-fixture-step_races"
 path = "fixtures/step_races.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-symbols"
+path = "fixtures/symbols.rs"
+test = false

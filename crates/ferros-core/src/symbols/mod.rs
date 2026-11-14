@@ -10,6 +10,7 @@
 //! - **`demangle`**: Symbol demangling utilities (Rust, C++)
 //! - **`extractor`**: DWARF type extraction and introspection
 //! - **`image`**: Binary image parsing and DWARF section loading
+//! - **`lines`**: Line-table index: `file:line` to addresses, address to line and ranges
 //!
 //! ## DWARF Sections
 //!
@@ -34,6 +35,7 @@ pub mod debuginfo;
 pub mod demangle;
 pub mod extractor;
 pub mod image;
+pub mod lines;
 pub mod unwind;
 
 // Shared type aliases
@@ -45,3 +47,4 @@ pub use cache::{SymbolCache, SymbolFrame, Symbolication};
 pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping};
+pub use lines::{AddressLine, LineAddresses, SourceLookupError};

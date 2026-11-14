@@ -1447,9 +1447,15 @@ fn detach_cleanup_after_starting_step_releases_suspended_threads()
                 );
                 assert_step_cleaned(stepped, &threads);
             }
-            // Releasing publication does not deliver a stop to the client, and so
-            // cannot perform the deliver-time cleanup on the direct-drop path.
+            if !explicit {
+                // The public contract stays stopped-only while the step is pending.
+                assert!(session.detach().is_err(), "detach was allowed while running");
+            }
+            // Publish the late real completion before either release path, so each run
+            // takes one ordering: drop's own interrupt is consumed by that pending stop
+            // and its wait receives the SingleStep; the explicit path drains it first.
             faults.release_stop_publication();
+            wait_for_published_stop(&faults);
             if explicit {
                 assert_eq!(
                     session.wait(Some(STOP_TIMEOUT)).expect("late step"),
@@ -1640,6 +1646,15 @@ fn event_batched_with_real_internal_step_is_reported_before_resume()
             expected_pc,
             "internal step resumed past its completion while another event was pending"
         );
+        // The hook balanced and restored exactly one peer suspension, and delivery then
+        // released the step request's suspensions: nothing per-thread may remain.
+        for &thread in &threads {
+            assert_eq!(
+                diagnostics::thread_suspend_count(thread).expect("suspend count"),
+                0,
+                "thread {thread:?} kept a suspension after the batched stop"
+            );
+        }
         let pcs: Vec<_> = threads.iter().map(|&id| (id, pc_of(&mut d, id))).collect();
         assert_eq!(d.wait(Some(Duration::from_millis(50))).expect("no other event"), None);
         for (id, pc) in pcs {
@@ -1694,6 +1709,7 @@ fn retained_signal_survives_abandoned_real_step_over_or_is_explicitly_dropped()
                 Some(StopEvent::Interrupted { thread: None })
             );
             faults.release_stop_publication();
+            wait_for_published_stop(&faults);
             assert_eq!(d.wait(Some(Duration::from_millis(100))).expect("late internal step"), None);
             d.remove_breakpoint(id).expect("remove breakpoint");
             if deliver {
@@ -1757,8 +1773,9 @@ fn backend_drop_releases_directly_observed_step_suspends()
         for &thread in threads.iter().filter(|&&id| id != stepped) {
             assert_eq!(diagnostics::thread_suspend_count(thread).expect("suspend count"), 1);
         }
-        // Do not call wait: even if a real completion is already queued, only
-        // detach_target can balance the suspensions on this path.
+        // Do not call wait: even if a real completion is already queued, only the
+        // backend's teardown (detach_target and release_ports) can balance the
+        // suspensions on this path.
         drop(debugger);
         control.release("run-0");
         control.release("run-1");

@@ -194,9 +194,9 @@ control and real kernel exception messages:
   narrowly armed hook: once a real step exception arrives, it queues SIGUSR1 to a peer,
   temporarily balances that peer's one thread suspension, receives its real signal
   exception, then restores the suspension. Both kernel events are published together.
-  Session must report the signal, leave the stepping pc exactly one instruction ahead,
-  and keep every thread stopped. The hook synthesizes no `StopEvent` and is inactive
-  when unarmed.
+  Session must report the signal, leave the stepping pc at the decoded successor of the
+  marker instruction, and keep every thread stopped. The hook synthesizes no `StopEvent`
+  and is inactive when unarmed.
 - `single_step::retained_signal_survives_abandoned_real_step_over_or_is_explicitly_dropped`
   retains worker 1's real thread-directed SIGUSR1 while worker 0 is at a breakpoint.
   Publication of worker 0's internal completion is paused and an interrupt abandons

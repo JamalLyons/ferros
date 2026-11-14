@@ -827,11 +827,15 @@ pub(crate) fn run_exception_loop(
             hold_exception(&request, architecture)
         };
         let mut injected_batch = Vec::new();
-        if matches!(first.1, StopEvent::SingleStep { .. }) {
+        // Only a step that starts a new stop outside a ptrace handshake: those paths
+        // `continue` before publishing and would drop the batched peer exception.
+        if !pending && matches!(first.1, StopEvent::SingleStep { .. }) && lock_shared(&shared).handshake_signals.is_none() {
             let peer = faults.step_batch_signal.swap(0, Ordering::SeqCst);
             if peer != 0 {
-                // SAFETY: this armed test hook uses a backend-owned suspended peer.
-                // Queue first so no user instruction is needed to raise the signal.
+                // SAFETY: this armed test hook requires a peer with exactly one
+                // backend-owned `thread_suspend` (from a step request) and a SIGUSR1
+                // handler; the backend holds the thread right. Queue the signal first
+                // so no user instruction is needed to raise it.
                 assert_eq!(unsafe { crate::ffi::__pthread_kill(peer, libc::SIGUSR1) }, 0);
                 assert_eq!(unsafe { crate::ffi::thread_resume(peer) }, KERN_SUCCESS);
                 let buffer =

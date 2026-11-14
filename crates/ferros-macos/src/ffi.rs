@@ -674,7 +674,7 @@ unsafe extern "C" {
     /// Read a Mach thread information flavor into a caller-owned integer buffer.
     pub fn thread_info(
         thread: thread_act_t,
-        flavor: c_int,
+        flavor: natural_t,
         info: *mut c_int,
         count: *mut mach_msg_type_number_t,
     ) -> kern_return_t;

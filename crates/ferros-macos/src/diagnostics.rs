@@ -391,13 +391,22 @@ pub fn single_step_enabled(thread: ferros_core::ThreadId) -> Result<bool>
 #[doc(hidden)]
 pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
 {
-    // THREAD_BASIC_INFO = 3; two time_value_t pairs followed by six integers.
-    let mut info = [0_i32; 10];
-    let mut count = 10;
+    // `struct thread_basic_info`: user_time and system_time (two time_value_t pairs),
+    // then cpu_usage, policy, run_state, flags, suspend_count and sleep_time.
+    const THREAD_BASIC_INFO: libc::natural_t = 3;
+    const THREAD_BASIC_INFO_COUNT: mach_msg_type_number_t = 10;
+    const SUSPEND_COUNT: usize = 8;
+    let mut info = [0_i32; THREAD_BASIC_INFO_COUNT as usize];
+    let mut count = THREAD_BASIC_INFO_COUNT;
     // SAFETY: `info` holds exactly THREAD_BASIC_INFO_COUNT integer_t words.
-    let kr = unsafe { ffi::thread_info(thread.raw() as mach_port_t, 3, info.as_mut_ptr(), &mut count) };
+    let kr = unsafe { ffi::thread_info(thread.raw() as mach_port_t, THREAD_BASIC_INFO, info.as_mut_ptr(), &mut count) };
     if kr != KERN_SUCCESS {
         return Err(DebuggerError::from(MachError::from(kr)));
     }
-    Ok(info[8])
+    if (count as usize) <= SUSPEND_COUNT {
+        return Err(DebuggerError::InvalidArgument(format!(
+            "thread_info returned {count} words, too few for suspend_count"
+        )));
+    }
+    Ok(info[SUSPEND_COUNT])
 }

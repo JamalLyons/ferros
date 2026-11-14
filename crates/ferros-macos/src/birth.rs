@@ -17,6 +17,14 @@
 //! the entry cannot be located yet. Once the image is published, failing to
 //! install the traps fails the resume. A software breakpoint at an armed entry
 //! is reported to the client, and that newborn stays suspended.
+//!
+//! The traps are invisible to the engine. `read_memory` shows the original
+//! instruction under a trap. A write over a trap updates the instruction the trap
+//! stands for, so a software breakpoint the engine plants there survives the trap
+//! being removed. A thread that existed before the resume and was told to
+//! `Continue` is not held when it enters an entry again, as a reused workqueue
+//! thread does: its first instruction (`stp xzr, xzr, [sp, #-16]!`) is emulated
+//! and the thread goes on.
 
 use std::fs;
 
@@ -30,6 +38,9 @@ use crate::memory::{MemoryProtectionGuard, read_memory, write_memory};
 
 /// `brk #0`, the same trap the engine plants for software breakpoints.
 const BRK: [u8; 4] = [0x00, 0x00, 0x20, 0xD4];
+
+/// `stp xzr, xzr, [sp, #-16]!`, the first instruction of both pthread entries.
+const STP_XZR_XZR_PREDEC: [u8; 4] = [0xff, 0x7f, 0xbf, 0xa9];
 
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 const LC_UUID: u32 = 0x1b;
@@ -84,8 +95,9 @@ pub(crate) struct BirthPolicy
     owned: Vec<thread_act_t>,
     /// Address of the one-shot executable-entry breakpoint.
     notifier_pc: Option<u64>,
-    /// Debug-register slot kept so an older hardware watch can still be cleared.
-    notifier_slot: Option<u32>,
+    /// Threads that existed before this resume and were told to `Continue`. One of
+    /// them at an entry is a reused workqueue thread, not a newborn.
+    running: Vec<thread_act_t>,
 }
 
 impl BirthPolicy
@@ -110,13 +122,106 @@ impl BirthPolicy
         self.matching_entry(event, true)
     }
 
-    /// Dyld calling `_lldb_image_notifier`. The image list may now contain pthread.
+    /// The executable entry breakpoint: dyld has mapped the images the program links.
     pub(crate) fn is_notifier(&self, event: &StopEvent) -> bool
     {
         let StopEvent::Breakpoint { pc, .. } = event else {
             return false;
         };
         self.notifier_pc == Some(pc.value())
+    }
+
+    /// Record the threads this resume lets `Continue`. They are never held at an entry.
+    pub(crate) fn set_running(&mut self, threads: Vec<thread_act_t>)
+    {
+        self.running = threads;
+    }
+
+    /// `thread` was told to `Continue` and has entered an armed entry, as a reused
+    /// workqueue thread does. Returns whether the engine also has a breakpoint there.
+    pub(crate) fn running_thread_entry(&self, event: &StopEvent, thread: thread_act_t) -> Option<bool>
+    {
+        let StopEvent::Breakpoint { pc, .. } = event else {
+            return None;
+        };
+        if !self.active || !self.running.contains(&thread) {
+            return None;
+        }
+        self.sites
+            .iter()
+            .find(|site| site.entry && site.armed && site.address == pc.value())
+            .map(|site| site.client_breakpoint)
+    }
+
+    /// Execute the entry instruction `thread` is stopped on without removing the trap.
+    ///
+    /// # Errors
+    ///
+    /// The entry is not the expected `stp`, or the thread or its stack cannot be updated.
+    /// The thread is then unchanged.
+    pub(crate) fn emulate_entry(&self, task: mach_port_t, thread: thread_act_t) -> Result<(), String>
+    {
+        let mut registers = crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread)
+            .map_err(|err| format!("reading the registers of thread {thread} failed: {err}"))?;
+        let pc = registers.pc.value();
+        let site = self
+            .sites
+            .iter()
+            .find(|site| site.entry && site.address == pc)
+            .ok_or_else(|| format!("thread {thread} is not at a pthread entry"))?;
+        if site.original != STP_XZR_XZR_PREDEC {
+            return Err(format!(
+                "the pthread entry at {pc:#x} is {:02x?}, not the stp this backend emulates",
+                site.original
+            ));
+        }
+        let sp = registers
+            .sp
+            .value()
+            .checked_sub(16)
+            .ok_or_else(|| format!("thread {thread} has no room on its stack"))?;
+        write_memory(task, Address::from(sp), &[0; 16])
+            .map_err(|err| format!("writing the entry frame of thread {thread} failed: {err}"))?;
+        registers.sp = Address::from(sp);
+        registers.pc = Address::from(pc + 4);
+        write_entry_registers(thread, &registers)
+    }
+
+    /// Show the original instruction wherever `data`, read at `address`, covers an armed
+    /// trap the engine did not plant itself.
+    pub(crate) fn mask_read(&self, address: u64, data: &mut [u8])
+    {
+        for site in self.sites.iter().filter(|site| site.armed && !site.client_breakpoint) {
+            if let Some((at, from, len)) = overlap(address, data.len(), site.address) {
+                data[at..at + len].copy_from_slice(&site.original[from..from + len]);
+            }
+        }
+    }
+
+    /// An engine write of `data` at `address` that covers an armed trap.
+    ///
+    /// The covered bytes become the instruction that trap stands for: a `brk` marks an
+    /// engine breakpoint, anything else is the new original. Returns the bytes to write
+    /// instead, with every armed trap kept, or `None` when no trap is covered.
+    pub(crate) fn filter_engine_write(&mut self, address: u64, data: &[u8]) -> Option<Vec<u8>>
+    {
+        let mut written = None;
+        for site in self.sites.iter_mut().filter(|site| site.armed) {
+            let Some((at, from, len)) = overlap(address, data.len(), site.address) else {
+                continue;
+            };
+            let mut word = if site.client_breakpoint { BRK } else { site.original };
+            word[from..from + len].copy_from_slice(&data[at..at + len]);
+            if word == BRK {
+                site.client_breakpoint = true;
+            } else {
+                site.client_breakpoint = false;
+                site.original = word;
+            }
+            let bytes = written.get_or_insert_with(|| data.to_vec());
+            bytes[at..at + len].copy_from_slice(&BRK[from..from + len]);
+        }
+        written
     }
 
     fn matching_entry(&self, event: &StopEvent, client_breakpoint: bool) -> bool
@@ -137,24 +242,6 @@ impl BirthPolicy
             .filter(|site| site.entry && site.armed)
             .map(|site| site.address)
             .collect()
-    }
-
-    /// A 4-byte write exactly on an armed trap.
-    ///
-    /// Returns the bytes that must remain in memory (`brk`) when this policy handles
-    /// the write.
-    pub(crate) fn note_engine_write(&mut self, address: u64, bytes: &[u8; 4]) -> Option<[u8; 4]>
-    {
-        let site = self.sites.iter_mut().find(|site| site.armed && site.address == address)?;
-        if *bytes == BRK {
-            site.client_breakpoint = true;
-        } else if *bytes == site.original {
-            site.client_breakpoint = false;
-        } else {
-            site.original = *bytes;
-            site.client_breakpoint = false;
-        }
-        Some(BRK)
     }
 
     pub(crate) fn is_step_off(&self, event: &StopEvent) -> bool
@@ -226,21 +313,13 @@ impl BirthPolicy
     ///
     /// `require_cover` is set when some thread will `Continue`. A one-instruction
     /// step may resume before dyld is locatable; a continue may not.
-    pub(crate) fn arm(
-        &mut self,
-        task: mach_port_t,
-        pid: ProcessId,
-        threads: &[thread_act_t],
-        require_cover: bool,
-    ) -> Result<(), BirthInstallError>
+    pub(crate) fn arm(&mut self, task: mach_port_t, pid: ProcessId, require_cover: bool) -> Result<(), BirthInstallError>
     {
-        let _ = threads;
         if !self.sites.iter().any(|site| site.entry) {
             self.sites.extend(resolve_sites(task, pid)?);
         }
         if self.sites.iter().any(|site| site.entry) {
-            self.clear_notifier_hardware(threads);
-            self.forget_notifier();
+            self.retire_notifier(task).map_err(BirthInstallError::Os)?;
             self.patch_unarmed(task)?;
             self.active = true;
             return Ok(());
@@ -288,7 +367,7 @@ impl BirthPolicy
         if !self.sites.iter().any(|site| site.entry) {
             return Ok(false);
         }
-        self.retire_notifier(task)?;
+        self.retire_notifier(task).map_err(BirthInstallError::Os)?;
         self.patch_unarmed(task)?;
         self.active = true;
         Ok(true)
@@ -301,14 +380,23 @@ impl BirthPolicy
             if self.sites[index].armed || !self.sites[index].entry {
                 continue;
             }
-            if let Err(err) = patch(task, self.sites[index].address, &BRK) {
-                for armed in newly_armed {
-                    let original = self.sites[armed].original;
-                    let address = self.sites[armed].address;
-                    if patch(task, address, &original).is_ok() {
-                        self.sites[armed].armed = false;
-                    }
+            // The engine may have planted or removed a breakpoint here while the trap
+            // was out. What is in memory now is what the entry holds.
+            let live = match read_word(task, self.sites[index].address) {
+                Ok(live) => live,
+                Err(err) => {
+                    self.restore_newly_armed(task, &newly_armed);
+                    return Err(BirthInstallError::Os(err));
                 }
+            };
+            if live == BRK {
+                self.sites[index].client_breakpoint = true;
+            } else {
+                self.sites[index].client_breakpoint = false;
+                self.sites[index].original = live;
+            }
+            if let Err(err) = patch(task, self.sites[index].address, &BRK) {
+                self.restore_newly_armed(task, &newly_armed);
                 return Err(BirthInstallError::Os(err));
             }
             self.sites[index].armed = true;
@@ -317,17 +405,34 @@ impl BirthPolicy
         Ok(())
     }
 
-    fn retire_notifier(&mut self, task: mach_port_t) -> Result<(), BirthInstallError>
+    fn restore_newly_armed(&mut self, task: mach_port_t, newly_armed: &[usize])
     {
-        let Some(index) = self.sites.iter().position(|site| !site.entry) else {
-            return Ok(());
-        };
-        if self.sites[index].armed {
-            let address = self.sites[index].address;
-            let original = self.sites[index].original;
-            patch(task, address, &original).map_err(BirthInstallError::Os)?;
+        for &armed in newly_armed {
+            let site = &self.sites[armed];
+            let bytes = if site.client_breakpoint { BRK } else { site.original };
+            if patch(task, site.address, &bytes).is_ok() {
+                self.sites[armed].armed = false;
+            }
         }
-        self.sites.remove(index);
+    }
+
+    /// Whether the engine has its own breakpoint on the executable entry trap.
+    pub(crate) fn notifier_is_engine_breakpoint(&self) -> bool
+    {
+        self.sites.iter().any(|site| !site.entry && site.client_breakpoint)
+    }
+
+    /// Remove the executable entry trap, leaving an engine breakpoint there in place.
+    fn retire_notifier(&mut self, task: mach_port_t) -> Result<(), String>
+    {
+        if let Some(index) = self.sites.iter().position(|site| !site.entry) {
+            let site = &self.sites[index];
+            if site.armed && !site.client_breakpoint {
+                patch(task, site.address, &site.original)?;
+            }
+            self.sites.remove(index);
+        }
+        self.notifier_pc = None;
         Ok(())
     }
 
@@ -343,39 +448,21 @@ impl BirthPolicy
         Ok(())
     }
 
-    pub(crate) fn clear_notifier_hardware(&mut self, threads: &[thread_act_t])
-    {
-        let Some(slot) = self.notifier_slot.take() else {
-            return;
-        };
-        for &thread in threads {
-            if let Err(err) = crate::registers::clear_hardware_breakpoint(thread, slot) {
-                tracing::debug!("clearing the image-notifier breakpoint on {thread} failed: {err}");
-            }
-        }
-        if let Some(site) = self.sites.iter_mut().find(|site| !site.entry) {
-            site.armed = false;
-        }
-    }
-
-    pub(crate) fn bridge_address(&self) -> Option<u64>
-    {
-        self.notifier_pc
-    }
-
-    pub(crate) fn forget_notifier(&mut self)
-    {
-        self.notifier_pc = None;
-        self.sites.retain(|site| site.entry);
-    }
-
     /// Put every original pthread instruction back. A later suspend resume may arm again.
+    ///
+    /// An entry the engine has a breakpoint on keeps its `brk`: that trap is the engine's.
+    /// The executable entry trap is removed too, so it cannot arm entries later.
     pub(crate) fn disarm(&mut self, task: mach_port_t) -> Result<(), String>
     {
         self.active = false;
-        let mut failure = None;
+        self.running.clear();
+        let mut failure = self.retire_notifier(task).err();
         for site in &mut self.sites {
             if !site.armed || !site.entry {
+                continue;
+            }
+            if site.client_breakpoint {
+                site.armed = false;
                 continue;
             }
             match patch(task, site.address, &site.original) {
@@ -444,6 +531,36 @@ fn patch(task: mach_port_t, address: u64, bytes: &[u8; 4]) -> Result<(), String>
             result.map_err(|err| err.to_string())
         }
     }
+}
+
+/// Where a read or write of `len` bytes at `address` covers the 4-byte trap at `site`:
+/// (offset in the access, offset in the trap, length).
+fn overlap(address: u64, len: usize, site: u64) -> Option<(usize, usize, usize)>
+{
+    let end = address.checked_add(len as u64)?;
+    let site_end = site.checked_add(BRK.len() as u64)?;
+    let start = address.max(site);
+    let stop = end.min(site_end);
+    if start >= stop {
+        return None;
+    }
+    let at = usize::try_from(start - address).ok()?;
+    let from = usize::try_from(start - site).ok()?;
+    let len = usize::try_from(stop - start).ok()?;
+    Some((at, from, len))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_entry_registers(thread: thread_act_t, registers: &ferros_core::types::Registers) -> Result<(), String>
+{
+    crate::registers::write_registers_arm64(thread, registers)
+        .map_err(|err| format!("writing the registers of thread {thread} failed: {err}"))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn write_entry_registers(thread: thread_act_t, _registers: &ferros_core::types::Registers) -> Result<(), String>
+{
+    Err(format!("arm64 thread {thread} cannot be updated by this build"))
 }
 
 fn pthread_load_in_notification(task: mach_port_t, thread: thread_act_t) -> Option<u64>
@@ -569,8 +686,8 @@ fn resolve_sites(task: mach_port_t, pid: ProcessId) -> Result<Vec<BirthSite>, Bi
         .iter()
         .find(|image| image.path.file_name().is_some_and(|name| name == PTHREAD_FILE))
     else {
-        // pthread is not in the dyld list yet. The caller arms `_lldb_image_notifier`
-        // so the entries can be trapped when dyld publishes the library.
+        // pthread is not in the dyld list yet. The caller breakpoints the executable
+        // entry so the entries can be trapped once dyld has mapped the library.
         return Ok(Vec::new());
     };
     let identity = image_identity(task, image.load_address.value()).map_err(BirthInstallError::Os)?;
@@ -814,6 +931,50 @@ mod tests
                 assert_eq!(second[3] & 0xfc, 0x94, "{name} second instruction is not bl: {second:02x?}");
             }
         }
+    }
+
+    fn armed_site(address: u64) -> BirthSite
+    {
+        BirthSite {
+            address,
+            original: STP_XZR_XZR_PREDEC,
+            armed: true,
+            client_breakpoint: false,
+            entry: true,
+        }
+    }
+
+    #[test]
+    fn reads_show_the_original_under_a_trap()
+    {
+        let policy = BirthPolicy {
+            sites: vec![armed_site(0x1004)],
+            ..BirthPolicy::default()
+        };
+        let mut data = [0x11; 8];
+        data[4..].copy_from_slice(&BRK);
+        policy.mask_read(0x1000, &mut data);
+        assert_eq!(data[4..], STP_XZR_XZR_PREDEC);
+        let mut tail = BRK[2..].to_vec();
+        policy.mask_read(0x1006, &mut tail);
+        assert_eq!(tail, STP_XZR_XZR_PREDEC[2..]);
+    }
+
+    #[test]
+    fn writes_over_a_trap_keep_it_and_track_the_engine()
+    {
+        let mut policy = BirthPolicy {
+            sites: vec![armed_site(0x1000)],
+            ..BirthPolicy::default()
+        };
+        assert_eq!(policy.filter_engine_write(0x1000, &BRK).as_deref(), Some(&BRK[..]));
+        assert!(policy.sites[0].client_breakpoint);
+        let mut cover = vec![0x22; 2];
+        cover.extend_from_slice(&STP_XZR_XZR_PREDEC);
+        assert_eq!(policy.filter_engine_write(0x0ffe, &cover).expect("covered")[2..], BRK);
+        assert!(!policy.sites[0].client_breakpoint);
+        assert_eq!(policy.sites[0].original, STP_XZR_XZR_PREDEC);
+        assert!(policy.filter_engine_write(0x1004, &[0; 4]).is_none());
     }
 
     #[test]

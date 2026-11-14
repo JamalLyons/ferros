@@ -9,7 +9,7 @@
 //! release ports at the same time change the counts.
 
 use ferros_core::error::{DebuggerError, Result};
-use ferros_core::types::ProcessId;
+use ferros_core::types::{Address, ProcessId};
 use libc::{c_int, mach_msg_type_number_t, mach_port_t, vm_address_t, vm_size_t};
 use mach2::exception_types::EXC_MASK_ALL;
 use mach2::kern_return::{KERN_INVALID_NAME, KERN_INVALID_RIGHT, KERN_SUCCESS};
@@ -105,6 +105,49 @@ pub fn send_right_references() -> Result<u64>
         }
     }
     Ok(total)
+}
+
+/// User references of the send right named `name` in the calling process's own IPC
+/// space. A name that is not (or no longer) a send right counts 0.
+///
+/// # Errors
+///
+/// `DebuggerError` if `mach_port_get_refs` fails for another reason.
+pub fn send_right_count(name: u32) -> Result<u32>
+{
+    let mut refs = 0_u32;
+    // SAFETY: `refs` is valid for writes; a stale name only yields an error.
+    let kr = unsafe { ffi::mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &mut refs) };
+    match kr {
+        KERN_SUCCESS => Ok(refs),
+        KERN_INVALID_NAME | KERN_INVALID_RIGHT => Ok(0),
+        _ => Err(DebuggerError::from(MachError::from(kr))),
+    }
+}
+
+/// Read `len` bytes of process `pid` exactly as they are in memory, through a task port
+/// of its own (`task_for_pid`).
+///
+/// The backend's `read_memory` hides the traps it plants for itself; this shows them.
+/// Needs the same permission as attaching. The task port is released before returning.
+///
+/// # Errors
+///
+/// `DebuggerError` if `task_for_pid` or the read fails.
+pub fn raw_memory(pid: ProcessId, address: Address, len: usize) -> Result<Vec<u8>>
+{
+    let mut task: mach_port_t = MACH_PORT_NULL;
+    // SAFETY: `task` is valid for writes.
+    let kr = unsafe { ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task) };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    let bytes = crate::memory::read_memory(task, address, len);
+    // SAFETY: `task` is the send right task_for_pid gave us, released once.
+    unsafe {
+        let _ = ffi::mach_port_deallocate(mach_task_self(), task);
+    }
+    bytes
 }
 
 /// The handler of one group of exception types, as seen from the calling process.

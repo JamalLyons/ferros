@@ -42,7 +42,11 @@
 //!   that instruction runs. Failing to install a required trap fails the resume.
 //!   While a held thread executes the restored entry, every other thread stays
 //!   suspended. A software breakpoint on a pthread entry is reported, and the
-//!   newborn stays suspended.
+//!   newborn stays suspended. `read_memory` shows the instructions under those
+//!   traps, and an engine breakpoint written there survives their removal. A thread
+//!   told to `Continue` is not held when it re-enters `_start_wqthread` as a reused
+//!   workqueue thread: that entry instruction is emulated. On an x86-64 target, a
+//!   default-`Suspend` resume that lets a thread run is `BackendError::Unsupported`.
 //!   A suspended thread's stop record and any held Unix signal reply remain until a later
 //!   resume lets it run; hardware exception replies are sent while the task is stopped. The next stop `wait` delivers ends that resume: the per-thread
 //!   suspends are balanced and every single-step bit is cleared, so a step that did not

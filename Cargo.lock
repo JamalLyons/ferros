@@ -389,6 +389,7 @@ version = "0.0.0"
 name = "ferros-tests"
 version = "0.0.0"
 dependencies = [
+ "dispatch2",
  "ferros-core",
  "ferros-macos",
  "object 0.38.0",

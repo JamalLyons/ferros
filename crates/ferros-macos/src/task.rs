@@ -50,9 +50,12 @@
 //! install a required trap fails the resume. While a held thread executes the
 //! restored entry instruction, every other thread stays suspended, including
 //! across a requested single-step of that thread. A software breakpoint on a
-//! pthread entry is reported and the newborn stays suspended. `ThreadAction::Step`
-//! as the default, and any thread started at another address, are outside this
-//! guarantee.
+//! pthread entry is reported and the newborn stays suspended. `read_memory` shows the
+//! instructions under these traps and an engine breakpoint written there survives
+//! their removal. A thread told to `Continue` is not held at an entry it re-enters as
+//! a reused workqueue thread. `ThreadAction::Step` as the default, and any thread
+//! started at another address, are outside this guarantee. On x86-64 such a resume is
+//! `BackendError::Unsupported`.
 //!
 //! ## Exception ports
 //!
@@ -899,6 +902,15 @@ impl MacOSBackend
         if request.default_action == ThreadAction::Continue {
             return self.disarm_birth();
         }
+        // Threads told to `Continue` are not newborns, even when one re-enters a pthread
+        // entry as a reused workqueue thread.
+        let running = self
+            .threads
+            .iter()
+            .copied()
+            .filter(|port| request.action_for(ThreadId::from(u64::from(*port))) == ThreadAction::Continue)
+            .collect();
+        lock_shared(&self.exception_state).birth.set_running(running);
         let holds_new_threads = request.default_action == ThreadAction::Suspend
             && request
                 .thread_actions
@@ -914,10 +926,7 @@ impl MacOSBackend
         }
         {
             let mut shared = lock_shared(&self.exception_state);
-            match shared
-                .birth
-                .arm(self.task, self.pid, &self.threads, self.birth_cover_required(request))
-            {
+            match shared.birth.arm(self.task, self.pid, self.birth_cover_required(request)) {
                 Ok(()) => {}
                 Err(crate::birth::BirthInstallError::Unsupported(message)) => {
                     return Err(BackendError::Unsupported(message));
@@ -938,15 +947,10 @@ impl MacOSBackend
 
     fn disarm_birth(&mut self) -> BackendResult<()>
     {
-        let threads = self.threads.clone();
-        let result = {
-            let mut shared = lock_shared(&self.exception_state);
-            shared.birth.clear_notifier_hardware(&threads);
-            shared
-                .birth
-                .disarm(self.task)
-                .map_err(|message| BackendError::Os { code: -1, message })
-        };
+        let result = lock_shared(&self.exception_state)
+            .birth
+            .disarm(self.task)
+            .map_err(|message| BackendError::Os { code: -1, message });
         if result.is_ok() {
             // Original instructions are back, so a freeze from a step-off no longer
             // protects an open entry.
@@ -1497,12 +1501,12 @@ impl MacOSBackend
         result
     }
 
-    /// Keep an engine breakpoint on a birth trap without replacing the saved instruction.
-    fn birth_engine_write(&mut self, address: Address, data: &[u8]) -> Option<[u8; 4]>
+    /// A write over a birth trap updates the instruction it stands for and keeps the trap.
+    fn birth_engine_write(&mut self, address: Address, data: &[u8]) -> Option<Vec<u8>>
     {
-        let word: [u8; 4] = data.try_into().ok()?;
-        let mut shared = lock_shared(&self.exception_state);
-        shared.birth.note_engine_write(address.value(), &word)
+        lock_shared(&self.exception_state)
+            .birth
+            .filter_engine_write(address.value(), data)
     }
 }
 
@@ -1953,7 +1957,7 @@ impl Backend for MacOSBackend
     fn read_memory(&mut self, address: Address, len: usize) -> BackendResult<Vec<u8>>
     {
         self.require_stopped("read_memory")?;
-        let bytes = self.memory_cache.read(self.task, address, len).map_err(backend_error)?;
+        let mut bytes = self.memory_cache.read(self.task, address, len).map_err(backend_error)?;
         if bytes.len() != len {
             return Err(BackendError::NotFound(format!(
                 "only {} of {len} bytes at 0x{:016x} are mapped",
@@ -1961,6 +1965,10 @@ impl Backend for MacOSBackend
                 address.value()
             )));
         }
+        // The birth traps are the backend's own; the engine sees the instructions under them.
+        lock_shared(&self.exception_state)
+            .birth
+            .mask_read(address.value(), &mut bytes);
         Ok(bytes)
     }
 

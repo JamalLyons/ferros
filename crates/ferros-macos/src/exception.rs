@@ -1199,6 +1199,9 @@ fn try_consume_birth(
         deallocate_right(exception.thread);
         return BirthConsume::Consumed;
     }
+    if let Some(engine_breakpoint) = state.birth.running_thread_entry(event, exception.thread) {
+        return continue_running_thread(state, exception, task, faults, events, engine_breakpoint);
+    }
     if state.birth.is_reported_birth(event) {
         return suspend_newborn(state, exception, faults, events, true);
     }
@@ -1208,7 +1211,40 @@ fn try_consume_birth(
     suspend_newborn(state, exception, faults, events, false)
 }
 
-/// Dyld is publishing images. Arm pthread entries before the notifier returns.
+/// A thread this resume lets `Continue` entered an armed entry (a reused workqueue thread).
+///
+/// It is not a newborn and is not held. With an engine breakpoint there the stop is
+/// published as that breakpoint. Otherwise its entry instruction is emulated and it runs
+/// on; if that is impossible it is held like a newborn and the failure is reported.
+fn continue_running_thread(
+    state: &mut ExceptionSharedState,
+    exception: &mut HeldException,
+    task: mach_port_t,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+    engine_breakpoint: bool,
+) -> BirthConsume
+{
+    if engine_breakpoint {
+        return BirthConsume::Publish;
+    }
+    if let Err(err) = state.birth.emulate_entry(task, exception.thread) {
+        error!("a continuing thread entered a pthread entry and could not pass it: {err}");
+        let _ = events.send(Err(BackendError::Os {
+            code: -1,
+            message: format!("thread {} could not pass its pthread entry: {err}", exception.thread),
+        }));
+        return suspend_newborn(state, exception, faults, events, false);
+    }
+    if let Err(err) = reply_to_held(exception, faults) {
+        let _ = events.send(Err(err));
+    }
+    deallocate_right(exception.thread);
+    BirthConsume::Consumed
+}
+
+/// The main thread reached the executable entry: dyld has mapped the linked images.
+/// Arm pthread entries before that entry runs. An engine breakpoint there is published.
 fn consume_image_notifier(
     state: &mut ExceptionSharedState,
     exception: &mut HeldException,
@@ -1218,6 +1254,7 @@ fn consume_image_notifier(
     events: &mpsc::Sender<LoopEvent>,
 ) -> BirthConsume
 {
+    let engine_breakpoint = state.birth.notifier_is_engine_breakpoint();
     let covered = match state
         .birth
         .install_entries(task, ProcessId::from(pid as u32), exception.thread)
@@ -1240,13 +1277,9 @@ fn consume_image_notifier(
         }));
         return BirthConsume::SuspendFailed;
     }
-    if let Some(address) = state.birth.bridge_address()
-        && let Err(err) = state.birth.disarm_address(task, address)
-    {
-        let _ = events.send(Err(BackendError::Os { code: -1, message: err }));
-        return BirthConsume::SuspendFailed;
+    if engine_breakpoint {
+        return BirthConsume::Publish;
     }
-    state.birth.forget_notifier();
     if let Err(err) = reply_to_held(exception, faults) {
         let _ = events.send(Err(err));
     }
@@ -1266,6 +1299,22 @@ fn suspend_newborn(
     report: bool,
 ) -> BirthConsume
 {
+    if report {
+        // The published stop keeps the exception's own reference and releases it when
+        // the stop is answered. The hold needs a reference of its own.
+        // SAFETY: the exception message holds a send right to this thread, so the name
+        // is valid; this adds one user reference, owned by `BirthPolicy::suspended`.
+        let kr = unsafe {
+            mach2::mach_port::mach_port_mod_refs(mach_task_self(), exception.thread, mach2::port::MACH_PORT_RIGHT_SEND, 1)
+        };
+        if kr != KERN_SUCCESS {
+            let _ = events.send(Err(BackendError::Os {
+                code: i64::from(kr),
+                message: format!("retaining new thread {} failed: {kr}", exception.thread),
+            }));
+            return BirthConsume::SuspendFailed;
+        }
+    }
     // SAFETY: the exception message retains this thread right. One user suspend
     // keeps the newborn out of application code after the task runs again.
     let kr = if faults.fail_birth_suspend() {
@@ -1275,6 +1324,9 @@ fn suspend_newborn(
     };
     if kr != KERN_SUCCESS {
         error!("thread_suspend of a new thread {} failed: {kr}", exception.thread);
+        if report {
+            deallocate_right(exception.thread);
+        }
         let _ = events.send(Err(BackendError::Os {
             code: i64::from(kr),
             message: format!("thread_suspend of a new thread {} failed: {kr}", exception.thread),

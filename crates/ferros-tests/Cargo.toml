@@ -20,6 +20,8 @@ ferros-macos = { path = "../ferros-macos" }
 # `symbols::function_address` reads fixture symbol tables (Mach-O, no DWARF).
 object = { version = "0.38.0", features = ["read", "macho"] }
 rustc-demangle = "0.1"
+# The `workqueue` fixture submits GCD work items without `unsafe`.
+dispatch2 = { version = "0.3.0", default-features = false, features = ["std"] }
 
 # Only the tests need the scripted mock backend. Keeping the feature here leaves it out
 # of ordinary workspace builds, so the `ferros` binary is not built with the mock.
@@ -75,4 +77,9 @@ test = false
 [[bin]]
 name = "ferros-fixture-spawn_thread"
 path = "fixtures/spawn_thread.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-workqueue"
+path = "fixtures/workqueue.rs"
 test = false

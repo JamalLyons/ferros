@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines nine fixture binaries:
+The crate defines ten fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -23,8 +23,11 @@ The crate defines nine fixture binaries:
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).
-- `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward,
-  demonstrating the macOS resume suspension snapshot.
+- `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward.
+  `pause=<milliseconds>` delays the second thread so a test can attach first. The second thread
+  is a normal pthread and must stay stopped while the default resume action is `Suspend`.
+- `ferros-fixture-workqueue`: Runs two GCD work items in turn, so the second normally reuses the
+  first one's parked workqueue thread, which re-enters `_start_wqthread`. It prints whether it did (macOS).
 
 ## Marker Convention
 
@@ -166,8 +169,18 @@ step, then checks that continuing produces no stray stop. The session
 unit tests script an interrupt before internal step completion and separately force the
 interrupt-policy flag when completion wins. They also script a simultaneous late
 `SingleStep` after another event and verify it is discarded before continuing; that
-precise simultaneous ordering remains mock-only. The macOS suspend-snapshot test also
-shows that a thread created after resume can run despite the default `Suspend` action.
+precise simultaneous ordering remains mock-only. `new_threads_can_run_after_suspend_snapshot`
+is the original regression for that snapshot: a thread created after resume now stays
+stopped until a later continue, including across a single-step of its pthread entry.
+Other threads stay suspended while that entry instruction is restored. A launch that
+is still inside dyld holds a later pthread the same way, by stopping at the
+executable entry once the library is mapped.
+An engine breakpoint on the entry is reported and the newborn stays suspended, and the
+backend keeps its own port right to that newborn. Session breakpoints on `_thread_start`
+and on the executable entry survive the backend's traps there, and `read_memory` shows the
+original instruction under a trap. A step from the launch stop followed by a continue
+holds nothing. With the `workqueue` fixture, a reused workqueue thread told to `Continue`
+runs its second work item instead of being held.
 
 Draining events alongside an internal completion and carrying signals from an abandoned
 step-over also retain deterministic session mock tests. Real kernel scheduling cannot

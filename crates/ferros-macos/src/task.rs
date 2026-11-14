@@ -41,6 +41,22 @@
 //! `detach` does it before it raises its private SIGSTOP, so that signal cannot be
 //! taken by a thread that is still suspended.
 //!
+//! When the default action is `Suspend` and some thread will run, a thread created
+//! during that resume is held at the first instruction of `libsystem_pthread`'s
+//! `_thread_start` or `_start_wqthread` until a later resume lets it execute that
+//! instruction. Continuing every thread removes those traps first. If dyld has not
+//! published the library yet, the resume breakpoints the executable entry and
+//! arms the pthread entries there, before that instruction runs. Failing to
+//! install a required trap fails the resume. While a held thread executes the
+//! restored entry instruction, every other thread stays suspended, including
+//! across a requested single-step of that thread. A software breakpoint on a
+//! pthread entry is reported and the newborn stays suspended. `read_memory` shows the
+//! instructions under these traps and an engine breakpoint written there survives
+//! their removal. A thread told to `Continue` is not held at an entry it re-enters as
+//! a reused workqueue thread. `ThreadAction::Step` as the default, and any thread
+//! started at another address, are outside this guarantee. On x86-64 such a resume is
+//! `BackendError::Unsupported`.
+//!
 //! ## Exception ports
 //!
 //! Attaching installs the backend's handler with `task_swap_exception_ports` and keeps
@@ -690,9 +706,11 @@ impl MacOSBackend
 
     /// Balance every `thread_suspend` of the last resume with `thread_resume`.
     ///
-    /// A failure (the thread has exited, or the process is gone) is ignored.
+    /// Newborns held by the birth policy are included, each exactly once. A failure
+    /// (the thread has exited, or the process is gone) is ignored.
     fn release_thread_suspends(&mut self)
     {
+        self.absorb_birth_holds();
         for port in std::mem::take(&mut self.suspended_threads) {
             // SAFETY: `port` is a thread right this backend holds (it is in `threads`);
             // the call only balances the suspend this backend added.
@@ -788,11 +806,226 @@ impl MacOSBackend
     }
 
     /// Undo [`apply_thread_actions`](Self::apply_thread_actions) (the rollback of a failed
-    /// resume, and teardown).
+    /// resume, and teardown). Single-step bits are cleared before any `thread_resume`,
+    /// so a thread let go on detach or failure cannot complete a stale step.
     fn undo_thread_actions(&mut self)
     {
-        self.release_thread_suspends();
         self.clear_step_bits();
+        self.clear_birth_step_offs();
+        self.release_thread_suspends();
+    }
+
+    /// Move birth holds onto [`Self::suspended_threads`], keeping one send right each.
+    fn absorb_birth_holds(&mut self)
+    {
+        let holds = std::mem::take(&mut lock_shared(&self.exception_state).birth.suspended);
+        for port in holds {
+            if self.threads.contains(&port) {
+                // SAFETY: the birth record and `threads` each own a send right of this name.
+                unsafe {
+                    let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+                }
+            } else {
+                self.threads.push(port);
+            }
+            if !self.suspended_threads.contains(&port) {
+                self.suspended_threads.push(port);
+            }
+        }
+    }
+
+    /// Clear hardware steps that were only leaving a birth trap, and release threads
+    /// frozen for that step.
+    fn clear_birth_step_offs(&mut self)
+    {
+        for port in lock_shared(&self.exception_state).birth.clear_step_offs() {
+            if let Err(err) = crate::registers::set_single_step(port, false) {
+                tracing::debug!("clearing a birth step-off bit of thread {port} failed: {err}");
+            }
+        }
+        if let Err(err) = self.thaw_birth_freeze() {
+            tracing::error!("{err}");
+        }
+    }
+
+    /// Balance `thread_suspend`s taken so other threads cannot pass a disarmed birth site.
+    ///
+    /// A thread that is already dead is dropped. Any other failure puts the port back
+    /// so a later thaw can retry it.
+    fn thaw_birth_freeze(&mut self) -> std::result::Result<(), String>
+    {
+        let ports = lock_shared(&self.exception_state).birth.take_frozen();
+        let mut resumed = Vec::new();
+        let mut failed = Vec::new();
+        for port in ports {
+            // SAFETY: `port` was suspended by `prepare_birth_step_off` and is a thread
+            // right this backend holds.
+            let kr = unsafe { ffi::thread_resume(port) };
+            if kr == mach2::kern_return::KERN_SUCCESS
+                || kr == mach2::kern_return::KERN_INVALID_NAME
+                || kr == mach2::kern_return::KERN_TERMINATED
+            {
+                resumed.push(port);
+            } else {
+                failed.push(port);
+            }
+        }
+        let owned = lock_shared(&self.exception_state).birth.take_owned(&resumed);
+        for port in owned {
+            // SAFETY: this drops the extra send right taken when the exception loop
+            // froze the thread. A dead name has already lost that right.
+            unsafe {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        let mut shared = lock_shared(&self.exception_state);
+        for port in failed {
+            shared.birth.freeze(port);
+        }
+        Err("thread_resume of a birth step-off freeze failed".into())
+    }
+
+    /// A continue can map `libsystem_pthread` in this resume. A step cannot.
+    fn birth_cover_required(&self, request: &ResumeRequest) -> bool
+    {
+        self.threads
+            .iter()
+            .any(|port| request.action_for(ThreadId::from(u64::from(*port))) == ThreadAction::Continue)
+    }
+
+    /// Arm or remove new-thread traps to match `request`, before any thread runs.
+    fn sync_birth_policy(&mut self, request: &ResumeRequest) -> BackendResult<()>
+    {
+        if request.default_action == ThreadAction::Continue {
+            return self.disarm_birth();
+        }
+        // Threads told to `Continue` are not newborns, even when one re-enters a pthread
+        // entry as a reused workqueue thread.
+        let running = self
+            .threads
+            .iter()
+            .copied()
+            .filter(|port| request.action_for(ThreadId::from(u64::from(*port))) == ThreadAction::Continue)
+            .collect();
+        lock_shared(&self.exception_state).birth.set_running(running);
+        let holds_new_threads = request.default_action == ThreadAction::Suspend
+            && request
+                .thread_actions
+                .iter()
+                .any(|(_, action)| *action != ThreadAction::Suspend);
+        if !holds_new_threads {
+            return Ok(());
+        }
+        if self.architecture != Architecture::Arm64 {
+            return Err(BackendError::Unsupported(
+                "suspending threads created during a resume is supported for arm64 targets only".into(),
+            ));
+        }
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            match shared.birth.arm(self.task, self.pid, self.birth_cover_required(request)) {
+                Ok(()) => {}
+                Err(crate::birth::BirthInstallError::Unsupported(message)) => {
+                    return Err(BackendError::Unsupported(message));
+                }
+                Err(crate::birth::BirthInstallError::Os(message)) => {
+                    return Err(BackendError::Os { code: -1, message });
+                }
+            }
+        }
+        // A previous step-off may have kept peers frozen after a failed restore.
+        // The trap is armed again now (or there is nothing to protect), so those
+        // suspends must not outlive this resume.
+        self.thaw_birth_freeze()
+            .map_err(|message| BackendError::Os { code: -1, message })?;
+        self.memory_cache.clear();
+        Ok(())
+    }
+
+    fn disarm_birth(&mut self) -> BackendResult<()>
+    {
+        let result = lock_shared(&self.exception_state)
+            .birth
+            .disarm(self.task)
+            .map_err(|message| BackendError::Os { code: -1, message });
+        if result.is_ok() {
+            // Original instructions are back, so a freeze from a step-off no longer
+            // protects an open entry.
+            if let Err(err) = self.thaw_birth_freeze() {
+                self.memory_cache.clear();
+                return Err(BackendError::Os { code: -1, message: err });
+            }
+        }
+        self.memory_cache.clear();
+        result
+    }
+
+    fn rearm_birth_if_active(&mut self)
+    {
+        lock_shared(&self.exception_state).birth.rearm_all(self.task);
+        self.memory_cache.clear();
+    }
+
+    /// A runnable thread parked on an armed birth trap must execute the original
+    /// instruction. With the trap still required, that is one hardware step.
+    ///
+    /// The restored instruction is process-wide. Every other thread is
+    /// `thread_suspend`ed until the trap is written back, so a creator running in
+    /// the same resume cannot start another thread through the open entry.
+    fn prepare_birth_step_off(&mut self, suspend: &[thread_act_t]) -> BackendResult<()>
+    {
+        if !lock_shared(&self.exception_state).birth.is_active() {
+            return Ok(());
+        }
+        let runnable: Vec<thread_act_t> = self.threads.iter().copied().filter(|port| !suspend.contains(port)).collect();
+        let mut leaving = Vec::new();
+        for port in runnable {
+            let pc = read_registers_for_port(self.architecture, port)
+                .map_err(backend_error)?
+                .pc
+                .value();
+            if !lock_shared(&self.exception_state).birth.armed_addresses().contains(&pc) {
+                continue;
+            }
+            let user_step = self.stepping_threads.contains(&port);
+            lock_shared(&self.exception_state)
+                .birth
+                .disarm_address(self.task, pc)
+                .map_err(|message| BackendError::Os { code: -1, message })?;
+            if !user_step {
+                lock_shared(&self.exception_state).birth.note_step_off(port);
+                crate::registers::set_single_step(port, true).map_err(backend_error)?;
+            }
+            leaving.push(port);
+        }
+        if !leaving.is_empty() {
+            let mut frozen = Vec::new();
+            for &port in &self.threads {
+                if suspend.contains(&port) || leaving.contains(&port) {
+                    continue;
+                }
+                // SAFETY: `port` is a thread right this backend holds. The suspend is
+                // recorded on the birth policy and balanced by `thaw_birth_freeze`.
+                let kr = unsafe { ffi::thread_suspend(port) };
+                if kr != KERN_SUCCESS {
+                    for port in frozen {
+                        // SAFETY: this balances the suspend just taken above.
+                        let _ = unsafe { ffi::thread_resume(port) };
+                    }
+                    return Err(mach_error(kr, &format!("thread_suspend of thread {port} failed")));
+                }
+                frozen.push(port);
+            }
+            let mut shared = lock_shared(&self.exception_state);
+            for port in frozen {
+                shared.birth.freeze(port);
+            }
+        }
+        self.memory_cache.clear();
+        Ok(())
     }
 
     /// Balance every `task_suspend` the backend holds with `task_resume`, ignoring
@@ -1073,8 +1306,11 @@ impl MacOSBackend
     fn detach_target(&mut self) -> BackendResult<()>
     {
         // Before the private SIGSTOP: the kernel could otherwise pick a thread that is
-        // still `thread_suspend`ed to take it, and the detach would time out. No thread
-        // of a released process may be left single-stepping either.
+        // still `thread_suspend`ed to take it, and the detach would time out. Restore
+        // birth-trap instructions first, so a newborn resumes on its original `stp`
+        // rather than a `brk` this backend is about to stop handling. No thread of a
+        // released process may be left single-stepping either.
+        let birth = self.disarm_birth();
         self.undo_thread_actions();
         let traced = self.stop_tracing();
         // Replay errors cannot undo a successful PT_DETACH. In particular they
@@ -1118,7 +1354,7 @@ impl MacOSBackend
             }
         }
         self.release_ports();
-        let failures: Vec<_> = [traced, replayed, fallback, restored]
+        let failures: Vec<_> = [birth, traced, replayed, fallback, restored]
             .into_iter()
             .filter_map(|result| result.err())
             .map(|err| err.to_string())
@@ -1264,6 +1500,14 @@ impl MacOSBackend
         self.memory_cache.invalidate_range(address, data.len());
         result
     }
+
+    /// A write over a birth trap updates the instruction it stands for and keeps the trap.
+    fn birth_engine_write(&mut self, address: Address, data: &[u8]) -> Option<Vec<u8>>
+    {
+        lock_shared(&self.exception_state)
+            .birth
+            .filter_engine_write(address.value(), data)
+    }
 }
 
 impl Backend for MacOSBackend
@@ -1377,8 +1621,10 @@ impl Backend for MacOSBackend
 
         // The process is dying: its exception ports need no restoring, only releasing.
         // Threads kept suspended by a resume in flight are let go too, so nothing of
-        // ours holds a thread back from exiting.
-        self.release_thread_suspends();
+        // ours holds a thread back from exiting. Birth traps are removed first so a
+        // newborn is not released onto a `brk`.
+        let _ = self.disarm_birth();
+        self.undo_thread_actions();
         let _ = self.stop_exception_handler(false);
         self.release_suspends();
         let reaped = if let Some(watcher) = &self.exit_watcher {
@@ -1520,10 +1766,18 @@ impl Backend for MacOSBackend
         self.reply_faults.publish_resume_race();
         let restore = |backend: &mut Self, count: u32| {
             backend.undo_thread_actions();
+            backend.rearm_birth_if_active();
             let mut shared = lock_shared(&backend.exception_state);
             shared.suspends += count;
             shared.preparing_resume = false;
         };
+
+        // Traps go in before any thread can run. A failure here leaves the snapshot
+        // policy unused: the resume returns and the target stays stopped.
+        if let Err(err) = self.sync_birth_policy(request) {
+            restore(self, count);
+            return Err(err);
+        }
 
         // Suspend and arm the threads before any of them can run.
         if let Err(err) = self.apply_thread_actions(&suspend, &step) {
@@ -1593,6 +1847,11 @@ impl Backend for MacOSBackend
                     message: format!("failed to reply to the Mach exception: {message}"),
                 });
             }
+        }
+
+        if let Err(err) = self.prepare_birth_step_off(&suspend) {
+            restore(self, count);
+            return Err(err);
         }
 
         // Continue has been acknowledged before any actual task_resume. The loop
@@ -1698,7 +1957,7 @@ impl Backend for MacOSBackend
     fn read_memory(&mut self, address: Address, len: usize) -> BackendResult<Vec<u8>>
     {
         self.require_stopped("read_memory")?;
-        let bytes = self.memory_cache.read(self.task, address, len).map_err(backend_error)?;
+        let mut bytes = self.memory_cache.read(self.task, address, len).map_err(backend_error)?;
         if bytes.len() != len {
             return Err(BackendError::NotFound(format!(
                 "only {} of {len} bytes at 0x{:016x} are mapped",
@@ -1706,12 +1965,19 @@ impl Backend for MacOSBackend
                 address.value()
             )));
         }
+        // The birth traps are the backend's own; the engine sees the instructions under them.
+        lock_shared(&self.exception_state)
+            .birth
+            .mask_read(address.value(), &mut bytes);
         Ok(bytes)
     }
 
     fn write_memory(&mut self, address: Address, data: &[u8]) -> BackendResult<()>
     {
         self.require_stopped("write_memory")?;
+        if let Some(word) = self.birth_engine_write(address, data) {
+            return self.write_target_memory(address, &word).map_err(backend_error);
+        }
         self.write_target_memory(address, data).map_err(backend_error)
     }
 

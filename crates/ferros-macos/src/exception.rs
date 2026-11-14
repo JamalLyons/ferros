@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use ferros_core::backend::{BackendError, BackendResult, StopEvent};
-use ferros_core::types::{Address, Architecture, ThreadId};
+use ferros_core::types::{Address, Architecture, ProcessId, ThreadId};
 use libc::{c_int, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::exc::__Reply__exception_raise_t;
@@ -104,7 +104,9 @@ use mach2::ndr::NDR_record_t;
 #[cfg(target_os = "macos")]
 use mach2::port::{MACH_PORT_DEAD, MACH_PORT_NULL};
 #[cfg(target_os = "macos")]
-use mach2::task::{task_get_exception_ports, task_set_exception_ports, task_suspend, task_swap_exception_ports};
+use mach2::task::{
+    task_get_exception_ports, task_resume, task_set_exception_ports, task_suspend, task_swap_exception_ports,
+};
 #[cfg(target_os = "macos")]
 use mach2::thread_status::thread_state_flavor_t;
 #[cfg(target_os = "macos")]
@@ -144,6 +146,8 @@ pub(crate) struct ExceptionSharedState
     pub dead: bool,
     /// Sticky watcher failure: no later terminal event can arrive from that watcher.
     pub watcher_error: Option<BackendError>,
+    /// Traps that hold threads created while the default resume action is `Suspend`.
+    pub(crate) birth: crate::birth::BirthPolicy,
 }
 
 impl ExceptionSharedState
@@ -185,6 +189,10 @@ pub struct ReplyFaultInjector
     publish_during_resume: Arc<AtomicBool>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
     pub(crate) handshake_requeue: Arc<AtomicBool>,
+    /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
+    birth_step_off_hold: Arc<AtomicU8>,
+    /// Fail the next `thread_suspend` of a newborn. Tests only.
+    birth_suspend: Arc<AtomicBool>,
 }
 
 impl ReplyFaultInjector
@@ -266,6 +274,54 @@ impl ReplyFaultInjector
     pub fn reap_before_exit_watcher(&self)
     {
         self.other_exit_reaper.store(true, Ordering::SeqCst);
+    }
+
+    /// Pause the next birth step-off before the task is suspended. Tests only.
+    ///
+    /// The entry instruction is already restored and other threads are still
+    /// scheduled, unless the backend suspended them for the step-off. The pause
+    /// ends at [`Self::release_birth_step_off`] or after five seconds.
+    pub fn hold_next_birth_step_off(&self)
+    {
+        self.birth_step_off_hold.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether the exception loop is inside [`Self::hold_next_birth_step_off`].
+    #[must_use]
+    pub fn birth_step_off_is_held(&self) -> bool
+    {
+        self.birth_step_off_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Let a held birth step-off suspend the task and restore the trap.
+    pub fn release_birth_step_off(&self)
+    {
+        self.birth_step_off_hold.store(3, Ordering::SeqCst);
+    }
+
+    /// Make the next newborn `thread_suspend` fail. Tests only.
+    pub fn fail_next_birth_suspend(&self)
+    {
+        self.birth_suspend.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_birth_suspend(&self) -> bool
+    {
+        self.birth_suspend.swap(false, Ordering::SeqCst)
+    }
+
+    /// If `relevant` and a test armed [`Self::hold_next_birth_step_off`], pause here.
+    pub(crate) fn pause_for_birth_step_off(&self, relevant: bool)
+    {
+        if !relevant || self.birth_step_off_hold.load(Ordering::SeqCst) != 1 {
+            return;
+        }
+        self.birth_step_off_hold.store(2, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.birth_step_off_hold.load(Ordering::SeqCst) == 2 {
+            assert!(std::time::Instant::now() < deadline, "birth step-off hold was not released");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Consume a pending injected failure.
@@ -816,8 +872,19 @@ pub(crate) fn run_exception_loop(
         if pending {
             // Preserve the next logical stop, but not its kernel reply: otherwise an
             // ordinary signal arriving at a breakpoint could block a later SIGKILL.
+            // A birth-policy breakpoint or its internal step-off is not a client stop:
+            // the task is already suspended, so the newborn is held or the step is
+            // retired without queueing an event beside the stop already published.
             let (mut exception, event) = first;
-            let state = lock_shared(&shared);
+            let mut state = lock_shared(&shared);
+            match try_consume_birth(&mut state, &mut exception, &event, task, pid, &faults, &events) {
+                BirthConsume::Consumed => continue,
+                BirthConsume::SuspendFailed => {
+                    state.held.push(exception);
+                    continue;
+                }
+                BirthConsume::Publish => {}
+            }
             if (state.suspends > 0 || state.preparing_resume)
                 && !is_internal_stop(&event, &state)
                 && let Err(err) = prepare_stop(&mut exception, pid, &faults)
@@ -829,6 +896,12 @@ pub(crate) fn run_exception_loop(
         }
 
         {
+            // A test can pause after a birth step-off is received and before this
+            // task_suspend. Other threads keep running during that pause unless the
+            // resume already suspended them. Production resumes do not arm the hold.
+            let step_off = lock_shared(&shared).birth.is_step_off(&first.1);
+            faults.pause_for_birth_step_off(step_off);
+
             // Stop every thread, collect every message of this stop, mark the exceptions
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
@@ -858,9 +931,64 @@ pub(crate) fn run_exception_loop(
                 debug!("{} threads stopped at once", stops.len());
             }
 
+            let mut client = Vec::new();
+            let mut stuck = Vec::new();
+            for (mut exception, event) in stops {
+                match try_consume_birth(&mut state, &mut exception, &event, task, pid, &faults, &events) {
+                    BirthConsume::Consumed => continue,
+                    BirthConsume::SuspendFailed => stuck.push(exception),
+                    BirthConsume::Publish => client.push((exception, event)),
+                }
+            }
+            // Only birth-policy stops: the newborn is `thread_suspend`ed (or has stepped
+            // off the trap, which releases threads frozen for that step) and the task
+            // runs again. Do not publish a stop.
+            if client.is_empty() {
+                if !stuck.is_empty() {
+                    // The newborn is still inside its exception. Keep the task
+                    // suspended and surface a stop so resume can try the suspend again.
+                    state.held.extend(stuck);
+                    state.pending_exception = true;
+                    faults.pending_stop.store(true, Ordering::SeqCst);
+                    let _ = events.send(Ok(StopEvent::Interrupted { thread: None }));
+                    continue;
+                }
+                if kr == KERN_SUCCESS {
+                    // SAFETY: this balances the `task_suspend` just taken above.
+                    let resume_kr = unsafe { task_resume(task) };
+                    if resume_kr == KERN_SUCCESS {
+                        state.suspends = state.suspends.saturating_sub(1);
+                    } else {
+                        error!("task_resume failed after a new-thread hold: {resume_kr}");
+                        state.pending_exception = true;
+                        faults.pending_stop.store(true, Ordering::SeqCst);
+                        let _ = events.send(Ok(StopEvent::Interrupted { thread: None }));
+                    }
+                }
+                continue;
+            }
+            state.held.extend(stuck);
+            // A real stop cancels an in-flight step off a birth site. The task stays
+            // suspended. Peers frozen for that step are released only after the trap
+            // is armed again; a failed restore leaves them suspended.
+            for thread in state.birth.clear_step_offs() {
+                if let Err(err) = crate::registers::set_single_step(thread, false) {
+                    debug!("clearing a birth step-off bit on thread {thread} failed: {err}");
+                }
+            }
+            if let Err(err) = state.birth.rearm_except(task, &[]) {
+                error!("failed to restore a new-thread trap: {err}");
+                let _ = events.send(Err(BackendError::Os {
+                    code: -1,
+                    message: format!("failed to restore the new-thread trap: {err}"),
+                }));
+            } else if let Err(err) = thaw_birth_freeze(&mut state) {
+                let _ = events.send(Err(BackendError::Os { code: -1, message: err }));
+            }
+
             state.pending_exception = true;
             faults.pending_stop.store(true, Ordering::SeqCst);
-            for (mut exception, event) in stops {
+            for (mut exception, event) in client {
                 let internal = is_internal_stop(&event, &state);
                 if state.handshake_signals.is_some() && !internal {
                     if let Err(err) = preserve_handshake_stop(exception, &event, &mut state, pid, &faults) {
@@ -978,6 +1106,241 @@ fn decode_request(buffer: &ReceiveBuffer) -> Option<MachExceptionRaiseRequest>
     // releases them once.
     unsafe { mach_msg_destroy(copy.0.as_mut_ptr().cast::<mach_msg_header_t>()) };
     None
+}
+
+/// Release threads suspended so they could not pass a disarmed birth site.
+fn thaw_birth_freeze(state: &mut ExceptionSharedState) -> std::result::Result<(), String>
+{
+    let ports = state.birth.take_frozen();
+    let mut resumed = Vec::new();
+    let mut failed = Vec::new();
+    for port in ports {
+        // SAFETY: `prepare_birth_step_off` or the notifier path suspended this tracee
+        // thread. This call only balances that one suspend.
+        let kr = unsafe { crate::ffi::thread_resume(port) };
+        if kr == KERN_SUCCESS || kr == mach2::kern_return::KERN_INVALID_NAME || kr == mach2::kern_return::KERN_TERMINATED {
+            resumed.push(port);
+        } else {
+            failed.push(port);
+        }
+    }
+    for port in state.birth.take_owned(&resumed) {
+        deallocate_right(port);
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    for port in failed {
+        state.birth.freeze(port);
+    }
+    Err("thread_resume of a birth step-off freeze failed".into())
+}
+
+/// What [`try_consume_birth`] did with one exception.
+enum BirthConsume
+{
+    /// The reply was sent, or the stop stays internal.
+    Consumed,
+    /// Publish the stop. A reported birth breakpoint was already `thread_suspend`ed.
+    Publish,
+    /// `thread_suspend` failed and the reply is still outstanding.
+    SuspendFailed,
+}
+
+/// Consume a birth-policy exception without publishing it.
+///
+/// [`BirthConsume::Consumed`] means the reply has been sent. A held newborn's thread
+/// right stays in [`BirthPolicy::suspended`](crate::birth::BirthPolicy). A software
+/// breakpoint on an entry is [`BirthConsume::Publish`] after the newborn is suspended.
+#[cfg(target_os = "macos")]
+fn try_consume_birth(
+    state: &mut ExceptionSharedState,
+    exception: &mut HeldException,
+    event: &StopEvent,
+    task: mach_port_t,
+    pid: libc::pid_t,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+) -> BirthConsume
+{
+    if state.birth.is_notifier(event) {
+        return consume_image_notifier(state, exception, task, pid, faults, events);
+    }
+    if state.birth.is_step_off(event) {
+        let thread = exception.thread;
+        state.birth.take_step_off(thread);
+        if let Err(err) = crate::registers::set_single_step(thread, false) {
+            debug!("clearing a completed birth step-off on thread {thread} failed: {err}");
+        }
+        let remaining = state.birth.step_off_threads();
+        let mut occupied = Vec::new();
+        for port in remaining {
+            match crate::task::read_registers_for_port(Architecture::Arm64, port) {
+                Ok(registers) => occupied.push(registers.pc.value()),
+                Err(err) => debug!("reading a birth step-off thread {port} failed: {err}"),
+            }
+        }
+        if let Err(err) = state.birth.rearm_except(task, &occupied) {
+            error!("failed to restore a new-thread trap: {err}");
+            // Leave the exception unanswered and the peer freezes in place. The
+            // client-stop path retries the restore and only releases those threads
+            // after it succeeds. The task stays suspended either way.
+            return BirthConsume::Publish;
+        }
+        if state.birth.step_off_threads().is_empty()
+            && let Err(err) = thaw_birth_freeze(state)
+        {
+            let _ = events.send(Err(BackendError::Os { code: -1, message: err }));
+            return BirthConsume::Publish;
+        }
+        if let Err(err) = reply_to_held(exception, faults) {
+            let _ = events.send(Err(err));
+        }
+        deallocate_right(exception.thread);
+        return BirthConsume::Consumed;
+    }
+    if let Some(engine_breakpoint) = state.birth.running_thread_entry(event, exception.thread) {
+        return continue_running_thread(state, exception, task, faults, events, engine_breakpoint);
+    }
+    if state.birth.is_reported_birth(event) {
+        return suspend_newborn(state, exception, faults, events, true);
+    }
+    if !state.birth.is_birth_breakpoint(event) {
+        return BirthConsume::Publish;
+    }
+    suspend_newborn(state, exception, faults, events, false)
+}
+
+/// A thread this resume lets `Continue` entered an armed entry (a reused workqueue thread).
+///
+/// It is not a newborn and is not held. With an engine breakpoint there the stop is
+/// published as that breakpoint. Otherwise its entry instruction is emulated and it runs
+/// on; if that is impossible it is held like a newborn and the failure is reported.
+fn continue_running_thread(
+    state: &mut ExceptionSharedState,
+    exception: &mut HeldException,
+    task: mach_port_t,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+    engine_breakpoint: bool,
+) -> BirthConsume
+{
+    if engine_breakpoint {
+        return BirthConsume::Publish;
+    }
+    if let Err(err) = state.birth.emulate_entry(task, exception.thread) {
+        error!("a continuing thread entered a pthread entry and could not pass it: {err}");
+        let _ = events.send(Err(BackendError::Os {
+            code: -1,
+            message: format!("thread {} could not pass its pthread entry: {err}", exception.thread),
+        }));
+        return suspend_newborn(state, exception, faults, events, false);
+    }
+    if let Err(err) = reply_to_held(exception, faults) {
+        let _ = events.send(Err(err));
+    }
+    deallocate_right(exception.thread);
+    BirthConsume::Consumed
+}
+
+/// The main thread reached the executable entry: dyld has mapped the linked images.
+/// Arm pthread entries before that entry runs. An engine breakpoint there is published.
+fn consume_image_notifier(
+    state: &mut ExceptionSharedState,
+    exception: &mut HeldException,
+    task: mach_port_t,
+    pid: libc::pid_t,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+) -> BirthConsume
+{
+    let engine_breakpoint = state.birth.notifier_is_engine_breakpoint();
+    let covered = match state
+        .birth
+        .install_entries(task, ProcessId::from(pid as u32), exception.thread)
+    {
+        Ok(covered) => covered,
+        Err(err) => {
+            let message = match err {
+                crate::birth::BirthInstallError::Unsupported(message) | crate::birth::BirthInstallError::Os(message) => {
+                    message
+                }
+            };
+            let _ = events.send(Err(BackendError::Os { code: -1, message }));
+            return BirthConsume::SuspendFailed;
+        }
+    };
+    if !covered {
+        let _ = events.send(Err(BackendError::Os {
+            code: -1,
+            message: "libsystem_pthread was not loaded when the executable entry ran".into(),
+        }));
+        return BirthConsume::SuspendFailed;
+    }
+    if engine_breakpoint {
+        return BirthConsume::Publish;
+    }
+    if let Err(err) = reply_to_held(exception, faults) {
+        let _ = events.send(Err(err));
+    }
+    deallocate_right(exception.thread);
+    BirthConsume::Consumed
+}
+
+/// `thread_suspend` a newborn at an armed entry.
+///
+/// `report` publishes the stop after the suspend (the engine has a breakpoint
+/// there). Otherwise the stop stays internal.
+fn suspend_newborn(
+    state: &mut ExceptionSharedState,
+    exception: &mut HeldException,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+    report: bool,
+) -> BirthConsume
+{
+    if report {
+        // The published stop keeps the exception's own reference and releases it when
+        // the stop is answered. The hold needs a reference of its own.
+        // SAFETY: the exception message holds a send right to this thread, so the name
+        // is valid; this adds one user reference, owned by `BirthPolicy::suspended`.
+        let kr = unsafe {
+            mach2::mach_port::mach_port_mod_refs(mach_task_self(), exception.thread, mach2::port::MACH_PORT_RIGHT_SEND, 1)
+        };
+        if kr != KERN_SUCCESS {
+            let _ = events.send(Err(BackendError::Os {
+                code: i64::from(kr),
+                message: format!("retaining new thread {} failed: {kr}", exception.thread),
+            }));
+            return BirthConsume::SuspendFailed;
+        }
+    }
+    // SAFETY: the exception message retains this thread right. One user suspend
+    // keeps the newborn out of application code after the task runs again.
+    let kr = if faults.fail_birth_suspend() {
+        mach2::kern_return::KERN_FAILURE
+    } else {
+        unsafe { crate::ffi::thread_suspend(exception.thread) }
+    };
+    if kr != KERN_SUCCESS {
+        error!("thread_suspend of a new thread {} failed: {kr}", exception.thread);
+        if report {
+            deallocate_right(exception.thread);
+        }
+        let _ = events.send(Err(BackendError::Os {
+            code: i64::from(kr),
+            message: format!("thread_suspend of a new thread {} failed: {kr}", exception.thread),
+        }));
+        return BirthConsume::SuspendFailed;
+    }
+    state.birth.hold(exception.thread);
+    if report {
+        return BirthConsume::Publish;
+    }
+    if let Err(err) = reply_to_held(exception, faults) {
+        let _ = events.send(Err(err));
+    }
+    BirthConsume::Consumed
 }
 
 /// Turn a decoded request into a held exception and its stop event.

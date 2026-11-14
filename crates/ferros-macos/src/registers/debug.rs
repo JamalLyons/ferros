@@ -272,6 +272,27 @@ pub fn set_single_step(thread: thread_act_t, enabled: bool) -> Result<()>
     }
 }
 
+/// Read the hardware single-step control bit without modifying it. Tests only.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn single_step_enabled(thread: thread_act_t) -> Result<bool>
+{
+    let mut state = ArmDebugState64::default();
+    let mut count = constants::ARM_DEBUG_STATE64_COUNT;
+    // SAFETY: the buffer has the ARM_DEBUG_STATE64 layout and `count` words.
+    let kr = unsafe {
+        ffi::thread_get_state(
+            thread,
+            constants::ARM_DEBUG_STATE64,
+            (&raw mut state).cast::<natural_t>(),
+            &mut count,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    Ok(state.mdscr_el1 & MDSCR_EL1_SS != 0)
+}
+
 #[cfg(target_arch = "x86_64")]
 fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
 {

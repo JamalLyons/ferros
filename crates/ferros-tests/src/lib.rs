@@ -1,6 +1,8 @@
 //! Integration test fixtures and harness helpers for Ferros.
 
 pub mod arm64;
+pub mod control;
+
 pub mod fixture;
 #[cfg(target_os = "macos")]
 pub mod harness;

@@ -364,3 +364,40 @@ pub fn raise_sigusr1() -> std::io::Result<()>
         Err(std::io::Error::last_os_error())
     }
 }
+
+/// Read MDSCR_EL1.SS using a thread port held by the debugger. Tests only.
+///
+/// # Errors
+/// Returns the Mach error if the name is invalid or the state cannot be read.
+#[doc(hidden)]
+pub fn single_step_enabled(thread: ferros_core::ThreadId) -> Result<bool>
+{
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::registers::single_step_enabled(thread.raw() as mach_port_t)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = thread;
+        Err(DebuggerError::InvalidArgument("single-step diagnostics require arm64".into()))
+    }
+}
+
+/// Read THREAD_BASIC_INFO's per-thread suspend count, excluding task suspensions.
+/// The debugger must still own the supplied thread port. Tests only.
+///
+/// # Errors
+/// Returns the Mach error if the thread info cannot be read.
+#[doc(hidden)]
+pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
+{
+    // THREAD_BASIC_INFO = 3; two time_value_t pairs followed by six integers.
+    let mut info = [0_i32; 10];
+    let mut count = 10;
+    // SAFETY: `info` holds exactly THREAD_BASIC_INFO_COUNT integer_t words.
+    let kr = unsafe { ffi::thread_info(thread.raw() as mach_port_t, 3, info.as_mut_ptr(), &mut count) };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    Ok(info[8])
+}

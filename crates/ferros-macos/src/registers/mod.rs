@@ -33,6 +33,8 @@ pub mod debug;
 // Re-export architecture-specific functions
 #[cfg(target_arch = "aarch64")]
 pub use arm64::{read_registers_arm64, write_registers_arm64};
+#[cfg(target_arch = "aarch64")]
+pub(crate) use debug::single_step_enabled;
 // Re-export debug register functions
 pub use debug::{clear_hardware_breakpoint, clear_watchpoint, set_hardware_breakpoint, set_single_step, set_watchpoint};
 #[cfg(target_arch = "x86_64")]

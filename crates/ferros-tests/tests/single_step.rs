@@ -16,8 +16,9 @@ use ferros_core::{
 };
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::{Flow, TRAP, flow};
+use ferros_tests::control::ControlDir;
 use ferros_tests::harness::{self, Debuggee};
-use ferros_tests::symbols::function_address;
+use ferros_tests::symbols::{function_address, marker_address};
 use ferros_tests::{Fixture, fixture};
 
 /// How long a test waits for a stop.
@@ -1356,78 +1357,161 @@ fn kill_releases_a_held_new_thread()
     });
 }
 
-/// Releasing an attached session after starting a step resumes every suspended thread.
-/// Explicit detach requires a stopped session; drop performs its own stop and detach.
+/// Release the publication hook even if an assertion unwinds.
+struct ReleasePublication(ferros_macos::exception::ReplyFaultInjector);
+impl Drop for ReleasePublication
+{
+    fn drop(&mut self)
+    {
+        self.0.release_stop_publication();
+    }
+}
+
+fn wait_for_publication_pause(faults: &ferros_macos::exception::ReplyFaultInjector)
+{
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !faults.stop_publication_is_paused() {
+        assert!(Instant::now() < deadline, "real exception never reached publication pause");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_for_published_stop(faults: &ferros_macos::exception::ReplyFaultInjector)
+{
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !faults.has_pending_stop() {
+        assert!(Instant::now() < deadline, "released real exception was never published");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn assert_step_cleaned(stepped: ThreadId, threads: &[ThreadId])
+{
+    assert!(
+        !diagnostics::single_step_enabled(stepped).expect("MDSCR_EL1.SS"),
+        "single-step bit still set immediately after cancellation"
+    );
+    for &thread in threads {
+        assert_eq!(
+            diagnostics::thread_suspend_count(thread).expect("suspend count"),
+            0,
+            "thread {thread:?} still suspended immediately after cancellation"
+        );
+    }
+}
+
+/// Both detach paths start with directly observed per-thread suspensions. The
+/// publication pause holds the real step completion until cleanup is deliberately begun.
 #[test]
 fn detach_cleanup_after_starting_step_releases_suspended_threads()
 {
-    harness::run_with_timeout(Duration::from_secs(30), |t| {
+    harness::run_with_timeout(Duration::from_secs(40), |t| {
         for explicit in [false, true] {
-            let mut target = t.spawn(&fixture!("threads"), &["1000", "1000"]);
-            let pid = target.pid();
-            let deadline = Instant::now() + STOP_TIMEOUT;
-            while thread_count(pid.0) < 3 {
-                assert!(Instant::now() < deadline, "workers never started");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
-            session.attach(pid).expect("attach");
+            let control = ControlDir::new();
+            let fixture = fixture!("step_races");
+            let mut target = t.spawn(&fixture, &[control.path().to_str().expect("path")]);
+            control.wait("ready-0");
+            control.wait("ready-1");
+            let debugger = MacOSBackend::new().expect("backend");
+            let faults = debugger.reply_fault_injector();
+            let mut session = Session::new(Box::new(debugger));
+            let _release = ReleasePublication(faults.clone());
+            session.attach(target.pid()).expect("attach");
+            let address = marker_address(&mut session, &fixture, "step_site");
+            let id = session
+                .add_breakpoint(BreakpointRequest::Software { address })
+                .expect("breakpoint");
+            control.release("run-0");
+            session.resume().expect("resume");
+            let stepped = match session.wait(Some(STOP_TIMEOUT)).expect("breakpoint") {
+                Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+                other => panic!("expected first worker breakpoint: {other:?}"),
+            };
+            session.remove_breakpoint(id).expect("remove breakpoint");
             let threads = session.threads().expect("threads");
-            assert!(threads.len() >= 3, "expected multiple threads: {threads:?}");
-            session.step_instruction(threads[1]).expect("start step");
+            faults.pause_next_stop_publication();
+            session.step_instruction(stepped).expect("start step");
+            wait_for_publication_pause(&faults);
+            for &thread in threads.iter().filter(|&&thread| thread != stepped) {
+                assert_eq!(
+                    diagnostics::thread_suspend_count(thread).expect("suspend count"),
+                    1,
+                    "other thread was not suspended while step pending"
+                );
+            }
             if explicit {
                 session.interrupt().expect("interrupt step");
-                assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
-                while session.wait(Some(Duration::ZERO)).expect("drain").is_some() {}
+                assert_eq!(
+                    session.wait(Some(STOP_TIMEOUT)).expect("interrupt"),
+                    Some(StopEvent::Interrupted { thread: None })
+                );
+                assert_step_cleaned(stepped, &threads);
+            }
+            // Releasing publication does not deliver a stop to the client, and so
+            // cannot perform the deliver-time cleanup on the direct-drop path.
+            faults.release_stop_publication();
+            if explicit {
+                assert_eq!(
+                    session.wait(Some(STOP_TIMEOUT)).expect("late step"),
+                    Some(StopEvent::SingleStep { thread: stepped })
+                );
                 session.detach().expect("detach after stop");
             }
             drop(session);
+            control.release("run-1");
+            control.release("exit");
             let deadline = Instant::now() + STOP_TIMEOUT;
             loop {
-                if let Some(status) = target.try_wait().expect("query detached child status") {
+                if let Some(status) = target.try_wait().expect("child status") {
                     assert!(status.success(), "detached process failed (explicit: {explicit}): {status}");
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "attached process did not finish (explicit: {explicit}): {}",
-                    process_state(pid.0)
+                    "attached process did not finish (explicit: {explicit})"
                 );
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     });
 }
 
-/// Race an interrupt against a requested step, accepting either documented winner.
+/// The kernel has already raised `SingleStep`, but publication is held until an
+/// interrupt is queued. This forces the interrupt to win every time.
 #[test]
-fn interrupt_races_a_real_instruction_step()
+fn interrupt_precedes_a_real_instruction_step()
 {
     harness::run(|t| {
-        let fixture = fixture!("loop_counter");
-        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
-        let tick = function_address(&mut d, &fixture, "tick");
+        let fixture = fixture!("threads");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, tick);
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d).write_memory(tick, &original).expect("restore");
+        let threads = backend(&mut d).threads().expect("threads");
+        let _release = ReleasePublication(faults.clone());
+        faults.pause_next_stop_publication();
         backend(&mut d).resume(&ResumeRequest::step(thread)).expect("step");
+        wait_for_publication_pause(&faults);
         backend(&mut d).interrupt().expect("interrupt");
-        let event = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait");
-        assert!(
-            matches!(event, Some(StopEvent::SingleStep { thread: id }) if id == thread)
-                || matches!(event, Some(StopEvent::Interrupted { .. })),
-            "unexpected race outcome: {event:?}"
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait"),
+            Some(StopEvent::Interrupted { thread: None })
         );
-        // Drain any event from the same stop before continuing, then ensure no step
-        // exception appears after the next continue.
-        while backend(&mut d).wait(Some(Duration::ZERO)).expect("drain").is_some() {}
+        assert_step_cleaned(thread, &threads);
+        faults.release_stop_publication();
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("late step"),
+            Some(StopEvent::SingleStep { thread })
+        );
         backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
         assert_eq!(
-            backend(&mut d).wait(Some(Duration::from_millis(300))).expect("wait"),
-            None,
-            "stray stop after cancellation"
+            backend(&mut d).wait(Some(Duration::from_millis(100))).expect("no stray step"),
+            None
         );
-        backend(&mut d).interrupt().expect("interrupt after continue");
+        backend(&mut d).interrupt().expect("interrupt");
         assert!(matches!(
             backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
             Some(StopEvent::Interrupted { .. })
@@ -1435,53 +1519,258 @@ fn interrupt_races_a_real_instruction_step()
     });
 }
 
-/// Deliver a signal while stopped and race it against a step. When the signal wins,
-/// a subsequent plain continue must not leave hardware single-step enabled.
+/// A planted brk is synchronously taken before the instruction can complete. Unlike
+/// an externally sent signal, its ordering against single-step is architectural.
 #[test]
-fn signal_cancels_a_real_step_without_a_stray_step_stop()
+fn breakpoint_cancels_a_real_step_without_a_stray_step_stop()
 {
-    const TRIALS: usize = 20;
-    harness::run_with_timeout(Duration::from_secs(60), |t| {
+    harness::run(|t| {
+        let fixture = fixture!("threads");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+        let tick = function_address(&mut d, &fixture, "worker_body");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        let threads = backend(&mut d).threads().expect("threads");
+        // Leave the real brk at pc: the step executes it instead of the original.
+        assert_eq!(step(&mut d, thread), StopEvent::Breakpoint { thread, pc: tick });
+        assert_step_cleaned(thread, &threads);
+        backend(&mut d).write_memory(tick, &original).expect("restore");
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(100))).expect("no stray step"),
+            None
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+    });
+}
+
+/// A real internal step completion arriving after abandonment belongs to no user
+/// request. Waiting after Interrupted must consume it silently, without a resume.
+#[test]
+fn late_real_internal_step_is_dropped_after_abandonment()
+{
+    harness::run(|t| {
         let fixture = fixture!("loop_counter");
-        for trial in 1..=TRIALS {
-            let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
-            let tick = function_address(&mut d, &fixture, "tick");
-            let original = plant_trap(&mut d, tick);
-            let (thread, _) = run_to_trap(&mut d, tick);
-            backend(&mut d).write_memory(tick, &original).expect("restore");
-            assert!(
-                Command::new("/bin/kill")
-                    .args(["-USR1", &d.pid().0.to_string()])
-                    .status()
-                    .expect("signal")
-                    .success()
-            );
-            backend(&mut d).resume(&ResumeRequest::step(thread)).expect("start step");
-            let event = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("step or signal");
-            match event {
-                Some(StopEvent::SingleStep { thread: id }) if id == thread => continue,
-                Some(StopEvent::Signal { signal: SIGUSR1, .. }) => {}
-                other => panic!("unexpected step race outcome: {other:?}"),
-            }
-            // Suppress the held signal and resume freely. A stale step bit would stop
-            // the target immediately with SingleStep instead of running the loop.
-            assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let address = function_address(&mut d, &fixture, "tick");
+        let id = d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+        d.resume().expect("resume");
+        assert!(
+            matches!(d.wait(Some(STOP_TIMEOUT)).expect("breakpoint"), Some(StopEvent::Breakpoint { pc, .. }) if pc == address)
+        );
+        let _release = ReleasePublication(faults.clone());
+        faults.pause_next_stop_publication();
+        d.resume().expect("internal step times out waiting for publication");
+        wait_for_publication_pause(&faults);
+        d.interrupt().expect("interrupt");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("interrupt"),
+            Some(StopEvent::Interrupted { thread: None })
+        );
+        faults.release_stop_publication();
+        wait_for_published_stop(&faults);
+        assert_eq!(
+            d.wait(Some(Duration::from_millis(100))).expect("drain late real step"),
+            None,
+            "abandoned internal SingleStep reached the caller"
+        );
+        d.remove_breakpoint(id).expect("remove breakpoint");
+        d.resume().expect("continue");
+        assert_eq!(d.wait(Some(Duration::from_millis(100))).expect("running"), None);
+        d.interrupt().expect("interrupt");
+        assert!(matches!(
+            d.wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+    });
+}
+
+/// Complete a real internal step with a real signal in the same exception batch.
+/// Session must return that signal before issuing the final continue.
+#[test]
+fn event_batched_with_real_internal_step_is_reported_before_resume()
+{
+    harness::run(|t| {
+        let control = ControlDir::new();
+        let fixture = fixture!("step_races");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[control.path().to_str().expect("path")], debugger);
+        let address = marker_address(&mut d, &fixture, "step_site");
+        let id = d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+        control.release("run-0");
+        d.resume().expect("run first worker");
+        let stepped = match d.wait(Some(STOP_TIMEOUT)).expect("breakpoint") {
+            Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+            other => panic!("expected worker breakpoint: {other:?}"),
+        };
+        let threads = d.session_mut().threads().expect("threads");
+        let peer = *threads
+            .iter()
+            .find(|&&id| id != stepped && id != threads[0])
+            .expect("second worker");
+        let instruction = u32::from_le_bytes(
+            d.read_memory(address, 4)
+                .expect("original instruction")
+                .try_into()
+                .expect("instruction"),
+        );
+        let expected_pc = match flow(address.value(), instruction) {
+            Flow::Next => address.value() + 4,
+            Flow::Direct(target) => target,
+            other => panic!("step_site marker needs a fixed successor, got {other:?}"),
+        };
+        faults.batch_next_step_with_signal(peer);
+        d.resume().expect("finish internal step without resuming over pending signal");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("batched signal"),
+            Some(StopEvent::Signal {
+                thread: peer,
+                signal: SIGUSR1
+            })
+        );
+        assert_eq!(
+            pc_of(&mut d, stepped).value(),
+            expected_pc,
+            "internal step resumed past its completion while another event was pending"
+        );
+        let pcs: Vec<_> = threads.iter().map(|&id| (id, pc_of(&mut d, id))).collect();
+        assert_eq!(d.wait(Some(Duration::from_millis(50))).expect("no other event"), None);
+        for (id, pc) in pcs {
+            assert_eq!(pc_of(&mut d, id), pc, "thread ran while pending event was reported");
+        }
+        assert!(!control.path().join("done-0").exists(), "worker resumed past step_site");
+        d.remove_breakpoint(id).expect("remove breakpoint");
+    });
+}
+
+/// Retain worker 1's signal while worker 0 leaves a breakpoint, then abandon that
+/// internal step. Only `resume_with_signal` may later deliver worker 1's held signal.
+#[test]
+fn retained_signal_survives_abandoned_real_step_over_or_is_explicitly_dropped()
+{
+    harness::run_with_timeout(Duration::from_secs(40), |t| {
+        for deliver in [true, false] {
+            let control = ControlDir::new();
+            let fixture = fixture!("step_races");
+            let debugger = MacOSBackend::new().expect("backend");
+            let faults = debugger.reply_fault_injector();
+            let mut d = t.launch_with_backend(&fixture, &[control.path().to_str().expect("path")], debugger);
+            let address = marker_address(&mut d, &fixture, "step_site");
+            let id = d.add_breakpoint(BreakpointRequest::Software { address }).expect("breakpoint");
+            control.release("run-0");
+            d.resume().expect("run worker 0");
+            let stepped = match d.wait(Some(STOP_TIMEOUT)).expect("breakpoint") {
+                Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+                other => panic!("expected worker 0 breakpoint: {other:?}"),
+            };
+            // Restore only while admitting worker 1: it must pass step_site and
+            // raise its own SIGUSR1 while worker 0's breakpoint record stays held.
+            d.disable_breakpoint(id).expect("disable trap for worker 1");
+            control.release("signal-1");
+            control.release("run-1");
             backend(&mut d)
-                .resume(&ResumeRequest::continue_all())
-                .expect("continue after signal");
+                .resume(&ResumeRequest::continue_all().with_thread(stepped, ThreadAction::Suspend))
+                .expect("run signalled worker");
+            let signalled = match d.wait(Some(STOP_TIMEOUT)).expect("worker signal") {
+                Some(StopEvent::Signal { thread, signal: SIGUSR1 }) => thread,
+                other => panic!("expected worker 1 SIGUSR1: {other:?}"),
+            };
+            assert_ne!(signalled, stepped);
+            d.enable_breakpoint(id).expect("restore trap for internal step");
+            let _release = ReleasePublication(faults.clone());
+            faults.pause_next_stop_publication();
+            d.resume_with_signal().expect("start step-over with retained signal for peer");
+            wait_for_publication_pause(&faults);
+            d.interrupt().expect("abandon internal step");
             assert_eq!(
-                backend(&mut d).wait(Some(Duration::from_millis(300))).expect("wait"),
-                None,
-                "stray stop after signal cancelled the step"
+                d.wait(Some(STOP_TIMEOUT)).expect("interrupt"),
+                Some(StopEvent::Interrupted { thread: None })
             );
-            backend(&mut d).interrupt().expect("interrupt");
+            faults.release_stop_publication();
+            assert_eq!(d.wait(Some(Duration::from_millis(100))).expect("late internal step"), None);
+            d.remove_breakpoint(id).expect("remove breakpoint");
+            if deliver {
+                d.resume_with_signal().expect("deliver carried worker signal");
+            } else {
+                d.resume().expect("drop carried worker signal");
+            }
+            control.wait("done-1");
+            control.release("snapshot");
+            control.wait("observed");
+            assert_eq!(
+                control.read("observed"),
+                if deliver { "2" } else { "0" },
+                "wrong fixture-side handlers after abandoned step (deliver: {deliver})"
+            );
+            assert_eq!(
+                d.wait(Some(Duration::from_millis(50))).expect("no stray step or signal"),
+                None
+            );
+            d.interrupt().expect("stop");
             assert!(matches!(
-                backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+                d.wait(Some(STOP_TIMEOUT)).expect("interrupt"),
                 Some(StopEvent::Interrupted { .. })
             ));
-            eprintln!("signal won the step race on trial {trial} of {TRIALS}");
-            return;
+            if !deliver {
+                // A plain resume must forget the carried decision, not merely defer
+                // it again. A later signal-passing resume must also remain silent.
+                std::fs::remove_file(control.path().join("snapshot")).expect("clear snapshot request");
+                std::fs::remove_file(control.path().join("observed")).expect("clear snapshot");
+                d.resume_with_signal()
+                    .expect("plain resume discarded carried signal permanently");
+                control.release("snapshot");
+                control.wait("observed");
+                assert_eq!(control.read("observed"), "0", "plain resume kept a carried signal");
+                d.interrupt().expect("stop after second resume");
+                assert!(matches!(
+                    d.wait(Some(STOP_TIMEOUT)).expect("stop"),
+                    Some(StopEvent::Interrupted { .. })
+                ));
+            }
         }
-        panic!("signal did not win the step race in {TRIALS} trials");
+    });
+}
+
+/// Backend drop must also undo the step without any intervening wait/deliver. This
+/// covers teardown's own cleanup independently of Session's interrupt/wait on drop.
+#[test]
+fn backend_drop_releases_directly_observed_step_suspends()
+{
+    harness::run(|t| {
+        let control = ControlDir::new();
+        let mut target = t.spawn(&fixture!("step_races"), &[control.path().to_str().expect("path")]);
+        control.wait("ready-0");
+        control.wait("ready-1");
+        let mut debugger = MacOSBackend::new().expect("backend");
+        debugger.attach(target.pid()).expect("attach");
+        let threads = debugger.threads().expect("threads");
+        assert!(threads.len() >= 3);
+        let stepped = threads[1];
+        debugger.resume(&ResumeRequest::step(stepped)).expect("step");
+        for &thread in threads.iter().filter(|&&id| id != stepped) {
+            assert_eq!(diagnostics::thread_suspend_count(thread).expect("suspend count"), 1);
+        }
+        // Do not call wait: even if a real completion is already queued, only
+        // detach_target can balance the suspensions on this path.
+        drop(debugger);
+        control.release("run-0");
+        control.release("run-1");
+        control.release("exit");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            if let Some(status) = target.try_wait().expect("child status") {
+                assert!(status.success(), "backend drop left a failing child: {status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "backend drop left worker threads suspended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     });
 }

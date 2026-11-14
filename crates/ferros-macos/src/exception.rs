@@ -187,6 +187,7 @@ pub struct ReplyFaultInjector
     pending_stop: Arc<AtomicBool>,
     stop_publication: Arc<AtomicU8>,
     publish_during_resume: Arc<AtomicBool>,
+    step_batch_signal: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
     pub(crate) handshake_requeue: Arc<AtomicBool>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
@@ -249,6 +250,24 @@ impl ReplyFaultInjector
     pub fn stop_publication_is_paused(&self) -> bool
     {
         self.stop_publication.load(Ordering::SeqCst) == 2
+    }
+
+    /// Release a real exception paused before publication. Tests only.
+    pub fn release_stop_publication(&self)
+    {
+        let _ = self
+            .stop_publication
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Collect a real SIGUSR1 on `thread` alongside the next real SingleStep.
+    /// The peer must have one backend-owned thread suspension and a SIGUSR1 handler.
+    /// Its suspension is temporarily balanced to let the kernel deliver the signal,
+    /// then restored before publishing the two events. No event is synthesized.
+    pub fn batch_next_step_with_signal(&self, thread: ferros_core::ThreadId)
+    {
+        self.step_batch_signal
+            .store(u32::try_from(thread.raw()).expect("thread port"), Ordering::SeqCst);
     }
 
     /// Publish that exception between the next resume's lock sections. Tests only.
@@ -808,6 +827,29 @@ pub(crate) fn run_exception_loop(
             hold_exception(&request, architecture)
         };
         let mut injected_batch = Vec::new();
+        if matches!(first.1, StopEvent::SingleStep { .. }) {
+            let peer = faults.step_batch_signal.swap(0, Ordering::SeqCst);
+            if peer != 0 {
+                // SAFETY: this armed test hook uses a backend-owned suspended peer.
+                // Queue first so no user instruction is needed to raise the signal.
+                assert_eq!(unsafe { crate::ffi::__pthread_kill(peer, libc::SIGUSR1) }, 0);
+                assert_eq!(unsafe { crate::ffi::thread_resume(peer) }, KERN_SUCCESS);
+                let buffer =
+                    receive_exception_with_timeout(exception_port, Some(1000)).expect("signal batched with real step");
+                let request = decode_request(&buffer).expect("real signal request");
+                let racing = hold_exception(&request, architecture);
+                assert!(
+                    matches!(racing.1, StopEvent::Signal { thread, signal: libc::SIGUSR1 }
+                    if thread.raw() == u64::from(peer)),
+                    "unexpected batched event: {:?}",
+                    racing.1
+                );
+                // SAFETY: restore exactly the one suspension temporarily balanced above.
+                assert_eq!(unsafe { crate::ffi::thread_suspend(peer) }, KERN_SUCCESS);
+                injected_batch.push(racing);
+            }
+        }
+
         if is_internal_stop(&first.1, &lock_shared(&shared)) {
             let race = faults.private_stop_race.swap(0, Ordering::SeqCst);
             if race != 0 {

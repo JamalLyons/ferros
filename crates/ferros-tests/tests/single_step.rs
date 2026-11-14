@@ -1617,9 +1617,18 @@ fn event_batched_with_real_internal_step_is_reported_before_resume()
             other => panic!("expected worker breakpoint: {other:?}"),
         };
         let threads = d.session_mut().threads().expect("threads");
+        // Identify the workers by the system-wide ids the fixture reported, not by
+        // the order of the thread list.
+        control.wait("ready-1");
+        let worker = |slot: usize| control.read(&format!("tid-{slot}")).parse::<u64>().expect("worker id");
+        assert_eq!(
+            diagnostics::thread_unique_id(stepped).expect("stepped id"),
+            worker(0),
+            "the breakpoint stop was not worker 0"
+        );
         let peer = *threads
             .iter()
-            .find(|&&id| id != stepped && id != threads[0])
+            .find(|&&id| diagnostics::thread_unique_id(id).expect("thread id") == worker(1))
             .expect("second worker");
         let instruction = u32::from_le_bytes(
             d.read_memory(address, 4)

@@ -410,3 +410,50 @@ pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
     }
     Ok(info[SUSPEND_COUNT])
 }
+
+/// The calling thread's system-wide unique id (`pthread_threadid_np`), for fixtures
+/// that report which worker is which. Tests only.
+#[doc(hidden)]
+#[must_use]
+pub fn current_thread_unique_id() -> u64
+{
+    let mut id = 0_u64;
+    // SAFETY: pthread_self names the calling thread; `id` is valid for writes.
+    let rc = unsafe { libc::pthread_threadid_np(libc::pthread_self(), &mut id) };
+    assert_eq!(rc, 0, "pthread_threadid_np failed");
+    id
+}
+
+/// The system-wide unique id of a target thread whose port the debugger holds
+/// (`THREAD_IDENTIFIER_INFO`), matching [`current_thread_unique_id`] in the target.
+/// Tests only.
+///
+/// # Errors
+/// Returns the Mach error if the thread info cannot be read.
+#[doc(hidden)]
+pub fn thread_unique_id(thread: ferros_core::ThreadId) -> Result<u64>
+{
+    // `struct thread_identifier_info`: thread_id, thread_handle, dispatch_qaddr (u64 each).
+    const THREAD_IDENTIFIER_INFO: libc::natural_t = 4;
+    const THREAD_IDENTIFIER_INFO_COUNT: mach_msg_type_number_t = 6;
+    let mut info = [0_u64; 3];
+    let mut count = THREAD_IDENTIFIER_INFO_COUNT;
+    // SAFETY: `info` is 24 bytes, exactly THREAD_IDENTIFIER_INFO_COUNT natural_t words.
+    let kr = unsafe {
+        ffi::thread_info(
+            thread.raw() as mach_port_t,
+            THREAD_IDENTIFIER_INFO,
+            info.as_mut_ptr().cast::<c_int>(),
+            &mut count,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    if count < 2 {
+        return Err(DebuggerError::InvalidArgument(format!(
+            "thread_info returned {count} words, too few for thread_id"
+        )));
+    }
+    Ok(info[0])
+}

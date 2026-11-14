@@ -19,6 +19,8 @@ fn main()
         let directory = directory.clone();
         workers.push(std::thread::spawn(move || {
             diagnostics::register_signal_worker(slot);
+            let id = diagnostics::current_thread_unique_id().to_string();
+            std::fs::write(directory.join(format!("tid-{slot}")), id).expect("thread id");
             std::fs::write(directory.join(format!("ready-{slot}")), b"ready").expect("ready");
             while !directory.join(format!("run-{slot}")).exists() || !directory.join(format!("ready-{}", 1 - slot)).exists()
             {

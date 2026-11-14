@@ -24,6 +24,34 @@ impl Observer
         std::fs::create_dir(&path).expect("observer directory");
         Self(path)
     }
+    fn wait_released_after_drop(&self, pid: ferros_core::ProcessId)
+    {
+        let progress_before = std::fs::read_to_string(self.0.join("progress"));
+        let began = Instant::now();
+        // Both handlers must run after release. A missing acknowledgement alone
+        // cannot distinguish signal loss from a task left suspended (#76).
+        while !self.0.join("handled").exists() || !self.0.join("continued").exists() {
+            if began.elapsed() >= Duration::from_secs(2) {
+                let state = std::process::Command::new("/bin/ps")
+                    .args(["-M", "-o", "pid,ppid,stat,time,command"])
+                    .arg("-p")
+                    .arg(pid.0.to_string())
+                    .output()
+                    .expect("target state");
+                eprintln!("release acknowledgement deadline elapsed: {:?}", began.elapsed());
+                eprintln!(
+                    "handled={}, continued={}",
+                    self.0.join("handled").exists(),
+                    self.0.join("continued").exists()
+                );
+                eprintln!("progress before wait: {progress_before:?}");
+                eprintln!("progress after wait: {:?}", std::fs::read_to_string(self.0.join("progress")));
+                eprintln!("target: {}", String::from_utf8_lossy(&state.stdout));
+                panic!("missing release acknowledgement");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     fn wait(&self, file: &str)
     {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -153,7 +181,7 @@ fn dropping_a_running_backend_with_a_pending_stop_releases_the_target_promptly()
                 .unwrap()
                 .success()
         );
-        observer.wait("handled");
+        observer.wait_released_after_drop(target.pid());
     });
 }
 
@@ -194,7 +222,7 @@ fn dropping_a_running_session_with_a_pending_stop_releases_the_target_promptly()
                 .unwrap()
                 .success()
         );
-        observer.wait("handled");
+        observer.wait_released_after_drop(target.pid());
     });
 }
 

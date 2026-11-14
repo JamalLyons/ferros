@@ -1264,6 +1264,14 @@ impl MacOSBackend
         // PT_DETACH needs the tracee waiting in its signal exception (EBUSY otherwise),
         // so it comes before the reply.
         self.ptrace(ffi::ptrace_requests::PT_DETACH, 0, 0)?;
+        // XNU's PT_DETACH clears P_LSIGEXC and calls task_resume while the
+        // private signal is waiting. It consumes one of our task suspensions.
+        // Account for that before teardown balances the rest: a second resume
+        // could otherwise consume the job-control hold as it is being placed.
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            shared.suspends = shared.suspends.saturating_sub(1);
+        }
         self.traced = false;
         Ok(())
     }
@@ -1337,11 +1345,12 @@ impl MacOSBackend
             // The handler answered the private SIGSTOP exception after PT_DETACH, so the
             // kernel takes the SIGSTOP as an ordinary job-control stop (state `T`) once the
             // thread processes the reply. Wait (bounded) until it has, so the SIGCONT
-            // cannot overtake the stop, then undo our own stop: the released process must
+            // cannot overtake the stop. SSTOP alone precedes the kernel task hold;
+            // wait for that hold too, then undo our own stop: the released process must
             // keep running. A program with a SIGCONT handler sees one extra SIGCONT.
             let pid = self.pid.0 as libc::pid_t;
             let deadline = Instant::now() + DETACH_STOP_TIMEOUT;
-            while !crate::lifecycle::is_job_control_stopped(pid) && Instant::now() < deadline {
+            while !crate::lifecycle::job_control_stop_has_taken_effect(pid, self.task) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
             }
             // SAFETY: plain kill(2) on the pid this backend still holds (not yet released).

@@ -15,7 +15,10 @@ fn main()
     });
     worker.recv().expect("worker started");
     std::fs::write(format!("{directory}/ready"), b"ready").expect("ready file");
+    let mut progress = 0_u64;
     loop {
+        progress += 1;
+        std::fs::write(format!("{directory}/progress"), progress.to_string()).expect("progress file");
         if ferros_macos::diagnostics::sigusr1_observed() {
             std::fs::write(format!("{directory}/handled"), b"handled").expect("handled file");
         }

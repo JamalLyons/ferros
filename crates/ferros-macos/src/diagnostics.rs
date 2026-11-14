@@ -411,6 +411,52 @@ pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
     Ok(info[SUSPEND_COUNT])
 }
 
+/// Snapshot task and per-thread suspend counts without attaching or stopping the
+/// process. Used after release timeouts, before cleanup destroys the evidence.
+/// Counts are sampled separately and can change while the process runs. Tests only.
+///
+/// # Errors
+/// Returns an error if the process exits, permission is denied, or Mach info fails.
+#[doc(hidden)]
+pub fn process_suspend_counts(pid: ProcessId) -> Result<(i32, Vec<i32>)>
+{
+    use mach2::task::task_info;
+    use mach2::task_info::{MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT, mach_task_basic_info};
+
+    let mut task = MACH_PORT_NULL;
+    // SAFETY: `task` is writable; the acquired send right is released below.
+    let kr = unsafe { ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task) };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    let result = (|| {
+        let mut info = mach_task_basic_info::default();
+        let mut count = MACH_TASK_BASIC_INFO_COUNT;
+        // SAFETY: `info` holds MACH_TASK_BASIC_INFO_COUNT words and outlives the call.
+        let kr = unsafe { task_info(task, MACH_TASK_BASIC_INFO, (&raw mut info).cast(), &mut count) };
+        if kr != KERN_SUCCESS {
+            return Err(DebuggerError::from(MachError::from(kr)));
+        }
+        let threads = crate::threads::ThreadManager::refresh_thread_list(task, &[])?;
+        let counts: Result<Vec<_>> = threads
+            .iter()
+            .map(|&port| thread_suspend_count(ferros_core::ThreadId::from(u64::from(port))))
+            .collect();
+        for port in threads {
+            // SAFETY: refresh_thread_list returned one owned send right per entry.
+            unsafe {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+            }
+        }
+        counts.map(|counts| (info.suspend_count, counts))
+    })();
+    // SAFETY: release the task_for_pid send right exactly once, on all paths.
+    unsafe {
+        let _ = ffi::mach_port_deallocate(mach_task_self(), task);
+    }
+    result
+}
+
 /// The calling thread's system-wide unique id (`pthread_threadid_np`), for fixtures
 /// that report which worker is which. Tests only.
 #[doc(hidden)]

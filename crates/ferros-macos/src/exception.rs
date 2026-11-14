@@ -939,14 +939,22 @@ pub(crate) fn run_exception_loop(
                 continue;
             }
             // A real stop cancels an in-flight step off a birth site. The task stays
-            // suspended, so the trap can be armed again before the client resumes.
+            // suspended. Peers frozen for that step are released only after the trap
+            // is armed again; a failed restore leaves them suspended.
             for thread in state.birth.clear_step_offs() {
                 if let Err(err) = crate::registers::set_single_step(thread, false) {
                     debug!("clearing a birth step-off bit on thread {thread} failed: {err}");
                 }
             }
-            state.birth.rearm_all(task);
-            thaw_birth_freeze(&mut state);
+            if let Err(err) = state.birth.rearm_except(task, &[]) {
+                error!("failed to restore a new-thread trap: {err}");
+                let _ = events.send(Err(BackendError::Os {
+                    code: -1,
+                    message: format!("failed to restore the new-thread trap: {err}"),
+                }));
+            } else {
+                thaw_birth_freeze(&mut state);
+            }
 
             state.pending_exception = true;
             faults.pending_stop.store(true, Ordering::SeqCst);
@@ -1116,8 +1124,9 @@ fn try_consume_birth(
         }
         if let Err(err) = state.birth.rearm_except(task, &occupied) {
             error!("failed to restore a new-thread trap: {err}");
-            // Leave the exception unanswered so this stop stays with the task
-            // suspended. Continuing would let new threads execute the restored entry.
+            // Leave the exception unanswered and the peer freezes in place. The
+            // client-stop path retries the restore and only releases those threads
+            // after it succeeds. The task stays suspended either way.
             return false;
         }
         if state.birth.step_off_threads().is_empty() {

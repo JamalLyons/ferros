@@ -885,6 +885,10 @@ impl MacOSBackend
                 }
             }
         }
+        // A previous step-off may have kept peers frozen after a failed restore.
+        // The trap is armed again now (or there is nothing to protect), so those
+        // suspends must not outlive this resume.
+        self.thaw_birth_freeze();
         self.memory_cache.clear();
         Ok(())
     }
@@ -895,6 +899,11 @@ impl MacOSBackend
             .birth
             .disarm(self.task)
             .map_err(|message| BackendError::Os { code: -1, message });
+        if result.is_ok() {
+            // Original instructions are back, so a freeze from a step-off no longer
+            // protects an open entry.
+            self.thaw_birth_freeze();
+        }
         self.memory_cache.clear();
         result
     }

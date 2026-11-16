@@ -8,7 +8,7 @@ use ferros_core::backend::mock::{MockBackend, MockCallKind, MockState, MockStop,
 use ferros_core::{Address, LaunchSpec, ProcessId, StopEvent, ThreadId};
 
 use super::commands::{find, parse_address, parse_number};
-use super::{Debugger, Input, PROMPT, Target};
+use super::{Debugger, Input, PROMPT, Target, history_path};
 
 const THREAD: ThreadId = ThreadId(7);
 const CODE: u64 = 0x1_0000;
@@ -364,4 +364,23 @@ fn run_reports_a_breakpoint_that_stays_pending()
         t.out
     );
     assert!(t.out.contains("breakpoint 1 at main is pending: "), "{}", t.out);
+}
+
+#[test]
+fn history_path_prefers_ferros_history_then_home()
+{
+    use std::path::PathBuf;
+    assert_eq!(
+        history_path(Some("/tmp/h".into()), Some("/home/u".into())),
+        Some(PathBuf::from("/tmp/h"))
+    );
+    assert_eq!(
+        history_path(Some("".into()), Some("/home/u".into())),
+        Some(PathBuf::from("/home/u/.ferros_history"))
+    );
+    assert_eq!(
+        history_path(None, Some("/home/u".into())),
+        Some(PathBuf::from("/home/u/.ferros_history"))
+    );
+    assert_eq!(history_path(None, None), None);
 }

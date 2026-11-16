@@ -51,7 +51,8 @@ text without colour or timestamps.
 ## Input modes
 
 - **Interactive**: stdin is a terminal and neither `--batch` nor `--command` is given. Line
-  editing and history (`~/.ferros_history`) come from rustyline.
+  editing and history come from rustyline. The history file is `$FERROS_HISTORY` when that
+  variable is set and not empty, otherwise `~/.ferros_history`.
 - **Piped**: stdin is not a terminal. `ferros` prints the prompt `(ferros) ` before reading each
   line and echoes the line, so a driving program can wait for the prompt before sending the next
   command.

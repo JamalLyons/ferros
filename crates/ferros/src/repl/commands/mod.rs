@@ -139,6 +139,7 @@ registry! {
     breakpoints: [Break, Delete, Breakpoints],
     inspect: [Registers, Memory],
     threads: [Threads, Thread],
+    stack: [Backtrace],
     images: [Images],
     help: [Help],
 }

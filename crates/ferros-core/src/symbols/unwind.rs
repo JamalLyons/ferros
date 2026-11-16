@@ -1,620 +1,971 @@
 //! # Stack Unwinding
 //!
-//! DWARF CFI (Call Frame Information) based stack unwinding with fallback heuristics.
+//! Walks a stopped thread's stack from its registers, innermost frame first.
 //!
-//! This module implements stack unwinding using DWARF CFI from `.eh_frame` and `.debug_frame`
-//! sections, with fallback strategies for when CFI is unavailable:
+//! ## Unwind sources and their order
 //!
-//! 1. **CFI-based unwinding**: Uses DWARF CFI to compute CFA (Canonical Frame Address) and
-//!    register recovery rules.
-//! 2. **Frame pointer fallback**: Uses the frame pointer register (RBP on x86-64, X29 on ARM64)
-//!    to walk the stack.
-//! 3. **Stack scan fallback**: Scans the stack for values that look like return addresses.
-//! 4. **Link register fallback**: Uses the link register (LR on ARM64) as the return address.
+//! Rust binaries built for `aarch64-apple-darwin` carry these unwind sources (checked on
+//! a debug build of the `nested_calls` fixture with `xcrun dwarfdump --eh-frame
+//! --debug-frame` and `objdump --unwind-info`):
 //!
-//! ## DWARF CFI Sections
+//! - `__TEXT,__unwind_info` (compact unwind) has an entry for every function: 257 with
+//!   `UNWIND_ARM64_MODE_DWARF` (0x03, the low 24 bits are the offset of the function's
+//!   FDE in `__eh_frame`), 77 `UNWIND_ARM64_MODE_FRAMELESS` (0x02, leaves with no FDE, such
+//!   as `__rust_alloc`), 21 `UNWIND_ARM64_MODE_FRAME` (0x04, a frame record at `x29` and
+//!   no FDE, such as the C `_main` shim), 5 with encoding 0, and 134 DWARF-mode entries
+//!   with personality/LSDA bits. Rust functions, including the fixture's own `main`, are
+//!   DWARF mode.
+//! - `__TEXT,__eh_frame` holds the FDEs the DWARF-mode entries point to. Their rows
+//!   describe the prologue exactly, including the first instruction (`CFA=sp`, return
+//!   address still in `x30`).
+//! - `.debug_frame` in the dSYM is empty.
+//! - Frameless leaves do not set up `x29`: there `fp` is still the caller's, so following
+//!   the frame-pointer chain from such a leaf skips its caller.
 //!
-//! - **`.eh_frame`**: Exception handling frame information (used at runtime)
-//! - **`.debug_frame`**: Debug frame information (used by debuggers)
+//! Each step looks up the compact entry of the function containing the lookup address
+//! (the pc of the innermost frame, the call instruction of a caller) and uses:
 //!
-//! Both sections contain FDEs (Frame Description Entries) that describe how to unwind
-//! the stack for each function.
+//! 1. **`MODE_DWARF`**: the FDE at the encoded offset in `__eh_frame`, evaluated directly
+//!    (no search: the main `ferros` binary has about 34,000 FDEs). If it cannot be
+//!    evaluated, the frame-pointer chain.
+//! 2. **`MODE_FRAMELESS`**: in the innermost frame, the caller is the link register and
+//!    its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
+//!    allocation). Past the allocation's release in the epilogue the `sp` is off by
+//!    `stack_size`; compact unwind cannot describe that window. A frameless leaf makes no calls, so it cannot be a
+//!    caller frame; there the walk stops instead of guessing.
+//! 3. **`MODE_FRAME`**: the frame-pointer chain: the record at `fp` holds the caller's
+//!    `fp` and the return address. On the function's first instruction (innermost frame
+//!    only) the record is not built yet, so the caller is the link register. The linker
+//!    merges a run of adjacent functions with the same encoding into one entry (33 such
+//!    function starts under a `MODE_FRAME` entry in this build), so a first instruction is
+//!    recognized from the entry or from the DWARF function index. Elsewhere inside the
+//!    prologue or epilogue, or in a shrink-wrapped function before its record is built,
+//!    the frame record is not there and the caller is skipped: compact unwind cannot
+//!    describe those windows.
+//! 4. **Encoding 0, no entry, or no `__unwind_info`** (for example an ELF image or a
+//!    synthetic one): `.eh_frame_hdr` lookup, else a linear scan of `__eh_frame` (FDE
+//!    ranges as runtime addresses), then of `.debug_frame` (FDE ranges as file addresses,
+//!    since it lives in the unslid dSYM); then, in the innermost frame on the first
+//!    instruction of a function known to DWARF, the link register; then the frame-pointer
+//!    chain.
+//!
+//! Images whose files could not be loaded (for example libraries in the dyld shared cache)
+//! have none of this, and use the frame-pointer chain.
+//!
+//! The link register only holds a return address for the innermost frame (its value is
+//! known only there); a caller frame never uses it. There is no stack-scan heuristic: a
+//! frame is either derived from unwind information or not produced.
+//!
+//! ## Registers in caller frames
+//!
+//! A caller frame keeps only what is known about it: the callee-saved `x19`-`x29` the
+//! callee left alone, plus registers its CFI restores. Caller-saved registers (`x0`-`x18`,
+//! and `x30` except through the return-address rule) and registers whose rule is
+//! `Undefined` are unknown and read as zero. Rules that use an unknown register fail.
+//!
+//! ## Termination
+//!
+//! The walk stops cleanly, without an error, when the return address is zero, when no
+//! source applies, when the frame-pointer chain ends (`fp == 0`) or is not strictly
+//! increasing, when the stack pointer would move down, when memory cannot be read, or when
+//! the next pc is not in executable memory ([`MemoryAccess::is_executable`]). This is how
+//! the thread base (`thread_start`, dyld's `start`) ends a trace.
+//!
+//! ## Pointer authentication
+//!
+//! Every recovered return address (from memory or from the link register) goes through
+//! [`Arch::strip_pointer_auth`].
+//!
+//! ## Caller frames
+//!
+//! A caller frame's pc is the return address, the instruction after the call. Its function
+//! and source line are looked up at the call instruction (`pc - 4` on arm64), and its
+//! unwind row too, so the reported line is the call site and a call that is the last
+//! instruction of a function still finds that function.
 //!
 //! ## References
 //!
-//! - [DWARF Debugging Information Format](https://dwarfstd.org/)
-//! - [DWARF CFI Specification](https://dwarfstd.org/doc/DWARF5.pdf#page=179)
+//! - [DWARF 5, section 6.4 Call Frame Information](https://dwarfstd.org/doc/DWARF5.pdf)
 //! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
 
 use gimli::{
-    self, BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, Register, RegisterRule, UnwindContext, UnwindSection,
+    BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset, EndianSlice, Register, RegisterRule,
+    RunTimeEndian, UnwindContext, UnwindSection,
 };
 
-use crate::error::{DebuggerError, Result};
+use crate::arch::Arch;
+use crate::error::Result;
+use crate::symbols::compact_unwind::{self, Arm64Mode};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
 use crate::types::{Address, Architecture, FrameId, FrameKind, FrameStatus, Registers, StackFrame, ThreadId};
 
 /// Minimal memory accessor required for stack unwinding.
 ///
-/// This trait allows the unwinder to read memory from the target process
-/// to recover register values and compute the CFA (Canonical Frame Address).
-///
-/// ## Implementation Notes
-///
-/// Implementations should handle:
-/// - Invalid memory addresses (return errors, don't panic)
-/// - Partial reads (if memory is partially unmapped)
-/// - Endianness (matches target architecture)
+/// Implementations return an error for unreadable addresses rather than panicking.
 pub trait MemoryAccess
 {
-    /// Read a 64-bit value from the given address.
+    /// Read a 64-bit little-endian value from the given address.
     ///
-    /// Returns an error if the address is invalid or unreadable.
+    /// # Errors
+    ///
+    /// An error if the address is invalid or unreadable.
     fn read_u64(&self, address: Address) -> Result<u64>;
+
+    /// Whether `address` lies in executable memory. The unwinder stops before a frame
+    /// whose pc is not. The default accepts every address.
+    fn is_executable(&self, _address: Address) -> bool
+    {
+        true
+    }
 }
 
-/// CFI-driven stack unwinder with frame-pointer fallbacks.
-///
-/// This unwinder attempts to build a call stack by:
-///
-/// 1. Using DWARF CFI from `.eh_frame` or `.debug_frame` sections
-/// 2. Falling back to frame pointer walking if CFI is unavailable
-/// 3. Falling back to stack scanning if frame pointer is unavailable
-/// 4. Falling back to link register (ARM64) if available
-///
-/// ## Architecture Support
-///
-/// - **x86-64**: Uses RBP (frame pointer) and RSP (stack pointer)
-/// - **ARM64**: Uses X29 (frame pointer), X30 (link register), and SP (stack pointer)
-///
-/// ## Inlined Frames
-///
-/// The unwinder detects inlined functions using DWARF line information and creates
-/// multiple `StackFrame` entries for a single physical frame when inlining is present.
+/// Stack unwinder over CFI and the frame-pointer chain (see the module documentation).
 pub struct StackUnwinder<'a, M>
 {
-    architecture: Architecture,
+    arch: &'a dyn Arch,
     symbols: &'a SymbolCache,
     memory: &'a M,
 }
 
+/// Register state of one physical frame while walking.
+#[derive(Clone)]
+struct Cursor
+{
+    regs: Registers,
+    /// Bit `n` set: general register `xn` (n < 31) holds this frame's value. All are
+    /// known in the innermost frame; in a caller only the callee-saved registers
+    /// (`x19`-`x29`) and those its callee's CFI restored are. `x30` known means it still
+    /// holds this frame's return address, which is only true before a prologue saved it.
+    known: u32,
+    /// Whether this frame's pc is a return address (every frame but the innermost).
+    is_caller: bool,
+}
+
+/// `x0`-`x30`.
+const ALL_GENERAL: u32 = (1 << 31) - 1;
+/// Callee-saved registers under the arm64 Apple ABI: `x19`-`x29` (`x29` is the frame
+/// pointer). Everything else is clobbered by a call, so a caller's value is unknown unless
+/// CFI says where it was saved.
+const CALLEE_SAVED: u32 = ((1 << 30) - 1) & !((1 << 19) - 1);
+/// `x30`, the link register.
+const LINK_REGISTER: u32 = 1 << 30;
+
+/// One unwind step: the caller's registers and how they were found.
+struct UnwindStep
+{
+    next: Registers,
+    known: u32,
+    status: FrameStatus,
+}
+
+/// What an image's `__unwind_info` says about the function containing an address.
+enum Compact
+{
+    /// No `__unwind_info`, no entry, or encoding 0.
+    Absent,
+    /// The function's mode, and whether the address is its first instruction.
+    Mode
+    {
+        mode: Arm64Mode, at_entry: bool
+    },
+}
+
 impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 {
-    /// Create a new stack unwinder.
+    /// Create a stack unwinder.
     ///
-    /// ## Parameters
-    ///
-    /// - `architecture`: Target architecture (x86-64 or ARM64)
-    /// - `symbols`: Symbol cache for resolving addresses to functions
-    /// - `memory`: Memory accessor for reading process memory
-    pub fn new(architecture: Architecture, symbols: &'a SymbolCache, memory: &'a M) -> Self
+    /// - `arch`: target architecture knowledge (registers, pointer authentication)
+    /// - `symbols`: loaded images, for CFI and symbolication
+    /// - `memory`: reads the target's stack
+    pub fn new(arch: &'a dyn Arch, symbols: &'a SymbolCache, memory: &'a M) -> Self
     {
-        Self {
-            architecture,
-            symbols,
-            memory,
-        }
+        Self { arch, symbols, memory }
     }
 
-    /// Unwind the call stack starting from the given registers.
+    /// Unwind at most `max_frames` logical frames (inlined frames included), innermost
+    /// first.
     ///
-    /// This method walks the stack frame by frame, using CFI when available
-    /// and falling back to heuristics when CFI is unavailable.
+    /// # Errors
     ///
-    /// ## Parameters
-    ///
-    /// - `thread`: Thread ID for frame identification
-    /// - `regs`: Initial register state (PC, SP, FP, etc.)
-    /// - `max_frames`: Maximum number of frames to unwind
-    ///
-    /// ## Returns
-    ///
-    /// A vector of `StackFrame` entries, ordered from most recent (top) to oldest (bottom).
-    /// Each frame includes:
-    /// - Frame ID (stable identifier)
-    /// - Program counter (PC)
-    /// - Stack pointer (SP)
-    /// - Frame pointer (FP) if available
-    /// - Symbolication (function name, source location)
-    /// - Frame status (complete, incomplete, error)
-    ///
-    /// ## Frame Status
-    ///
-    /// - `Complete`: Frame was successfully unwound with CFI
-    /// - `Incomplete`: Frame was unwound using fallback heuristics
-    /// - `Error`: Frame unwinding failed
-    ///
-    /// ## Errors
-    ///
-    /// Returns an error if memory reads fail or CFI parsing fails.
+    /// None in practice: every failure to find the next frame ends the trace instead. The
+    /// `Result` is kept for implementations of [`MemoryAccess`] whose failures must stop
+    /// the walk with an error in the future.
     pub fn unwind(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<Vec<StackFrame>>
     {
         let mut frames = Vec::new();
-        let mut cursor = regs.clone();
-        let mut depth: u32 = 0;
+        let mut cursor = Cursor {
+            regs: regs.clone(),
+            known: ALL_GENERAL,
+            is_caller: false,
+        };
         let mut status = FrameStatus::Complete;
-        let mut return_address = None;
+        let mut depth: u32 = 0;
 
-        while depth < max_frames as u32 && cursor.pc != Address::ZERO {
-            let symbolication = self.symbols.symbolicate(cursor.pc);
-            // Only log if we have an image for this address but still can't symbolicate it
-            // (this indicates a real problem, not just a missing system library)
-            // Otherwise, it's expected - address is in a system library we haven't loaded
-            if symbolication.is_none() && self.symbols.image_for_address(cursor.pc).is_some() {
-                use tracing::debug;
-                debug!(
-                    "No symbolication for address 0x{:x} (image loaded but symbolication failed)",
-                    cursor.pc.value()
-                );
-            }
-            append_logical_frames(&mut frames, thread, depth, &cursor, &symbolication, status, return_address);
+        while frames.len() < max_frames && cursor.regs.pc != Address::ZERO {
+            let lookup = self.lookup_address(&cursor);
+            let symbolication = self.symbols.symbolicate(lookup);
+            let next = self.step(&cursor);
+            let return_address = next.as_ref().map(|step| step.next.pc);
+            append_logical_frames(
+                &mut frames,
+                max_frames,
+                thread,
+                depth,
+                &cursor.regs,
+                symbolication.as_ref(),
+                status,
+                return_address,
+            );
 
-            if frames.len() >= max_frames {
-                break;
-            }
-
-            let outcome = self
-                .unwind_once(&cursor)?
-                .or_else(|| self.frame_pointer_fallback(&cursor).transpose().ok().flatten())
-                .or_else(|| self.stack_scan_fallback(&cursor).transpose().ok().flatten())
-                .or_else(|| self.link_register_fallback(&cursor).transpose().ok().flatten());
-
-            let Some(outcome) = outcome else {
+            let Some(step) = next else {
                 break;
             };
-
-            cursor = outcome.next;
-            return_address = outcome.return_address;
-            status = outcome.status;
-            depth += 1;
-
-            if frames.len() >= max_frames {
-                break;
+            status = step.status;
+            let mut regs = step.next;
+            // Unknown registers read as zero rather than as a callee's stale value.
+            for (index, slot) in regs.general.iter_mut().enumerate().take(31) {
+                if step.known & (1 << index) == 0 {
+                    *slot = 0;
+                }
             }
+            cursor = Cursor {
+                regs,
+                known: step.known,
+                is_caller: true,
+            };
+            depth += 1;
         }
 
         Ok(frames)
     }
 
-    /// Attempt a single unwind step using available DWARF metadata for the image that
-    /// contains the supplied program counter.
-    fn unwind_once(&self, regs: &Registers) -> Result<Option<UnwindStep>>
+    /// The address used for symbolication and unwind lookup: the call instruction for a
+    /// caller frame, the pc itself for the innermost frame.
+    fn lookup_address(&self, cursor: &Cursor) -> Address
     {
-        let Some(image) = self.symbols.image_for_address(regs.pc) else {
-            return Ok(None);
-        };
-        if let Some(step) = self.try_unwind_eh_frame(&image, regs)? {
-            return Ok(Some(step));
-        }
-        if let Some(step) = self.try_unwind_debug_frame(&image, regs)? {
-            return Ok(Some(step));
-        }
-        Ok(None)
-    }
-
-    /// Evaluate a DWARF register rule using the provided register state and computed
-    /// Canonical Frame Address.
-    fn evaluate_rule(&self, rule: &RegisterRule<usize>, regs: &Registers, cfa: u64) -> Result<u64>
-    {
-        match rule {
-            RegisterRule::Undefined | RegisterRule::SameValue => {
-                Err(DebuggerError::InvalidArgument("register rule unavailable".into()))
-            }
-            RegisterRule::Offset(offset) => {
-                let addr = Address::from((cfa as i64 + *offset) as u64);
-                self.memory.read_u64(addr)
-            }
-            RegisterRule::ValOffset(offset) => Ok((cfa as i64 + *offset) as u64),
-            RegisterRule::Register(register) => read_register_value(self.architecture, regs, *register)
-                .ok_or_else(|| DebuggerError::InvalidArgument("register redirect missing value".into())),
-            _ => Err(DebuggerError::InvalidArgument(
-                "unsupported CFI expression encountered".into(),
-            )),
+        if cursor.is_caller {
+            let back = match self.arch.architecture() {
+                Architecture::Arm64 => 4,
+                _ => 1,
+            };
+            Address::new(cursor.regs.pc.value().saturating_sub(back))
+        } else {
+            cursor.regs.pc
         }
     }
 
-    /// Attempt to unwind the current frame using `.eh_frame` data (and header table
-    /// when available) from the binary image that owns the PC.
-    fn try_unwind_eh_frame(&self, image: &BinaryImage, regs: &Registers) -> Result<Option<UnwindStep>>
+    /// Find the caller of `cursor`'s frame, or `None` at the end of the stack. The order
+    /// of sources is described in the module documentation.
+    fn step(&self, cursor: &Cursor) -> Option<UnwindStep>
     {
-        let Some((eh_vmaddr, eh_bytes)) = image.eh_frame_section() else {
-            return Ok(None);
-        };
+        let lookup = self.lookup_address(cursor);
+        let step = match self.symbols.image_for_address(lookup) {
+            Some(image) => self.image_step(&image, cursor, lookup),
+            None => self.frame_pointer_step(cursor),
+        }?;
+        self.accept(cursor, step)
+    }
 
+    /// Steps 1-4 of the module documentation for a pc inside a loaded image.
+    fn image_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
+    {
+        match compact_entry(image, lookup) {
+            Compact::Mode {
+                mode: Arm64Mode::Dwarf { fde_offset },
+                ..
+            } => self
+                .eh_frame_fde_step(image, cursor, lookup, fde_offset)
+                .or_else(|| self.frame_pointer_step(cursor)),
+            Compact::Mode {
+                mode: Arm64Mode::Frameless { stack_size },
+                at_entry,
+            } => {
+                // On the first instruction the leaf has not allocated its stack yet.
+                let allocated = if at_entry || self.is_dwarf_function_start(image, cursor) {
+                    0
+                } else {
+                    stack_size
+                };
+                self.frameless_step(cursor, allocated)
+            }
+            Compact::Mode {
+                mode: Arm64Mode::Frame,
+                at_entry,
+            } => {
+                // The linker gives one compact entry to a run of adjacent functions with
+                // the same encoding, so only the first of them is recognized from the
+                // entry; the others are recognized from the DWARF function index.
+                if at_entry || self.is_dwarf_function_start(image, cursor) {
+                    self.entry_step(cursor)
+                } else {
+                    self.frame_pointer_step(cursor)
+                }
+            }
+            Compact::Mode {
+                mode: Arm64Mode::None, ..
+            }
+            | Compact::Absent => self
+                .scan_cfi_step(image, cursor, lookup)
+                .or_else(|| self.dwarf_entry_step(image, cursor))
+                .or_else(|| self.frame_pointer_step(cursor)),
+        }
+    }
+
+    /// Sanity checks every step must pass; failing one ends the trace.
+    fn accept(&self, cursor: &Cursor, step: UnwindStep) -> Option<UnwindStep>
+    {
+        let next = &step.next;
+        if next.pc == Address::ZERO || next.sp == Address::ZERO {
+            return None;
+        }
+        // The stack grows down: a caller's frame is never below its callee's. Equal is
+        // allowed only for the innermost frame (before its prologue, or frameless).
+        if next.sp < cursor.regs.sp || (next.sp == cursor.regs.sp && cursor.is_caller) {
+            return None;
+        }
+        if !self.memory.is_executable(next.pc) {
+            return None;
+        }
+        Some(step)
+    }
+
+    fn eh_frame(image: &BinaryImage, pointer_size: u8) -> Option<(EhFrame<EndianSlice<'_, RunTimeEndian>>, BaseAddresses)>
+    {
+        let (vmaddr, bytes) = image.eh_frame_section()?;
         let (text_base, _) = image.runtime_range();
         let mut bases = BaseAddresses::default()
             .set_text(text_base)
-            .set_eh_frame(image.relocated_address(eh_vmaddr));
+            .set_eh_frame(image.relocated_address(vmaddr));
         if let Some((hdr_vmaddr, _)) = image.eh_frame_hdr_section() {
             bases = bases.set_eh_frame_hdr(image.relocated_address(hdr_vmaddr));
         }
-
-        let mut eh_frame = EhFrame::new(eh_bytes, image.endian());
-        eh_frame.set_address_size(self.architecture.pointer_size_bytes());
-
-        if let Some((_hdr_vmaddr, hdr_bytes)) = image.eh_frame_hdr_section() {
-            let header = EhFrameHdr::new(hdr_bytes, image.endian());
-            if let Some(step) = self.unwind_with_eh_frame_hdr(&eh_frame, header, bases.clone(), regs)? {
-                return Ok(Some(step));
-            }
-        }
-
-        self.unwind_with_cfi(&eh_frame, bases, regs)
+        let mut section = EhFrame::new(bytes, image.endian());
+        section.set_address_size(pointer_size);
+        Some((section, bases))
     }
 
-    /// Attempt to unwind the current frame using `.debug_frame` data when the runtime
-    /// `.eh_frame` path is unavailable.
-    fn try_unwind_debug_frame(&self, image: &BinaryImage, regs: &Registers) -> Result<Option<UnwindStep>>
-    {
-        let Some((df_vmaddr, df_bytes)) = image.debug_frame_section() else {
-            return Ok(None);
-        };
-
-        let (text_base, _) = image.runtime_range();
-        // In gimli 0.32, debug_frame uses the same base address mechanism
-        let bases = BaseAddresses::default()
-            .set_text(text_base)
-            .set_eh_frame(image.relocated_address(df_vmaddr));
-
-        let mut debug_frame = DebugFrame::new(df_bytes, image.endian());
-        debug_frame.set_address_size(self.architecture.pointer_size_bytes());
-        self.unwind_with_cfi(&debug_frame, bases, regs)
-    }
-
-    /// Translate a resolved DWARF unwind row into the `Registers` describing the next
-    /// frame. Returns `Ok(None)` when the row cannot produce a valid next PC.
-    fn build_step_from_row(&self, regs: &Registers, row: &gimli::UnwindTableRow<usize>) -> Result<Option<UnwindStep>>
-    {
-        let cfa = match row.cfa() {
-            CfaRule::RegisterAndOffset { register, offset } => {
-                let base = read_register_value(self.architecture, regs, *register)
-                    .ok_or_else(|| DebuggerError::InvalidArgument("missing register for CFA evaluation".to_string()))?;
-                (base as i64 + offset) as u64
-            }
-            _ => return Ok(None),
-        };
-
-        let return_reg = return_register(self.architecture);
-        let rule = row.register(return_reg);
-        let (pc, status) = match rule {
-            RegisterRule::Undefined | RegisterRule::SameValue => (Address::ZERO, FrameStatus::CfiFallback),
-            _ => match self.evaluate_rule(&rule, regs, cfa) {
-                Ok(value) => (Address::from(value), FrameStatus::Complete),
-                Err(_) => (Address::ZERO, FrameStatus::CfiFallback),
-            },
-        };
-
-        if pc == Address::ZERO {
-            return Ok(None);
-        }
-
-        let mut next = regs.clone();
-        next.sp = Address::from(cfa);
-        next.pc = pc;
-
-        Ok(Some(UnwindStep {
-            next,
-            return_address: Some(pc),
-            status,
-        }))
-    }
-
-    /// Walk the frame-pointer chain (RBP/X29) when structured unwind info is missing.
-    fn frame_pointer_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
-    {
-        match self.architecture {
-            Architecture::Arm64 => {
-                let fp = regs.fp;
-                if fp == Address::ZERO {
-                    return None;
-                }
-
-                let saved_fp = match self.memory.read_u64(fp) {
-                    Ok(value) => value,
-                    Err(err) => return Some(Err(err)),
-                };
-                let saved_lr = match self.memory.read_u64(Address::from(fp.value() + 8)) {
-                    Ok(value) => value,
-                    Err(err) => return Some(Err(err)),
-                };
-
-                let mut next = regs.clone();
-                next.fp = Address::from(saved_fp);
-                next.sp = Address::from(fp.value() + 16);
-                next.pc = Address::from(saved_lr);
-
-                Some(Ok(UnwindStep {
-                    next,
-                    return_address: Some(Address::from(saved_lr)),
-                    status: FrameStatus::CfiFallback,
-                }))
-            }
-            Architecture::X86_64 => {
-                let fp = regs.fp;
-                if fp == Address::ZERO {
-                    return None;
-                }
-
-                let saved_fp = match self.memory.read_u64(fp) {
-                    Ok(value) => value,
-                    Err(err) => return Some(Err(err)),
-                };
-                let return_addr = match self.memory.read_u64(Address::from(fp.value() + 8)) {
-                    Ok(value) => value,
-                    Err(err) => return Some(Err(err)),
-                };
-
-                let mut next = regs.clone();
-                next.fp = Address::from(saved_fp);
-                next.sp = Address::from(fp.value() + 16);
-                next.pc = Address::from(return_addr);
-
-                Some(Ok(UnwindStep {
-                    next,
-                    return_address: Some(Address::from(return_addr)),
-                    status: FrameStatus::CfiFallback,
-                }))
-            }
-            _ => None,
-        }
-    }
-
-    /// Heuristically scan the stack for a plausible return address when both CFI and
-    /// frame-pointer strategies fail.
-    fn stack_scan_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
-    {
-        if regs.sp == Address::ZERO {
-            return None;
-        }
-
-        match self.architecture {
-            Architecture::Arm64 | Architecture::X86_64 => {
-                let return_addr = match self.memory.read_u64(regs.sp) {
-                    Ok(value) if value != 0 && value != regs.pc.value() => value,
-                    Ok(_) => return None,
-                    Err(err) => return Some(Err(err)),
-                };
-
-                let mut next = regs.clone();
-                next.sp = Address::from(regs.sp.value() + 8);
-                next.pc = Address::from(return_addr);
-
-                Some(Ok(UnwindStep {
-                    next,
-                    return_address: Some(Address::from(return_addr)),
-                    status: FrameStatus::Heuristic,
-                }))
-            }
-            _ => None,
-        }
-    }
-
-    /// ARM64-only heuristic that treats the link register as the next return address.
-    fn link_register_fallback(&self, regs: &Registers) -> Option<Result<UnwindStep>>
-    {
-        if self.architecture != Architecture::Arm64 {
-            return None;
-        }
-
-        let lr = regs.general.get(30).copied()?;
-        if lr == 0 || lr == regs.pc.value() {
-            return None;
-        }
-
-        let mut next = regs.clone();
-        next.pc = Address::from(lr);
-
-        Some(Ok(UnwindStep {
-            next,
-            return_address: Some(Address::from(lr)),
-            status: FrameStatus::Heuristic,
-        }))
-    }
-}
-
-impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
-{
-    /// Use the `.eh_frame_hdr` index to locate an FDE quickly and evaluate the unwind
-    /// row for the current PC.
-    fn unwind_with_eh_frame_hdr<R>(
+    /// `UNWIND_ARM64_MODE_DWARF`: evaluate the FDE at `fde_offset` in `__eh_frame`
+    /// directly, with no search.
+    fn eh_frame_fde_step(
         &self,
-        eh_frame: &EhFrame<R>,
-        header: EhFrameHdr<R>,
-        bases: BaseAddresses,
-        regs: &Registers,
-    ) -> Result<Option<UnwindStep>>
+        image: &BinaryImage,
+        cursor: &Cursor,
+        lookup: Address,
+        fde_offset: usize,
+    ) -> Option<UnwindStep>
+    {
+        let (section, bases) = Self::eh_frame(image, self.arch.architecture().pointer_size_bytes())?;
+        let fde = section
+            .partial_fde_from_offset(&bases, EhFrameOffset(fde_offset))
+            .ok()?
+            .parse(EhFrame::cie_from_offset)
+            .ok()?;
+        let mut ctx = UnwindContext::<usize>::new();
+        let row = fde.unwind_info_for_address(&section, &bases, &mut ctx, lookup.value()).ok()?;
+        self.apply_row(cursor, row)
+    }
+
+    /// Without a compact entry: `.eh_frame_hdr` (ELF), then a linear scan of `__eh_frame`,
+    /// then `.debug_frame`.
+    ///
+    /// `__eh_frame` FDE ranges are runtime addresses (pc-relative, resolved through the
+    /// section's runtime base); `.debug_frame` lives in the unslid dSYM, so its ranges are
+    /// file addresses. Each section is searched with its own address form only: trying the
+    /// other one could match an unrelated function's FDE.
+    fn scan_cfi_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
+    {
+        let pointer_size = self.arch.architecture().pointer_size_bytes();
+        if let Some((section, bases)) = Self::eh_frame(image, pointer_size) {
+            if let Some((_, hdr_bytes)) = image.eh_frame_hdr_section()
+                && let Some(step) = self.unwind_with_eh_frame_hdr(&section, hdr_bytes, &bases, image, cursor, lookup)
+            {
+                return Some(step);
+            }
+            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, lookup.value()) {
+                return Some(step);
+            }
+        }
+        if let Some((_, bytes)) = image.debug_frame_section()
+            && let Some(file) = image.file_address(lookup)
+        {
+            let bases = BaseAddresses::default();
+            let mut section = DebugFrame::new(bytes, image.endian());
+            section.set_address_size(pointer_size);
+            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, file) {
+                return Some(step);
+            }
+        }
+        None
+    }
+
+    /// Evaluate the row of the first FDE in `section` whose range contains `address`
+    /// (in the section's own address form, see [`scan_cfi_step`](Self::scan_cfi_step)).
+    fn unwind_with_section<R, S>(
+        &self,
+        section: &S,
+        bases: &BaseAddresses,
+        cursor: &Cursor,
+        address: u64,
+    ) -> Option<UnwindStep>
     where
         R: gimli::Reader<Offset = usize>,
+        S: UnwindSection<R>,
     {
-        let parsed = header
-            .parse(&bases, self.architecture.pointer_size_bytes())
-            .map_err(|err| map_gimli_error("parsing .eh_frame_hdr", err))?;
-        let Some(table) = parsed.table() else {
-            return Ok(None);
-        };
-
-        let pc = regs.pc.value();
-        let pointer = table
-            .lookup(pc, &bases)
-            .map_err(|err| map_gimli_error("looking up FDE in .eh_frame_hdr", err))?;
-        let offset = table
-            .pointer_to_offset(pointer)
-            .map_err(|err| map_gimli_error("resolving FDE pointer", err))?;
-
-        let partial = eh_frame
-            .partial_fde_from_offset(&bases, offset)
-            .map_err(|err| map_gimli_error("loading FDE from .eh_frame_hdr", err))?;
-        let fde = partial
-            .parse(|section, base_addresses, cie_offset| section.cie_from_offset(base_addresses, cie_offset))
-            .map_err(|err| map_gimli_error("parsing frame description entry", err))?;
-
-        if !fde.contains(pc) {
-            return Ok(None);
-        }
-
         let mut ctx = UnwindContext::<usize>::new();
-        match fde.unwind_info_for_address(eh_frame, &bases, &mut ctx, pc) {
-            Ok(row) => self.build_step_from_row(regs, row),
-            Err(gimli::Error::NoUnwindInfoForAddress) => Ok(None),
-            Err(err) => Err(map_gimli_error("evaluating unwind row", err)),
-        }
-    }
-
-    /// Iterate through an unwind section, parsing each FDE until one contains the
-    /// current PC, then evaluate it to produce the next frame.
-    fn unwind_with_cfi<R, Section>(
-        &self,
-        section: &Section,
-        bases: BaseAddresses,
-        regs: &Registers,
-    ) -> Result<Option<UnwindStep>>
-    where
-        R: gimli::Reader<Offset = usize>,
-        Section: gimli::UnwindSection<R>,
-    {
-        let pc = regs.pc.value();
-        let mut entries = section.entries(&bases);
-        let mut ctx = UnwindContext::<usize>::new();
-        while let Some(entry) = entries.next().map_err(|err| map_gimli_error("reading unwind entry", err))? {
+        let mut entries = section.entries(bases);
+        while let Ok(Some(entry)) = entries.next() {
             let gimli::CieOrFde::Fde(partial) = entry else {
                 continue;
             };
-            let fde = partial
-                .parse(|unwind_section, base_addresses, cie_offset| {
-                    unwind_section.cie_from_offset(base_addresses, cie_offset)
-                })
-                .map_err(|err| map_gimli_error("parsing frame description entry", err))?;
-            if !fde.contains(pc) {
+            let Ok(fde) = partial.parse(S::cie_from_offset) else {
+                continue;
+            };
+            if !fde.contains(address) {
                 continue;
             }
+            let row = fde.unwind_info_for_address(section, bases, &mut ctx, address).ok()?;
+            return self.apply_row(cursor, row);
+        }
+        None
+    }
 
-            match fde.unwind_info_for_address(section, &bases, &mut ctx, pc) {
-                Ok(row) => {
-                    if let Some(step) = self.build_step_from_row(regs, row)? {
-                        return Ok(Some(step));
-                    }
+    /// Find the FDE for `lookup` through the `.eh_frame_hdr` binary-search table.
+    fn unwind_with_eh_frame_hdr(
+        &self,
+        section: &EhFrame<EndianSlice<'_, RunTimeEndian>>,
+        hdr_bytes: &[u8],
+        bases: &BaseAddresses,
+        image: &BinaryImage,
+        cursor: &Cursor,
+        lookup: Address,
+    ) -> Option<UnwindStep>
+    {
+        let header = EhFrameHdr::new(hdr_bytes, image.endian())
+            .parse(bases, self.arch.architecture().pointer_size_bytes())
+            .ok()?;
+        let table = header.table()?;
+        let mut ctx = UnwindContext::<usize>::new();
+        let row = table
+            .unwind_info_for_address(section, bases, &mut ctx, lookup.value(), EhFrame::cie_from_offset)
+            .ok()?;
+        self.apply_row(cursor, row)
+    }
+
+    /// Build the caller's registers from a CFI row.
+    ///
+    /// The caller keeps only the callee-saved registers (`SameValue` by default) plus
+    /// whatever the row restores; caller-saved registers become unknown, and so does any
+    /// register whose rule is `Undefined`.
+    fn apply_row(&self, cursor: &Cursor, row: &gimli::UnwindTableRow<usize>) -> Option<UnwindStep>
+    {
+        let regs = &cursor.regs;
+        let cfa = match row.cfa() {
+            CfaRule::RegisterAndOffset { register, offset } => {
+                let base = self.register_value(cursor, *register)?;
+                base.checked_add_signed(*offset)?
+            }
+            CfaRule::Expression(_) => return None,
+        };
+
+        let return_register = return_register(self.arch.architecture());
+        let return_address = self.recover(cursor, &row.register(return_register), cfa, return_register)??;
+
+        let mut next = regs.clone();
+        let mut known = cursor.known & CALLEE_SAVED;
+        for (register, rule) in row.registers() {
+            if *register == return_register {
+                continue;
+            }
+            let Some(bit) = general_bit(*register) else {
+                continue;
+            };
+            match self.recover(cursor, rule, cfa, *register) {
+                Some(Some(value)) => {
+                    self.set_register_value(&mut next, *register, value);
+                    known |= bit;
                 }
-                Err(gimli::Error::NoUnwindInfoForAddress) => continue,
-                Err(err) => return Err(map_gimli_error("evaluating unwind row", err)),
+                _ => known &= !bit,
             }
         }
+        next.sp = Address::new(cfa);
+        next.pc = self.arch.strip_pointer_auth(Address::new(return_address));
+        Some(UnwindStep {
+            next,
+            known,
+            status: FrameStatus::Complete,
+        })
+    }
 
-        Ok(None)
+    /// Recover a register's value in the caller. `None` when the rule cannot be evaluated
+    /// (memory unreadable, unsupported expression); `Some(None)` when the caller's value
+    /// is unknown.
+    ///
+    /// For the return-address column, `Undefined` and `SameValue` both mean "still in
+    /// `x30`": Apple's CIEs leave that column undefined in the initial row, so before the
+    /// prologue saves it the return address is the link register, if this frame's `x30`
+    /// is known (the innermost frame). For any other register `Undefined` means unknown.
+    fn recover(&self, cursor: &Cursor, rule: &RegisterRule<usize>, cfa: u64, register: Register) -> Option<Option<u64>>
+    {
+        match rule {
+            RegisterRule::Undefined | RegisterRule::SameValue if register == return_register(self.arch.architecture()) => {
+                if cursor.known & LINK_REGISTER == 0 {
+                    return None;
+                }
+                Some(self.arch.link_register(&cursor.regs).map(Address::value))
+            }
+            RegisterRule::Undefined => Some(None),
+            RegisterRule::SameValue => Some(self.register_value(cursor, register)),
+            RegisterRule::Offset(offset) => {
+                let address = cfa.checked_add_signed(*offset)?;
+                self.memory.read_u64(Address::new(address)).ok().map(Some)
+            }
+            RegisterRule::ValOffset(offset) => Some(cfa.checked_add_signed(*offset)),
+            RegisterRule::Register(other) => Some(self.register_value(cursor, *other)),
+            _ => None,
+        }
+    }
+
+    /// `UNWIND_ARM64_MODE_FRAMELESS`: a leaf that never saves `x30` or `fp`. In the
+    /// innermost frame the caller is the link register and the caller's `sp` is `sp`
+    /// plus the leaf's stack allocation. A frameless leaf makes no calls, so it cannot be a
+    /// caller frame with a valid return address: as a caller (or without `x30`) the walk
+    /// stops here rather than guessing through the frame-pointer chain.
+    fn frameless_step(&self, cursor: &Cursor, stack_size: u64) -> Option<UnwindStep>
+    {
+        if cursor.is_caller || cursor.known & LINK_REGISTER == 0 {
+            return None;
+        }
+        let link = self.arch.link_register(&cursor.regs)?;
+        let mut next = cursor.regs.clone();
+        next.pc = self.arch.strip_pointer_auth(link);
+        next.sp = Address::new(cursor.regs.sp.value().checked_add(stack_size)?);
+        Some(UnwindStep {
+            next,
+            known: cursor.known & CALLEE_SAVED,
+            status: FrameStatus::CfiFallback,
+        })
+    }
+
+    /// Innermost frame on a function's first instruction: nothing was pushed, so the
+    /// caller is the link register with the same `sp` and `fp`.
+    fn entry_step(&self, cursor: &Cursor) -> Option<UnwindStep>
+    {
+        if cursor.is_caller || cursor.known & LINK_REGISTER == 0 {
+            return None;
+        }
+        let link = self.arch.link_register(&cursor.regs)?;
+        let mut next = cursor.regs.clone();
+        next.pc = self.arch.strip_pointer_auth(link);
+        Some(UnwindStep {
+            next,
+            known: cursor.known & CALLEE_SAVED,
+            status: FrameStatus::CfiFallback,
+        })
+    }
+
+    /// [`entry_step`](Self::entry_step) when the image has no compact entry: the entry
+    /// is recognized from the DWARF function index.
+    fn dwarf_entry_step(&self, image: &BinaryImage, cursor: &Cursor) -> Option<UnwindStep>
+    {
+        if !self.is_dwarf_function_start(image, cursor) {
+            return None;
+        }
+        self.entry_step(cursor)
+    }
+
+    /// Whether the innermost frame's pc is the first instruction of a function in the
+    /// image's DWARF function index. Always `false` for a caller frame.
+    fn is_dwarf_function_start(&self, image: &BinaryImage, cursor: &Cursor) -> bool
+    {
+        if cursor.is_caller {
+            return false;
+        }
+        let Some(file) = image.file_address(cursor.regs.pc) else {
+            return false;
+        };
+        image
+            .function_index()
+            .is_ok_and(|index| index.starts().binary_search(&file).is_ok())
+    }
+
+    /// Follow the frame record at `fp`: `[fp]` is the caller's `fp`, `[fp + 8]` the return
+    /// address.
+    fn frame_pointer_step(&self, cursor: &Cursor) -> Option<UnwindStep>
+    {
+        let regs = &cursor.regs;
+        if cursor.known & (1 << 29) == 0 {
+            return None;
+        }
+        let fp = regs.fp.value();
+        if fp == 0 || !fp.is_multiple_of(8) || fp < regs.sp.value() {
+            return None;
+        }
+        let saved_fp = self.memory.read_u64(Address::new(fp)).ok()?;
+        let saved_lr = self.memory.read_u64(Address::new(fp.checked_add(8)?)).ok()?;
+        // The chain must move up the stack; zero marks its end (checked on the next step).
+        if saved_fp != 0 && saved_fp <= fp {
+            return None;
+        }
+        let mut next = regs.clone();
+        self.arch.set_fp(&mut next, Address::new(saved_fp));
+        next.sp = Address::new(fp + 16);
+        next.pc = self.arch.strip_pointer_auth(Address::new(saved_lr));
+        // Registers saved below the frame record are not described, so only `fp` is known
+        // beyond what the callee left untouched; a frame-record function may have saved and
+        // reused x19-x28, so they are unknown too.
+        Some(UnwindStep {
+            next,
+            known: 1 << 29,
+            status: FrameStatus::CfiFallback,
+        })
+    }
+
+    fn register_value(&self, cursor: &Cursor, register: Register) -> Option<u64>
+    {
+        if let Some(bit) = general_bit(register)
+            && self.arch.architecture() == Architecture::Arm64
+            && cursor.known & bit == 0
+        {
+            return None;
+        }
+        read_register_value(self.arch.architecture(), &cursor.regs, register)
+    }
+
+    fn set_register_value(&self, regs: &mut Registers, register: Register, value: u64)
+    {
+        if self.arch.architecture() != Architecture::Arm64 {
+            return;
+        }
+        match register.0 {
+            29 => self.arch.set_fp(regs, Address::new(value)),
+            31 => regs.sp = Address::new(value),
+            n @ 0..=30 => {
+                if let Some(slot) = regs.general.get_mut(usize::from(n)) {
+                    *slot = value;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
-struct UnwindStep
+/// The `known` bit of an arm64 DWARF register number `x0`-`x30`.
+fn general_bit(register: Register) -> Option<u32>
 {
-    next: Registers,
-    return_address: Option<Address>,
-    status: FrameStatus,
+    (register.0 <= 30).then(|| 1 << register.0)
 }
 
+/// The compact-unwind entry of the function containing `lookup`, if the image has one.
+fn compact_entry(image: &BinaryImage, lookup: Address) -> Compact
+{
+    let Some(section) = image.unwind_info_section() else {
+        return Compact::Absent;
+    };
+    let (header, _) = image.runtime_range();
+    let Some(offset) = lookup
+        .value()
+        .checked_sub(header)
+        .and_then(|offset| u32::try_from(offset).ok())
+    else {
+        return Compact::Absent;
+    };
+    match compact_unwind::lookup(section, offset) {
+        Some(entry) if entry.encoding != 0 => Compact::Mode {
+            mode: Arm64Mode::decode(entry.encoding),
+            at_entry: entry.function_offset == offset,
+        },
+        _ => Compact::Absent,
+    }
+}
+
+/// Push one physical frame and the frames inlined into it.
+///
+/// `symbolication.frames` comes from `addr2line`, innermost first: the inlined callees,
+/// then the function that owns the code. Each inlined function is its own logical frame
+/// (kind [`FrameKind::Inlined`]) before the physical frame.
+#[allow(clippy::too_many_arguments)]
 fn append_logical_frames(
     frames: &mut Vec<StackFrame>,
+    max_frames: usize,
     thread: ThreadId,
     depth: u32,
     regs: &Registers,
-    symbolication: &Option<Symbolication>,
+    symbolication: Option<&Symbolication>,
     status: FrameStatus,
     return_address: Option<Address>,
 )
 {
-    if let Some(symbols) = symbolication {
-        for (
-            inline_depth,
-            SymbolFrame {
-                symbol,
-                location,
-                parameters,
-            },
-        ) in symbols.frames.iter().enumerate()
-        {
-            let inline_id = FrameId::new(thread, depth, inline_depth as u8, regs.pc, regs.sp);
-            frames.push(StackFrame {
-                id: inline_id,
-                thread,
-                index: frames.len(),
-                kind: FrameKind::Inlined {
-                    physical: inline_id,
-                    depth: inline_depth as u8,
-                },
-                pc: regs.pc,
-                sp: regs.sp,
-                fp: regs.fp,
-                return_address,
-                symbol: Some(symbol.clone()),
-                location: location.clone(),
-                parameters: parameters.clone(),
-                status,
-            });
-        }
-    }
-
     let physical_id = FrameId::new(thread, depth, 0, regs.pc, regs.sp);
-    let (symbol, location, parameters) = symbolication
-        .as_ref()
-        .and_then(|sym| sym.frames.first())
-        .map(|frame| (Some(frame.symbol.clone()), frame.location.clone(), frame.parameters.clone()))
-        .unwrap_or((None, None, Vec::new()));
-
-    frames.push(StackFrame {
-        id: physical_id,
+    let symbol_frames: &[SymbolFrame] = symbolication.map_or(&[], |symbols| symbols.frames.as_slice());
+    let frame = |kind, symbol_frame: Option<&SymbolFrame>, id, index| StackFrame {
+        id,
         thread,
-        index: frames.len(),
-        kind: FrameKind::Physical,
+        index,
+        kind,
         pc: regs.pc,
         sp: regs.sp,
         fp: regs.fp,
         return_address,
-        symbol,
-        location,
-        parameters,
+        symbol: symbol_frame.map(|f| f.symbol.clone()),
+        location: symbol_frame.and_then(|f| f.location.clone()),
+        parameters: symbol_frame.map(|f| f.parameters.clone()).unwrap_or_default(),
         status,
-    });
+    };
+
+    let (physical, inlined) = match symbol_frames.split_last() {
+        Some((physical, inlined)) => (Some(physical), inlined),
+        None => (None, &[][..]),
+    };
+    for (inline_depth, symbol_frame) in inlined.iter().enumerate() {
+        if frames.len() >= max_frames {
+            return;
+        }
+        let inline_depth = u8::try_from(inline_depth).unwrap_or(u8::MAX);
+        let id = FrameId::new(thread, depth, inline_depth.saturating_add(1), regs.pc, regs.sp);
+        let kind = FrameKind::Inlined {
+            physical: physical_id,
+            depth: inline_depth,
+        };
+        frames.push(frame(kind, Some(symbol_frame), id, frames.len()));
+    }
+    if frames.len() < max_frames {
+        frames.push(frame(FrameKind::Physical, physical, physical_id, frames.len()));
+    }
 }
+
 fn read_register_value(architecture: Architecture, regs: &Registers, register: Register) -> Option<u64>
 {
     let reg_num = register.0;
     match architecture {
-        Architecture::Arm64 => {
-            // ARM64 DWARF register mapping
-            match reg_num {
-                31 => Some(regs.sp.value()),         // SP
-                30 => regs.general.get(30).copied(), // LR
-                29 => Some(regs.fp.value()),         // FP
-                0..=28 => regs.general.get(reg_num as usize).copied(),
-                _ => None,
+        Architecture::Arm64 => match reg_num {
+            31 => Some(regs.sp.value()),
+            29 => Some(regs.fp.value()),
+            0..=30 => regs.general.get(usize::from(reg_num)).copied(),
+            _ => None,
+        },
+        Architecture::X86_64 => match reg_num {
+            7 => Some(regs.sp.value()),
+            16 => Some(regs.pc.value()),
+            6 => Some(regs.fp.value()),
+            0..=15 => {
+                let mapping = [0, 2, 1, 3, 6, 7, 5, 4, 8, 9, 10, 11, 12, 13, 14, 15];
+                mapping
+                    .get(usize::from(reg_num))
+                    .and_then(|&idx| regs.general.get(idx).copied())
             }
-        }
-        Architecture::X86_64 => {
-            // x86-64 DWARF register mapping
-            match reg_num {
-                7 => Some(regs.sp.value()),  // RSP
-                16 => Some(regs.pc.value()), // RIP
-                6 => Some(regs.fp.value()),  // RBP
-                0..=15 => {
-                    // Map DWARF register numbers to our general register array
-                    let mapping = [0, 2, 1, 3, 6, 7, 5, 4, 8, 9, 10, 11, 12, 13, 14, 15];
-                    mapping.get(reg_num as usize).and_then(|&idx| regs.general.get(idx).copied())
-                }
-                _ => None,
-            }
-        }
-        _ => None,
+            _ => None,
+        },
+        Architecture::Unknown(_) => None,
     }
 }
 
 fn return_register(architecture: Architecture) -> Register
 {
     match architecture {
-        Architecture::Arm64 => Register(30),  // LR
-        Architecture::X86_64 => Register(16), // RA (return address, same as RIP)
-        _ => Register(0),
+        Architecture::X86_64 => Register(16),
+        _ => Register(30),
     }
 }
 
-fn map_gimli_error(context: &str, err: gimli::Error) -> DebuggerError
+#[cfg(test)]
+mod tests
 {
-    DebuggerError::InvalidArgument(format!("{context}: {err}"))
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::arch::Arm64;
+    use crate::backend::mock::arm64_registers;
+    use crate::error::DebuggerError;
+
+    /// Little-endian words at addresses; anything else is unreadable.
+    #[derive(Default)]
+    struct FakeMemory
+    {
+        words: HashMap<u64, u64>,
+        code: Option<(u64, u64)>,
+    }
+
+    impl MemoryAccess for FakeMemory
+    {
+        fn read_u64(&self, address: Address) -> Result<u64>
+        {
+            self.words
+                .get(&address.value())
+                .copied()
+                .ok_or_else(|| DebuggerError::InvalidArgument(format!("unreadable {address}")))
+        }
+
+        fn is_executable(&self, address: Address) -> bool
+        {
+            self.code.is_none_or(|(start, end)| (start..end).contains(&address.value()))
+        }
+    }
+
+    static ARCH: Arm64 = Arm64::new();
+
+    fn regs(pc: u64, sp: u64, fp: u64, lr: u64) -> Registers
+    {
+        let mut regs = arm64_registers();
+        regs.pc = Address::new(pc);
+        regs.sp = Address::new(sp);
+        ARCH.set_fp(&mut regs, Address::new(fp));
+        ARCH.set_link_register(&mut regs, Address::new(lr)).expect("lr");
+        regs
+    }
+
+    fn pcs(memory: &FakeMemory, regs: &Registers) -> Vec<u64>
+    {
+        let symbols = SymbolCache::new();
+        StackUnwinder::new(&ARCH, &symbols, memory)
+            .unwind(ThreadId::from(1), regs, 64)
+            .expect("unwind")
+            .iter()
+            .map(|frame| frame.pc.value())
+            .collect()
+    }
+
+    /// Three frame records; the outermost has a zero fp, which ends the chain.
+    fn chain() -> FakeMemory
+    {
+        let mut memory = FakeMemory::default();
+        memory.words.insert(0x1000, 0x1100);
+        memory.words.insert(0x1008, 0x4000_0010);
+        memory.words.insert(0x1100, 0x1200);
+        memory.words.insert(0x1108, 0x4000_0020);
+        memory.words.insert(0x1200, 0);
+        memory.words.insert(0x1208, 0x4000_0030);
+        memory
+    }
+
+    #[test]
+    fn frame_pointer_chain_ends_at_a_zero_fp()
+    {
+        let memory = chain();
+        assert_eq!(
+            pcs(&memory, &regs(0x4000_0000, 0xf00, 0x1000, 0x4000_0abc)),
+            [0x4000_0000, 0x4000_0010, 0x4000_0020, 0x4000_0030]
+        );
+    }
+
+    #[test]
+    fn link_register_is_never_used_for_caller_frames()
+    {
+        // No frame pointer and no CFI: the old link-register fallback produced the LR as a
+        // caller and then the LR again at every depth. Now the trace is just frame 0.
+        let memory = FakeMemory::default();
+        assert_eq!(pcs(&memory, &regs(0x4000_0000, 0xf00, 0, 0x4000_0abc)), [0x4000_0000]);
+    }
+
+    #[test]
+    fn no_stack_scan_on_an_unreadable_frame_record()
+    {
+        // The old stack scan read [sp] as a return address when fp was unusable.
+        let mut memory = FakeMemory::default();
+        memory.words.insert(0xf00, 0x4000_0500);
+        assert_eq!(pcs(&memory, &regs(0x4000_0000, 0xf00, 0x2000, 0)), [0x4000_0000]);
+    }
+
+    #[test]
+    fn pointer_auth_bits_are_stripped_from_saved_return_addresses()
+    {
+        let mut memory = chain();
+        memory.words.insert(0x1008, 0x8012_0000_4000_0010);
+        let trace = pcs(&memory, &regs(0x4000_0000, 0xf00, 0x1000, 0));
+        assert_eq!(trace[1], 0x4000_0010);
+    }
+
+    #[test]
+    fn a_decreasing_frame_chain_stops_the_trace()
+    {
+        let mut memory = chain();
+        memory.words.insert(0x1100, 0x1000);
+        assert_eq!(pcs(&memory, &regs(0x4000_0000, 0xf00, 0x1000, 0)), [0x4000_0000, 0x4000_0010]);
+    }
+
+    #[test]
+    fn a_return_address_outside_code_stops_the_trace()
+    {
+        let mut memory = chain();
+        memory.code = Some((0x4000_0000, 0x4000_0021));
+        assert_eq!(
+            pcs(&memory, &regs(0x4000_0000, 0xf00, 0x1000, 0)),
+            [0x4000_0000, 0x4000_0010, 0x4000_0020]
+        );
+    }
+
+    fn innermost(regs: Registers) -> Cursor
+    {
+        Cursor {
+            regs,
+            known: ALL_GENERAL,
+            is_caller: false,
+        }
+    }
+
+    #[test]
+    fn frameless_leaf_returns_through_the_link_register_only_when_innermost()
+    {
+        let memory = FakeMemory::default();
+        let symbols = SymbolCache::new();
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let mut regs = regs(0x4000_0000, 0xf00, 0x1000, 0x8012_0000_4000_0abc);
+        regs.general[3] = 33;
+        regs.general[20] = 20;
+        let step = unwinder
+            .frameless_step(&innermost(regs.clone()), 32)
+            .expect("innermost frameless");
+        assert_eq!(step.next.pc, Address::new(0x4000_0abc), "PAC bits stripped");
+        assert_eq!(step.next.sp, Address::new(0xf20));
+        assert_eq!(step.next.fp, Address::new(0x1000), "a leaf leaves fp alone");
+        assert_eq!(step.known & (1 << 3), 0, "x3 is caller-saved");
+        assert_ne!(step.known & (1 << 20), 0, "x20 is callee-saved");
+        assert_eq!(step.known & LINK_REGISTER, 0);
+
+        let caller = Cursor {
+            is_caller: true,
+            ..innermost(regs)
+        };
+        assert!(unwinder.frameless_step(&caller, 32).is_none(), "a leaf is never a caller");
+    }
+
+    #[test]
+    fn unknown_registers_cannot_feed_a_rule()
+    {
+        let memory = FakeMemory::default();
+        let symbols = SymbolCache::new();
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let cursor = Cursor {
+            known: CALLEE_SAVED,
+            is_caller: true,
+            ..innermost(regs(0x4000_0000, 0xf00, 0x1000, 0x4000_0abc))
+        };
+        let lr = Register(30);
+        assert_eq!(unwinder.recover(&cursor, &RegisterRule::SameValue, 0, lr), None);
+        assert_eq!(unwinder.recover(&cursor, &RegisterRule::Undefined, 0, lr), None);
+        assert_eq!(
+            unwinder.recover(&cursor, &RegisterRule::Undefined, 0, Register(20)),
+            Some(None)
+        );
+        assert_eq!(
+            unwinder.recover(&cursor, &RegisterRule::SameValue, 0, Register(2)),
+            Some(None)
+        );
+        assert_eq!(
+            unwinder.recover(&cursor, &RegisterRule::SameValue, 0, Register(29)),
+            Some(Some(0x1000))
+        );
+    }
+
+    #[test]
+    fn max_frames_limits_the_trace()
+    {
+        let memory = chain();
+        let symbols = SymbolCache::new();
+        let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 2)
+            .expect("unwind");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].index, 1);
+        assert_eq!(frames[0].return_address, Some(Address::new(0x4000_0010)));
+    }
 }

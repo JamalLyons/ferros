@@ -97,3 +97,8 @@ test = false
 name = "ferros-fixture-symbols"
 path = "fixtures/symbols.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-recursion"
+path = "fixtures/recursion.rs"
+test = false

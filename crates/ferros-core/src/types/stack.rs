@@ -199,52 +199,33 @@ impl FrameKind
     }
 }
 
-/// Indicates how reliable a frame's unwind data is.
+/// Which unwind source produced a frame's registers.
 ///
-/// The quality of stack unwinding can vary depending on the availability of
-/// debug information and the unwinding method used. This enum indicates the
-/// reliability of the frame's data.
-///
-/// ## Reliability Levels
-///
-/// - `Complete`: Most reliable - full debug information available
-/// - `CfiFallback`: Moderate reliability - using frame pointers or link register
-/// - `Heuristic`: Least reliable - best-effort reconstruction
+/// Every frame comes from unwind information; there is no stack-scan heuristic (see
+/// [`symbols::unwind`](crate::symbols::unwind)).
 ///
 /// ## Example
 ///
 /// ```rust
 /// use ferros_core::types::FrameStatus;
 ///
-/// // Check frame reliability
 /// let frame_status = FrameStatus::Complete;
 /// match frame_status {
-///     FrameStatus::Complete => println!("Frame data is fully reliable"),
-///     FrameStatus::CfiFallback => println!("Frame data may have minor inaccuracies"),
-///     FrameStatus::Heuristic => println!("Frame data may be inaccurate"),
+///     FrameStatus::Complete => println!("recovered with DWARF CFI"),
+///     FrameStatus::CfiFallback => {
+///         println!("recovered from the frame-pointer chain or the link register")
+///     }
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameStatus
 {
-    /// CFI (Call Frame Information) provided full register restoration.
-    ///
-    /// This is the most reliable status. The frame was unwound using complete
-    /// DWARF CFI (Call Frame Information) data, which provides accurate register
-    /// restoration and frame boundaries.
+    /// The innermost frame, or a frame recovered with DWARF CFI (`__eh_frame` or
+    /// `.debug_frame`).
     Complete,
-    /// DWARF CFI missing; fallback to frame pointers or link register.
-    ///
-    /// This indicates moderate reliability. The frame was unwound using frame
-    /// pointers (RBP/FP) or the link register (LR), which is less accurate than
-    /// CFI but still generally reliable for most cases.
+    /// No CFI covered the callee: recovered from the frame-pointer chain, or from the link
+    /// register when the innermost frame was stopped on a function's first instruction.
     CfiFallback,
-    /// Heuristic or best-effort reconstruction (may be inaccurate).
-    ///
-    /// This is the least reliable status. The frame was reconstructed using
-    /// heuristics or best-effort methods when debug information is unavailable.
-    /// The frame data may be inaccurate or incomplete.
-    Heuristic,
 }
 
 /// Logical stack frame (physical or inline).
@@ -304,14 +285,16 @@ pub struct StackFrame
     /// Ordered index within the stack trace (includes inline frames).
     ///
     /// The topmost frame (most recent call) has index 0, the caller has index 1,
-    /// and so on. Inline frames are included in this ordering.
+    /// and so on. Inline frames are included in this ordering: the functions inlined at a
+    /// pc come before the physical frame that owns the code.
     pub index: usize,
     /// Whether this is a physical or inline frame.
     pub kind: FrameKind,
     /// Program counter corresponding to this frame.
     ///
-    /// This is the address of the instruction that was executing (or about to
-    /// execute) when this frame was active.
+    /// For the innermost frame, the instruction about to execute. For a caller frame,
+    /// the return address (the instruction after the call), with pointer-authentication
+    /// bits stripped; its `symbol` and `location` are those of the call instruction.
     pub pc: Address,
     /// Stack pointer snapshot at this frame.
     ///
@@ -324,8 +307,7 @@ pub struct StackFrame
     pub fp: Address,
     /// Return address that unwinding will jump to (if known).
     ///
-    /// This is the address where execution will resume after this function returns.
-    /// Used for stack unwinding to the caller frame.
+    /// The pc of the caller frame; `None` for the outermost frame of the trace.
     pub return_address: Option<Address>,
     /// Best-effort symbol for the frame.
     ///
@@ -343,10 +325,7 @@ pub struct StackFrame
     /// Contains the function's parameters with their names and types if debug
     /// information is available. May be empty if parameter information is not available.
     pub parameters: Vec<FunctionParameter>,
-    /// Reliability indicator for this frame's unwind data.
-    ///
-    /// Indicates how reliable the frame's data is based on the unwinding method
-    /// used (CFI, frame pointers, or heuristics).
+    /// Which unwind source recovered this frame's registers.
     pub status: FrameStatus,
 }
 

@@ -89,19 +89,6 @@ impl Debugger
         ))
     }
 
-    /// Present SIGINT from an isolated launched program as the user's interrupt.
-    /// Keep the engine's raw signal stop so continue still suppresses that signal.
-    fn stop_for_display(&self, event: &StopEvent) -> StopEvent
-    {
-        if let Target::Launch(spec) = &self.target
-            && spec.process_group == Some(ferros_core::backend::ProcessGroup::New)
-            && let StopEvent::Signal { thread, signal: SIGINT } = event
-        {
-            return StopEvent::Interrupted { thread: Some(*thread) };
-        }
-        event.clone()
-    }
-
     /// Release the process: kill it if it was launched, detach if attached.
     ///
     /// Returns the line to print, if there was a process.
@@ -162,28 +149,16 @@ impl Ctx<'_>
     {
         self.out.flush()?;
         self.interrupt.store(false, Ordering::SeqCst);
-        let terminal_pid = match &self.debugger.target {
-            Target::Launch(spec)
-                if spec.process_group == Some(ferros_core::backend::ProcessGroup::New)
-                    && spec.stdin == ferros_core::backend::StdioSpec::Inherit =>
-            {
-                self.debugger.session.pid()
-            }
-            _ => None,
-        };
         let session = &mut self.debugger.session;
-        let event = crate::platform::with_terminal_foreground(terminal_pid, || {
-            match step {
-                Some(thread) => session.step_instruction(thread)?,
-                None if matches!(session.last_stop(), Some(StopEvent::Signal { signal: SIGINT, .. })) => {
-                    session.resume()?;
-                }
-                None => session.resume_with_signal()?,
+        match step {
+            Some(thread) => session.step_instruction(thread)?,
+            None if matches!(session.last_stop(), Some(StopEvent::Signal { signal: SIGINT, .. })) => {
+                session.resume()?;
             }
-            self.debugger.at_entry = false;
-            interrupt::wait_for_stop(session, self.interrupt)
-        })?;
-        let event = self.debugger.stop_for_display(&event);
+            None => session.resume_with_signal()?,
+        }
+        self.debugger.at_entry = false;
+        let event = interrupt::wait_for_stop(session, self.interrupt)?;
         self.print_stop(&event)?;
         Ok(event)
     }

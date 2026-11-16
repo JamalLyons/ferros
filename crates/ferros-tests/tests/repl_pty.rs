@@ -375,10 +375,11 @@ fn end_with_ctrl_d(ferros: &mut PtyFerros, tag: &Tag)
     assert!(tagged(tag).is_empty(), "processes left running: {:?}", tagged(tag));
 }
 
-/// In terminal mode the program reads the terminal: rustyline gives the terminal back
-/// (cooked mode, echo on) while the program runs, so a typed line reaches it.
+/// A launched program keeps inherited terminal stdin, but reads from its background
+/// group stop with SIGTTIN. Ferros retains the foreground and can still read commands.
+/// `stdin_file_wins_over_the_terminal` covers the supported way to supply program input.
 #[test]
-fn the_program_reads_a_line_typed_at_the_terminal()
+fn terminal_stdin_stops_the_background_program_with_sigttin()
 {
     run(|t| {
         let tag = t.tag();
@@ -386,14 +387,15 @@ fn the_program_reads_a_line_typed_at_the_terminal()
         let mut ferros = PtyFerros::launch(&tag, &fixture!("read_line"), &scratch);
 
         ferros.type_line("continue");
-        ferros.expect("continue");
-        // Let the program block in its read; a line typed earlier would also be queued.
-        thread::sleep(Duration::from_millis(300));
-        ferros.type_line("hello from tty");
-        ferros.expect("read: hello from tty");
-        ferros.expect("process exited with status 0");
+        ferros.expect("stopped: signal 21 ");
         ferros.expect(PROMPT);
-
+        assert!(!ferros.text().contains("read: "), "{}", ferros.text());
+        ferros.type_line("status");
+        ferros.expect("stopped: signal 21 ");
+        ferros.expect(PROMPT);
+        ferros.type_line("help");
+        ferros.expect("list the commands");
+        ferros.expect(PROMPT);
         end_with_ctrl_d(&mut ferros, &tag);
     });
 }
@@ -426,8 +428,8 @@ fn stdin_file_wins_over_the_terminal()
 
 /// Ctrl-C typed while the program runs stops it and returns to the prompt.
 ///
-/// The program has its own group and owns the terminal while running. Its terminal
-/// SIGINT stop is presented as an interrupt; ownership returns before the prompt.
+/// Ferros keeps the terminal foreground; the program runs in a separate background
+/// group. The terminal sends SIGINT only to ferros, which calls `Session::interrupt`.
 #[test]
 fn ctrl_c_while_the_program_runs_stops_it()
 {
@@ -513,6 +515,42 @@ fn sigint_to_ferros_process_group_always_reports_interrupted()
             ferros.expect(PROMPT);
             assert!(!ferros.text().contains("stopped: signal 2"), "{}", ferros.text());
         }
+        end_with_ctrl_d(&mut ferros, &tag);
+    });
+}
+
+/// A real program SIGINT stays a signal stop in both the command reply and status.
+#[test]
+fn sigint_sent_directly_to_the_debuggee_remains_a_signal_stop()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
+        let pid = ferros.child.process_id().expect("ferros pid");
+        let targets: Vec<_> = tagged(&tag).into_iter().filter(|candidate| *candidate != pid).collect();
+        assert_eq!(targets.len(), 1, "one debuggee: {targets:?}");
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-INT", &targets[0].to_string()])
+            .status()
+            .expect("signal debuggee pid");
+        assert!(status.success(), "kill failed: {status}");
+        ferros.expect("stopped: signal 2 ");
+        ferros.expect(PROMPT);
+        ferros.type_line("status");
+        ferros.expect("stopped: signal 2 ");
+        ferros.expect(PROMPT);
+        assert!(!ferros.text().contains("stopped: interrupted"), "{}", ferros.text());
+
+        // Existing policy suppresses held SIGINT on continue. A later terminal Ctrl-C
+        // must still take the separate Session::interrupt path.
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: interrupted");
+        ferros.expect(PROMPT);
         end_with_ctrl_d(&mut ferros, &tag);
     });
 }

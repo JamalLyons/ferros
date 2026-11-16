@@ -180,7 +180,7 @@ impl ReplCommand for Status
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
     {
         no_args("status", args)?;
-        let last = ctx.debugger.session.last_stop().map(|event| ctx.debugger.stop_for_display(event));
+        let last = ctx.debugger.session.last_stop().cloned();
         let session = ctx.session();
         let (head, detail) = match session.state() {
             SessionState::Stopped => {

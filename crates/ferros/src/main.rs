@@ -43,8 +43,8 @@ enum Commands
     {
         #[command(flatten)]
         script: Script,
-        /// Feed FILE to the program's stdin. Without it the program shares the terminal or
-        /// the batch-mode stdin, and reads /dev/null when commands come from a pipe
+        /// Feed FILE to the program's stdin. Terminal reads otherwise stop the background
+        /// program with SIGTTIN; piped commands give it /dev/null; batch stdin is inherited
         #[arg(long, value_name = "FILE")]
         stdin: Option<PathBuf>,
         /// Path to the executable to launch

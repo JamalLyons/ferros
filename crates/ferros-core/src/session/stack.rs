@@ -8,7 +8,7 @@ use crate::backend::Backend;
 use crate::error::{DebuggerError, Result};
 use crate::symbols::Symbolication;
 use crate::symbols::demangle::make_symbol_name;
-use crate::symbols::symtab::{self, SymtabLayout};
+use crate::symbols::symtab::{self, SymbolTable, SymtabLayout};
 use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
 use crate::types::{Address, MemoryRegion, StackFrame, SymbolName, SymbolSource};
 
@@ -140,7 +140,7 @@ impl Session
     fn name_frames_from_symbol_tables(&mut self, frames: &mut [StackFrame])
     {
         // Images found by their header in this trace, for code the loader does not list.
-        let mut unlisted: Vec<SessionSymtab> = Vec::new();
+        let mut unlisted = UnlistedImages::default();
         for frame in frames.iter_mut().filter(|frame| frame.symbol.is_none()) {
             let lookup = if frame.index == 0 {
                 frame.pc
@@ -159,41 +159,83 @@ impl Session
     /// dyld leaves itself out of the image list it publishes, yet its `start` is the base
     /// of every main-thread trace (on current macOS dyld itself lives in the shared cache).
     /// The header is searched for at 4 KiB boundaries, from `address` back to the start of
-    /// its region, and the nearest one is accepted only when its executable sections
-    /// contain `address`.
-    fn unlisted_symbol_table_name(&mut self, unlisted: &mut Vec<SessionSymtab>, address: Address) -> Option<SymbolName>
+    /// its region. A candidate that does not parse, or whose executable sections do not
+    /// contain `address`, is skipped. A region searched without success is not searched
+    /// again in this trace.
+    fn unlisted_symbol_table_name(&mut self, unlisted: &mut UnlistedImages, address: Address) -> Option<SymbolName>
     {
         // A backend that lists no images (one that cannot, or a mock) gets no search either.
         if self.loaded_images.is_empty() {
             return None;
         }
-        if let Some(entry) = unlisted.iter_mut().find(|entry| entry.layout.contains(address)) {
-            return name_in(self.backend.as_mut(), entry, address);
+        let request = self.symbol_request;
+        if let Some(entry) = unlisted.images.iter_mut().find(|entry| entry.layout.contains(address)) {
+            return name_in(self.backend.as_mut(), entry, address, request);
         }
-        let regions = self.backend.memory_regions().ok()?;
-        let region = regions
+        if unlisted
+            .searched
             .iter()
-            .find(|region| region.permissions.contains('x') && region.start <= address && address < region.end)?;
-        let start = region.start.value();
+            .any(|&(start, end)| start <= address.value() && address.value() < end)
+        {
+            return None;
+        }
+        if unlisted.regions.is_none() {
+            match self.backend.memory_regions() {
+                Ok(regions) => {
+                    unlisted.regions = Some(
+                        regions
+                            .into_iter()
+                            .filter(|region| region.permissions.contains('x'))
+                            .collect(),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!("no image header search for {address}: listing memory regions: {error}");
+                    unlisted.regions = Some(Vec::new());
+                }
+            }
+        }
+        let region = unlisted
+            .regions
+            .as_deref()?
+            .iter()
+            .find(|region| region.start <= address && address < region.end)?;
+        let (start, end) = (region.start.value(), region.end.value());
+        let found = self.search_image_header(start, address);
+        let Some(layout) = found else {
+            unlisted.searched.push((start, end));
+            return None;
+        };
+        unlisted.images.push(SessionSymtab::new(layout));
+        let entry = unlisted.images.last_mut()?;
+        name_in(self.backend.as_mut(), entry, address, request)
+    }
+
+    /// The layout of the nearest image header at or before `address`, on a 4 KiB boundary
+    /// no lower than `start`, whose executable sections contain `address`.
+    fn search_image_header(&mut self, start: u64, address: Address) -> Option<SymtabLayout>
+    {
         let mut page = address.value() & !(PAGE_SIZE - 1);
         for _ in 0..MAX_HEADER_SEARCH_PAGES {
             if page < start {
                 return None;
             }
-            let magic = self.backend.read_memory(Address::new(page), 4).ok()?;
+            let magic = match self.backend.read_memory(Address::new(page), 4) {
+                Ok(magic) => magic,
+                Err(error) => {
+                    tracing::debug!("image header search for {address} stops at 0x{page:x}: {error}");
+                    return None;
+                }
+            };
             if magic == MH_MAGIC_64.to_le_bytes() {
                 let layout = self
                     .read_mapped_header(page)
-                    .ok()
-                    .and_then(|header| SymtabLayout::from_header(&header, page).ok())
-                    .filter(|layout| layout.contains(address))?;
-                unlisted.push(SessionSymtab {
-                    layout,
-                    table: None,
-                    names: std::collections::HashMap::new(),
-                });
-                let entry = unlisted.last_mut()?;
-                return name_in(self.backend.as_mut(), entry, address);
+                    .and_then(|header| SymtabLayout::from_header(&header, page).map_err(|error| error.to_string()));
+                match layout {
+                    Ok(layout) if layout.contains(address) => return Some(layout),
+                    Ok(_) => tracing::debug!("image header at 0x{page:x} does not contain {address}"),
+                    Err(detail) => tracing::debug!("skipping a candidate image header for {address}: {detail}"),
+                }
             }
             page = page.checked_sub(PAGE_SIZE)?;
         }
@@ -235,7 +277,8 @@ impl Session
 {
     /// The name of the function containing `address` from the symbol table of the image
     /// mapped there, marked [`SymbolSource::SymbolTable`]. `None` when no image's code
-    /// contains it, or the table could not be read (logged, and kept for the image).
+    /// contains it, or the table could not be read (logged, and tried again by the next
+    /// request).
     ///
     /// The image is found by its mapped header rather than by [`ImageMapping`], which does
     /// not map shared-cache images; each image's table is read once and its names as
@@ -244,39 +287,48 @@ impl Session
     /// [`ImageMapping`]: crate::symbols::ImageMapping
     fn symbol_table_name(&mut self, address: Address) -> Option<SymbolName>
     {
+        let request = self.symbol_request;
         for index in 0..self.loaded_images.len() {
-            if self.loaded_images[index].symtab.is_none() {
-                let load_address = self.loaded_images[index].descriptor_load_address();
+            let image = &self.loaded_images[index];
+            if image.symtab.is_none() && image.symtab_failed_in_request != Some(request) {
+                let load_address = image.descriptor_load_address();
                 let layout = self
                     .read_mapped_header(load_address)
                     .and_then(|header| SymtabLayout::from_header(&header, load_address).map_err(|error| error.to_string()));
-                self.loaded_images[index].symtab = Some(layout.map(|layout| SessionSymtab {
-                    layout,
-                    table: None,
-                    names: std::collections::HashMap::new(),
-                }));
+                let image = &mut self.loaded_images[index];
+                match layout {
+                    Ok(layout) => {
+                        image.symtab = Some(SessionSymtab::new(layout));
+                        image.symtab_failed_in_request = None;
+                    }
+                    Err(detail) => {
+                        tracing::debug!("no symbol table for the image at {}: {detail}", Address::new(load_address));
+                        image.symtab_failed_in_request = Some(request);
+                    }
+                }
             }
-            let Some(Ok(entry)) = &self.loaded_images[index].symtab else {
+            let backend = self.backend.as_mut();
+            let Some(entry) = &mut self.loaded_images[index].symtab else {
                 continue;
             };
-            if !entry.layout.contains(address) {
-                continue;
+            if entry.layout.contains(address) {
+                return name_in(backend, entry, address, request);
             }
-            return self.symbol_table_name_in(index, address);
         }
         None
     }
+}
 
-    /// [`symbol_table_name`](Self::symbol_table_name) within the image at `index`, whose
-    /// code contains `address`.
-    fn symbol_table_name_in(&mut self, index: usize, address: Address) -> Option<SymbolName>
-    {
-        let backend = self.backend.as_mut();
-        let Some(Ok(entry)) = &mut self.loaded_images[index].symtab else {
-            return None;
-        };
-        name_in(backend, entry, address)
-    }
+/// Images found by their header during one trace (see
+/// [`Session::unlisted_symbol_table_name`]).
+#[derive(Default)]
+struct UnlistedImages
+{
+    images: Vec<SessionSymtab>,
+    /// Executable regions `[start, end)` searched without finding a header.
+    searched: Vec<(u64, u64)>,
+    /// The executable regions, listed on the first search.
+    regions: Option<Vec<MemoryRegion>>,
 }
 
 /// Alignment of Mach-O headers searched for: images in the dyld shared cache start on
@@ -290,60 +342,96 @@ const MAX_HEADER_SEARCH_PAGES: usize = 4096;
 const MH_MAGIC_64: u32 = 0xfeed_facf;
 
 /// The symbol table name of `address` in the image of `entry`, reading the table and the
-/// name from the target as needed.
-fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Address) -> Option<SymbolName>
+/// name from the target as needed. Read failures are logged and not kept, except that
+/// the table is not read again within `request`.
+fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Address, request: u64) -> Option<SymbolName>
 {
-    let table = entry.table.get_or_insert_with(|| {
-        let (at, size) = entry.layout.nlist_range();
-        backend
-            .read_memory(at, size)
-            .map(|bytes| entry.layout.parse_symbols(&bytes))
-            .map_err(|error| format!("reading the symbol table at {at}: {error}"))
-    });
-    let table = match table {
-        Ok(table) => table,
-        Err(detail) => {
-            tracing::debug!("no symbol table name for {address}: {detail}");
+    if entry.table.is_none() {
+        if entry.table_failed_in_request == Some(request) {
             return None;
         }
-    };
-    let strx = table.lookup(&entry.layout, address)?;
-    let layout = &entry.layout;
-    let raw = entry
-        .names
-        .entry(strx)
-        .or_insert_with(|| read_symbol_string(backend, layout, strx))
-        .clone()?;
+        match read_symbol_table(backend, &entry.layout) {
+            Ok(table) => {
+                entry.table = Some(table);
+                entry.table_failed_in_request = None;
+            }
+            Err(detail) => {
+                tracing::debug!("no symbol table name for {address}: {detail}");
+                entry.table_failed_in_request = Some(request);
+                return None;
+            }
+        }
+    }
+    let strx = entry.table.as_ref()?.lookup(&entry.layout, address)?;
+    let raw = if let Some(raw) = entry.names.get(&strx) {
+        raw.clone()
+    } else {
+        match read_symbol_string(backend, &entry.layout, strx) {
+            Ok(raw) => {
+                entry.names.insert(strx, raw.clone());
+                raw
+            }
+            Err(detail) => {
+                tracing::debug!("no symbol table name for {address}: {detail}");
+                None
+            }
+        }
+    }?;
     let name = symtab::strip_symbol_prefix(&raw).to_owned();
     Some(make_symbol_name(name).with_source(SymbolSource::SymbolTable))
+}
+
+/// Read an image's `nlist` entries and, when it records them, its function starts.
+fn read_symbol_table(backend: &mut dyn Backend, layout: &SymtabLayout) -> std::result::Result<SymbolTable, String>
+{
+    let (at, size) = layout.nlist_range();
+    let nlists = backend
+        .read_memory(at, size)
+        .map_err(|error| format!("reading the symbol table at {at}: {error}"))?;
+    let table = layout.parse_symbols(&nlists);
+    let Some((at, size)) = layout.function_starts_range() else {
+        return Ok(table);
+    };
+    let starts = backend
+        .read_memory(at, size)
+        .map_err(|error| format!("reading the function starts at {at}: {error}"))?;
+    Ok(table.with_function_starts(layout.parse_function_starts(&starts)))
 }
 
 /// Longest symbol name read; a longer one is cut off here.
 const MAX_SYMBOL_NAME: usize = 4096;
 
 /// Read the NUL-terminated string at `strx` of an image's string table, in pages so a
-/// short name near the end of mapped memory still reads.
-fn read_symbol_string(backend: &mut dyn Backend, layout: &SymtabLayout, strx: u32) -> Option<String>
+/// short name near the end of mapped memory still reads. `Ok(None)` for an empty or
+/// non-UTF-8 name, or an index outside the table; `Err` when memory could not be read.
+fn read_symbol_string(
+    backend: &mut dyn Backend,
+    layout: &SymtabLayout,
+    strx: u32,
+) -> std::result::Result<Option<String>, String>
 {
     const CHUNK: usize = 256;
-    let (start, available) = layout.string_range(strx)?;
+    let Some((start, available)) = layout.string_range(strx) else {
+        return Ok(None);
+    };
     let limit = available.min(MAX_SYMBOL_NAME);
     let mut bytes = Vec::new();
     while bytes.len() < limit {
-        let offset = u64::try_from(bytes.len()).ok()?;
-        let at = Address::new(start.value().wrapping_add(offset));
+        let at = Address::new(start.value().wrapping_add(bytes.len() as u64));
         // Stay within one page so a read never crosses into unmapped memory needlessly.
-        let to_page = usize::try_from(0x4000 - (at.value() & 0x3fff)).ok()?;
+        let to_page = usize::try_from(0x4000 - (at.value() & 0x3fff)).unwrap_or(CHUNK);
         let length = CHUNK.min(limit - bytes.len()).min(to_page);
-        let chunk = backend.read_memory(at, length).ok()?;
+        let chunk = backend
+            .read_memory(at, length)
+            .map_err(|error| format!("reading a symbol name at {at}: {error}"))?;
         if let Some(end) = chunk.iter().position(|&byte| byte == 0) {
             bytes.extend_from_slice(&chunk[..end]);
-            return String::from_utf8(bytes).ok().filter(|name| !name.is_empty());
+            break;
         }
         if chunk.is_empty() {
-            return None;
+            return Err(format!("reading a symbol name at {at}: no bytes"));
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes).ok().filter(|name| !name.is_empty())
+    Ok(String::from_utf8(bytes).ok().filter(|name| !name.is_empty()))
 }

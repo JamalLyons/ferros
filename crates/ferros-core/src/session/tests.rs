@@ -1426,3 +1426,6 @@ mod logical
         assert!(session.breakpoints().is_empty());
     }
 }
+
+#[path = "tests/symtab.rs"]
+mod symtab;

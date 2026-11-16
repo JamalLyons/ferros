@@ -7,24 +7,24 @@ use ferros_core::{BreakpointLocation, LogicalBreakpoint, LogicalBreakpointId, So
 use super::{CommandError, CommandResult, Flow, ReplCommand, no_args, parse_address, parse_number};
 use crate::repl::Ctx;
 
-/// Parse the argument of `break`: `*<address>` (or a bare number), `<file>:<line>`, or a
+/// Parse the argument of `break`: `*<address>` (or a bare number), `<file>:<line>`,
+/// `<file>:<line>:<column>` (the column is ignored: breakpoints are per line), or a
 /// function path.
+///
+/// A `file:line` form is recognised before a bare number, so a relative path that starts
+/// with a digit (`2024/x.rs:3`) is a file, not an address.
 pub fn parse_location(text: &str) -> Result<BreakpointLocation, CommandError>
 {
     let text = text.trim();
     if text.is_empty() {
         return Err(CommandError::new("usage: break <file:line | function | *address>"));
     }
-    if text.starts_with('*') || text.starts_with(|c: char| c.is_ascii_digit()) {
+    if text.starts_with('*') {
         return parse_address(text).map(BreakpointLocation::Address);
     }
-    // `a::b` splits into `a:` and `b`; only digits after a lone `:` make a line.
-    if let Some((file, line)) = text.rsplit_once(':')
-        && !file.is_empty()
-        && !file.ends_with(':')
-        && !line.is_empty()
-        && line.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if let Some((file, line)) = split_line(text) {
+        // `file:line:column`: drop the column.
+        let (file, line) = split_line(file).unwrap_or((file, line));
         let line = line
             .parse::<u32>()
             .map_err(|_| CommandError::new(format!("invalid line '{line}'")))?;
@@ -33,7 +33,19 @@ pub fn parse_location(text: &str) -> Result<BreakpointLocation, CommandError>
             line,
         });
     }
+    if text.starts_with(|c: char| c.is_ascii_digit()) {
+        return parse_address(text).map(BreakpointLocation::Address);
+    }
     Ok(BreakpointLocation::Function(text.to_owned()))
+}
+
+/// `text` split at its last lone `:` followed only by digits, as `(before, digits)`.
+/// `a::b` splits into `a:` and `b`, which is a path, not a line.
+fn split_line(text: &str) -> Option<(&str, &str)>
+{
+    let (file, line) = text.rsplit_once(':')?;
+    (!file.is_empty() && !file.ends_with(':') && !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((file, line))
 }
 
 /// `<function> at <file>:<line>`, or the parts of it that are known; empty when none is.
@@ -102,7 +114,7 @@ impl ReplCommand for Break
     {
         "break <file:line | function | *address> (alias: b)\n\nAdd a breakpoint at:\n  <file>:<line>  a source \
          line; <file> is a full path or its last components (main.rs, src/main.rs). A line with no code uses the \
-         next line that has code, and says so.\n  <function>     a Rust function path (parse, my_crate::parse, \
+         next line that has code, and says so. A trailing :<column> is accepted and ignored.\n  <function>     a Rust function path (parse, my_crate::parse, \
          Counter::bump); the breakpoint is after the function's prologue.\n  *<address>     a runtime address, as \
          0x-prefixed hex or decimal.\nOne breakpoint can have several locations (generic instantiations, inlined \
          copies); it stops at each, and is listed, disabled and deleted as one. Prints 'breakpoint <id> at \
@@ -315,6 +327,50 @@ mod tests
         );
         assert!(parse_location("").is_err());
         assert!(parse_location("*").is_err());
+    }
+
+    /// Issue #109: `file:line:column` sets the same breakpoint as `file:line`.
+    #[test]
+    fn a_column_suffix_is_ignored()
+    {
+        assert_eq!(parse_location("main.rs:12:5"), parse_location("main.rs:12"));
+        assert_eq!(
+            parse_location("src/main.rs:12:5"),
+            Ok(BreakpointLocation::Line {
+                file: "src/main.rs".into(),
+                line: 12
+            })
+        );
+        assert_eq!(
+            parse_location("my_crate::parse:7:1"),
+            Ok(BreakpointLocation::Line {
+                file: "my_crate::parse".into(),
+                line: 7
+            })
+        );
+    }
+
+    /// Issue #109: a relative path that starts with a digit is a file, not an address;
+    /// a bare number is still an address.
+    #[test]
+    fn a_path_starting_with_a_digit_is_a_file()
+    {
+        assert_eq!(
+            parse_location("2024/x.rs:3"),
+            Ok(BreakpointLocation::Line {
+                file: "2024/x.rs".into(),
+                line: 3
+            })
+        );
+        assert_eq!(
+            parse_location("2024/x.rs:3:9"),
+            Ok(BreakpointLocation::Line {
+                file: "2024/x.rs".into(),
+                line: 3
+            })
+        );
+        assert_eq!(parse_location("4096"), Ok(BreakpointLocation::Address(Address::new(4096))));
+        assert!(parse_location("2024/x.rs").is_err(), "no line: not a function, not an address");
     }
 
     #[test]

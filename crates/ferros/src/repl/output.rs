@@ -71,11 +71,18 @@ pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
     }
 }
 
-/// `<line>  <text>` for the source line of `position`, when its file can be read and
-/// has that line. Trailing whitespace is dropped.
+/// `<line>  <text>` for the source line of `position`, when its file is an absolute path
+/// that can be read and has that line. Trailing whitespace is dropped.
+///
+/// A relative path in debug info (std's `library/...`, a relative compilation directory)
+/// is relative to the build, not to ferros's current directory, so reading it here could
+/// print a line of an unrelated file; no source text is shown for it.
 pub fn source_line(position: &SourcePosition) -> Option<String>
 {
     let (file, line) = (position.file.as_ref()?, position.line?);
+    if !std::path::Path::new(file).is_absolute() {
+        return None;
+    }
     let text = std::fs::read_to_string(file).ok()?;
     let source = text.lines().nth(usize::try_from(line).ok()?.checked_sub(1)?)?;
     Some(format!("{line}  {}", source.trim_end()))
@@ -147,6 +154,29 @@ pub fn hexdump(start: Address, bytes: &[u8]) -> String
 mod tests
 {
     use super::*;
+
+    fn position(file: String, line: u32) -> SourcePosition
+    {
+        SourcePosition {
+            function: None,
+            file: Some(file),
+            line: Some(line),
+        }
+    }
+
+    /// Issue #109: an absolute path is read; the same file named by a path relative to
+    /// the current directory is not, so a relative debug-info path never shows text.
+    #[test]
+    fn source_text_only_for_absolute_paths()
+    {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let absolute = format!("{manifest}/Cargo.toml");
+        assert_eq!(source_line(&position(absolute, 1)).as_deref(), Some("1  [package]"));
+        // The test runs in the crate directory, where this relative path exists.
+        assert!(std::path::Path::new("Cargo.toml").exists());
+        assert_eq!(source_line(&position("Cargo.toml".into(), 1)), None);
+        assert_eq!(source_line(&position("library/core/src/num/mod.rs".into(), 1)), None);
+    }
 
     #[test]
     fn hexdump_formats_full_and_partial_rows()

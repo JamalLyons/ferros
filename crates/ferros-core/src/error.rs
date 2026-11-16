@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 use crate::backend::BackendError;
+use crate::symbols::SourceLookupError;
 
 /// Main error type for debugger operations
 ///
@@ -283,6 +284,12 @@ pub enum DebuggerError
     /// variant keep working.
     #[error(transparent)]
     Backend(BackendError),
+
+    /// A source location or function name could not be translated to addresses: an
+    /// unknown or ambiguous file or function, a line with no code, or unreadable debug
+    /// info. The [`SourceLookupError`] is kept as is, so callers can match on it.
+    #[error(transparent)]
+    SourceLookup(#[from] SourceLookupError),
 }
 
 impl From<BackendError> for DebuggerError

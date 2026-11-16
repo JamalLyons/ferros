@@ -6,7 +6,9 @@
 
 use std::fmt::Write as _;
 
-use ferros_core::{Address, Architecture, Registers, Session, StopEvent};
+use ferros_core::{Address, Architecture, Registers, Session, SourcePosition, StopEvent};
+
+use super::commands::describe_position;
 
 /// Bytes shown by `memory` when no length is given.
 pub const DEFAULT_MEMORY_LEN: usize = 64;
@@ -14,23 +16,41 @@ pub const DEFAULT_MEMORY_LEN: usize = 64;
 /// Bytes per hexdump row.
 pub const HEXDUMP_ROW: usize = 16;
 
-/// One line describing `event`.
+/// The lines describing `event`.
 ///
-/// For a breakpoint stop the breakpoint's id is looked up in the session's table; a
-/// single-step stop reads the stepped thread's pc. Both reads are best effort.
+/// A breakpoint stop names the logical breakpoint, then, when known, the function and
+/// `file:line` of the stop on a second line and that source line's text on a third (when
+/// the file is readable). A single-step stop reads the stepped thread's pc. Every lookup
+/// is best effort.
 pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
 {
     match event {
         StopEvent::Breakpoint { thread, pc } => {
-            let id = session
-                .breakpoints()
-                .iter()
-                .find(|info| info.address == *pc)
-                .map(|info| info.id.raw());
-            match id {
-                Some(id) => format!("stopped: breakpoint {id} at {:#x} (thread {})", pc.value(), thread.raw()),
-                None => format!("stopped: trap at {:#x} (thread {})", pc.value(), thread.raw()),
+            let hit = session.breakpoint_hit().filter(|hit| hit.site.address == *pc);
+            let (head, position) = match hit {
+                Some(hit) => (
+                    format!(
+                        "stopped: breakpoint {} at {:#x} (thread {})",
+                        hit.id.raw(),
+                        pc.value(),
+                        thread.raw()
+                    ),
+                    hit.site.position,
+                ),
+                None => (
+                    format!("stopped: trap at {:#x} (thread {})", pc.value(), thread.raw()),
+                    session.source_position(*pc).unwrap_or_default(),
+                ),
+            };
+            let mut text = head;
+            let described = describe_position(&position);
+            if !described.is_empty() {
+                let _ = write!(text, "\n  {described}");
             }
+            if let Some(source) = source_line(&position) {
+                let _ = write!(text, "\n  {source}");
+            }
+            text
         }
         StopEvent::SingleStep { thread } => match session.read_registers_for(*thread) {
             Ok(registers) => format!("stopped: step at {:#x} (thread {})", registers.pc.value(), thread.raw()),
@@ -49,6 +69,16 @@ pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
         },
         other => format!("stopped: {other:?}"),
     }
+}
+
+/// `<line>  <text>` for the source line of `position`, when its file can be read and
+/// has that line. Trailing whitespace is dropped.
+pub fn source_line(position: &SourcePosition) -> Option<String>
+{
+    let (file, line) = (position.file.as_ref()?, position.line?);
+    let text = std::fs::read_to_string(file).ok()?;
+    let source = text.lines().nth(usize::try_from(line).ok()?.checked_sub(1)?)?;
+    Some(format!("{line}  {}", source.trim_end()))
 }
 
 /// The registers of one thread, one per line: `pc`, `sp`, `fp`, `lr` and `cpsr`, then

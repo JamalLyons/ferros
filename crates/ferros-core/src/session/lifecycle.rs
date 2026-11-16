@@ -49,6 +49,7 @@ impl Session
         let pid = self.backend.launch(spec)?;
         self.begin_process(pid);
         self.ownership = Some(ProcessOwnership::Launched);
+        self.resolve_logical_breakpoints();
         Ok(pid)
     }
 
@@ -66,6 +67,7 @@ impl Session
         self.backend.attach(pid)?;
         self.begin_process(pid);
         self.ownership = Some(ProcessOwnership::Attached);
+        self.resolve_logical_breakpoints();
         Ok(())
     }
 
@@ -345,6 +347,7 @@ impl Session
             StopEvent::Breakpoint { thread, pc } => {
                 let pc = arch::for_architecture(self.backend.architecture()).map_or(pc, |arch| arch.pc_after_trap(pc));
                 self.breakpoints.record_hit(pc);
+                self.record_logical_hit(pc);
                 StopEvent::Breakpoint { thread, pc }
             }
             other => other,

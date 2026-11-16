@@ -70,6 +70,7 @@
 mod breakpoints;
 mod images;
 mod lifecycle;
+mod location;
 mod stack;
 mod stepping;
 #[cfg(test)]
@@ -77,6 +78,8 @@ mod tests;
 
 use std::time::{Duration, Instant};
 
+pub use self::breakpoints::{BreakpointHit, LogicalBreakpoint, LogicalBreakpointId};
+pub use self::location::{BreakpointLocation, BreakpointSite, SourcePosition};
 use crate::backend::{Backend, StopEvent};
 use crate::breakpoints::BreakpointStore;
 use crate::error::{DebuggerError, Result};
@@ -125,6 +128,10 @@ pub struct Session
     /// sequence that another event cut short; the next `resume_with_signal` passes them.
     carried_signals: Vec<(ThreadId, i32)>,
     breakpoints: BreakpointStore,
+    /// Logical breakpoints, ordered by id; their sites live in `breakpoints`.
+    logical: Vec<LogicalBreakpoint>,
+    /// Number of the last logical breakpoint id handed out.
+    next_logical: u64,
     symbols: SymbolCache,
     /// Live executable mappings and their symbol-loading state.
     loaded_images: Vec<images::SessionImage>,
@@ -279,6 +286,8 @@ impl Session
             stale_step: None,
             carried_signals: Vec::new(),
             breakpoints: BreakpointStore::new(),
+            logical: Vec::new(),
+            next_logical: 0,
             symbols: SymbolCache::new(),
             loaded_images: Vec::new(),
             symbol_request: 0,
@@ -406,6 +415,7 @@ impl Session
         self.stale_step = None;
         self.carried_signals.clear();
         self.breakpoints.drain();
+        self.forget_logical_sites();
     }
 
     fn selected_or_error(&self) -> Result<ThreadId>

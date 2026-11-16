@@ -8,15 +8,104 @@
 //!
 //! Every mutation is all or nothing: if a memory access fails, the table is unchanged.
 
+//!
+//! # Logical breakpoints
+//!
+//! On top of that address table, [`Session::set_breakpoint`] adds a *logical* breakpoint
+//! for a [`BreakpointLocation`] (a source line, a function name or an address). One
+//! logical breakpoint can resolve to several addresses (*sites*: inlined copies, generic
+//! instantiations), and is listed, counted, disabled and deleted as one. Each site is a
+//! software breakpoint in the address table; several logical breakpoints at one address
+//! share its trap, which stays inserted while any of them is enabled.
+//!
+//! The address table does not record which logical breakpoint created an entry, so a
+//! caller should not mix [`Session::add_breakpoint`] / [`Session::remove_breakpoint`]
+//! with logical breakpoints at the same address: deleting the logical breakpoint removes
+//! the trap, and removing the trap leaves the logical breakpoint without it.
+//!
+//! A logical breakpoint set while there is no process is *pending*. Every source
+//! breakpoint is resolved again when a process is launched or attached, at its first stop,
+//! so it holds across runs; a failure leaves it pending with the reason. Address
+//! breakpoints mean nothing in another process and are deleted when the process ends.
+
 use std::time::SystemTime;
 
 use super::Session;
+use super::location::{BreakpointLocation, BreakpointSite};
 use crate::arch::{self, Arch};
 use crate::backend::BackendError;
 use crate::breakpoints::{
     BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
 };
 use crate::error::{DebuggerError, Result};
+use crate::types::Address;
+
+/// Identifier of a logical breakpoint (see [`Session::set_breakpoint`]). Numbered from 1,
+/// separately from the ids of the address table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LogicalBreakpointId(u64);
+
+impl LogicalBreakpointId
+{
+    /// An identifier from its number.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self
+    {
+        Self(value)
+    }
+
+    /// The number.
+    #[must_use]
+    pub const fn raw(self) -> u64
+    {
+        self.0
+    }
+}
+
+/// A logical breakpoint: one requested location and every address it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalBreakpoint
+{
+    /// Its identifier.
+    pub id: LogicalBreakpointId,
+    /// What was asked for.
+    pub location: BreakpointLocation,
+    /// Whether its sites trap.
+    pub enabled: bool,
+    /// Stops at any of its sites while it was enabled, over every run.
+    pub hit_count: u64,
+    /// The addresses it resolved to in the current process, sorted. Empty while pending.
+    pub sites: Vec<BreakpointSite>,
+    /// Why it has no sites: `None` once resolved in the current process, otherwise the
+    /// reason (no process yet, or the lookup error of the last attempt).
+    pub pending: Option<String>,
+}
+
+impl LogicalBreakpoint
+{
+    /// Its site at `address`, if it has one.
+    #[must_use]
+    pub fn site_at(&self, address: Address) -> Option<&BreakpointSite>
+    {
+        self.sites.iter().find(|site| site.address == address)
+    }
+}
+
+/// A stop at a logical breakpoint, as returned by [`Session::breakpoint_hit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointHit
+{
+    /// The logical breakpoint that stopped the program.
+    pub id: LogicalBreakpointId,
+    /// The thread that hit it.
+    pub thread: crate::types::ThreadId,
+    /// The site it stopped at: its address, function and source line, exactly as the
+    /// breakpoint reported them when it was resolved.
+    pub site: BreakpointSite,
+}
+
+/// Pending reason of a breakpoint set while there is no process.
+const NO_PROCESS: &str = "the program is not running";
 
 impl Session
 {
@@ -275,6 +364,290 @@ impl Session
         for entry in updates {
             if let Some(stored) = self.breakpoints.get_mut(entry.info.id) {
                 *stored = entry;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Session
+{
+    /// Add a logical breakpoint at `location` and insert a trap at each of its sites.
+    ///
+    /// With a stopped process the location is resolved now (see the
+    /// [`location`](super::location) module) and an error adds nothing. With no process,
+    /// a source location is kept pending and resolved when one is launched or attached.
+    ///
+    /// # Errors
+    ///
+    /// [`DebuggerError::NotStopped`] while running; [`DebuggerError::NotAttached`] for an
+    /// address with no process; [`DebuggerError::SourceLookup`] for an unknown or
+    /// ambiguous file or function, or a line with no code at or after it; the main image's
+    /// symbol-loading error; or an error inserting a trap (as for
+    /// [`add_breakpoint`](Self::add_breakpoint); traps already inserted are removed).
+    pub fn set_breakpoint(&mut self, location: BreakpointLocation) -> Result<LogicalBreakpointId>
+    {
+        let (sites, pending) = match self.state {
+            super::SessionState::Running => return Err(DebuggerError::NotStopped),
+            super::SessionState::Stopped => {
+                let sites = self.resolve_location(&location)?;
+                self.insert_sites(&sites)?;
+                (sites, None)
+            }
+            super::SessionState::NotStarted | super::SessionState::Exited => {
+                if matches!(location, BreakpointLocation::Address(_)) {
+                    return Err(DebuggerError::NotAttached);
+                }
+                (Vec::new(), Some(NO_PROCESS.to_owned()))
+            }
+        };
+        self.next_logical = self.next_logical.wrapping_add(1);
+        let id = LogicalBreakpointId(self.next_logical);
+        self.logical.push(LogicalBreakpoint {
+            id,
+            location,
+            enabled: true,
+            hit_count: 0,
+            sites,
+            pending,
+        });
+        Ok(id)
+    }
+
+    /// Delete a logical breakpoint, removing the traps no other logical breakpoint uses.
+    ///
+    /// # Errors
+    ///
+    /// [`DebuggerError::NotStopped`] while running, [`DebuggerError::BreakpointIdNotFound`]
+    /// for an unknown id, or an error restoring a trap (the breakpoint is then kept).
+    pub fn delete_breakpoint(&mut self, id: LogicalBreakpointId) -> Result<()>
+    {
+        self.require_not_running()?;
+        let index = self.logical_index(id)?;
+        // Also for a disabled breakpoint: a trap entry it shared with breakpoints since
+        // deleted must not outlive the last of them.
+        let addresses = self.site_addresses(index);
+        self.release_sites(id, &addresses)?;
+        self.logical.remove(index);
+        Ok(())
+    }
+
+    /// Enable a logical breakpoint: insert the traps of its sites, resolving it first if
+    /// it is pending and there is a process. Enabling an enabled breakpoint does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DebuggerError::NotStopped`] while running, [`DebuggerError::BreakpointIdNotFound`]
+    /// for an unknown id, the lookup error of a pending breakpoint, or an error inserting
+    /// a trap; the breakpoint then stays disabled.
+    pub fn enable_logical_breakpoint(&mut self, id: LogicalBreakpointId) -> Result<()>
+    {
+        self.require_not_running()?;
+        let index = self.logical_index(id)?;
+        if self.logical[index].enabled {
+            return Ok(());
+        }
+        if self.state == super::SessionState::Stopped {
+            let sites = if self.logical[index].pending.is_some() {
+                let location = self.logical[index].location.clone();
+                self.resolve_location(&location)?
+            } else {
+                self.logical[index].sites.clone()
+            };
+            self.insert_sites(&sites)?;
+            let breakpoint = &mut self.logical[index];
+            breakpoint.sites = sites;
+            breakpoint.pending = None;
+        }
+        self.logical[index].enabled = true;
+        Ok(())
+    }
+
+    /// Disable a logical breakpoint: restore the traps no other enabled logical breakpoint
+    /// uses, keeping its sites. Disabling a disabled breakpoint does nothing.
+    ///
+    /// # Errors
+    ///
+    /// As for [`delete_breakpoint`](Self::delete_breakpoint); on a failed write the
+    /// breakpoint stays enabled.
+    pub fn disable_logical_breakpoint(&mut self, id: LogicalBreakpointId) -> Result<()>
+    {
+        self.require_not_running()?;
+        let index = self.logical_index(id)?;
+        if !self.logical[index].enabled {
+            return Ok(());
+        }
+        let addresses = self.site_addresses(index);
+        self.release_sites(id, &addresses)?;
+        self.logical[index].enabled = false;
+        Ok(())
+    }
+
+    /// Every logical breakpoint, ordered by id.
+    #[must_use]
+    pub fn logical_breakpoints(&self) -> &[LogicalBreakpoint]
+    {
+        &self.logical
+    }
+
+    /// The enabled logical breakpoint with the lowest id that has a site at `address`:
+    /// the one a breakpoint stop at `address` belongs to.
+    #[must_use]
+    pub fn logical_breakpoint_at(&self, address: Address) -> Option<&LogicalBreakpoint>
+    {
+        self.logical
+            .iter()
+            .find(|breakpoint| breakpoint.enabled && breakpoint.sites.iter().any(|site| site.address == address))
+    }
+
+    /// The logical breakpoint the last stop belongs to, when it was a breakpoint stop at
+    /// one of its sites.
+    #[must_use]
+    pub fn breakpoint_hit(&self) -> Option<BreakpointHit>
+    {
+        let crate::backend::StopEvent::Breakpoint { thread, pc } = self.last_stop.as_ref()? else {
+            return None;
+        };
+        let breakpoint = self.logical_breakpoint_at(*pc)?;
+        Some(BreakpointHit {
+            id: breakpoint.id,
+            thread: *thread,
+            site: breakpoint.site_at(*pc)?.clone(),
+        })
+    }
+
+    /// Count a breakpoint stop at `address` for every enabled logical breakpoint there.
+    pub(super) fn record_logical_hit(&mut self, address: Address)
+    {
+        for breakpoint in &mut self.logical {
+            if breakpoint.enabled && breakpoint.sites.iter().any(|site| site.address == address) {
+                breakpoint.hit_count = breakpoint.hit_count.saturating_add(1);
+            }
+        }
+    }
+
+    /// The process ended: address breakpoints are deleted, the others become pending.
+    pub(super) fn forget_logical_sites(&mut self)
+    {
+        self.logical
+            .retain(|breakpoint| !matches!(breakpoint.location, BreakpointLocation::Address(_)));
+        for breakpoint in &mut self.logical {
+            breakpoint.sites.clear();
+            breakpoint.pending = Some(NO_PROCESS.to_owned());
+        }
+    }
+
+    /// Resolve every logical breakpoint in a new process at its first stop. A failure
+    /// leaves that breakpoint pending with the reason; it never fails the launch.
+    pub(super) fn resolve_logical_breakpoints(&mut self)
+    {
+        for index in 0..self.logical.len() {
+            let location = self.logical[index].location.clone();
+            let resolved = self.resolve_location(&location).and_then(|sites| {
+                if self.logical[index].enabled {
+                    self.insert_sites(&sites)?;
+                }
+                Ok(sites)
+            });
+            let breakpoint = &mut self.logical[index];
+            match resolved {
+                Ok(sites) => {
+                    breakpoint.sites = sites;
+                    breakpoint.pending = None;
+                }
+                Err(error) => {
+                    tracing::debug!("breakpoint {} at {} stays pending: {error}", breakpoint.id.raw(), location);
+                    breakpoint.sites.clear();
+                    breakpoint.pending = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn require_not_running(&self) -> Result<()>
+    {
+        if self.state == super::SessionState::Running {
+            Err(DebuggerError::NotStopped)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn logical_index(&self, id: LogicalBreakpointId) -> Result<usize>
+    {
+        self.logical
+            .iter()
+            .position(|breakpoint| breakpoint.id == id)
+            .ok_or(DebuggerError::BreakpointIdNotFound(id.raw()))
+    }
+
+    fn site_addresses(&self, index: usize) -> Vec<Address>
+    {
+        self.logical[index].sites.iter().map(|site| site.address).collect()
+    }
+
+    /// Insert (or re-enable) a trap at every site. All or nothing: on an error, the traps
+    /// this call inserted or enabled are taken out again.
+    fn insert_sites(&mut self, sites: &[BreakpointSite]) -> Result<()>
+    {
+        let mut added = Vec::new();
+        let mut enabled = Vec::new();
+        let mut result = Ok(());
+        for site in sites {
+            match self.breakpoints.id_for_kind(site.address, BreakpointKind::Software) {
+                Some(id) if self.breakpoints.info(id).is_some_and(|info| info.enabled) => {}
+                Some(id) => match self.enable_breakpoint(id) {
+                    Ok(()) => enabled.push(id),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                },
+                None => match self.add_breakpoint(BreakpointRequest::Software { address: site.address }) {
+                    Ok(id) => added.push(id),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                },
+            }
+        }
+        if result.is_err() {
+            for id in added {
+                let _ = self.remove_breakpoint(id);
+            }
+            for id in enabled {
+                let _ = self.disable_breakpoint(id);
+            }
+        }
+        result
+    }
+
+    /// Take out the traps at `addresses` that no enabled logical breakpoint other than
+    /// `owner` uses: removed when no other logical breakpoint has a site there, otherwise
+    /// disabled.
+    fn release_sites(&mut self, owner: LogicalBreakpointId, addresses: &[Address]) -> Result<()>
+    {
+        for &address in addresses {
+            let others = self
+                .logical
+                .iter()
+                .filter(|breakpoint| breakpoint.id != owner && breakpoint.sites.iter().any(|site| site.address == address));
+            let (mut shared, mut enabled) = (false, false);
+            for other in others {
+                shared = true;
+                enabled |= other.enabled;
+            }
+            if enabled {
+                continue;
+            }
+            let Some(id) = self.breakpoints.id_for_kind(address, BreakpointKind::Software) else {
+                continue;
+            };
+            if shared {
+                self.disable_breakpoint(id)?;
+            } else {
+                self.remove_breakpoint(id)?;
             }
         }
         Ok(())

@@ -19,9 +19,10 @@
 //!
 //! # Unreadable debug info
 //!
-//! A compilation unit whose header, root entry, line program or rows cannot be parsed is
-//! skipped, and the index is built from every other unit; sequences of the unit that were
-//! complete before the error are kept. If the list of unit headers itself cannot be read
+//! A compilation unit whose header, root entry or line-program header cannot be parsed is
+//! skipped whole (reported as `unit: ...`). When the rows of its line program stop parsing,
+//! the rest of that program is skipped (reported as `line program: ...`) and the sequences
+//! completed before the error are kept. The index is built from every other unit. If the list of unit headers itself cannot be read
 //! past some point, later units cannot be located and indexing stops there. Each skip is
 //! recorded as a [`SkippedDebugInfo`], logged as a `tracing` warning, and reported by
 //! [`BinaryImage::skipped_debug_info`], so a caller that gets
@@ -130,6 +131,7 @@ pub enum SourceLookupError
 /// Debug info that was skipped, because it could not be parsed, while building an image's
 /// line or function index, as returned by [`BinaryImage::skipped_debug_info`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub struct SkippedDebugInfo
 {
     /// `.debug_info` offset of the compilation unit that was skipped (or that contains the

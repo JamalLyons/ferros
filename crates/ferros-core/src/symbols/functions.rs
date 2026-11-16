@@ -39,7 +39,9 @@
 //!
 //! # Unreadable debug info
 //!
-//! A compilation unit whose header or root entry cannot be parsed is skipped; a DIE whose
+//! A compilation unit whose header, root entry or line-program header cannot be parsed is
+//! skipped (`gimli` reads the line-program header while loading the unit, so such a unit is
+//! lost to this index too, although functions need no line program); a DIE whose
 //! attributes, strings or range list cannot be read is skipped alone; when the DIE tree
 //! itself cannot be walked further, the rest of that unit is skipped. Every other unit is
 //! still indexed, and each skip is recorded and reported as for the line index (see
@@ -330,7 +332,11 @@ fn resolve_name(names: &HashMap<usize, DieName>, offset: usize) -> Option<String
     let mut next = Some(offset);
     // A short bound guards against reference cycles in malformed DWARF.
     for _ in 0..8 {
-        let die = names.get(&next?)?;
+        // The chain ends at a DIE without a reference, or at one that was not indexed (in a
+        // skipped unit, for example); a name found on the way is still used.
+        let Some(die) = next.and_then(|offset| names.get(&offset)) else {
+            break;
+        };
         if let Some(linkage) = &die.linkage {
             return Some(rustc_demangle::try_demangle(linkage).map_or_else(|_| linkage.clone(), |name| format!("{name:#}")));
         }
@@ -705,6 +711,29 @@ mod tests
         assert_eq!(found("with_entry_pc"), (0x4008, 0x4020));
         assert_eq!(found("stripped"), (0x6100, 0x6110));
         assert_eq!(index.starts(), &[0x3000, 0x4008, 0x6100]);
+    }
+
+    /// A function with no linkage name is named by its scoped `DW_AT_name`, also when the
+    /// DIE it refers to was not indexed (it is in a skipped unit).
+    #[test]
+    fn a_name_without_linkage_survives_a_missing_reference()
+    {
+        let die = |scoped: Option<&str>, reference| DieName {
+            linkage: None,
+            scoped: scoped.map(str::to_owned),
+            reference,
+        };
+        let names = HashMap::from([
+            (0x10, die(Some("ns::plain"), None)),
+            (0x20, die(Some("ns::dangling"), Some(0x999))),
+            (0x30, die(None, Some(0x10))),
+            (0x40, die(None, None)),
+        ]);
+        assert_eq!(resolve_name(&names, 0x10).as_deref(), Some("ns::plain"));
+        assert_eq!(resolve_name(&names, 0x20).as_deref(), Some("ns::dangling"));
+        assert_eq!(resolve_name(&names, 0x30).as_deref(), Some("ns::plain"));
+        assert_eq!(resolve_name(&names, 0x40), None);
+        assert_eq!(resolve_name(&names, 0x50), None);
     }
 
     fn path(name: &str) -> Option<String>

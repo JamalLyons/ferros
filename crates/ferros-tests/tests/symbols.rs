@@ -353,13 +353,15 @@ fn lookup_errors_are_typed()
     let zero = image.line_addresses("fixtures/symbols.rs", 0);
     assert!(matches!(zero, Err(SourceLookupError::InvalidLine { line: 0 })), "{zero:?}");
 
-    // Inlined standard-library code puts several distinct `mod.rs` files in the tables.
-    let ambiguous = image.line_addresses("mod.rs", 1);
+    // The fixture has two `twin.rs` files (`symbols/left/` and `symbols/right/`). Standard
+    // library file names are not used: their paths depend on how the toolchain was built.
+    let ambiguous = image.line_addresses("twin.rs", 1);
     let Err(SourceLookupError::AmbiguousFile { candidates, .. }) = ambiguous else {
         panic!("expected AmbiguousFile: {ambiguous:?}");
     };
-    assert!(candidates.len() >= 2, "{candidates:?}");
-    assert!(candidates.iter().all(|path| path.ends_with("/mod.rs")), "{candidates:?}");
+    assert_eq!(candidates.len(), 2, "{candidates:?}");
+    assert!(candidates[0].ends_with("symbols/left/twin.rs"), "{candidates:?}");
+    assert!(candidates[1].ends_with("symbols/right/twin.rs"), "{candidates:?}");
     assert!(
         candidates.windows(2).all(|pair| pair[0] < pair[1]),
         "sorted and distinct: {candidates:?}"
@@ -468,7 +470,7 @@ const TIMED_FUNCTION_QUERIES: &[&str] = &[
     "shapes::area",
     "ferros_fixture_symbols::shapes::area",
     "with_gap",
-    "fmt",
+    "twin",
     "no_such_function",
 ];
 
@@ -665,14 +667,18 @@ fn function_lookup_errors_are_typed()
         );
     }
 
-    // The standard library code in the fixture's DWARF has many `fmt` implementations.
-    let ambiguous = image.function_addresses("fmt");
+    // The fixture defines `left::twin` and `right::twin`. Standard library names are not
+    // used: which of them have DWARF depends on how the toolchain was built.
+    let ambiguous = image.function_addresses("twin");
     let Err(SourceLookupError::AmbiguousFunction { query, candidates }) = ambiguous else {
         panic!("expected AmbiguousFunction: {ambiguous:?}");
     };
-    assert_eq!(query, "fmt");
-    assert!(candidates.len() >= 2, "{candidates:?}");
-    assert!(candidates.iter().all(|path| path.ends_with("::fmt")), "{candidates:?}");
+    assert_eq!(query, "twin");
+    assert_eq!(
+        candidates,
+        ["ferros_fixture_symbols::left::twin", "ferros_fixture_symbols::right::twin"],
+        "{candidates:?}"
+    );
     assert!(
         candidates.windows(2).all(|pair| pair[0] < pair[1]),
         "sorted and distinct: {candidates:?}"

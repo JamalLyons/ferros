@@ -32,8 +32,9 @@ The crate defines fourteen fixture binaries:
   carried-signal delivery, and to keep attached workers alive throughout teardown checks.
 - `ferros-fixture-symbols`: Source-lookup targets read from its dSYM without a process: a generic
   function instantiated twice, an inherent method, a function in a module, an `#[inline(always)]`
-  function inlined at two call sites (markers `call_inlined_first`, `call_inlined_second`), and a
-  comment-only line before marker `after_gap`.
+  function inlined at two call sites (markers `call_inlined_first`, `call_inlined_second`), a
+  comment-only line before marker `after_gap`, and two `twin` functions in two `twin.rs` files
+  (`fixtures/symbols/left/`, `fixtures/symbols/right/`) for ambiguous name and file queries.
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).

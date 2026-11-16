@@ -9,12 +9,17 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines thirteen fixture binaries:
+The crate defines fourteen fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
 - `ferros-fixture-loop_counter`: Iterates a counter in a loop with small sleeps, printing the final count.
 - `ferros-fixture-nested_calls`: Executes nested non-inlined function calls and prints the computed result.
+  Markers `call_a`, `call_b` and `call_c` sit on the call lines, for backtrace call-site checks.
+  `leaf_mix` is a frameless leaf (compact unwind `MODE_FRAMELESS`, no `__eh_frame` FDE) called
+  from `main` at marker `call_leaf`.
+- `ferros-fixture-recursion`: `descend` recurses to the depth given by the first argument (default 60);
+  marker `bottom` is reached at the deepest call. Used for deep backtraces.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
 - `ferros-fixture-signal_tracing`: Keeps two threads alive and acknowledges SIGUSR1 through
   files in a test-owned directory (macOS).
@@ -27,7 +32,8 @@ The crate defines thirteen fixture binaries:
   carried-signal delivery, and to keep attached workers alive throughout teardown checks.
 - `ferros-fixture-symbols`: Source-lookup targets read from its dSYM without a process: a generic
   function instantiated twice, an inherent method, a function in a module, an `#[inline(always)]`
-  function inlined at two call sites, and a comment-only line before marker `after_gap`.
+  function inlined at two call sites (markers `call_inlined_first`, `call_inlined_second`), and a
+  comment-only line before marker `after_gap`.
 - `ferros-fixture-threads`: Spawns two named worker threads synchronized with a barrier. An optional
   first argument keeps the process running that many milliseconds after both workers exit; a second
   sets the worker sleep duration (default 50 milliseconds).
@@ -133,6 +139,11 @@ fn resume_runs_hello()
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
   executable's Mach-O symbol table (no DWARF) and translates through the Session image mapping.
+- `tests/backtrace.rs` covers `Session::stack_trace` and the `backtrace`/`bt` command (issue #38):
+  call-site lines from the `nested_calls` `call_*` markers, a stop on a function's first instruction,
+  a spawned thread's trace ending at its base, a 60-level `recursion` trace under one second, and
+  every frame pc in an executable region, an inlined frame in `symbols`, and a stop inside the
+  frameless `leaf_mix`.
 - `tests/code_writes.rs` checks that code the backend writes is what the target executes next
   (issue #80): a `brk` planted over an instruction the `hot_loop` threads have cached stops them.
 - `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit

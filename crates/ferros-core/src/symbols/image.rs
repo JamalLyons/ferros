@@ -424,6 +424,8 @@ pub struct BinaryImage
     eh_frame: Option<SectionBlob>,
     eh_frame_hdr: Option<SectionBlob>,
     debug_frame: Option<SectionBlob>,
+    /// `__TEXT,__unwind_info` (Mach-O compact unwind) of the executable.
+    unwind_info: Option<SectionBlob>,
     dwarf_cache: OnceCell<OwnedDwarf>,
     /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
@@ -471,6 +473,7 @@ impl BinaryImage
         let eh_frame = load_section_blob(&file, &[".eh_frame", "__eh_frame"])?;
         let eh_frame_hdr = load_section_blob(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?;
         let debug_frame = load_section_blob(&debug_file, &[".debug_frame", "__debug_frame"])?;
+        let unwind_info = load_section_blob(&file, &["__unwind_info"])?;
 
         Ok(Self {
             id: ImageId::from_parts(&desc.path, desc.load_address),
@@ -482,6 +485,7 @@ impl BinaryImage
             eh_frame,
             eh_frame_hdr,
             debug_frame,
+            unwind_info,
             dwarf_cache: OnceCell::new(),
             context_cache: OnceCell::new(),
             type_cache: RwLock::new(HashMap::new()),
@@ -542,6 +546,11 @@ impl BinaryImage
     pub(crate) fn debug_frame_section(&self) -> Option<(u64, &[u8])>
     {
         self.debug_frame.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
+    }
+
+    pub(crate) fn unwind_info_section(&self) -> Option<&[u8]>
+    {
+        self.unwind_info.as_ref().map(|blob| blob.data.as_ref())
     }
 
     /// Get the unique identifier for this image.

@@ -7,6 +7,7 @@
 //! ## Module Structure
 //!
 //! - **`cache`**: Symbol cache for binary images and address symbolication
+//! - **`compact_unwind`**: Lookup in Mach-O `__unwind_info` (used by `unwind`)
 //! - **`demangle`**: Symbol demangling utilities (Rust, C++)
 //! - **`extractor`**: DWARF type extraction and introspection
 //! - **`functions`**: Function index: function name to entry and post-prologue addresses
@@ -32,6 +33,7 @@
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
 pub mod cache;
+pub(crate) mod compact_unwind;
 pub mod debuginfo;
 pub mod demangle;
 pub mod extractor;

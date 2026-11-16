@@ -1,22 +1,38 @@
 //! Stack traces and symbolication.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
 use super::Session;
 use crate::backend::Backend;
 use crate::error::{DebuggerError, Result};
 use crate::symbols::Symbolication;
 use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
-use crate::types::{Address, StackFrame};
+use crate::types::{Address, MemoryRegion, StackFrame};
 
 /// [`MemoryAccess`] over a backend.
 ///
 /// The unwinder reads through `&self` while [`Backend::read_memory`] needs `&mut`, so the
 /// borrow is kept in a `RefCell`. The unwinder never reads re-entrantly, so the borrow
 /// never conflicts.
+///
+/// Executable regions are listed once per trace, on the first question, so a trace that
+/// never needs them (a single frame) does not ask the backend. A backend that cannot list
+/// regions answers every address as executable.
 struct BackendMemory<'a>
 {
     backend: RefCell<&'a mut dyn Backend>,
+    executable: OnceCell<Option<Vec<MemoryRegion>>>,
+}
+
+impl<'a> BackendMemory<'a>
+{
+    fn new(backend: &'a mut dyn Backend) -> Self
+    {
+        Self {
+            backend: RefCell::new(backend),
+            executable: OnceCell::new(),
+        }
+    }
 }
 
 impl MemoryAccess for BackendMemory<'_>
@@ -33,11 +49,34 @@ impl MemoryAccess for BackendMemory<'_>
         })?;
         Ok(u64::from_le_bytes(bytes))
     }
+
+    fn is_executable(&self, address: Address) -> bool
+    {
+        let regions = self.executable.get_or_init(|| {
+            let regions = self.backend.borrow_mut().memory_regions().ok()?;
+            Some(
+                regions
+                    .into_iter()
+                    .filter(|region| region.permissions.contains('x'))
+                    .collect(),
+            )
+        });
+        regions
+            .as_ref()
+            .is_none_or(|regions| regions.iter().any(|region| region.start <= address && address < region.end))
+    }
 }
 
 impl Session
 {
-    /// Unwind the selected thread's stack, at most `max_frames` frames, innermost first.
+    /// Unwind the selected thread's stack, at most `max_frames` logical frames (inlined
+    /// frames included), innermost first.
+    ///
+    /// The unwind sources and their order are described in
+    /// [`symbols::unwind`](crate::symbols::unwind). Every frame's pc lies in executable
+    /// memory as the backend reports it ([`Backend::memory_regions`]); the trace ends at
+    /// the thread's base instead of guessing. Caller frames are symbolicated at their call
+    /// instruction, so their line is the call site.
     ///
     /// The backend's images are loaded into the symbol cache first (see
     /// [`images`](Self::images)); frames in images that could not be loaded have no
@@ -47,7 +86,8 @@ impl Session
     ///
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, [`DebuggerError::NoThreadSelected`] if the process has no
-    /// thread, or an error from the backend or the unwinder.
+    /// thread, [`DebuggerError::Backend`] with `Unsupported` for an architecture without
+    /// an [`Arch`](crate::arch::Arch), or an error from the backend.
     pub fn stack_trace(&mut self, max_frames: usize) -> Result<Vec<StackFrame>>
     {
         self.require_stopped()?;
@@ -58,7 +98,7 @@ impl Session
 
         // Missing symbols never prevent returning raw stack frames.
         self.load_symbols_for_frame(registers.pc);
-        let architecture = self.backend.architecture();
+        let arch = self.arch()?;
         // Each pass repeats only after a successful load, which marks one live image as
         // loaded. Thus this loop terminates after at most the live image count, even when
         // a caller's newly available CFI reveals further images that the frame-pointer
@@ -66,14 +106,15 @@ impl Session
         // is read at most once per trace.
         loop {
             let frames = {
-                let memory = BackendMemory {
-                    backend: RefCell::new(self.backend.as_mut()),
-                };
-                StackUnwinder::new(architecture, &self.symbols, &memory).unwind(thread, &registers, max_frames)?
+                let memory = BackendMemory::new(self.backend.as_mut());
+                StackUnwinder::new(arch, &self.symbols, &memory).unwind(thread, &registers, max_frames)?
             };
             let mut added = false;
             for frame in &frames {
                 added |= self.load_symbols_for_frame(frame.pc);
+                // A caller is symbolicated at its call instruction, which can lie in the
+                // previous image when the call was the image's last instruction.
+                added |= self.load_symbols_for_frame(Address::new(frame.pc.value().saturating_sub(4)));
             }
             if !added {
                 return Ok(frames);

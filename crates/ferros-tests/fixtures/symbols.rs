@@ -15,6 +15,7 @@
 //! - `in_method`
 //! - `in_module`
 //! - `in_inlined`
+//! - `call_inlined_first`, `call_inlined_second` (the two calls of `always_inlined`)
 //! - `before_gap`
 //! - `after_gap`
 
@@ -78,8 +79,8 @@ fn main()
     let mut counter = Counter { count: 0 };
     let bumped = counter.bump();
     let area = shapes::area(3, 4);
-    let first = always_inlined(std::hint::black_box(10));
-    let second = always_inlined(std::hint::black_box(first));
+    let first = always_inlined(std::hint::black_box(10)); // BREAK: call_inlined_first
+    let second = always_inlined(std::hint::black_box(first)); // BREAK: call_inlined_second
     let gap = with_gap(5);
     let total = wide
         .wrapping_add(u64::from(narrow))

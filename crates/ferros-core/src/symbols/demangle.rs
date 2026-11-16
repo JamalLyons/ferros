@@ -50,7 +50,9 @@ use crate::types::{SymbolLanguage, SymbolName};
 /// ```
 pub(crate) fn make_symbol_name(raw: String) -> SymbolName
 {
-    let demangled = try_demangle(&raw).ok().map(|d| d.to_string());
+    // The alternate form leaves out crate disambiguators (`[e9e28b783c7f9d4c]`) and legacy
+    // `::h<hash>` suffixes, as the function index does.
+    let demangled = try_demangle(&raw).ok().map(|d| format!("{d:#}"));
     let language = if raw.starts_with("_R") || raw.starts_with("_ZN") || raw.contains("::") {
         SymbolLanguage::Rust
     } else if raw.starts_with("_Z") {

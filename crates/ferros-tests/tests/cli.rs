@@ -246,6 +246,151 @@ fn batch_file_runs_before_commands()
     });
 }
 
+/// A temporary directory removed when dropped.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir
+{
+    fn new(name: &str) -> Self
+    {
+        let path = std::env::temp_dir().join(format!("ferros-cli-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        Self(path)
+    }
+
+    /// Write `contents` to `name` in the directory and return its path.
+    fn file(&self, name: &str, contents: &str) -> std::path::PathBuf
+    {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+}
+
+impl Drop for TempDir
+{
+    fn drop(&mut self)
+    {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pipe mode (issue #95): the launched program reads `/dev/null`, not ferros's stdin. Both
+/// commands are written before the first reply, so a program sharing the pipe would take
+/// input meant for ferros or block reading it; instead ferros answers both and `read_line`
+/// sees end of file.
+#[test]
+fn pipe_mode_gives_the_program_an_empty_stdin()
+{
+    run(|t| {
+        let tag = t.tag();
+        let mut ferros = Interactive::launch(&tag, &fixture!("read_line"), &[]);
+        ferros.write_line("continue");
+        ferros.write_line("status");
+        let reply = ferros.read_reply();
+        assert_eq!(reply, "read: <eof>\nprocess exited with status 0\n", "{reply:?}");
+        let reply = ferros.read_reply();
+        assert_eq!(reply, "status: exited\n  process exited with status 0\n", "{reply:?}");
+        assert_eq!(ferros.stderr(), "");
+        let (status, rest) = ferros.finish();
+        assert!(status.success(), "{status}: {rest:?}");
+    });
+}
+
+/// `launch --stdin <file>` feeds the file to the program in pipe mode, while ferros keeps
+/// reading its commands from the pipe.
+#[test]
+fn stdin_option_feeds_the_file_to_the_program_in_pipe_mode()
+{
+    run(|t| {
+        let dir = TempDir::new("stdin-pipe");
+        let input = dir.file("input.txt", "line from the file\nsecond line\n");
+        let input = input.display().to_string();
+
+        let tag = t.tag();
+        let mut ferros = Interactive::launch_with_options(&tag, &fixture!("read_line"), &["--stdin", &input], &[]);
+        let reply = ferros.send("continue");
+        assert_eq!(reply, "read: line from the file\nprocess exited with status 0\n", "{reply:?}");
+        assert_eq!(ferros.stderr(), "");
+        let (status, rest) = ferros.finish();
+        assert!(status.success(), "{status}: {rest:?}");
+    });
+}
+
+/// `launch --stdin <file>` also overrides batch mode's inherited stdin, and `run`
+/// relaunches the program with the file opened again from its start.
+#[test]
+fn stdin_option_overrides_batch_stdin_and_is_reopened_by_run()
+{
+    run(|t| {
+        let dir = TempDir::new("stdin-batch");
+        let input = dir.file("input.txt", "line from the file\n");
+        let input = input.display().to_string();
+
+        let tag = t.tag();
+        let run = transcript::launch_batch_with(
+            &tag,
+            &fixture!("read_line"),
+            &["--stdin", &input],
+            &[],
+            &["continue", "run", "continue"],
+            Some(b"line from ferros stdin\n"),
+        );
+        assert!(run.status.success(), "status {}: {run:?}", run.status);
+        assert_eq!(
+            normalize(&run.stdout),
+            "launched process <pid>\n(ferros) continue\nread: line from the file\nprocess exited with status 0\n(ferros) \
+             run\nlaunched process <pid> (stopped at entry; address breakpoints were cleared)\n(ferros) continue\nread: \
+             line from the file\nprocess exited with status 0\n",
+            "{run:?}"
+        );
+        assert_eq!(run.stderr, "", "{run:?}");
+    });
+}
+
+/// A `--stdin` file that cannot be opened is reported before anything is launched.
+#[test]
+fn stdin_option_with_a_missing_file_fails_before_launching()
+{
+    run(|t| {
+        let dir = TempDir::new("stdin-missing");
+        let missing = dir.0.join("missing.txt").display().to_string();
+
+        let tag = t.tag();
+        let run =
+            transcript::launch_batch_with(&tag, &fixture!("read_line"), &["--stdin", &missing], &[], &["continue"], None);
+        assert_eq!(run.status.code(), Some(1), "{run:?}");
+        assert_eq!(run.stdout, "", "{run:?}");
+        assert!(run.stderr.starts_with(&format!("error: {missing}: ")), "{run:?}");
+        assert_eq!(harness::tagged_pids(tag.as_str()), Vec::<u32>::new());
+    });
+}
+
+/// Batch mode is unchanged by issue #95: ferros does not read stdin, so the program
+/// inherits it and reads what was piped into ferros.
+#[test]
+fn batch_mode_program_inherits_stdin()
+{
+    run(|t| {
+        let tag = t.tag();
+        let run = transcript::launch_batch_with(
+            &tag,
+            &fixture!("read_line"),
+            &[],
+            &[],
+            &["continue"],
+            Some(b"line from ferros stdin\n"),
+        );
+        assert!(run.status.success(), "status {}: {run:?}", run.status);
+        assert_eq!(
+            normalize(&run.stdout),
+            "launched process <pid>\n(ferros) continue\nread: line from ferros stdin\nprocess exited with status 0\n",
+            "{run:?}"
+        );
+        assert_eq!(run.stderr, "", "{run:?}");
+    });
+}
+
 /// `ferros --help` lists only the subcommands that work. Launches no fixture process, so
 /// it does not need the harness.
 #[test]

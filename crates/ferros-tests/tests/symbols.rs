@@ -28,6 +28,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("hot_loop"),
         fixture!("loop_counter"),
         fixture!("nested_calls"),
+        fixture!("read_line"),
         fixture!("recursion"),
         fixture!("signal_handler"),
         fixture!("signal_tracing"),

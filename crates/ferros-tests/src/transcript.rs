@@ -296,17 +296,48 @@ pub struct Transcript
 #[must_use]
 pub fn launch_batch(tag: &Tag, fixture: &Fixture, args: &[&str], commands: &[&str]) -> Transcript
 {
-    let options: Vec<String> = commands
+    launch_batch_with(tag, fixture, &[], args, commands, None)
+}
+
+/// [`launch_batch`] with extra `launch` `options` (such as `--stdin <file>`) before the
+/// `--command`s, and `stdin` written to a pipe on ferros's stdin and then closed (stdin is
+/// `/dev/null` when it is `None`).
+///
+/// # Panics
+///
+/// As for [`launch_batch`], or when `stdin` cannot be written.
+#[must_use]
+pub fn launch_batch_with(
+    tag: &Tag,
+    fixture: &Fixture,
+    options: &[&str],
+    args: &[&str],
+    commands: &[&str],
+    stdin: Option<&[u8]>,
+) -> Transcript
+{
+    let options: Vec<String> = options
         .iter()
-        .flat_map(|command| ["--command".to_owned(), (*command).to_owned()])
+        .map(|option| (*option).to_owned())
+        .chain(
+            commands
+                .iter()
+                .flat_map(|command| ["--command".to_owned(), (*command).to_owned()]),
+        )
         .collect();
     let mut child = Command::new(ferros_bin())
         .args(launch_args(tag, fixture, &options, args))
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("ferros-tests: cannot start {}: {err}", ferros_bin().display()));
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // Small enough for the pipe buffer, so this never waits for a reader; dropping
+        // `pipe` closes it.
+        pipe.write_all(bytes)
+            .unwrap_or_else(|err| panic!("ferros-tests: write stdin of ferros: {err}"));
+    }
     let stdout = Captured::spawn(child.stdout.take().expect("piped stdout"));
     let stderr = Captured::spawn(child.stderr.take().expect("piped stderr"));
     let Some(status) = wait_with_timeout(&mut child, COMMAND_TIMEOUT) else {
@@ -355,8 +386,21 @@ impl Interactive
     #[must_use]
     pub fn launch(tag: &Tag, fixture: &Fixture, args: &[&str]) -> Self
     {
+        Self::launch_with_options(tag, fixture, &[], args)
+    }
+
+    /// [`Interactive::launch`] with extra `launch` `options` before the program, such as
+    /// `--stdin <file>`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`Interactive::launch`].
+    #[must_use]
+    pub fn launch_with_options(tag: &Tag, fixture: &Fixture, options: &[&str], args: &[&str]) -> Self
+    {
+        let options: Vec<String> = options.iter().map(|option| (*option).to_owned()).collect();
         let mut child = Command::new(ferros_bin())
-            .args(launch_args(tag, fixture, &[], args))
+            .args(launch_args(tag, fixture, &options, args))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

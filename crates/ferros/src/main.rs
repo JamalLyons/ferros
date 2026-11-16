@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use ferros_core::backend::StdioSpec;
 use ferros_core::{LaunchSpec, ProcessId};
 use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
 
@@ -42,6 +43,10 @@ enum Commands
     {
         #[command(flatten)]
         script: Script,
+        /// Feed FILE to the program's stdin. Without it the program shares the terminal or
+        /// the batch-mode stdin, and reads /dev/null when commands come from a pipe
+        #[arg(long, value_name = "FILE")]
+        stdin: Option<PathBuf>,
         /// Path to the executable to launch
         program: PathBuf,
         /// Arguments passed to the program (after `--`)
@@ -121,16 +126,21 @@ fn main() -> ExitCode
         }
     };
 
-    let (script, target) = match cli.command {
+    let (script, mut target, stdin_file) = match cli.command {
         Commands::FindLogs => {
             println!("{}", log_directory().display());
             return ExitCode::SUCCESS;
         }
-        Commands::Launch { script, program, args } => {
-            let program = absolute(&program);
-            (script, Target::Launch(LaunchSpec::new(program).args(args)))
+        Commands::Launch {
+            script,
+            stdin,
+            program,
+            args,
+        } => {
+            let spec = LaunchSpec::new(absolute(&program)).args(args);
+            (script, Target::Launch(spec), stdin)
         }
-        Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid))),
+        Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid)), None),
     };
 
     // Logs go to a file so the session output stays deterministic (no timestamps, no colour).
@@ -146,7 +156,20 @@ fn main() -> ExitCode
         }
     };
 
-    if run_session(target, lines) {
+    // Decided before the launch: the program's stdin depends on where commands come from.
+    let mode = Mode::of(lines, io::stdin().is_terminal());
+    if let Target::Launch(spec) = &mut target {
+        let stdin_file = stdin_file.map(|path| absolute(&path));
+        if let Some(path) = &stdin_file
+            && let Err(error) = std::fs::File::open(path)
+        {
+            eprintln!("error: {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+        spec.stdin = debuggee_stdin(stdin_file, &mode);
+    }
+
+    if run_session(target, mode) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -163,8 +186,45 @@ fn absolute(program: &Path) -> PathBuf
     }
 }
 
+/// Where the commands come from.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode
+{
+    /// `--batch` and `--command` lines; stdin is not read.
+    Batch(Vec<String>),
+    /// A line editor on the terminal.
+    Terminal,
+    /// Lines read from stdin, which is not a terminal (a pipe or a file).
+    Pipe,
+}
+
+impl Mode
+{
+    /// The mode for the batch `lines` (if any) and whether stdin is a terminal.
+    fn of(lines: Option<Vec<String>>, stdin_is_terminal: bool) -> Self
+    {
+        match lines {
+            Some(lines) => Self::Batch(lines),
+            None if stdin_is_terminal => Self::Terminal,
+            None => Self::Pipe,
+        }
+    }
+}
+
+/// The launched program's stdin: `file` when given; otherwise `/dev/null` in pipe mode,
+/// where ferros reads its commands from stdin and the program must not take them, and
+/// ferros's own stdin (the terminal, or whatever batch mode leaves unread) in the others.
+fn debuggee_stdin(file: Option<PathBuf>, mode: &Mode) -> StdioSpec
+{
+    match (file, mode) {
+        (Some(path), _) => StdioSpec::Path(path),
+        (None, Mode::Pipe) => StdioSpec::Null,
+        (None, Mode::Batch(_) | Mode::Terminal) => StdioSpec::Inherit,
+    }
+}
+
 /// Start the session and run the command loop. Returns `true` when nothing failed.
-fn run_session(target: Target, lines: Option<Vec<String>>) -> bool
+fn run_session(target: Target, mode: Mode) -> bool
 {
     let interrupt = repl::interrupt::install();
     let stdout = io::stdout();
@@ -184,9 +244,9 @@ fn run_session(target: Target, lines: Option<Vec<String>>) -> bool
     let _ = writeln!(out, "{message}");
 
     let stdin = io::stdin();
-    let input = match lines {
-        Some(lines) => Input::Lines(lines.into()),
-        None if stdin.is_terminal() => match repl::editor() {
+    let input = match mode {
+        Mode::Batch(lines) => Input::Lines(lines.into()),
+        Mode::Terminal => match repl::editor() {
             Ok(editor) => {
                 let _ = writeln!(out, "Type 'help' for the commands; 'quit' or Ctrl-D ends the session.");
                 editor
@@ -196,7 +256,43 @@ fn run_session(target: Target, lines: Option<Vec<String>>) -> bool
                 Input::Reader(stdin.lock())
             }
         },
-        None => Input::Reader(stdin.lock()),
+        Mode::Pipe => Input::Reader(stdin.lock()),
     };
     repl::run(&mut debugger, input, &mut out, &mut err, &interrupt)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn mode_follows_the_script_then_the_terminal()
+    {
+        assert_eq!(
+            Mode::of(Some(vec!["status".into()]), false),
+            Mode::Batch(vec!["status".into()])
+        );
+        assert_eq!(Mode::of(Some(Vec::new()), true), Mode::Batch(Vec::new()));
+        assert_eq!(Mode::of(None, true), Mode::Terminal);
+        assert_eq!(Mode::of(None, false), Mode::Pipe);
+    }
+
+    #[test]
+    fn only_pipe_mode_closes_the_program_stdin()
+    {
+        assert_eq!(debuggee_stdin(None, &Mode::Pipe), StdioSpec::Null);
+        assert_eq!(debuggee_stdin(None, &Mode::Terminal), StdioSpec::Inherit);
+        assert_eq!(debuggee_stdin(None, &Mode::Batch(Vec::new())), StdioSpec::Inherit);
+    }
+
+    #[test]
+    fn an_explicit_stdin_file_wins_in_every_mode()
+    {
+        let file = PathBuf::from("/tmp/input.txt");
+        let expected = StdioSpec::Path(file.clone());
+        assert_eq!(debuggee_stdin(Some(file.clone()), &Mode::Pipe), expected);
+        assert_eq!(debuggee_stdin(Some(file.clone()), &Mode::Terminal), expected);
+        assert_eq!(debuggee_stdin(Some(file), &Mode::Batch(Vec::new())), expected);
+    }
 }

@@ -136,6 +136,12 @@ fn resume_runs_hello()
   "timed out" message. Permission failures fail within a few seconds with signing guidance.
 - Use the `// BREAK: <name>` markers through `fixture.marker_line("<name>")` rather than
   hard-coding line numbers.
+- `fixture!("name")` returns a private copy of the built executable and its dSYM, taken once per
+  test process under `$CARGO_TARGET_TMPDIR/ferros-fixtures/` (issue #84). Every Cargo command
+  removes and recreates the uplifted `target/debug/ferros-fixture-*` files, so a test reading or
+  launching that path while another Cargo command runs could find it missing. The copy keeps the
+  executable's file name, and `fixture.path()` is the path the loader reports. Copies are keyed
+  by Mach-O UUID and removed by `cargo clean`. `tests/fixture_staging.rs` covers this.
 - `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the

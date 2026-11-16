@@ -73,6 +73,9 @@ pub struct Fixture
 impl Fixture
 {
     /// Creates a new fixture descriptor from its short name and executable path.
+    ///
+    /// The path is used as given. [`fixture!`](crate::fixture) uses [`Fixture::stable`]
+    /// instead, so tests do not read Cargo's uplifted executable.
     #[must_use]
     pub fn from_built(name: &'static str, path: &'static str) -> Self
     {
@@ -82,6 +85,28 @@ impl Fixture
         }
     }
 
+    /// Creates a fixture descriptor for a private, stable copy of the built executable
+    /// `path` (and, on macOS, its dSYM) under `root`.
+    ///
+    /// Every Cargo command removes and recreates the uplifted `target/debug/ferros-fixture-*`
+    /// files, so a concurrent `cargo test` could otherwise find them missing (issue #84).
+    /// The copy is made once per test process and fixture and keeps the executable's file
+    /// name. `root` is the test crate's `CARGO_TARGET_TMPDIR`. On other systems the path is
+    /// used as given.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the copy cannot be made, for example when the fixture stays missing.
+    #[must_use]
+    pub fn stable(name: &'static str, path: &'static str, root: &'static str) -> Self
+    {
+        #[cfg(target_os = "macos")]
+        let path = crate::staging::staged(Path::new(path), Path::new(root));
+        #[cfg(not(target_os = "macos"))]
+        let (path, _) = (PathBuf::from(path), root);
+        Self { name, path }
+    }
+
     /// Returns the short name of the fixture (e.g. `"hello"`).
     #[must_use]
     pub fn name(&self) -> &str
@@ -89,7 +114,8 @@ impl Fixture
         self.name
     }
 
-    /// Returns the path to the built fixture executable.
+    /// Returns the path to the fixture executable (for [`fixture!`](crate::fixture), the
+    /// stable copy).
     #[must_use]
     pub fn path(&self) -> &Path
     {
@@ -150,11 +176,18 @@ impl Fixture
     }
 }
 
-/// Locates a built fixture binary by short name using compile-time cargo environment variables.
+/// Locates a built fixture binary by short name using compile-time cargo environment
+/// variables, and returns a stable private copy of it (see [`Fixture::stable`]).
+///
+/// Only usable in integration tests, where Cargo sets `CARGO_TARGET_TMPDIR`.
 #[macro_export]
 macro_rules! fixture {
     ($name:literal) => {
-        $crate::Fixture::from_built($name, env!(concat!("CARGO_BIN_EXE_ferros-fixture-", $name)))
+        $crate::Fixture::stable(
+            $name,
+            env!(concat!("CARGO_BIN_EXE_ferros-fixture-", $name)),
+            env!("CARGO_TARGET_TMPDIR"),
+        )
     };
 }
 

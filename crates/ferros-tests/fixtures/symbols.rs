@@ -8,6 +8,8 @@
 //! - `shapes::area` (inside a module)
 //! - `always_inlined` (`#[inline(always)]`; inlined into `main` at two call sites)
 //! - `with_gap` (a comment-only line between two code lines, just before `after_gap`)
+//! - `left::twin`, `right::twin` (same function name, each in its own `twin.rs`, so both
+//!   the name `twin` and the file `twin.rs` are ambiguous)
 //!
 //! Markers:
 //! - `in_generic`
@@ -62,6 +64,11 @@ fn always_inlined(value: u64) -> u64
     std::hint::black_box(value.wrapping_add(7)) // BREAK: in_inlined
 }
 
+#[path = "symbols/left/twin.rs"]
+mod left;
+#[path = "symbols/right/twin.rs"]
+mod right;
+
 #[inline(never)]
 fn with_gap(value: u64) -> u64
 {
@@ -82,6 +89,7 @@ fn main()
     let first = always_inlined(std::hint::black_box(10)); // BREAK: call_inlined_first
     let second = always_inlined(std::hint::black_box(first)); // BREAK: call_inlined_second
     let gap = with_gap(5);
+    let twins = left::twin(6).wrapping_add(right::twin(7));
     let total = wide
         .wrapping_add(u64::from(narrow))
         .wrapping_add(one_wide)
@@ -89,6 +97,7 @@ fn main()
         .wrapping_add(bumped)
         .wrapping_add(area)
         .wrapping_add(second)
-        .wrapping_add(gap);
+        .wrapping_add(gap)
+        .wrapping_add(twins);
     println!("symbols: {total}");
 }

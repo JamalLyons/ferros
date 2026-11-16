@@ -515,3 +515,101 @@ fn line_in_an_inlined_function_names_that_function()
         assert!(sites.contains(&hit.site), "{:?} not in {sites:?}", hit.site);
     });
 }
+
+/// Iterations for a `loop_counter` that must outlive the test (10 ms each).
+const LONG_LOOP: &str = "100000";
+
+/// The `ps` state of `pid`, or an empty string when it is gone.
+fn process_state(pid: u32) -> String
+{
+    let output = std::process::Command::new("/bin/ps")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// The process exists and is not stopped, sampled over a few `tick` calls: a trap left
+/// in `tick` would stop or kill it.
+fn assert_running(pid: u32, what: &str)
+{
+    for _ in 0..5 {
+        let state = process_state(pid);
+        assert!(
+            !state.is_empty() && !state.starts_with('T') && !state.starts_with('Z'),
+            "{what}: the process is stopped or gone (state {state:?})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn new_session() -> Session
+{
+    Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")))
+}
+
+/// A function breakpoint set with no process is resolved when the session attaches to a
+/// running `loop_counter`, and the process stops there. Issue #110.
+#[test]
+fn breakpoint_set_before_attach_is_resolved_at_attach()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let target = t.spawn(&fixture, &[LONG_LOOP]);
+        let mut session = new_session();
+        let id = set(&mut session, function("tick"));
+        assert!(session.logical_breakpoints()[0].pending.is_some());
+
+        session.attach(target.pid()).expect("attach");
+        assert_eq!(session.state(), SessionState::Stopped);
+        let breakpoint = session.logical_breakpoints()[0].clone();
+        assert_eq!(breakpoint.pending, None, "{breakpoint:?}");
+        assert_eq!(breakpoint.sites.len(), 1, "{breakpoint:?}");
+
+        let hit = continue_to_hit(&mut session);
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.site, breakpoint.sites[0]);
+        assert_eq!(
+            hit.site.position.function.as_deref(),
+            Some(qualified(&fixture, "tick").as_str())
+        );
+    });
+}
+
+/// Detaching from a process with a source breakpoint leaves it running without traps and
+/// the breakpoint pending; attaching again resolves it and stops there. Issue #110.
+#[test]
+fn source_breakpoint_survives_detach_and_reattach()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut target = t.spawn(&fixture, &[LONG_LOOP]);
+        let mut session = new_session();
+        session.attach(target.pid()).expect("attach");
+        let id = set(&mut session, at_marker(&fixture, "tick_body"));
+        let [site] = sites(&session, id).try_into().expect("one site");
+        assert_eq!(continue_to_hit(&mut session).site, site);
+
+        session.detach().expect("detach");
+        assert_eq!(session.state(), SessionState::NotStarted);
+        let breakpoint = session.logical_breakpoints()[0].clone();
+        assert!(breakpoint.pending.is_some(), "{breakpoint:?}");
+        assert!(breakpoint.sites.is_empty(), "{breakpoint:?}");
+        assert!(breakpoint.enabled);
+        // `tick` runs every 10 ms: a trap left in it would stop or kill the process.
+        assert_running(target.pid().0, "after detach");
+        assert_eq!(target.try_wait().expect("try_wait"), None, "the process ended");
+
+        session.attach(target.pid()).expect("attach again");
+        let breakpoint = session.logical_breakpoints()[0].clone();
+        assert_eq!(breakpoint.pending, None, "{breakpoint:?}");
+        assert_eq!(breakpoint.sites, vec![site.clone()], "same address in the same process");
+        let hit = continue_to_hit(&mut session);
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.site, site);
+        assert_eq!(session.logical_breakpoints()[0].hit_count, 2);
+    });
+}

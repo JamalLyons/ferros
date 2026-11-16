@@ -102,3 +102,8 @@ test = false
 name = "ferros-fixture-recursion"
 path = "fixtures/recursion.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-read_line"
+path = "fixtures/read_line.rs"
+test = false

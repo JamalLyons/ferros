@@ -35,6 +35,9 @@ ferros attach <pid>
 ferros launch --command continue <program>
 ferros launch --batch script.ferros --command registers <program> -- arg1 arg2
 
+# Feed a file to the program's stdin.
+ferros launch --stdin input.txt <program>
+
 # Print the directory that holds the log files.
 ferros find-logs
 ```
@@ -43,6 +46,10 @@ ferros find-logs
 
 - **`--batch <FILE>`**: run the commands in the file, one per line.
 - **`--command <CMD>`** (`-c`, repeatable): run this command, after the `--batch` file.
+
+`launch` also takes **`--stdin <FILE>`**: the program reads FILE as its stdin (see
+[The program's stdin](#the-programs-stdin)). The file must exist; `run` reopens it from the start
+for each relaunch.
 
 The global options `--log-level <LEVEL>` and `--log-format <pretty|json>` configure the log file
 (`~/.ferros/YYYY-MM-DD-ferros.log`). Logs never go to the terminal, so the session output is plain
@@ -65,8 +72,22 @@ command failed, 0 otherwise.
 At `quit` or the end of input, a launched program is killed (`killed process <pid>`) and an attached
 one is detached (`detached from process <pid>`) and keeps running.
 
-The debuggee's stdin, stdout and stderr are those of `ferros`: its output appears in the terminal
-(or the same pipe) between the lines `ferros` prints.
+The debuggee's stdout and stderr are those of `ferros`: its output appears in the terminal (or the
+same pipe) between the lines `ferros` prints.
+
+### The program's stdin
+
+A launched program's stdin depends on where `ferros` reads its commands:
+
+| Mode | Program's stdin |
+|---|---|
+| Interactive (terminal) | The terminal, shared with `ferros` |
+| Piped | `/dev/null`: the commands on the pipe are for `ferros` only, so the program reads end of file |
+| Batch (`--batch`, `--command`) | `ferros`'s stdin, which `ferros` does not read in this mode |
+| Any mode with `--stdin <FILE>` | FILE |
+
+To give a program input while driving `ferros` over a pipe, use `--stdin`. An attached process
+keeps whatever stdin it already has.
 
 ## Commands
 

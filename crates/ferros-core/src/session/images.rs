@@ -96,6 +96,25 @@ impl Session
         }
     }
 
+    /// Load address of the main executable (the first image the backend reports), after
+    /// [`load_images`](Self::load_images). `None` when the backend reports no image.
+    ///
+    /// # Errors
+    /// [`DebuggerError::ImageMapping`] when the main image's mapped header could not be read.
+    pub(super) fn main_load_address(&self) -> Result<Option<Address>>
+    {
+        let Some(main) = self.loaded_images.first() else {
+            return Ok(None);
+        };
+        match &main.mapping {
+            Ok(_) => Ok(Some(Address::new(main.descriptor.load_address))),
+            Err(detail) => Err(DebuggerError::ImageMapping {
+                path: main.descriptor.path.clone(),
+                detail: detail.clone(),
+            }),
+        }
+    }
+
     /// Refresh mappings without requesting DWARF or reading image files. Images whose
     /// mapped header has no segment at file offset zero (for example libraries in the
     /// shared cache) stay unmapped, which is harmless here.

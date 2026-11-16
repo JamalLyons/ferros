@@ -450,7 +450,7 @@ fn components(path: &str) -> Vec<&str>
 
 /// A rendered path's [`components`] joined with `/`, with a leading `/` when the path is
 /// absolute. `..` components are kept.
-fn normalize_path(path: &str) -> String
+pub(crate) fn normalize_path(path: &str) -> String
 {
     let joined = components(path).join("/");
     if path.starts_with('/') { format!("/{joined}") } else { joined }

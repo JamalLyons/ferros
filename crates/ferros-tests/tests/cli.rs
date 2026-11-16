@@ -104,7 +104,10 @@ fn breakpoint_stop_shows_pc_at_the_breakpoint()
         let address = base + offset;
 
         let reply = ferros.send(&format!("break *{address:#x}"));
-        assert_eq!(reply, format!("breakpoint 1 at {address:#x}\n"));
+        // An address breakpoint also names its function and source line (issue #37).
+        let line = hello.marker_line("hello_print");
+        assert!(reply.starts_with(&format!("breakpoint 1 at {address:#x}: ")), "{reply:?}");
+        assert!(reply.ends_with(&format!("/fixtures/hello.rs:{line}\n")), "{reply:?}");
         let reply = ferros.send("continue");
         assert!(
             reply.starts_with(&format!("stopped: breakpoint 1 at {address:#x} (thread ")),

@@ -25,8 +25,9 @@ impl ReplCommand for Run
     {
         "run (alias: r)\n\nResume a just-launched program from its entry stop and wait for the next stop \
          (as 'continue' does). After the program exited or was killed, launch it again with the same \
-         arguments and stop at its entry: breakpoints do not survive the end of a process, so add them \
-         again, then 'run' (or 'continue') starts it. An attached process cannot be restarted."
+         arguments and stop at its entry, with every file:line and function breakpoint resolved again \
+         (address breakpoints are deleted, since addresses change between runs); then 'run' (or \
+         'continue') starts it. An attached process cannot be restarted."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -43,7 +44,17 @@ impl ReplCommand for Run
                 };
                 let pid = ctx.session().launch(&spec)?;
                 ctx.debugger.at_entry = true;
-                writeln!(ctx.out, "launched process {} (stopped at entry; breakpoints were cleared)", pid.0)?;
+                writeln!(ctx.out, "launched process {} (stopped at entry; address breakpoints were cleared)", pid.0)?;
+                // A breakpoint that did not resolve in the new process would never stop it.
+                let pending: Vec<_> = ctx
+                    .session()
+                    .logical_breakpoints()
+                    .iter()
+                    .filter_map(|breakpoint| Some((breakpoint.id.raw(), breakpoint.location.to_string(), breakpoint.pending.clone()?)))
+                    .collect();
+                for (id, location, reason) in pending {
+                    writeln!(ctx.out, "breakpoint {id} at {location} is pending: {reason}")?;
+                }
                 return Ok(Flow::Continue);
             }
         }
@@ -70,7 +81,8 @@ impl ReplCommand for Continue
     fn help(&self) -> &'static str
     {
         "continue (alias: c)\n\nResume every thread and wait for the next stop, which is printed as one of:\n  \
-         stopped: breakpoint <id> at <address> (thread <tid>)\n  stopped: signal <number> (thread <tid>)\n  \
+         stopped: breakpoint <id> at <address> (thread <tid>), then '<function> at <file>:<line>' and the \
+         source line when known\n  stopped: signal <number> (thread <tid>)\n  \
          stopped: interrupted\n  process exited with status <code>\n  process killed by signal <number>\nA \
          signal the program stopped for is passed on to it, except SIGINT (2). Ctrl-C while the program \
          runs interrupts it and returns to the prompt."

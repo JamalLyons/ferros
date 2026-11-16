@@ -133,10 +133,12 @@ macro_rules! registry {
     };
 }
 
+pub use self::breakpoints::describe_position;
+
 registry! {
     process: [Run, Continue, Interrupt, Kill, Status, Quit],
     step: [StepInstruction],
-    breakpoints: [Break, Delete, Breakpoints],
+    breakpoints: [Break, Delete, Enable, Disable, Breakpoints],
     inspect: [Registers, Memory],
     threads: [Threads, Thread],
     stack: [Backtrace],

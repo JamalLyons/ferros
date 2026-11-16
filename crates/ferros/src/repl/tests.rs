@@ -153,7 +153,7 @@ fn breakpoint_stop_names_the_breakpoint()
         "{}",
         t.out
     );
-    assert!(t.out.contains(&format!("1 {address:#x} enabled hits=1\n")), "{}", t.out);
+    assert!(t.out.contains(&format!("1 *{address:#x} enabled hits=1\n")), "{}", t.out);
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn run_relaunches_after_exit_stopped_at_entry()
     assert!(t.out.contains("(ferros) run\nprocess exited with status 0\n"), "{}", t.out);
     assert!(
         t.out
-            .contains("launched process 42 (stopped at entry; breakpoints were cleared)\n"),
+            .contains("launched process 42 (stopped at entry; address breakpoints were cleared)\n"),
         "{}",
         t.out
     );
@@ -349,4 +349,19 @@ fn stepi_reports_the_new_pc()
         "{}",
         t.out
     );
+}
+
+#[test]
+fn run_reports_a_breakpoint_that_stays_pending()
+{
+    let mock = mock();
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    // The mock image has no debug info, so the function cannot be resolved.
+    let t = batch(&mock, &["c", "break main", "run"]);
+    assert!(
+        t.out.contains("breakpoint 1 at main (pending: the program is not running)\n"),
+        "{}",
+        t.out
+    );
+    assert!(t.out.contains("breakpoint 1 at main is pending: "), "{}", t.out);
 }

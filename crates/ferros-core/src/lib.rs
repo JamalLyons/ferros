@@ -51,7 +51,10 @@ pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRe
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};
 pub use events::{DebuggerEvent, DebuggerEventReceiver, DebuggerEventSender, format_stop_reason};
-pub use session::{DROP_STOP_TIMEOUT, ProcessOwnership, SIGKILL, Session, SessionState};
+pub use session::{
+    BreakpointHit, BreakpointLocation, BreakpointSite, DROP_STOP_TIMEOUT, LogicalBreakpoint, LogicalBreakpointId,
+    ProcessOwnership, SIGKILL, Session, SessionState, SourcePosition,
+};
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
     Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,

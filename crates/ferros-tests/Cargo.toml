@@ -28,6 +28,12 @@ dispatch2 = { version = "0.3.0", default-features = false, features = ["std"] }
 serde_json = "1.0"
 ferros-core = { path = "../ferros-core", features = ["test-util"] }
 
+# `tests/repl_pty.rs` drives the interactive (rustyline) REPL through a pseudo-terminal.
+# portable-pty opens the pty and makes it the child's controlling terminal (setsid and
+# TIOCSCTTY) behind a safe API, since this crate forbids `unsafe`.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+portable-pty = "0.9.0"
+
 # Fixture programs. `test = false`: they have no unit tests, so cargo should not build
 # and run an empty test harness for each one.
 [[bin]]

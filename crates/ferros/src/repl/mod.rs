@@ -2,7 +2,9 @@
 //!
 //! Commands come from one of three [`Input`] sources:
 //!
-//! - [`Input::Editor`]: an interactive terminal (rustyline, history in `~/.ferros_history`).
+//! - [`Input::Editor`]: an interactive terminal (rustyline). The history file is
+//!   `$FERROS_HISTORY` when that is set and not empty, otherwise `~/.ferros_history`
+//!   (see [`history_path`]).
 //! - [`Input::Reader`]: plain lines from a reader (stdin that is not a terminal). The
 //!   prompt `(ferros) ` is printed before each line is read and the line is echoed after
 //!   it, so a driver can wait for the prompt before sending the next command.
@@ -19,6 +21,7 @@ pub mod interrupt;
 pub mod output;
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -240,7 +243,7 @@ impl<R: BufRead> Input<R>
     }
 }
 
-/// An interactive editor with the history loaded from `~/.ferros_history`.
+/// An interactive editor with the history loaded from [`history_path`].
 ///
 /// # Errors
 ///
@@ -248,11 +251,23 @@ impl<R: BufRead> Input<R>
 pub fn editor<R>() -> rustyline::Result<Input<R>>
 {
     let mut editor = rustyline::DefaultEditor::new()?;
-    let history = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ferros_history"));
+    let history = history_path(std::env::var_os("FERROS_HISTORY"), std::env::var_os("HOME"));
     if let Some(path) = &history {
         let _ = editor.load_history(path);
     }
     Ok(Input::Editor(Box::new(editor), history))
+}
+
+/// The history file of the interactive editor, from the values of `FERROS_HISTORY` and
+/// `HOME`: `$FERROS_HISTORY` when it is set and not empty, otherwise
+/// `$HOME/.ferros_history`, or no history at all when neither is set.
+#[must_use]
+pub fn history_path(ferros_history: Option<OsString>, home: Option<OsString>) -> Option<PathBuf>
+{
+    match ferros_history {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        _ => home.map(|home| PathBuf::from(home).join(".ferros_history")),
+    }
 }
 
 /// Whether `line` is blank or a `#` comment.

@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use super::Session;
 use crate::error::{DebuggerError, Result};
-use crate::symbols::BinaryImage;
 use crate::symbols::lines::normalize_path;
+use crate::symbols::{BinaryImage, SymbolFrame};
 use crate::types::Address;
 
 /// Where a user asked for a breakpoint.
@@ -105,10 +105,7 @@ impl Session
                     .addresses
                     .iter()
                     .map(|&address| {
-                        let mut position = self.position_at(address, Some((&found.file, found.line)));
-                        // The line table decides the line: it is the one that has code.
-                        position.file = Some(found.file.clone());
-                        position.line = Some(found.line);
+                        let position = self.position_at(address, Some((&found.file, found.line)));
                         BreakpointSite { address, position }
                     })
                     .collect()
@@ -169,10 +166,10 @@ impl Session
 
     /// Function and source line of `address`, best effort.
     ///
-    /// The frame used is the innermost one at `prefer` (a normalized file and a line),
-    /// when given and present, else the frame of the function that owns the address (the
+    /// Without `prefer`, the frame is the one of the function that owns the address (the
     /// last, physical frame of the symbolication; the frames before it are inlined
-    /// callees). An address without symbols has an empty position.
+    /// callees). With `prefer` (a normalized file and a line from the line table), see
+    /// [`site_position`]. An address without symbols has an empty position.
     pub(super) fn position_at(&mut self, address: Address, prefer: Option<(&str, u32)>) -> SourcePosition
     {
         let symbolication = match self.symbolicate(address) {
@@ -183,21 +180,117 @@ impl Session
                 return SourcePosition::default();
             }
         };
-        let preferred = prefer.and_then(|(file, line)| {
-            symbolication.frames.iter().find(|frame| {
-                frame
-                    .location
-                    .as_ref()
-                    .is_some_and(|location| location.line == Some(line) && normalize_path(&location.file) == file)
-            })
-        });
-        let Some(frame) = preferred.or_else(|| symbolication.frames.last()) else {
-            return SourcePosition::default();
-        };
-        SourcePosition {
-            function: Some(frame.symbol.display_name().to_owned()),
-            file: frame.location.as_ref().map(|location| normalize_path(&location.file)),
-            line: frame.location.as_ref().and_then(|location| location.line),
+        match prefer {
+            Some((file, line)) => site_position(&symbolication.frames, file, line),
+            None => symbolication
+                .frames
+                .last()
+                .map_or_else(SourcePosition::default, frame_position),
         }
+    }
+}
+
+/// The position of a `file:line` site whose line-table row is `file` (normalized) and
+/// `line`, from `frames` (innermost first, as symbolication returns them).
+///
+/// The line table decides the file and the line: that is where the code is. The function
+/// is that of the innermost frame at `file` and `line`, else of the innermost frame in
+/// `file` (an inlined callee whose frame line differs from the row), else of the innermost
+/// frame. It is never the outer function when an inlined callee holds the row's file, so
+/// the function named is one whose source contains the line.
+fn site_position(frames: &[SymbolFrame], file: &str, line: u32) -> SourcePosition
+{
+    let in_file = |frame: &&SymbolFrame| {
+        frame
+            .location
+            .as_ref()
+            .is_some_and(|location| normalize_path(&location.file) == file)
+    };
+    let frame = frames
+        .iter()
+        .filter(in_file)
+        .find(|frame| frame.location.as_ref().is_some_and(|location| location.line == Some(line)))
+        .or_else(|| frames.iter().find(in_file))
+        .or_else(|| frames.first());
+    SourcePosition {
+        function: frame.map(|frame| frame.symbol.display_name().to_owned()),
+        file: Some(file.to_owned()),
+        line: Some(line),
+    }
+}
+
+/// The position a symbol frame reports.
+fn frame_position(frame: &SymbolFrame) -> SourcePosition
+{
+    SourcePosition {
+        function: Some(frame.symbol.display_name().to_owned()),
+        file: frame.location.as_ref().map(|location| normalize_path(&location.file)),
+        line: frame.location.as_ref().and_then(|location| location.line),
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::types::{SourceLocation, SymbolLanguage, SymbolName};
+
+    fn frame(function: &str, file: &str, line: u32) -> SymbolFrame
+    {
+        SymbolFrame {
+            symbol: SymbolName::new(function.to_owned(), None, SymbolLanguage::Rust),
+            location: Some(SourceLocation {
+                file: file.to_owned(),
+                line: Some(line),
+                column: None,
+            }),
+            parameters: Vec::new(),
+        }
+    }
+
+    /// Issue #108: the row is in the inlined callee's file at a line its frame does not
+    /// report; the site names the callee, not the caller, with the row's file and line.
+    #[test]
+    fn an_inlined_callee_in_the_rows_file_names_the_site()
+    {
+        let frames = [frame("inlined", "/src/callee.rs", 12), frame("caller", "/src/main.rs", 40)];
+        let position = site_position(&frames, "/src/callee.rs", 10);
+        assert_eq!(position.function.as_deref(), Some("inlined"));
+        assert_eq!(position.file.as_deref(), Some("/src/callee.rs"));
+        assert_eq!(position.line, Some(10));
+    }
+
+    /// An exact file and line match wins over an inner frame in the same file.
+    #[test]
+    fn an_exact_match_wins()
+    {
+        let frames = [
+            frame("inner", "/src/main.rs", 5),
+            frame("middle", "/src/main.rs", 10),
+            frame("outer", "/src/main.rs", 40),
+        ];
+        let position = site_position(&frames, "/src/main.rs", 10);
+        assert_eq!(position.function.as_deref(), Some("middle"));
+        assert_eq!(position.line, Some(10));
+    }
+
+    /// The file is compared normalized, as the line index spells it.
+    #[test]
+    fn frame_files_are_normalized()
+    {
+        let frames = [frame("inlined", "/src/./callee.rs", 12), frame("caller", "/src/main.rs", 40)];
+        let position = site_position(&frames, "/src/callee.rs", 10);
+        assert_eq!(position.function.as_deref(), Some("inlined"));
+    }
+
+    /// No frame in the row's file: the innermost frame names the site.
+    #[test]
+    fn no_frame_in_the_file_uses_the_innermost()
+    {
+        let frames = [frame("inlined", "/std/num.rs", 3), frame("caller", "/src/main.rs", 40)];
+        let position = site_position(&frames, "/src/other.rs", 7);
+        assert_eq!(position.function.as_deref(), Some("inlined"));
+        assert_eq!(position.file.as_deref(), Some("/src/other.rs"));
+        assert_eq!(position.line, Some(7));
     }
 }

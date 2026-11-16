@@ -483,3 +483,35 @@ fn shared_site_is_released_by_the_last_delete()
         assert_eq!(continue_to_hit(&mut d).id, again);
     });
 }
+
+/// `break symbols.rs:<in_inlined>` is a line of the `#[inline(always)]` function
+/// `always_inlined`, which only exists inlined into `main`. Every site names
+/// `always_inlined` (the function whose source holds that line), not `main`, and the stop
+/// reports the same position. Issue #108.
+#[test]
+fn line_in_an_inlined_function_names_that_function()
+{
+    harness::run(|t| {
+        let fixture = fixture!("symbols");
+        let mut d = t.launch(&fixture);
+        let line = fixture.marker_line("in_inlined");
+        let id = set(&mut d, at_marker(&fixture, "in_inlined"));
+        let sites = sites(&d, id);
+        assert!(sites.len() >= 2, "one site per inlined copy: {sites:?}");
+        let expected = qualified(&fixture, "always_inlined");
+        for site in &sites {
+            assert_eq!(site.position.function.as_deref(), Some(expected.as_str()), "{site:?}");
+            assert_eq!(site.position.line, Some(line), "{site:?}");
+            assert!(
+                site.position
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| file.ends_with("/fixtures/symbols.rs")),
+                "{site:?}"
+            );
+        }
+        let hit = continue_to_hit(&mut d);
+        assert_eq!(hit.id, id);
+        assert!(sites.contains(&hit.site), "{:?} not in {sites:?}", hit.site);
+    });
+}

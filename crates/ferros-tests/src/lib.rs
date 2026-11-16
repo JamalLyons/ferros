@@ -7,6 +7,8 @@ pub mod fixture;
 #[cfg(target_os = "macos")]
 pub mod harness;
 #[cfg(target_os = "macos")]
+mod staging;
+#[cfg(target_os = "macos")]
 pub mod symbols;
 #[cfg(target_os = "macos")]
 pub mod transcript;

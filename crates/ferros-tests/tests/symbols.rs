@@ -694,10 +694,16 @@ fn function_lookups_after_first_load_take_under_a_second()
 }
 
 /// A copy of the `symbols` fixture executable and its dSYM in a scratch directory, where
-/// the first compilation unit of the dSYM's `.debug_info` no longer parses: its unit
-/// header is intact, so the units after it can still be located, and the abbreviation code
-/// of its root entry is overwritten with one no abbreviation table has.
-fn load_with_corrupt_first_unit(fixture: &Fixture, scratch: &Scratch) -> Arc<BinaryImage>
+/// the last compilation unit of the dSYM's `.debug_info` no longer parses: its unit header
+/// is intact, so every unit can still be located, and the abbreviation code of its root
+/// entry is overwritten with one no abbreviation table has. Returns the image and the
+/// `.debug_info` offset of the corrupted unit.
+///
+/// The last unit, not the first: how rustc splits the fixture into units depends on the
+/// build (with incremental compilation off, as on a fresh CI build, the first unit holds
+/// all of the fixture's own code), while the last unit is always one of the standard
+/// library's, so the fixture's code stays readable in every layout.
+fn load_with_corrupt_last_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<BinaryImage>, u64)
 {
     let executable = scratch.0.join(fixture.path().file_name().expect("executable name"));
     fs::copy(fixture.path(), &executable).expect("copy executable");
@@ -709,17 +715,30 @@ fn load_with_corrupt_first_unit(fixture: &Fixture, scratch: &Scratch) -> Arc<Bin
         .next()
         .expect("DWARF file in the fixture dSYM");
     let mut dwarf = fs::read(&companion).expect("read DWARF file");
-    let (info, _) = object::File::parse(&*dwarf)
+    let (info, info_size) = object::File::parse(&*dwarf)
         .expect("parse DWARF file")
         .section_by_name(".debug_info")
         .expect(".debug_info section")
         .file_range()
         .expect(".debug_info file range");
     let info = usize::try_from(info).expect("offset");
-    // 32-bit DWARF unit header: 4-byte length, 2-byte version, then 5 more bytes in
-    // version 4 and 6 more in version 5. The root entry's abbreviation code follows.
-    let version = u16::from_le_bytes([dwarf[info + 4], dwarf[info + 5]]);
-    let root = info + if version >= 5 { 12 } else { 11 };
+    let info_end = info + usize::try_from(info_size).expect("size");
+    // Walk the 32-bit DWARF unit headers (4-byte length, not counting itself) to the last.
+    let mut last = info;
+    let mut next = info;
+    while next < info_end {
+        let length = u32::from_le_bytes(dwarf[next..next + 4].try_into().expect("4 bytes"));
+        assert!(
+            length < 0xffff_fff0,
+            "64-bit DWARF units are not expected in the fixture dSYM"
+        );
+        last = next;
+        next += 4 + usize::try_from(length).expect("length");
+    }
+    // After the length: 2-byte version, then 5 more bytes in version 4 and 6 more in
+    // version 5. The root entry's abbreviation code follows.
+    let version = u16::from_le_bytes([dwarf[last + 4], dwarf[last + 5]]);
+    let root = last + if version >= 5 { 12 } else { 11 };
     // ULEB128 0x1f_ffff: far more abbreviations than any unit declares.
     dwarf[root..root + 3].copy_from_slice(&[0xff, 0xff, 0x7f]);
     fs::write(dwarf_dir.join(companion.file_name().expect("DWARF file name")), dwarf).expect("write DWARF file");
@@ -731,12 +750,13 @@ fn load_with_corrupt_first_unit(fixture: &Fixture, scratch: &Scratch) -> Arc<Bin
         .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
         .expect("__TEXT segment");
     let mut cache = SymbolCache::with_debug_info_options(scratch.options());
-    cache
+    let image = cache
         .load_image(ImageDescriptor {
             path: executable,
             load_address: text.address(),
         })
-        .expect("image with a partly unreadable dSYM")
+        .expect("image with a partly unreadable dSYM");
+    (image, u64::try_from(last - info).expect("unit offset"))
 }
 
 /// Functions of the `symbols` fixture looked up by `one_unreadable_unit_does_not_hide_the_others`.
@@ -757,11 +777,11 @@ fn one_unreadable_unit_does_not_hide_the_others()
     );
 
     let scratch = Scratch::new();
-    let image = load_with_corrupt_first_unit(&fixture, &scratch);
+    let (image, corrupted) = load_with_corrupt_last_unit(&fixture, &scratch);
     let skipped = image.skipped_debug_info().expect("indexes build from the readable units");
     assert!(
-        skipped.iter().any(|skip| skip.unit_offset == Some(0)),
-        "the unit at .debug_info offset 0 is reported: {skipped:?}"
+        skipped.iter().any(|skip| skip.unit_offset == Some(corrupted)),
+        "the unit at .debug_info offset {corrupted:#x} is reported: {skipped:?}"
     );
 
     let text = source(&fixture);

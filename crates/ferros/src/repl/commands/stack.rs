@@ -28,7 +28,8 @@ impl ReplCommand for Backtrace
         "backtrace [n] (alias: bt)\n\nPrint the selected thread's frames, innermost first, at most n (default \
          256), one per line as '#<index> <pc> in <function> at <file>:<line>'. A caller's pc is its return \
          address; its line is the call site. Functions inlined into a frame are listed before it and marked \
-         '[inlined]'. A frame without symbols prints '??' for the function and no location."
+         '[inlined]'. A frame whose code has no debug info is named from its image's symbol table (the \
+         nearest symbol before its pc) and printed with no location; a frame with neither prints '??'."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -114,5 +115,10 @@ mod tests
             "#3 0x0000000000001000 in app::f at src/main.rs:2 [inlined]"
         );
         assert_eq!(format_frame(&frame(FrameKind::Physical, None, None)), "#3 0x0000000000001000 in ??");
+        // A name from the symbol table only has no location to print.
+        assert_eq!(
+            format_frame(&frame(FrameKind::Physical, Some("_pthread_start"), None)),
+            "#3 0x0000000000001000 in _pthread_start"
+        );
     }
 }

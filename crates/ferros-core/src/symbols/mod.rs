@@ -40,6 +40,7 @@ pub mod extractor;
 pub mod functions;
 pub mod image;
 pub mod lines;
+pub(crate) mod symtab;
 pub mod unwind;
 
 // Shared type aliases

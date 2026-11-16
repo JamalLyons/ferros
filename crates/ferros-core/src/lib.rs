@@ -58,6 +58,6 @@ pub use session::{
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
     Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,
-    RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName, ThreadId,
+    RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName, SymbolSource, ThreadId,
     VectorRegisterValue,
 };

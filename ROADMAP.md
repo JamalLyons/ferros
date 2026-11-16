@@ -41,7 +41,7 @@ This list captures concrete work needed to reach feature parity with production 
 
 ## ferros-ui (TUI)
 
-_`ferros-ui` is currently excluded from the workspace while the interactive front end is rebuilt; `ferros launch`/`attach` behave as `--headless`._
+_`ferros-ui` is currently excluded from the workspace while it is rebuilt; `ferros launch`/`attach` open the line-oriented REPL (see `crates/ferros/README.md`)._
 
 - [ ] **Command palette / mini-console:** Embed a small command line so users can run CLI commands without leaving the TUI (LLDB’s `command` window, Delve’s REPL).
 - [ ] **Source + breakpoint view:** Render source/machine code next to the PC with breakpoint gutter, hit counts, and enable/disable toggles.

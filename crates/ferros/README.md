@@ -24,34 +24,96 @@ just sign-debugger target/debug/ferros
 ## Usage
 
 ```bash
-# Launch a program under the debugger
-cargo run -p ferros -- launch <program> [args...]
+# Launch a program, stopped at its entry, and open a session on it.
+# Program arguments go after `--`.
+ferros launch <program> [-- args...]
 
-# Attach to an existing process by PID
-cargo run -p ferros -- attach <pid>
+# Attach to a running process by PID.
+ferros attach <pid>
 
-# Show debugger information
-cargo run -p ferros -- info
+# Run commands non-interactively (batch mode), then end the session.
+ferros launch --command continue <program>
+ferros launch --batch script.ferros --command registers <program> -- arg1 arg2
 
-# View or locate the log directory
-cargo run -p ferros -- find-logs
+# Print the directory that holds the log files.
+ferros find-logs
 ```
 
-> **Note**: The interactive terminal UI (`ferros-ui`) is currently parked and excluded from the workspace while being redesigned around `Session`. Both `launch` and `attach` currently operate in headless mode: inspecting the target at entry, printing debugger, thread, and memory region information, and detaching.
+`launch` and `attach` take the same options:
 
-## Subcommands
+- **`--batch <FILE>`**: run the commands in the file, one per line.
+- **`--command <CMD>`** (`-c`, repeatable): run this command, after the `--batch` file.
 
-- **`launch <program> [args...] [--headless]`**: Launch a new process under debugger control.
-- **`attach <pid> [--headless]`**: Attach to a running process by PID.
-- **`registers`**: Display CPU registers (requires persistent session).
-- **`memory <address> [--length <bytes>]`**: Read memory from process.
-- **`regions`**: List memory regions (segments) of the process.
-- **`threads`**: List all threads in the target process.
-- **`suspend`**: Suspend process execution.
-- **`resume`**: Resume process execution.
-- **`detach`**: Detach from target process.
-- **`info`**: Show target status, architecture, and debugger details.
-- **`find-logs`**: Print the path to the Ferros log directory.
+The global options `--log-level <LEVEL>` and `--log-format <pretty|json>` configure the log file
+(`~/.ferros/YYYY-MM-DD-ferros.log`). Logs never go to the terminal, so the session output is plain
+text without colour or timestamps.
+
+## Input modes
+
+- **Interactive**: stdin is a terminal and neither `--batch` nor `--command` is given. Line
+  editing and history (`~/.ferros_history`) come from rustyline.
+- **Piped**: stdin is not a terminal. `ferros` prints the prompt `(ferros) ` before reading each
+  line and echoes the line, so a driving program can wait for the prompt before sending the next
+  command.
+- **Batch**: the `--batch` lines, then each `--command`, are run in order; stdin is not read. Each
+  command is printed as `(ferros) <command>` before its output.
+
+In every mode, empty lines and lines starting with `#` are skipped. A failing command prints
+`error: <message>` on stderr and the next command still runs. `ferros` exits with status 1 if any
+command failed, 0 otherwise.
+
+At `quit` or the end of input, a launched program is killed (`killed process <pid>`) and an attached
+one is detached (`detached from process <pid>`) and keeps running.
+
+The debuggee's stdin, stdout and stderr are those of `ferros`: its output appears in the terminal
+(or the same pipe) between the lines `ferros` prints.
+
+## Commands
+
+| Command | Aliases | What it does |
+|---|---|---|
+| `run` | `r` | Resume from the entry stop and wait for the next stop; after the program exited, relaunch it stopped at entry (breakpoints are cleared with the old process) |
+| `continue` | `c` | Resume and wait for the next stop. A signal the program stopped for is passed on, except `SIGINT` |
+| `interrupt` | | Stop the program (Ctrl-C does this while it runs) |
+| `kill` | | Terminate the program with `SIGKILL` |
+| `status` | | `status: stopped (pid <pid>, thread <tid>)` and the last stop, `status: exited` and how, or `status: no process` |
+| `quit` | `q`, `exit` | End the session |
+| `stepi` | `si` | Execute one instruction of the selected thread |
+| `break *<address>` | `b` | Add a software breakpoint at a runtime address (`0x` hex or decimal) |
+| `delete <id>` | `d` | Remove a breakpoint |
+| `breakpoints` | | List breakpoints with hit counts |
+| `registers` | `regs` | `pc`, `sp`, `fp`, `lr`, `cpsr` and `x0`..`x28` of the selected thread |
+| `memory <address> [len]` | `x` | Hexdump `len` bytes (default 64), 16 per row |
+| `threads` | | List the threads; `*` marks the selected one |
+| `thread <index>` | | Select a thread by its index in `threads` |
+| `images` | | Load address and path of each loaded image (the address includes the ASLR slide) |
+| `help [command]` | `h`, `?` | List the commands, or show one command's usage |
+
+Stops print as one stable line each:
+
+```text
+stopped: breakpoint 1 at 0x100000f2c (thread 8963)
+stopped: step at 0x100000f30 (thread 8963)
+stopped: signal 11 (thread 8963)
+stopped: interrupted
+process exited with status 0
+process killed by signal 9
+```
+
+### Ctrl-C
+
+Ctrl-C never ends `ferros`. While the program runs (`continue`, `run`, `stepi`) it interrupts the
+program and returns to the prompt; at an interactive prompt it discards the line. The program runs in
+the same process group as `ferros`, so a Ctrl-C typed in the terminal also sends it `SIGINT`
+directly; that may be reported as `stopped: signal 2` instead of `stopped: interrupted`, and
+`continue` does not pass it on to the program.
+
+### Adding a command
+
+Commands live in `src/repl/commands/`, one module per area (`process.rs`, `inspect.rs`,
+`threads.rs`, `breakpoints.rs`, `step.rs`, `images.rs`, `help.rs`). A command is a unit struct
+implementing `ReplCommand` (`names`, `summary`, `help`, `run`). To add one, put it in a new file and
+add one line to the `registry!` list in `src/repl/commands/mod.rs`.
 
 ## Platform Support
 

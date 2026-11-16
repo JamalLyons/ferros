@@ -8,5 +8,7 @@ pub mod fixture;
 pub mod harness;
 #[cfg(target_os = "macos")]
 pub mod symbols;
+#[cfg(target_os = "macos")]
+pub mod transcript;
 
 pub use fixture::{Fixture, MarkerError, find_marker};

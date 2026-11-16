@@ -231,6 +231,30 @@ pub fn init_logging_for_tui(level: Option<LogLevel>) -> Result<PathBuf, LoggingE
     Ok(log_file)
 }
 
+/// Initialize file-only logging for an interactive or batch debugging session.
+///
+/// Like [`init_logging_for_tui`], nothing is written to stdout or stderr, so the
+/// session output stays deterministic. The log file is
+/// `~/.ferros/YYYY-MM-DD-ferros.log` (or the same name in `/tmp` without a home
+/// directory). `level` overrides `RUST_LOG`, which otherwise applies, defaulting to `INFO`.
+///
+/// ## Errors
+///
+/// Returns an error if logging is already initialized or the log directory cannot be created.
+pub fn init_logging_to_file(level: Option<LogLevel>, format: LogFormat) -> Result<PathBuf, LoggingError>
+{
+    let today = Utc::now().format("%Y-%m-%d");
+    let log_file = if let Ok(home) = env::var("HOME") {
+        let ferros_dir = PathBuf::from(home).join(".ferros");
+        std::fs::create_dir_all(&ferros_dir).map_err(LoggingError::FileError)?;
+        ferros_dir.join(format!("{today}-ferros.log"))
+    } else {
+        PathBuf::from("/tmp").join(format!("{today}-ferros.log"))
+    };
+    init_logging_file_only(log_file.clone(), format, level.map(Into::into))?;
+    Ok(log_file)
+}
+
 /// Internal initialization function
 #[allow(clippy::unnecessary_wraps)]
 fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), LoggingError>

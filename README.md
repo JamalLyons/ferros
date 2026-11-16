@@ -45,7 +45,7 @@ Ferros is **early and actively developed**. What is verified today:
 - **Software breakpoints**: Trap insertion, hit counting, transparent trap-hiding in memory reads, automatic serial step-over on resume, and trap restoration on detach and drop (verified by `tests/breakpoints.rs`).
 - **Platform boundary**: Zero unsafe code and zero OS dependencies in `ferros-core`, strictly enforced by `just check-boundary` and `tests/platform_boundary.rs`.
 
-The interactive TUI is being rebuilt: `ferros launch` and `attach` currently run in headless mode (inspect and exit/detach). Areas currently in progress include DWARF/symbol ingestion, call stack unwinding, and Linux support.
+- **Command line**: `ferros launch` and `attach` open a line-oriented session (interactive, piped or batch with `--batch`/`--command`) with run control, breakpoints, stepping, registers, memory, threads and images (verified by `tests/cli.rs`). The interactive TUI is being rebuilt. Areas currently in progress include DWARF/symbol ingestion, call stack unwinding, and Linux support.
 
 The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for milestone tracking.
 
@@ -78,7 +78,9 @@ Not published to crates.io yet. Build from source:
 
 ```bash
 cargo build --workspace
-cargo run -p ferros -- launch --headless <program> [args...]
+cargo run -p ferros -- launch <program> [-- args...]
+# or non-interactively:
+cargo run -p ferros -- launch --command continue <program>
 ```
 
 ### Requirements

@@ -1,10 +1,37 @@
 //! Source line tables: `file:line` to addresses, and address to line and ranges.
 //!
 //! The index is built once per [`BinaryImage`], on the first lookup, from the line program
-//! of every compilation unit. File paths are rendered the way `addr2line` renders them
-//! (compilation directory, then include directory, then file name, where an absolute
-//! component replaces what came before), so the paths here match
-//! [`BinaryImage::symbolicate`].
+//! of every compilation unit.
+//!
+//! # File paths
+//!
+//! A line-table file is first rendered the way `addr2line` renders it (compilation
+//! directory, then include directory, then file name, where an absolute component replaces
+//! what came before), then normalized: empty and `.` components are dropped and the
+//! remaining components are joined with `/` (a leading `/` is kept for an absolute path).
+//! Files are keyed by that normalized path, so units that spell one file differently
+//! (`/w/./src/lib.rs` and `/w/src/lib.rs`) share one entry, and [`LineAddresses::file`] /
+//! [`AddressLine::file`] report the normalized spelling. For the usual paths, which have no
+//! empty or `.` components, that is exactly the path [`BinaryImage::symbolicate`] reports;
+//! otherwise it can differ from it in those components only. `..` components are kept as
+//! they are: resolving them without the file system is unsound when a directory is a
+//! symbolic link.
+//!
+//! # Unreadable debug info
+//!
+//! A compilation unit whose header, root entry or line-program header cannot be parsed is
+//! skipped whole (reported as `unit: ...`). When the rows of its line program stop parsing,
+//! the rest of that program is skipped (reported as `line program: ...`) and the sequences
+//! completed before the error are kept. The index is built from every other unit. If the list of unit headers itself cannot be read
+//! past some point, later units cannot be located and indexing stops there. Each skip is
+//! recorded as a [`SkippedDebugInfo`], logged as a `tracing` warning, and reported by
+//! [`BinaryImage::skipped_debug_info`], so a caller that gets
+//! [`SourceLookupError::UnknownFile`] can tell missing debug info from a file that has no
+//! line information.
+//!
+//! The built index is cached on the image, and so is a failure to build it at all (the
+//! image's DWARF sections cannot be loaded): such a failure comes from the image's bytes,
+//! which do not change, so repeating the attempt on every lookup could only fail again.
 //!
 //! All public lookups take and return runtime [`Address`]es; the index itself stores file
 //! virtual addresses and translates through the image mapping.
@@ -12,7 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
-use gimli::{AttributeValue, ColumnType, FileEntry, LineProgramHeader, Reader as _, Unit};
+use gimli::{AttributeValue, ColumnType, FileEntry, LineProgramHeader, Reader as _, Unit, UnitHeader};
 
 use super::image::BinaryImage;
 use super::{OwnedDwarf, OwnedReader};
@@ -32,6 +59,9 @@ pub enum SourceLookupError
     },
 
     /// No source file in the image's line tables matches the requested path.
+    ///
+    /// When [`BinaryImage::skipped_debug_info`] is not empty, the file may be in debug info
+    /// that could not be read.
     #[error("no source file matching `{query}` has line information")]
     UnknownFile
     {
@@ -71,6 +101,9 @@ pub enum SourceLookupError
     },
 
     /// No function with code in the image matches the requested name.
+    ///
+    /// When [`BinaryImage::skipped_debug_info`] is not empty, the function may be in debug
+    /// info that could not be read.
     #[error("no function matching `{query}`")]
     UnknownFunction
     {
@@ -89,17 +122,49 @@ pub enum SourceLookupError
         candidates: Vec<String>,
     },
 
-    /// The image's DWARF line tables or debugging information entries could not be loaded
-    /// or parsed.
+    /// The image's DWARF sections could not be loaded at all. Individual compilation units
+    /// that cannot be parsed are skipped instead (see [`BinaryImage::skipped_debug_info`]).
     #[error("failed to read debug info: {0}")]
     DebugInfo(String),
+}
+
+/// Debug info that was skipped, because it could not be parsed, while building an image's
+/// line or function index, as returned by [`BinaryImage::skipped_debug_info`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct SkippedDebugInfo
+{
+    /// `.debug_info` offset of the compilation unit that was skipped (or that contains the
+    /// skipped entry), or `None` when the list of unit headers could not be read past this
+    /// point, so no later unit was indexed.
+    pub unit_offset: Option<u64>,
+    /// What was skipped and the parse error, for example `line program: ...` or
+    /// `DIE at .debug_info+0x1f4: ...`.
+    pub reason: String,
+}
+
+impl SkippedDebugInfo
+{
+    pub(crate) fn new(unit_offset: Option<u64>, context: &str, error: gimli::Error) -> Self
+    {
+        Self {
+            unit_offset,
+            reason: format!("{context}: {error}"),
+        }
+    }
+}
+
+/// `.debug_info` offset of a unit, `None` for a `.debug_types` unit.
+pub(crate) fn unit_offset(header: &UnitHeader<OwnedReader>) -> Option<u64>
+{
+    header.offset().as_debug_info_offset().map(|offset| offset.0 as u64)
 }
 
 /// The statement addresses of one source line, as returned by [`BinaryImage::line_addresses`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineAddresses
 {
-    /// Full path of the matched source file, as recorded in DWARF.
+    /// Full path of the matched source file, normalized (see the module documentation).
     pub file: String,
     /// The line the addresses belong to: the requested line, or the next line with code.
     pub line: u32,
@@ -112,7 +177,7 @@ pub struct LineAddresses
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressLine
 {
-    /// Full path of the source file, as recorded in DWARF.
+    /// Full path of the source file, normalized (see the module documentation).
     pub file: String,
     /// 1-based line number.
     pub line: u32,
@@ -157,7 +222,8 @@ pub(crate) struct LineSequence
 #[derive(Debug, Default)]
 pub(crate) struct LineIndex
 {
-    /// Distinct full file paths that have at least one row with a line.
+    /// Distinct normalized file paths (see the module documentation) of the line-table
+    /// file entries that rows refer to.
     pub(crate) files: Vec<String>,
     /// Every non-empty sequence, sorted by start address.
     pub(crate) sequences: Vec<LineSequence>,
@@ -166,13 +232,16 @@ pub(crate) struct LineIndex
     /// Sorted, distinct entry addresses of every concrete function. One line-table sequence
     /// can hold several functions back to back, so runs and line ranges stop at these.
     function_starts: Vec<u64>,
+    /// Units (or parts of them) that could not be parsed and were left out.
+    skipped: Vec<SkippedDebugInfo>,
 }
 
 impl LineIndex
 {
-    /// Index every compilation unit's line program. `function_starts` (sorted, distinct)
-    /// are the entry addresses of the image's concrete functions.
-    pub(crate) fn build(dwarf: &OwnedDwarf, function_starts: Vec<u64>) -> Result<Self, SourceLookupError>
+    /// Index every compilation unit's line program that can be parsed, skipping the others
+    /// (see the module documentation). `function_starts` (sorted, distinct) are the entry
+    /// addresses of the image's concrete functions.
+    pub(crate) fn build(dwarf: &OwnedDwarf, function_starts: Vec<u64>) -> Self
     {
         let mut index = Self {
             function_starts,
@@ -180,60 +249,26 @@ impl LineIndex
         };
         let mut paths = HashMap::<String, u32>::new();
         let mut units = dwarf.units();
-        while let Some(header) = units.next().map_err(dwarf_error)? {
-            let unit = dwarf.unit(header).map_err(dwarf_error)?;
-            let Some(program) = unit.line_program.clone() else {
-                continue;
+        loop {
+            let header = match units.next() {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(error) => {
+                    // Without a readable header, the next unit's offset is unknown.
+                    index.skipped.push(SkippedDebugInfo::new(None, "unit header", error));
+                    break;
+                }
             };
-            // DWARF file index -> index into `files`, for this unit.
-            let mut unit_files = HashMap::<u64, u32>::new();
-            let mut rows = program.rows();
-            let mut current = Vec::<LineRow>::new();
-            while let Some((header, row)) = rows.next_row().map_err(dwarf_error)? {
-                let file = match unit_files.get(&row.file_index()) {
-                    Some(&file) => file,
-                    None => {
-                        let path = row
-                            .file(header)
-                            .map(|entry| render_file(dwarf, &unit, entry, header))
-                            .transpose()?
-                            .unwrap_or_default();
-                        let next = u32::try_from(paths.len()).unwrap_or(u32::MAX);
-                        let file = *paths.entry(path).or_insert(next);
-                        unit_files.insert(row.file_index(), file);
-                        file
-                    }
-                };
-                let line = LineRow {
-                    address: row.address(),
-                    file,
-                    line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
-                    column: match row.column() {
-                        ColumnType::LeftEdge => 0,
-                        ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
-                    },
-                    is_stmt: row.is_stmt(),
-                    prologue_end: row.prologue_end(),
-                    end_sequence: row.end_sequence(),
-                };
-                match current.last_mut() {
-                    Some(last) if last.address == line.address && !last.end_sequence => {
-                        let prologue_end = last.prologue_end;
-                        *last = line;
-                        last.prologue_end |= prologue_end;
-                    }
-                    _ => current.push(line),
+            let offset = unit_offset(&header);
+            let unit = match dwarf.unit(header) {
+                Ok(unit) => unit,
+                Err(error) => {
+                    index.skipped.push(SkippedDebugInfo::new(offset, "unit", error));
+                    continue;
                 }
-                if line.end_sequence {
-                    let rows = std::mem::take(&mut current);
-                    if rows.len() > 1 {
-                        index.sequences.push(LineSequence {
-                            start: rows[0].address,
-                            end: line.address,
-                            rows,
-                        });
-                    }
-                }
+            };
+            if let Err(error) = index.add_unit(dwarf, &unit, &mut paths) {
+                index.skipped.push(SkippedDebugInfo::new(offset, "line program", error));
             }
         }
 
@@ -247,7 +282,79 @@ impl LineIndex
         for sequence in &index.sequences {
             index_statements(&mut index.lines, sequence, &index.function_starts);
         }
-        Ok(index)
+        index
+    }
+
+    /// Add the sequences of one unit's line program. On a parse error, the sequences
+    /// completed before it are kept.
+    fn add_unit(
+        &mut self,
+        dwarf: &OwnedDwarf,
+        unit: &Unit<OwnedReader>,
+        paths: &mut HashMap<String, u32>,
+    ) -> gimli::Result<()>
+    {
+        let Some(program) = unit.line_program.clone() else {
+            return Ok(());
+        };
+        // DWARF file index -> index into `files`, for this unit.
+        let mut unit_files = HashMap::<u64, u32>::new();
+        let mut rows = program.rows();
+        let mut current = Vec::<LineRow>::new();
+        while let Some((header, row)) = rows.next_row()? {
+            let file = match unit_files.get(&row.file_index()) {
+                Some(&file) => file,
+                None => {
+                    let path = row
+                        .file(header)
+                        .map(|entry| render_file(dwarf, unit, entry, header))
+                        .transpose()?
+                        .map(|path| normalize_path(&path))
+                        .unwrap_or_default();
+                    let next = u32::try_from(paths.len()).unwrap_or(u32::MAX);
+                    let file = *paths.entry(path).or_insert(next);
+                    unit_files.insert(row.file_index(), file);
+                    file
+                }
+            };
+            let line = LineRow {
+                address: row.address(),
+                file,
+                line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
+                column: match row.column() {
+                    ColumnType::LeftEdge => 0,
+                    ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
+                },
+                is_stmt: row.is_stmt(),
+                prologue_end: row.prologue_end(),
+                end_sequence: row.end_sequence(),
+            };
+            match current.last_mut() {
+                Some(last) if last.address == line.address && !last.end_sequence => {
+                    let prologue_end = last.prologue_end;
+                    *last = line;
+                    last.prologue_end |= prologue_end;
+                }
+                _ => current.push(line),
+            }
+            if line.end_sequence {
+                let rows = std::mem::take(&mut current);
+                if rows.len() > 1 {
+                    self.sequences.push(LineSequence {
+                        start: rows[0].address,
+                        end: line.address,
+                        rows,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Debug info left out of this index because it could not be parsed.
+    pub(crate) fn skipped(&self) -> &[SkippedDebugInfo]
+    {
+        &self.skipped
     }
 
     /// `[start, end)` of the function containing `address`: from the closest function
@@ -341,16 +448,24 @@ fn components(path: &str) -> Vec<&str>
         .collect()
 }
 
+/// A rendered path's [`components`] joined with `/`, with a leading `/` when the path is
+/// absolute. `..` components are kept.
+fn normalize_path(path: &str) -> String
+{
+    let joined = components(path).join("/");
+    if path.starts_with('/') { format!("/{joined}") } else { joined }
+}
+
 /// Render a line-program file entry the way `addr2line` does.
 fn render_file(
     dwarf: &OwnedDwarf,
     unit: &Unit<OwnedReader>,
     file: &FileEntry<OwnedReader>,
     header: &LineProgramHeader<OwnedReader>,
-) -> Result<String, SourceLookupError>
+) -> gimli::Result<String>
 {
     let mut path = match &unit.comp_dir {
-        Some(dir) => dir.to_string_lossy().map_err(dwarf_error)?.into_owned(),
+        Some(dir) => dir.to_string_lossy()?.into_owned(),
         None => String::new(),
     };
     // Directory index 0 is the compilation directory itself.
@@ -363,14 +478,9 @@ fn render_file(
     Ok(path)
 }
 
-fn attr_string(
-    dwarf: &OwnedDwarf,
-    unit: &Unit<OwnedReader>,
-    value: AttributeValue<OwnedReader>,
-) -> Result<String, SourceLookupError>
+fn attr_string(dwarf: &OwnedDwarf, unit: &Unit<OwnedReader>, value: AttributeValue<OwnedReader>) -> gimli::Result<String>
 {
-    let string = dwarf.attr_string(unit, value).map_err(dwarf_error)?;
-    Ok(string.to_string_lossy().map_err(dwarf_error)?.into_owned())
+    Ok(dwarf.attr_string(unit, value)?.to_string_lossy()?.into_owned())
 }
 
 fn push_path(path: &mut String, part: &str)
@@ -385,22 +495,49 @@ fn push_path(path: &mut String, part: &str)
     }
 }
 
-fn dwarf_error(error: gimli::Error) -> SourceLookupError
-{
-    SourceLookupError::DebugInfo(error.to_string())
-}
-
 impl BinaryImage
 {
-    /// The image's line index, built from every compilation unit on first use.
+    /// The image's line index, built on first use from every compilation unit that can be
+    /// parsed. The result is cached, including a failure to load the DWARF sections (see the
+    /// module documentation).
     pub(crate) fn line_index(&self) -> Result<&LineIndex, SourceLookupError>
     {
-        self.line_index_cell().get_or_try_init(|| {
-            let dwarf = self
-                .dwarf()
-                .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
-            LineIndex::build(dwarf, self.function_index()?.starts().to_vec())
-        })
+        self.line_index_cell()
+            .get_or_init(|| {
+                let dwarf = self
+                    .dwarf()
+                    .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
+                let index = LineIndex::build(dwarf, self.function_index()?.starts().to_vec());
+                warn_skipped(self, "line", index.skipped());
+                Ok(index)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Debug info that could not be parsed and was left out of this image's line and
+    /// function indexes, sorted and distinct; empty when everything was read. Builds both
+    /// indexes if needed.
+    ///
+    /// A lookup that fails with [`SourceLookupError::UnknownFile`] or
+    /// [`SourceLookupError::UnknownFunction`] while this is not empty may have missed a file
+    /// or function in the skipped debug info.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceLookupError::DebugInfo`] when the image's DWARF sections cannot be loaded.
+    pub fn skipped_debug_info(&self) -> Result<Vec<SkippedDebugInfo>, SourceLookupError>
+    {
+        let mut skipped: Vec<SkippedDebugInfo> = self
+            .line_index()?
+            .skipped()
+            .iter()
+            .chain(self.function_index()?.skipped())
+            .cloned()
+            .collect();
+        skipped.sort();
+        skipped.dedup();
+        Ok(skipped)
     }
 
     /// Every statement address of `file:line`, across all compilation units.
@@ -422,7 +559,9 @@ impl BinaryImage
     /// [`SourceLookupError::InvalidLine`] for line 0, [`SourceLookupError::UnknownFile`]
     /// or [`SourceLookupError::AmbiguousFile`] when `file` matches no or several paths,
     /// [`SourceLookupError::NoCodeAtOrAfterLine`] when `line` is past the file's last line
-    /// with code, and [`SourceLookupError::DebugInfo`] when the line tables cannot be read.
+    /// with code, and [`SourceLookupError::DebugInfo`] when the DWARF sections cannot be
+    /// loaded. Units that cannot be parsed are skipped rather than failing the lookup (see
+    /// [`BinaryImage::skipped_debug_info`]).
     pub fn line_addresses(&self, file: &str, line: u32) -> Result<LineAddresses, SourceLookupError>
     {
         if line == 0 {
@@ -467,7 +606,7 @@ impl BinaryImage
     ///
     /// # Errors
     ///
-    /// [`SourceLookupError::DebugInfo`] when the line tables cannot be read.
+    /// [`SourceLookupError::DebugInfo`] when the DWARF sections cannot be loaded.
     pub fn line_at_address(&self, address: Address) -> Result<Option<AddressLine>, SourceLookupError>
     {
         let Some(file_address) = self.file_address(address) else {
@@ -511,10 +650,254 @@ impl BinaryImage
     }
 }
 
+/// Log every skipped part of the debug info of `image`'s `kind` index.
+pub(crate) fn warn_skipped(image: &BinaryImage, kind: &str, skipped: &[SkippedDebugInfo])
+{
+    for skip in skipped {
+        tracing::warn!(
+            image = %image.path().display(),
+            unit_offset = ?skip.unit_offset,
+            reason = %skip.reason,
+            "skipped unreadable debug info while building the {kind} index"
+        );
+    }
+}
+
+/// Synthetic DWARF for index tests, written with `gimli::write`.
+#[cfg(test)]
+pub(crate) mod synthetic
+{
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use gimli::write::{
+        Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Range, RangeList, Sections, UnitEntryId,
+    };
+    use gimli::{
+        DW_AT_comp_dir, DW_AT_entry_pc, DW_AT_linkage_name, DW_AT_name, DW_AT_ranges, DW_TAG_subprogram, Encoding,
+        EndianArcSlice, Format, LineEncoding, LittleEndian, RunTimeEndian, SectionId,
+    };
+
+    use super::OwnedDwarf;
+
+    /// DWARF 4, 64-bit addresses: what rustc emits on macOS.
+    pub(crate) const ENCODING: Encoding = Encoding {
+        format: Format::Dwarf32,
+        version: 4,
+        address_size: 8,
+    };
+
+    /// One compilation unit to write.
+    pub(crate) struct TestUnit
+    {
+        /// `DW_AT_comp_dir`, also the line program's directory 0.
+        pub(crate) comp_dir: &'static str,
+        /// Line-table rows `(address, line)` of one sequence in file `file` (relative to
+        /// `comp_dir`), ending at `end`.
+        pub(crate) file: &'static str,
+        pub(crate) rows: Vec<(u64, u64)>,
+        pub(crate) end: u64,
+        /// Subprograms of the unit.
+        pub(crate) functions: Vec<TestFunction>,
+    }
+
+    /// One subprogram: `(name, [start, end) ranges in listed order, DW_AT_entry_pc)`. The
+    /// name is written as both `DW_AT_name` and `DW_AT_linkage_name`.
+    pub(crate) type TestFunction = (&'static str, Vec<(u64, u64)>, Option<u64>);
+
+    impl TestUnit
+    {
+        pub(crate) fn new(comp_dir: &'static str, file: &'static str) -> Self
+        {
+            Self {
+                comp_dir,
+                file,
+                rows: Vec::new(),
+                end: 0,
+                functions: Vec::new(),
+            }
+        }
+    }
+
+    /// Written section bytes, by section.
+    pub(crate) struct TestDwarf
+    {
+        pub(crate) sections: HashMap<SectionId, Vec<u8>>,
+    }
+
+    /// Write `units` (in order) to DWARF sections.
+    pub(crate) fn write(units: &[TestUnit]) -> TestDwarf
+    {
+        let mut dwarf = gimli::write::Dwarf::new();
+        for spec in units {
+            let mut line_program = LineProgram::new(
+                ENCODING,
+                LineEncoding::default(),
+                LineString::String(spec.comp_dir.into()),
+                None,
+                LineString::String(spec.file.into()),
+                None,
+            );
+            let directory = line_program.default_directory();
+            let file = line_program.add_file(LineString::String(spec.file.into()), directory, None);
+            if !spec.rows.is_empty() {
+                let base = spec.rows[0].0;
+                line_program.begin_sequence(Some(Address::Constant(base)));
+                for &(address, line) in &spec.rows {
+                    let row = line_program.row();
+                    row.address_offset = address - base;
+                    row.file = file;
+                    row.line = line;
+                    row.is_statement = true;
+                    line_program.generate_row();
+                }
+                line_program.end_sequence(spec.end - base);
+            }
+            let mut unit = DwarfUnit::new(ENCODING);
+            unit.unit.line_program = line_program;
+            let root = unit.unit.root();
+            let entry = unit.unit.get_mut(root);
+            entry.set(DW_AT_name, AttributeValue::String(spec.file.into()));
+            entry.set(DW_AT_comp_dir, AttributeValue::String(spec.comp_dir.into()));
+            for (name, ranges, entry_pc) in &spec.functions {
+                let list = RangeList(
+                    ranges
+                        .iter()
+                        .map(|&(begin, end)| Range::StartEnd {
+                            begin: Address::Constant(begin),
+                            end: Address::Constant(end),
+                        })
+                        .collect(),
+                );
+                let list = unit.unit.ranges.add(list);
+                let id: UnitEntryId = unit.unit.add(root, DW_TAG_subprogram);
+                let die = unit.unit.get_mut(id);
+                die.set(DW_AT_name, AttributeValue::String((*name).into()));
+                // Every rustc subprogram has a linkage name; the index resolves names
+                // through it.
+                die.set(DW_AT_linkage_name, AttributeValue::String((*name).into()));
+                die.set(DW_AT_ranges, AttributeValue::RangeListRef(list));
+                if let Some(entry_pc) = entry_pc {
+                    die.set(DW_AT_entry_pc, AttributeValue::Address(Address::Constant(*entry_pc)));
+                }
+            }
+            dwarf.units.add(unit.unit);
+        }
+        let mut sections = Sections::new(EndianVec::new(LittleEndian));
+        dwarf.write(&mut sections).expect("write DWARF");
+        let mut bytes = HashMap::new();
+        sections
+            .for_each(|id, section| {
+                bytes.insert(id, section.slice().to_vec());
+                Ok::<_, gimli::Error>(())
+            })
+            .expect("collect sections");
+        TestDwarf { sections: bytes }
+    }
+
+    /// Two units, `src/bad.rs` (function `bad_fn`, lines 3-4) and `src/good.rs` (function
+    /// `good_fn` at `0x2000`, lines 7-8), where the first unit's header parses but its root
+    /// entry does not. Returns the DWARF and the bad unit's `.debug_info` offset.
+    pub(crate) fn corrupt_then_good() -> (OwnedDwarf, u64)
+    {
+        let mut bad = TestUnit::new("/w", "src/bad.rs");
+        bad.rows = vec![(0x1000, 3), (0x1004, 4)];
+        bad.end = 0x1008;
+        bad.functions = vec![("bad_fn", vec![(0x1000, 0x1008)], None)];
+        let mut good = TestUnit::new("/w", "src/good.rs");
+        good.rows = vec![(0x2000, 7), (0x2008, 8)];
+        good.end = 0x2010;
+        good.functions = vec![("good_fn", vec![(0x2000, 0x2010)], None)];
+        let mut written = write(&[bad, good]);
+        // DWARF 4 unit header: 4-byte length, 2-byte version, 4-byte abbreviation offset,
+        // 1-byte address size. The root entry's abbreviation code follows; 0x7f is not in
+        // the table, so the header parses and the unit does not.
+        written.corrupt_info(11, 0x7f);
+        let dwarf = written.load();
+        let mut units = dwarf.units();
+        let header = units.next().expect("first header").expect("first unit");
+        assert_eq!(header.offset().as_debug_info_offset().map(|offset| offset.0), Some(0));
+        assert!(dwarf.unit(header).is_err(), "the first unit must fail to parse");
+        assert!(
+            units.next().expect("second header").is_some(),
+            "the second unit must be found"
+        );
+        (dwarf, 0)
+    }
+
+    impl TestDwarf
+    {
+        /// Load the sections the way `BinaryImage` does.
+        pub(crate) fn load(&self) -> OwnedDwarf
+        {
+            gimli::Dwarf::load(|id: SectionId| {
+                let data = self.sections.get(&id).map_or(&[][..], Vec::as_slice);
+                Ok::<_, gimli::Error>(EndianArcSlice::new(Arc::from(data), RunTimeEndian::Little))
+            })
+            .expect("load DWARF")
+        }
+
+        /// Overwrite one byte of `.debug_info`.
+        pub(crate) fn corrupt_info(&mut self, offset: usize, byte: u8)
+        {
+            self.sections.get_mut(&SectionId::DebugInfo).expect(".debug_info")[offset] = byte;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
+    use super::synthetic::{TestUnit, write};
     use super::*;
+
+    /// AC1 (issue #88, L4): a unit whose body does not parse is skipped; the good unit is
+    /// still indexed and the skip is recorded.
+    #[test]
+    fn a_corrupt_unit_does_not_hide_the_good_one()
+    {
+        let (dwarf, bad_offset) = super::synthetic::corrupt_then_good();
+        let lines = LineIndex::build(&dwarf, Vec::new());
+        let file = lines.resolve_file("good.rs").expect("good.rs");
+        assert_eq!(lines.files[file as usize], "/w/src/good.rs");
+        assert_eq!(lines.lines[file as usize].get(&8), Some(&vec![0x2008]));
+        assert!(matches!(
+            lines.resolve_file("bad.rs"),
+            Err(SourceLookupError::UnknownFile { .. })
+        ));
+        assert_eq!(lines.skipped().len(), 1, "{:?}", lines.skipped());
+        assert_eq!(lines.skipped()[0].unit_offset, Some(bad_offset));
+    }
+
+    /// AC2 (issue #88, L5): two spellings of one path are one file, found by an absolute
+    /// and by a suffix query, with the addresses of both units.
+    #[test]
+    fn two_spellings_of_one_file_are_one_file()
+    {
+        let mut first = TestUnit::new("/w/.", "src/lib.rs");
+        first.rows = vec![(0x1000, 5)];
+        first.end = 0x1004;
+        let mut second = TestUnit::new("/w", "src//lib.rs");
+        second.rows = vec![(0x2000, 5)];
+        second.end = 0x2004;
+        let dwarf = write(&[first, second]).load();
+        let lines = LineIndex::build(&dwarf, Vec::new());
+        for query in ["/w/src/lib.rs", "/w/./src/lib.rs", "src/lib.rs", "lib.rs"] {
+            let file = lines.resolve_file(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+            assert_eq!(lines.files[file as usize], "/w/src/lib.rs", "{query}");
+            assert_eq!(lines.lines[file as usize].get(&5), Some(&vec![0x1000, 0x2000]), "{query}");
+        }
+    }
+
+    /// `normalize_path` drops empty and `.` components and keeps `..`.
+    #[test]
+    fn paths_normalize_without_resolving_parent_components()
+    {
+        assert_eq!(normalize_path("/w/./src//lib.rs"), "/w/src/lib.rs");
+        assert_eq!(normalize_path("/w/a/../lib.rs"), "/w/a/../lib.rs");
+        assert_eq!(normalize_path("./src/lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path(""), "");
+    }
 
     fn index(paths: &[&str]) -> LineIndex
     {
@@ -523,6 +906,7 @@ mod tests
             sequences: Vec::new(),
             lines: paths.iter().map(|_| BTreeMap::from([(1, vec![0x1000])])).collect(),
             function_starts: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 

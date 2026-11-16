@@ -31,7 +31,9 @@ use libc::{c_int, mach_port_t, vm_address_t, vm_map_t, vm_offset_t};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::message::mach_msg_type_number_t;
 #[cfg(target_os = "macos")]
-use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region_recurse};
+use mach2::vm::{mach_vm_machine_attribute, mach_vm_protect, mach_vm_read_overwrite, mach_vm_region_recurse};
+#[cfg(target_os = "macos")]
+use mach2::vm_attributes::{MATTR_CACHE, MATTR_VAL_CACHE_FLUSH, vm_machine_attribute_val_t};
 #[cfg(target_os = "macos")]
 use mach2::vm_region::{
     VM_REGION_SUBMAP_SHORT_INFO_COUNT_64, vm_region_recurse_info_t, vm_region_submap_short_info_data_64_t,
@@ -286,6 +288,14 @@ pub fn read_memory(task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u
 /// );
 /// ```
 ///
+/// ## Instruction cache
+///
+/// `vm_write()` changes memory, not the instruction caches of the cores the target runs
+/// on. A thread that has the old instruction cached keeps executing it: it runs past a
+/// new `brk`, or traps on a `brk` that has been replaced (issue #80). After every write
+/// the written range is flushed with `MATTR_CACHE`, as LLDB's debugserver does, so the
+/// next instruction any thread fetches there is the one in memory.
+///
 /// See: [vm_write(3) man page](https://developer.apple.com/documentation/kernel/1585462-vm_write/)
 pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usize>
 {
@@ -309,9 +319,40 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
                 format!("vm_write() failed with error code: {}", result),
             )));
         }
-
-        Ok(data.len())
     }
+
+    flush_caches(task, addr, data.len())?;
+    Ok(data.len())
+}
+
+/// Write back data and invalidate instructions cached for `len` bytes at `addr`.
+///
+/// XNU syncs a page this way when it first maps it executable, never after a later
+/// write. The kernel flushes one page per call, so the range is split at page boundaries.
+///
+/// See: [vm_machine_attribute(3)](https://developer.apple.com/documentation/kernel/1402219-vm_machine_attribute/)
+fn flush_caches(task: mach_port_t, addr: Address, len: usize) -> Result<()>
+{
+    let page_size = *SYSTEM_PAGE_SIZE as u64;
+    let mut start = addr.value();
+    let end = start
+        .checked_add(len as u64)
+        .ok_or_else(|| DebuggerError::InvalidArgument(format!("range at 0x{start:016x} overflows")))?;
+    while start < end {
+        let page_end = page_align_down(start, *SYSTEM_PAGE_SIZE).saturating_add(page_size);
+        let size = page_end.min(end) - start;
+        let mut value: vm_machine_attribute_val_t = MATTR_VAL_CACHE_FLUSH;
+        // SAFETY: `value` is a valid, writable attribute value; the kernel only reads
+        // and writes that one value and validates the range in the target map itself.
+        let result = unsafe { mach_vm_machine_attribute(task, start, size, MATTR_CACHE, &raw mut value) };
+        if result != KERN_SUCCESS {
+            return Err(DebuggerError::Io(Error::other(format!(
+                "flushing the caches for 0x{start:016x}+{size} failed with error code: {result}"
+            ))));
+        }
+        start += size;
+    }
+    Ok(())
 }
 
 /// Get memory regions for a Mach task

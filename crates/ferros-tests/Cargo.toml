@@ -11,12 +11,10 @@ readme = "README.md"
 keywords = ["debugger", "rust", "testing", "fixtures"]
 categories = ["development-tools"]
 
-[dependencies]
-ferros-core = { path = "../ferros-core" }
-
-# The macOS debugger. The crate keeps building on other OSes because the harness that
-# uses it is gated on macOS.
+# The macOS debugger. The crate keeps building on other OSes because the harness and
+# symbol modules that use these are gated on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+ferros-core = { path = "../ferros-core" }
 ferros-macos = { path = "../ferros-macos" }
 # `symbols::function_address` reads fixture symbol tables (Mach-O, no DWARF).
 object = { version = "0.38.0", features = ["read", "macho"] }
@@ -88,6 +86,11 @@ test = false
 [[bin]]
 name = "ferros-fixture-step_races"
 path = "fixtures/step_races.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-hot_loop"
+path = "fixtures/hot_loop.rs"
 test = false
 
 [[bin]]

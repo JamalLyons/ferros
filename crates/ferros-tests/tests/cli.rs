@@ -17,6 +17,19 @@ use ferros_tests::{Fixture, fixture};
 /// Iterations passed to `loop_counter` so it outlives the test (10 ms each).
 const LONG_LOOP: &str = "100000";
 
+/// Runs `body` under [`harness::run`] after `ferros` is built and signed.
+///
+/// The first [`transcript::ferros_bin`] call builds the `ferros` package, which
+/// `cargo test -p ferros-tests` does not build. On a cold CI runner that takes longer
+/// than the harness deadline, so it must happen before the deadline starts.
+fn run<F>(body: F)
+where
+    F: FnOnce(&TestContext) + Send + 'static,
+{
+    let _ = transcript::ferros_bin();
+    harness::run(body);
+}
+
 /// Offset of an address from the load address of `fixture`'s main image, computed with a
 /// short-lived harness session (the slide differs between launches, the offset does not).
 fn offset_in_image(t: &TestContext, fixture: &Fixture, address: impl Fn(&mut ferros_core::Session) -> Address) -> u64
@@ -62,7 +75,7 @@ fn launched_pid(banner: &str) -> u32
 #[test]
 fn launch_and_continue_runs_hello_to_exit()
 {
-    harness::run(|t| {
+    run(|t| {
         let tag = t.tag();
         let run = transcript::launch_batch(&tag, &fixture!("hello"), &[], &["continue"]);
         assert!(run.status.success(), "status {}: {run:?}", run.status);
@@ -81,7 +94,7 @@ fn launch_and_continue_runs_hello_to_exit()
 #[test]
 fn breakpoint_stop_shows_pc_at_the_breakpoint()
 {
-    harness::run(|t| {
+    run(|t| {
         let hello = fixture!("hello");
         let offset = offset_in_image(t, &hello, |d| marker_address(d, &hello, "hello_print"));
 
@@ -114,7 +127,7 @@ fn breakpoint_stop_shows_pc_at_the_breakpoint()
 #[test]
 fn unknown_command_is_an_error_and_the_session_continues()
 {
-    harness::run(|t| {
+    run(|t| {
         let tag = t.tag();
         let run = transcript::launch_batch(&tag, &fixture!("hello"), &[], &["frobnicate", "status"]);
         assert_eq!(run.status.code(), Some(1), "{run:?}");
@@ -133,7 +146,7 @@ fn unknown_command_is_an_error_and_the_session_continues()
 #[test]
 fn end_of_input_kills_the_launched_debuggee()
 {
-    harness::run(|t| {
+    run(|t| {
         let fixture = fixture!("loop_counter");
         let offset = offset_in_image(t, &fixture, |d| function_address(d, &fixture, "tick"));
 
@@ -162,7 +175,7 @@ fn end_of_input_kills_the_launched_debuggee()
 #[test]
 fn sigint_interrupts_the_running_debuggee()
 {
-    harness::run(|t| {
+    run(|t| {
         let fixture = fixture!("loop_counter");
         let tag = t.tag();
         let mut ferros = Interactive::launch(&tag, &fixture, &[LONG_LOOP, "--progress"]);
@@ -202,7 +215,7 @@ fn sigint_interrupts_the_running_debuggee()
 #[test]
 fn batch_file_runs_before_commands()
 {
-    harness::run(|t| {
+    run(|t| {
         let dir = std::env::temp_dir().join(format!("ferros-cli-batch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let script = dir.join("script.ferros");

@@ -7,6 +7,9 @@
 //! the debugger entitlement (`crates/ferros-macos/ferros.entitlements`). Set `FERROS_BIN`
 //! to use an already signed binary instead.
 //!
+//! The first call can take longer than the [`harness::run`](crate::harness::run) deadline
+//! on a cold build, so call [`ferros_bin`] before entering the harness.
+//!
 //! Every fixture launched through these helpers receives the identifying argument of a
 //! [`Tag`] after `--`, so the harness kills it (and the `ferros` process, whose command line
 //! carries the same argument) if the test fails or times out.
@@ -15,6 +18,7 @@
 //! use ferros_tests::transcript::{self, Interactive};
 //! use ferros_tests::{fixture, harness};
 //!
+//! let _ = transcript::ferros_bin(); // build outside the deadline
 //! harness::run(|t| {
 //!     let tag = t.tag();
 //!     let run = transcript::launch_batch(&tag, &fixture!("hello"), &[], &["continue"]);

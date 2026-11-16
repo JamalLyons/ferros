@@ -128,6 +128,8 @@ pub struct Session
     symbols: SymbolCache,
     /// Live executable mappings and their symbol-loading state.
     loaded_images: Vec<images::SessionImage>,
+    /// Counter identifying the current symbol request; see `begin_symbol_request`.
+    symbol_request: u64,
 }
 
 /// How the session got its process, which decides what dropping the session does.
@@ -279,6 +281,7 @@ impl Session
             breakpoints: BreakpointStore::new(),
             symbols: SymbolCache::new(),
             loaded_images: Vec::new(),
+            symbol_request: 0,
         }
     }
 

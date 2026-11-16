@@ -318,6 +318,60 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
     });
 }
 
+/// Issue #85: a symbol load that fails for a reason other than missing debug info (here
+/// the image's file is briefly missing, as while Cargo re-uplifts a fixture) is reported
+/// with its original error, and a later request loads the symbols once the file is back.
+#[test]
+fn session_reports_a_transient_symbol_load_failure_and_retries_later()
+{
+    harness::run(|_| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        let executable = scratch.0.join("program");
+        let link = || std::os::unix::fs::symlink(fixture.path(), &executable).expect("link the executable");
+        std::os::unix::fs::symlink(fixture.dsym_path(), scratch.0.join("program.dSYM")).expect("link the dSYM");
+        let load_address = 0x2_0000_0000;
+        let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
+        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+            .expect("mapping")
+            .runtime_address(file)
+            .expect("runtime");
+        let mock = with_mapped_header(MockBackend::new(), fixture.path(), load_address)
+            .with_thread(ThreadId(1), Registers::default())
+            .with_image(LoadedImage {
+                path: executable.clone(),
+                load_address: Address::new(load_address),
+            });
+        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
+
+        for _ in 0..2 {
+            let error = session.symbolicate(address).expect_err("missing image file");
+            let DebuggerError::SymbolLoad { path, source } = &error else {
+                panic!("unexpected result {error}");
+            };
+            assert_eq!(path, &executable);
+            assert!(
+                matches!(&**source, DebuggerError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+                "{source}"
+            );
+        }
+        link();
+        let symbolication = session
+            .symbolicate(address)
+            .expect("symbols once the file is back")
+            .expect("main has a symbol");
+        assert!(
+            symbolication
+                .frames
+                .iter()
+                .any(|frame| rustc_demangle::try_demangle(frame.symbol.raw())
+                    .is_ok_and(|name| format!("{name:#}") == "ferros_fixture_hello::main")),
+            "{symbolication:?}"
+        );
+    });
+}
+
 #[test]
 fn session_refreshes_unloaded_and_relocated_images()
 {

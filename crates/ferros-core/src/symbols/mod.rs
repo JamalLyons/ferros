@@ -50,4 +50,4 @@ pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use functions::FunctionAddress;
 pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping};
-pub use lines::{AddressLine, LineAddresses, SourceLookupError};
+pub use lines::{AddressLine, LineAddresses, SkippedDebugInfo, SourceLookupError};

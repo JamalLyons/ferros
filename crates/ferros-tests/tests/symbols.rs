@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use ferros_core::symbols::{BinaryImage, DebugInfoOptions, FunctionAddress, ImageDescriptor, SourceLookupError};
 use ferros_core::{Address, SymbolCache};
 use ferros_tests::{Fixture, fixture};
-use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 
 /// Every fixture binary. `fixture!` needs a literal name, so the table is written out;
 /// `fixture_table_covers_every_source` keeps it in step with `fixtures/`.
@@ -691,4 +691,119 @@ fn function_lookups_after_first_load_take_under_a_second()
         let _ = image.function_addresses(query);
         assert!(started.elapsed() < limit, "{query} took {:?}", started.elapsed());
     }
+}
+
+/// A copy of the `symbols` fixture executable and its dSYM in a scratch directory, where
+/// the first compilation unit of the dSYM's `.debug_info` no longer parses: its unit
+/// header is intact, so the units after it can still be located, and the abbreviation code
+/// of its root entry is overwritten with one no abbreviation table has.
+fn load_with_corrupt_first_unit(fixture: &Fixture, scratch: &Scratch) -> Arc<BinaryImage>
+{
+    let executable = scratch.0.join(fixture.path().file_name().expect("executable name"));
+    fs::copy(fixture.path(), &executable).expect("copy executable");
+    let dwarf_dir = PathBuf::from(format!("{}.dSYM", executable.display())).join("Contents/Resources/DWARF");
+    fs::create_dir_all(&dwarf_dir).expect("create dSYM directory");
+    let companion = fs::read_dir(fixture.dsym_path().join("Contents/Resources/DWARF"))
+        .expect("fixture dSYM")
+        .map(|entry| entry.expect("dSYM entry").path())
+        .next()
+        .expect("DWARF file in the fixture dSYM");
+    let mut dwarf = fs::read(&companion).expect("read DWARF file");
+    let (info, _) = object::File::parse(&*dwarf)
+        .expect("parse DWARF file")
+        .section_by_name(".debug_info")
+        .expect(".debug_info section")
+        .file_range()
+        .expect(".debug_info file range");
+    let info = usize::try_from(info).expect("offset");
+    // 32-bit DWARF unit header: 4-byte length, 2-byte version, then 5 more bytes in
+    // version 4 and 6 more in version 5. The root entry's abbreviation code follows.
+    let version = u16::from_le_bytes([dwarf[info + 4], dwarf[info + 5]]);
+    let root = info + if version >= 5 { 12 } else { 11 };
+    // ULEB128 0x1f_ffff: far more abbreviations than any unit declares.
+    dwarf[root..root + 3].copy_from_slice(&[0xff, 0xff, 0x7f]);
+    fs::write(dwarf_dir.join(companion.file_name().expect("DWARF file name")), dwarf).expect("write DWARF file");
+
+    let bytes = fs::read(&executable).expect("read executable");
+    let file = object::File::parse(&*bytes).expect("parse executable");
+    let text = file
+        .segments()
+        .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
+        .expect("__TEXT segment");
+    let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+    cache
+        .load_image(ImageDescriptor {
+            path: executable,
+            load_address: text.address(),
+        })
+        .expect("image with a partly unreadable dSYM")
+}
+
+/// Functions of the `symbols` fixture looked up by `one_unreadable_unit_does_not_hide_the_others`.
+const FUNCTIONS: &[&str] = &["main", "area", "bump", "generic_identity", "one_line_identity"];
+
+/// Issue #88: one compilation unit that cannot be parsed is skipped and reported, and
+/// lines and functions of every other unit still resolve to the addresses they have in
+/// the intact image.
+#[test]
+fn one_unreadable_unit_does_not_hide_the_others()
+{
+    let fixture = fixture!("symbols");
+    let intact = load(&fixture);
+    assert_eq!(
+        intact.skipped_debug_info(),
+        Ok(Vec::new()),
+        "the fixture dSYM parses completely"
+    );
+
+    let scratch = Scratch::new();
+    let image = load_with_corrupt_first_unit(&fixture, &scratch);
+    let skipped = image.skipped_debug_info().expect("indexes build from the readable units");
+    assert!(
+        skipped.iter().any(|skip| skip.unit_offset == Some(0)),
+        "the unit at .debug_info offset 0 is reported: {skipped:?}"
+    );
+
+    let text = source(&fixture);
+    let query = source_query(&fixture);
+    let mut resolved = 0;
+    for marker in markers(&text) {
+        let line = fixture.marker_line(&marker);
+        let expected = intact.line_addresses(&query, line).expect("intact marker");
+        match image.line_addresses(&query, line) {
+            Ok(found) => {
+                // A line in the skipped unit resolves to a later line or to fewer copies.
+                if found.line == line {
+                    assert!(
+                        found.addresses.iter().all(|address| expected.addresses.contains(address)),
+                        "{marker}: {found:?} is not part of {expected:?}"
+                    );
+                    resolved += 1;
+                }
+            }
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    SourceLookupError::UnknownFile { .. } | SourceLookupError::NoCodeAtOrAfterLine { .. }
+                ),
+                "{marker}: a line in the skipped unit is a typed miss, not {error:?}"
+            ),
+        }
+    }
+    assert!(resolved > 0, "no marker resolved from the readable units");
+
+    let found = FUNCTIONS
+        .iter()
+        .filter(
+            |name| match (image.function_addresses(name), intact.function_addresses(name)) {
+                (Ok(found), Ok(expected)) => {
+                    assert!(found.iter().all(|function| expected.contains(function)), "{name}: {found:?}");
+                    !found.is_empty()
+                }
+                (Err(SourceLookupError::UnknownFunction { .. }), _) => false,
+                (found, expected) => panic!("{name}: {found:?} (intact: {expected:?})"),
+            },
+        )
+        .count();
+    assert!(found > 0, "no function resolved from the readable units");
 }

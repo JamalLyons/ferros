@@ -565,6 +565,9 @@ unsafe extern "C" {
     /// See: [posix_spawnattr_destroy(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/posix_spawnattr_destroy.3.html)
     pub fn posix_spawnattr_destroy(attrp: *mut libc::posix_spawnattr_t) -> libc::c_int;
 
+    /// Set the child's process group (zero selects its own PID).
+    pub fn posix_spawnattr_setpgroup(attrp: *mut libc::posix_spawnattr_t, pgroup: libc::pid_t) -> libc::c_int;
+
     /// Set spawn flags
     ///
     /// Sets flags that control the behavior of the spawned process.
@@ -616,6 +619,9 @@ unsafe extern "C" {
 pub mod spawn_flags
 {
     use libc::c_short;
+
+    /// Apply the process group selected by `posix_spawnattr_setpgroup`.
+    pub const POSIX_SPAWN_SETPGROUP: c_short = 0x0002;
 
     /// Start the process in a suspended state
     ///

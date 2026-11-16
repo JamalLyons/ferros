@@ -23,7 +23,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr;
 
-use ferros_core::backend::{Environment, LaunchSpec, StdioSpec};
+use ferros_core::backend::{Environment, LaunchSpec, ProcessGroup, StdioSpec};
 use ferros_core::error::{DebuggerError, Result};
 use libc::c_int;
 
@@ -194,7 +194,15 @@ impl LaunchManager
             }
 
             debug!("Setting POSIX_SPAWN_START_SUSPENDED flag");
-            let flags_result = ffi::posix_spawnattr_setflags(&mut attr.0, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED);
+            let mut flags = ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED;
+            if spec.process_group == Some(ProcessGroup::New) {
+                let result = ffi::posix_spawnattr_setpgroup(&mut attr.0, 0);
+                if result != 0 {
+                    return Err(spawn_error("set process group", result));
+                }
+                flags |= ffi::spawn_flags::POSIX_SPAWN_SETPGROUP;
+            }
+            let flags_result = ffi::posix_spawnattr_setflags(&mut attr.0, flags);
             if flags_result != 0 {
                 return Err(spawn_error("set spawn flags", flags_result));
             }
@@ -375,6 +383,110 @@ pub(crate) fn reap_child(pid: libc::pid_t, timeout: std::time::Duration) -> ferr
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// Temporarily lends stdin's controlling terminal to a launched process group.
+///
+/// Restore before reading another debugger command. Non-terminal stdin is a no-op.
+/// Dropping the guard also restores ownership, including on an error or panic.
+pub struct ForegroundTerminal
+{
+    previous: Option<libc::pid_t>,
+}
+
+impl ForegroundTerminal
+{
+    /// Give the terminal to `pid`'s process group, if stdin is a controlling terminal
+    /// currently owned by this process's group.
+    ///
+    /// # Errors
+    /// Returns an OS error if ownership cannot be changed.
+    pub fn give_to(pid: ferros_core::ProcessId) -> std::io::Result<Self>
+    {
+        // SAFETY: these calls take integer process/file IDs and retain no pointers.
+        let previous = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if previous < 0 {
+            let error = Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOTTY) {
+                return Ok(Self { previous: None });
+            }
+            return Err(error);
+        }
+        let group = libc::pid_t::try_from(process_group(pid)?.0).map_err(|_| Error::other("group ID out of range"))?;
+        // SAFETY: getpgrp retains no pointers.
+        if group == previous || previous != unsafe { libc::getpgrp() } {
+            return Ok(Self { previous: None });
+        }
+        set_foreground(group)?;
+        Ok(Self {
+            previous: Some(previous),
+        })
+    }
+
+    /// Return the terminal to its original foreground group.
+    ///
+    /// # Errors
+    /// Returns an OS error if terminal ownership cannot be restored.
+    pub fn restore(&mut self) -> std::io::Result<()>
+    {
+        if let Some(previous) = self.previous {
+            set_foreground(previous)?;
+            self.previous = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ForegroundTerminal
+{
+    fn drop(&mut self)
+    {
+        if let Err(error) = self.restore() {
+            tracing::warn!("could not restore terminal foreground group: {error}");
+        }
+    }
+}
+
+/// Block SIGTTOU on this thread while changing foreground ownership: ferros is
+/// itself in the background when reclaiming the terminal after a stop.
+fn set_foreground(group: libc::pid_t) -> std::io::Result<()>
+{
+    // SAFETY: signal sets are initialized before use; all pointers refer to live local
+    // storage. The previous thread mask is restored even when tcsetpgrp fails.
+    unsafe {
+        let mut blocked = std::mem::zeroed();
+        let mut previous = std::mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+        let result = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        if result != 0 {
+            return Err(Error::from_raw_os_error(result));
+        }
+        let result = libc::tcsetpgrp(libc::STDIN_FILENO, group);
+        let error = (result < 0).then(Error::last_os_error);
+        let restored = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, ptr::null_mut());
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if restored != 0 {
+            return Err(Error::from_raw_os_error(restored));
+        }
+        Ok(())
+    }
+}
+
+/// Look up a process's group ID using `getpgid`.
+///
+/// # Errors
+/// Returns an OS error if `pid` does not name an accessible process.
+pub fn process_group(pid: ferros_core::ProcessId) -> std::io::Result<ferros_core::ProcessId>
+{
+    let pid = libc::pid_t::try_from(pid.0).map_err(|_| Error::other("process ID out of range"))?;
+    // SAFETY: getpgid takes a process ID and retains no pointers.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group)
+        .map(ferros_core::ProcessId)
+        .map_err(|_| Error::last_os_error())
 }
 
 #[cfg(test)]

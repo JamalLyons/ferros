@@ -426,11 +426,8 @@ fn stdin_file_wins_over_the_terminal()
 
 /// Ctrl-C typed while the program runs stops it and returns to the prompt.
 ///
-/// The terminal is in cooked mode with `ISIG` on while the program runs, and the program
-/// shares ferros's process group (it is spawned without `POSIX_SPAWN_SETPGROUP`), so the
-/// terminal sends `SIGINT` to both. ferros survives and interrupts the program; the stop
-/// is reported as `stopped: interrupted` or, when the program's own `SIGINT` is seen
-/// first, `stopped: signal 2` (see `crates/ferros/src/repl/interrupt.rs`).
+/// The program has its own group and owns the terminal while running. Its terminal
+/// SIGINT stop is presented as an interrupt; ownership returns before the prompt.
 #[test]
 fn ctrl_c_while_the_program_runs_stops_it()
 {
@@ -442,19 +439,20 @@ fn ctrl_c_while_the_program_runs_stops_it()
         ferros.type_line("continue");
         ferros.expect("tick: ");
         ferros.type_keys(CTRL_C);
-        ferros.expect("stopped: ");
+        ferros.expect("stopped: interrupted");
         ferros.expect(PROMPT);
         thread::sleep(Duration::from_millis(200));
         assert!(ferros.is_running(), "ferros died on Ctrl-C:\n{}", ferros.text());
         let text = ferros.text();
         assert!(
-            text.contains("stopped: interrupted") || text.contains("stopped: signal 2 "),
+            text.contains("stopped: interrupted") && !text.contains("stopped: signal 2 "),
             "not an interrupt stop:\n{text}"
         );
         assert!(!text.contains("process killed"), "the program died:\n{text}");
 
         ferros.type_line("status");
         ferros.expect("status: stopped (pid ");
+        ferros.expect("stopped: interrupted");
         ferros.expect(PROMPT);
         ferros.type_line("backtrace");
         ferros.expect("#0 ");
@@ -466,7 +464,7 @@ fn ctrl_c_while_the_program_runs_stops_it()
         ferros.expect("tick: ");
         thread::sleep(Duration::from_millis(100));
         ferros.type_keys(CTRL_C);
-        ferros.expect("stopped: ");
+        ferros.expect("stopped: interrupted");
         ferros.expect(PROMPT);
         let text = ferros.text();
         assert!(!text.contains("process killed"), "the program died:\n{text}");
@@ -474,5 +472,47 @@ fn ctrl_c_while_the_program_runs_stops_it()
 
         end_with_ctrl_d(&mut ferros, &tag);
         assert!(ferros.text().contains("killed process "), "{}", ferros.text());
+    });
+}
+
+/// Send to the entire debugger process group, independently of terminal foreground
+/// ownership. Repeating resume/interrupt catches the old racing debuggee SIGINT stop.
+#[test]
+fn sigint_to_ferros_process_group_always_reports_interrupted()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
+        let pid = ferros.child.process_id().expect("ferros pid");
+        let group = ferros_macos::launch::process_group(ferros_core::ProcessId(pid)).expect("ferros group");
+        assert_eq!(group.0, pid, "pty child must lead its isolated group");
+        let targets: Vec<_> = tagged(&tag).into_iter().filter(|candidate| *candidate != pid).collect();
+        assert_eq!(targets.len(), 1, "one debuggee must carry the test tag: {targets:?}");
+        let target_group = ferros_macos::launch::process_group(ferros_core::ProcessId(targets[0])).expect("debuggee group");
+        assert_eq!(target_group.0, targets[0], "debuggee must lead its own group");
+        assert_ne!(target_group, group, "killpg must not directly signal the debuggee");
+        assert_ne!(
+            group,
+            ferros_macos::launch::process_group(ferros_core::ProcessId(std::process::id())).expect("test group")
+        );
+        for _ in 0..5 {
+            ferros.type_line("continue");
+            ferros.expect("tick: ");
+            // Python's safe os.killpg binding explicitly targets the whole group.
+            let status = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import os, signal, sys; os.killpg(int(sys.argv[1]), signal.SIGINT)",
+                    &group.0.to_string(),
+                ])
+                .status()
+                .expect("killpg");
+            assert!(status.success(), "killpg failed: {status}");
+            ferros.expect("stopped: interrupted");
+            ferros.expect(PROMPT);
+            assert!(!ferros.text().contains("stopped: signal 2"), "{}", ferros.text());
+        }
+        end_with_ctrl_d(&mut ferros, &tag);
     });
 }

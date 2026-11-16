@@ -4,10 +4,9 @@
 //! while the debuggee runs, [`wait_for_stop`] waits in short slices and turns a set flag
 //! into [`Session::interrupt`], so Ctrl-C stops the debuggee and returns to the prompt.
 //!
-//! The debuggee is in ferros's process group, so a Ctrl-C typed at the terminal also
-//! sends it `SIGINT` directly. That signal is reported as its own stop
-//! (`stopped: signal 2`), possibly instead of `stopped: interrupted`, and `continue`
-//! does not pass it on to the program.
+//! Launched debuggees have their own process group. When they inherit terminal stdin,
+//! the CLI lends them the foreground while running and maps their terminal SIGINT stop
+//! to `Interrupted`; SIGINT sent to ferros's group uses the flag below instead.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

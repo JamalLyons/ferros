@@ -112,7 +112,7 @@ mod types;
 use std::time::Duration;
 
 pub use error::{BackendError, BackendResult};
-pub use types::{Environment, LaunchSpec, LoadedImage, ResumeRequest, StdioSpec, StopEvent, ThreadAction};
+pub use types::{Environment, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent, ThreadAction};
 
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 

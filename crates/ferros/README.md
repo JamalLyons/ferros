@@ -125,10 +125,16 @@ process killed by signal 9
 ### Ctrl-C
 
 Ctrl-C never ends `ferros`. While the program runs (`continue`, `run`, `stepi`) it interrupts the
-program and returns to the prompt; at an interactive prompt it discards the line. The program runs in
-the same process group as `ferros`, so a Ctrl-C typed in the terminal also sends it `SIGINT`
-directly; that may be reported as `stopped: signal 2` instead of `stopped: interrupted`, and
-`continue` does not pass it on to the program.
+program and returns to the prompt; at an interactive prompt it discards the line. Launched programs
+have a separate process group, so a signal sent to ferros's group reaches only ferros, whose handler
+interrupts the program. Both paths are reported as `stopped: interrupted`; `continue` suppresses the
+held `SIGINT` rather than delivering it to the program.
+
+When the program inherits terminal stdin, ferros gives its group the terminal foreground while it
+runs, then takes the terminal back at every stop (also on errors). This lets the program read typed
+input without `SIGTTIN`. Terminal Ctrl-C reaches that foreground program directly; ferros reports
+its `SIGINT` stop as an interrupt. With `launch --stdin FILE`, the program instead reads the file
+and ferros keeps terminal ownership. Attaching leaves the target's process group unchanged.
 
 ### Adding a command
 

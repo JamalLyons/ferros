@@ -139,6 +139,14 @@ impl Default for Environment
     }
 }
 
+/// Process-group placement of a launched program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessGroup
+{
+    /// Create a group whose ID is the new process's ID (`setpgid(0, 0)`).
+    New,
+}
+
 /// Description of a program to start with [`Backend::launch`](super::Backend::launch).
 ///
 /// ```
@@ -161,6 +169,8 @@ pub struct LaunchSpec
     pub env: Environment,
     /// Working directory; `None` uses the debugger's current directory.
     pub cwd: Option<PathBuf>,
+    /// Process-group placement; `None` inherits the debugger's group.
+    pub process_group: Option<ProcessGroup>,
     /// Standard input.
     pub stdin: StdioSpec,
     /// Standard output.
@@ -181,6 +191,7 @@ impl LaunchSpec
             args: Vec::new(),
             env: Environment::default(),
             cwd: None,
+            process_group: None,
             stdin: StdioSpec::Inherit,
             stdout: StdioSpec::Inherit,
             stderr: StdioSpec::Inherit,
@@ -235,6 +246,14 @@ impl LaunchSpec
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self
     {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Set the process-group placement.
+    #[must_use]
+    pub fn process_group(mut self, process_group: ProcessGroup) -> Self
+    {
+        self.process_group = Some(process_group);
         self
     }
 

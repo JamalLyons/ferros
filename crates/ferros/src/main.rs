@@ -1,13 +1,16 @@
 mod platform;
+mod repl;
 
-use std::process;
+use std::io::{self, IsTerminal as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use ferros_core::types::ProcessId;
-use ferros_core::{LaunchSpec, Result as DebuggerResult, Session};
-use ferros_utils::{LogFormat, LogLevel, debug, info, init_logging, init_logging_with_level};
+use clap::{Args, Parser, Subcommand};
+use ferros_core::{LaunchSpec, ProcessId};
+use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
 
 use crate::platform::create_backend;
+use crate::repl::{Debugger, Input, Target};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
 #[derive(Parser, Debug)]
@@ -16,14 +19,13 @@ use crate::platform::create_backend;
 #[command(about = "A Rust-native debugger with hybrid MIR and system-level introspection", long_about = None)]
 struct Cli
 {
-    /// Set the log level (error, warn, info, debug, trace)
-    /// Overrides `RUST_LOG` environment variable
-    #[arg(long, value_name = "LEVEL")]
+    /// Set the log level (error, warn, info, debug, trace); overrides `RUST_LOG`.
+    /// Logs go to a file under ~/.ferros (see `ferros find-logs`), never to the terminal.
+    #[arg(long, value_name = "LEVEL", global = true)]
     log_level: Option<String>,
 
-    /// Set the log format (pretty, json)
-    /// Overrides `FERROS_LOG_FORMAT` environment variable
-    #[arg(long, value_name = "FORMAT")]
+    /// Set the log format of the log file (pretty, json); overrides `FERROS_LOG_FORMAT`.
+    #[arg(long, value_name = "FORMAT", global = true)]
     log_format: Option<String>,
 
     #[command(subcommand)]
@@ -33,202 +35,168 @@ struct Cli
 #[derive(Subcommand, Debug)]
 enum Commands
 {
-    /// Attach to a running process by PID
-    Attach
-    {
-        /// Process ID (PID) to attach to
-        pid: u32,
-        /// Use headless mode (print info and exit; currently the only mode)
-        #[arg(long, default_value_t = false)]
-        headless: bool,
-    },
-    /// Launch a new process under debugger control
+    /// Launch a program, stopped at its entry, and debug it
+    ///
+    /// Program arguments go after `--`: `ferros launch ./prog -- --flag value`.
     Launch
     {
+        #[command(flatten)]
+        script: Script,
         /// Path to the executable to launch
-        program: String,
-        /// Arguments to pass to the program
-        /// Note: To set Ferros log level, use --log-level before the 'launch' subcommand:
-        ///   ferros --log-level debug launch <program>
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        program: PathBuf,
+        /// Arguments passed to the program (after `--`)
+        #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
-        /// Use headless mode (print info and exit; currently the only mode)
-        #[arg(long, default_value_t = false)]
-        headless: bool,
     },
-    /// Display CPU registers from the attached process
-    Registers,
-    /// Read memory from the attached process
-    Memory
+    /// Attach to a running process by PID and debug it
+    Attach
     {
-        /// Memory address to read from (hex format: 0x1000 or decimal)
-        address: String,
-        /// Number of bytes to read (default: 16)
-        #[arg(short, long, default_value_t = 16)]
-        length: usize,
+        #[command(flatten)]
+        script: Script,
+        /// Process ID (PID) to attach to
+        pid: u32,
     },
-    /// List memory regions in the attached process
-    Regions,
-    /// List all threads in the attached process
-    Threads,
-    /// Suspend execution of the attached process
-    Suspend,
-    /// Resume execution of the attached process
-    Resume,
-    /// Detach from the attached process
-    Detach,
-    /// Show debugger information (architecture, status, etc.)
-    Info,
-    /// Change directory to the log directory for easy log viewing
+    /// Print the directory that holds the Ferros log files
     FindLogs,
 }
 
-fn main()
+/// Commands to run instead of reading them interactively.
+#[derive(Args, Debug)]
+struct Script
 {
-    let mut cli = Cli::parse();
+    /// Run the commands in FILE (one per line; `#` starts a comment), then end the session
+    #[arg(long, value_name = "FILE")]
+    batch: Option<PathBuf>,
+    /// Run CMD (repeatable; runs after --batch), then end the session
+    #[arg(long = "command", short = 'c', value_name = "CMD")]
+    commands: Vec<String>,
+}
 
-    // The interactive front end is being rebuilt; non-headless behaves like --headless.
-    if let Commands::Attach { headless, .. } | Commands::Launch { headless, .. } = &mut cli.command
-        && !*headless
+impl Script
+{
+    /// The batch command list, or `None` when commands come from stdin.
+    fn lines(&self) -> io::Result<Option<Vec<String>>>
     {
-        println!("The interactive front end is being rebuilt; running in headless mode.");
-        *headless = true;
+        if self.batch.is_none() && self.commands.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = Vec::new();
+        if let Some(path) = &self.batch {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+            lines.extend(text.lines().map(str::to_owned));
+        }
+        lines.extend(self.commands.iter().cloned());
+        Ok(Some(lines))
     }
+}
 
-    // Initialize logging with CLI flags or environment variables
-    let _log_file_path: Option<std::path::PathBuf> = if let Some(level_str) = &cli.log_level {
-        // Parse log level from CLI
-        let level = level_str.parse::<LogLevel>().unwrap_or_else(|_| {
-            eprintln!("Invalid log level: {level_str}. Use: error, warn, info, debug, or trace");
-            process::exit(1);
-        });
+fn log_directory() -> PathBuf
+{
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), |home| PathBuf::from(home).join(".ferros"))
+}
 
-        // Parse log format from CLI or default to pretty
-        let format = cli
-            .log_format
-            .as_ref()
-            .and_then(|f| f.parse::<LogFormat>().ok())
-            .unwrap_or(LogFormat::Pretty);
+fn main() -> ExitCode
+{
+    let cli = Cli::parse();
 
-        if let Err(e) = init_logging_with_level(level, format) {
-            eprintln!("Failed to initialize logging: {e}");
-            process::exit(1);
+    let level = match cli.log_level.as_deref().map(str::parse::<LogLevel>).transpose() {
+        Ok(level) => level,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
         }
-        None
-    } else {
-        // Use environment variables or defaults
-        if let Err(e) = init_logging() {
-            eprintln!("Failed to initialize logging: {e}");
-            process::exit(1);
-        }
-        None
     };
 
-    // Handle find-logs command early
-    if matches!(cli.command, Commands::FindLogs) {
-        let log_dir = if let Ok(home) = std::env::var("HOME") {
-            std::path::PathBuf::from(home).join(".ferros")
-        } else {
-            std::path::PathBuf::from("/tmp")
-        };
-
-        println!("{}", log_dir.display());
-        return;
-    }
-
-    if let Err(e) = run_command(cli) {
-        eprintln!("Error: {e}");
-        process::exit(1);
-    }
-}
-
-fn run_command(cli: Cli) -> DebuggerResult<()>
-{
-    match cli.command {
-        Commands::Attach { pid, headless: true } => {
-            info!("Attaching to process {}", pid);
-            let mut session = Session::new(create_backend()?);
-            session.attach(ProcessId::from(pid))?;
-            info!("Successfully attached to process {}", pid);
-            print_debugger_info(&mut session);
-            // Detach after showing info in headless mode; the process keeps running.
-            session.detach()?;
-            Ok(())
+    let format = cli
+        .log_format
+        .clone()
+        .or_else(|| std::env::var("FERROS_LOG_FORMAT").ok())
+        .map_or(Ok(LogFormat::Pretty), |text| text.parse::<LogFormat>());
+    let format = match format {
+        Ok(format) => format,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
         }
-        Commands::Launch {
-            program,
-            args,
-            headless: true,
-        } => {
-            info!("Launching program: {} with args: {:?}", program, args);
-            let mut session = Session::new(create_backend()?);
+    };
 
-            // Convert relative path to absolute path for posix_spawn
-            let program_path = std::path::Path::new(&program);
-            let absolute_program = if program_path.is_absolute() {
-                program_path.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(program_path).canonicalize()?
-            };
-
-            // `args` are the program's arguments; the backend passes the program as argv[0].
-            let spec = LaunchSpec::new(&absolute_program).args(args);
-            let pid = session.launch(&spec)?;
-            info!(
-                "Successfully launched program: {} (PID: {})",
-                absolute_program.display(),
-                pid.0
-            );
-
-            // The process is stopped at entry: show the info, then detach so it runs.
-            print_debugger_info(&mut session);
-            session.detach()?;
-            info!("Process detached and running");
-            Ok(())
-        }
-        Commands::Attach { headless: false, .. } | Commands::Launch { headless: false, .. } => {
-            unreachable!("non-headless is normalized to headless in main()")
-        }
-        Commands::Registers
-        | Commands::Memory { .. }
-        | Commands::Regions
-        | Commands::Threads
-        | Commands::Suspend
-        | Commands::Resume
-        | Commands::Detach
-        | Commands::Info => {
-            // TODO: Implement state management to persist debugger instance
-            eprintln!("Error: No process attached. Use 'ferros attach <pid>' or 'ferros launch <program>' first.");
-            eprintln!(
-                "Note: This command requires an attached process. State management will be added in a future version."
-            );
-            Err(ferros_core::error::DebuggerError::NotAttached)
-        }
+    let (script, target) = match cli.command {
         Commands::FindLogs => {
-            // This should be handled in main() before reaching here
-            unreachable!("FindLogs should be handled in main()")
+            println!("{}", log_directory().display());
+            return ExitCode::SUCCESS;
         }
+        Commands::Launch { script, program, args } => {
+            let program = absolute(&program);
+            (script, Target::Launch(LaunchSpec::new(program).args(args)))
+        }
+        Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid))),
+    };
+
+    // Logs go to a file so the session output stays deterministic (no timestamps, no colour).
+    if let Err(error) = init_logging_to_file(level, format) {
+        eprintln!("warning: logging is disabled: {error}");
+    }
+
+    let lines = match script.lines() {
+        Ok(lines) => lines,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if run_session(target, lines) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
-fn print_debugger_info(session: &mut Session)
+/// `program` as an absolute path (the backend spawns it by path).
+fn absolute(program: &Path) -> PathBuf
 {
-    info!("Debugger Information:");
-    info!("  Architecture: {}", session.architecture());
-    info!("  State: {:?}", session.state());
-    if let Some(pid) = session.pid() {
-        info!("  PID: {}", pid.0);
+    if program.is_absolute() {
+        program.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| program.to_path_buf(), |cwd| cwd.join(program))
     }
-    debug!("  Last Stop: {:?}", session.last_stop());
+}
 
-    if let Ok(threads) = session.threads() {
-        info!("  Threads: {}", threads.len());
-        if let Some(selected) = session.selected_thread() {
-            debug!("  Selected Thread: {}", selected.raw());
+/// Start the session and run the command loop. Returns `true` when nothing failed.
+fn run_session(target: Target, lines: Option<Vec<String>>) -> bool
+{
+    let interrupt = repl::interrupt::install();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+
+    let started = create_backend().and_then(|backend| Debugger::start(backend, target));
+    let (mut debugger, message) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return false;
         }
-    }
+    };
+    info!("{message}");
+    let _ = writeln!(out, "{message}");
 
-    if let Ok(regions) = session.memory_regions() {
-        info!("  Memory Regions: {}", regions.len());
-    }
+    let stdin = io::stdin();
+    let input = match lines {
+        Some(lines) => Input::Lines(lines.into()),
+        None if stdin.is_terminal() => match repl::editor() {
+            Ok(editor) => {
+                let _ = writeln!(out, "Type 'help' for the commands; 'quit' or Ctrl-D ends the session.");
+                editor
+            }
+            Err(error) => {
+                let _ = writeln!(err, "error: cannot start the line editor: {error}");
+                Input::Reader(stdin.lock())
+            }
+        },
+        None => Input::Reader(stdin.lock()),
+    };
+    repl::run(&mut debugger, input, &mut out, &mut err, &interrupt)
 }

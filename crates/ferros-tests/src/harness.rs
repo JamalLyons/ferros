@@ -409,6 +409,59 @@ impl TestContext
             shared: Arc::clone(&self.shared),
         }
     }
+
+    /// Reserves a fresh identifying argument (see [`TEST_ID_ARG_PREFIX`]) for processes the
+    /// test starts some other way, for example through the `ferros` binary. Every process
+    /// whose command line contains it is killed on the test's deadline, like a launched
+    /// fixture, and when the returned [`Tag`] is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test has already failed its deadline.
+    #[must_use]
+    pub fn tag(&self) -> Tag
+    {
+        assert!(
+            !self.shared.cancelled.load(Ordering::SeqCst),
+            "ferros-tests: refusing to reserve a tag: this test already failed its deadline"
+        );
+        let tag = unique_tag();
+        self.shared.tracked().push(Tracked {
+            tag: tag.clone(),
+            capture_dir: None,
+        });
+        Tag {
+            tag,
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// An identifying argument reserved by [`TestContext::tag`]. Dropping it kills every
+/// process still carrying it.
+pub struct Tag
+{
+    tag: String,
+    shared: Arc<Shared>,
+}
+
+impl Tag
+{
+    /// The argument, `--ferros-test-id=...`, to pass to the processes it should cover.
+    #[must_use]
+    pub fn as_str(&self) -> &str
+    {
+        &self.tag
+    }
+}
+
+impl Drop for Tag
+{
+    fn drop(&mut self)
+    {
+        kill_debuggee(&self.tag);
+        self.shared.forget(&self.tag);
+    }
 }
 
 /// A fixture started by [`TestContext::spawn`], not under the debugger. Dropping it kills

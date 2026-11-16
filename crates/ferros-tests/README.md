@@ -135,6 +135,15 @@ fn resume_runs_hello()
   breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
   drop. `Session::read_memory` hides traps, so raw bytes are read through
   `session.backend_mut().read_memory`.
+- `tests/cli.rs` runs the real `ferros` binary (issue #36). `ferros_tests::transcript` builds it once
+  per test process with `$CARGO build --package=ferros --message-format=json`, copies it next to
+  itself and ad-hoc signs the copy with the debugger entitlement (set `FERROS_BIN` to use a signed
+  binary instead). `transcript::launch_batch(&tag, &fixture, &args, &commands)` runs it with
+  `--command`s and returns stdout, stderr and the exit status; `transcript::Interactive` drives it
+  over pipes with `send(cmd)`, which returns the output up to the next `(ferros) ` prompt.
+  `transcript::normalize` replaces addresses, pids and thread ids with placeholders. Reserve the
+  identifying argument with `t.tag()`: the helpers pass it to the fixture after `--`, and the
+  harness kills every process carrying it on the deadline and when the `Tag` is dropped.
 - `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe

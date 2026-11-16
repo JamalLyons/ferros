@@ -25,7 +25,7 @@ target/debug/examples/simple_test
 
 ## Running with Ferros
 
-> **Note**: The interactive terminal UI (`ferros-ui`) is currently parked and being rebuilt. Launching or attaching with the `ferros` CLI currently runs in headless mode: it inspects the target process at entry, prints its state, thread count, and memory regions, and then detaches.
+> **Note**: Launching or attaching with the `ferros` CLI opens a line-oriented session (type `help` for the commands); see `crates/ferros/README.md`.
 
 ### Option 1: Launch directly under Ferros
 

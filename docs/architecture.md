@@ -110,40 +110,21 @@ The `ferros` crate provides the command-line interface for the debugger. It is t
 
 #### Main Entry Point
 
-The main function in [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs) handles:
-
-1. **Command Parsing**: Uses `clap` to parse command-line arguments and subcommands
-2. **Logging Initialization**: Sets up `tracing` structured logging based on CLI flags (`--log-level`, `--log-format`) or environment variables
-3. **Mode Normalization**: Normalizes non-headless attach and launch to headless mode while the interactive TUI is being rebuilt
-4. **Command Execution**: Calls `run_command` to drive `Session` through the platform backend
+The main function in [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs) parses the command line with `clap`, initializes file-only logging (`--log-level`, `--log-format`; nothing is logged to the terminal), creates the platform backend and hands one `Session` to the REPL in [`crates/ferros/src/repl/`](../crates/ferros/src/repl/).
 
 #### Command Structure
 
-The CLI supports several commands:
+- **`launch [--batch FILE] [--command CMD]... <program> [-- args...]`**: launch a process stopped at entry and open a session on it
+- **`attach [--batch FILE] [--command CMD]... <pid>`**: attach to a running process and open a session on it
+- **`find-logs`**: print the path to the Ferros log directory
 
-- **`attach <pid> [--headless]`**: Attach to a running process
-- **`launch <program> [args...] [--headless]`**: Launch a new process under debugger control
-- **`registers`**: Display CPU registers (requires persistent session)
-- **`memory <address> [--length <N>]`**: Read memory from process
-- **`regions`**: List memory regions of the target process
-- **`threads`**: List all threads
-- **`suspend`/`resume`**: Control process execution
-- **`detach`**: Detach from the target process
-- **`info`**: Show target status, architecture, and debugger information
-- **`find-logs`**: Print the path to the Ferros log directory
-
-#### Key Code References
-
-- **Main entry point**: [`crates/ferros/src/main.rs:86`](../crates/ferros/src/main.rs#L86)
-- **Command definitions**: [`crates/ferros/src/main.rs:33-84`](../crates/ferros/src/main.rs#L33-L84)
-- **Command execution**: [`crates/ferros/src/main.rs:145-212`](../crates/ferros/src/main.rs#L145-L212)
-- **Debugger info printer**: [`crates/ferros/src/main.rs:214-234`](../crates/ferros/src/main.rs#L214-L234)
+The session reads commands interactively (rustyline), from a pipe (with a `(ferros) ` prompt per line) or from the batch list. Commands are registered in [`crates/ferros/src/repl/commands/mod.rs`](../crates/ferros/src/repl/commands/mod.rs), one module per area; see [`crates/ferros/README.md`](../crates/ferros/README.md) for the list.
 
 #### Design Decisions
 
-- **Separation of concerns**: CLI parsing is separate from debugging engine logic
+- **Separation of concerns**: CLI parsing and the REPL are separate from debugging engine logic
 - **Platform abstraction**: CLI only names the platform backend in `crates/ferros/src/platform.rs`
-- **Logging flexibility**: Supports file and console logging in pretty and JSON formats
+- **Deterministic output**: the session logs to a file only, so batch transcripts can be compared in tests
 
 ---
 
@@ -418,6 +399,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 - `init_logging()`: Initialize with environment variables
 - `init_logging_with_level()`: Initialize with explicit level/format
 - `init_logging_for_tui()`: Initialize file-only logging for TUI
+- `init_logging_to_file()`: Initialize file-only logging for a CLI session
 
 **Code Reference**: [`crates/ferros-utils/src/logging.rs:152-224`](../crates/ferros-utils/src/logging.rs#L152-L224)
 
@@ -428,19 +410,19 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 ### Launching a Process
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:158-188`](../crates/ferros/src/main.rs#L158-L188)
+2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
 3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
 4. **Launch process**: `session.launch()` spawns process in suspended state
-5. **Show information**: the headless CLI prints the state, threads and memory regions while the process is stopped at entry
-6. **Detach**: `session.detach()` releases the process, which then runs on its own (the interactive front end is being rebuilt)
+5. **Run commands**: the REPL drives the session (`continue`, `break`, `registers`, ...) until `quit` or the end of input
+6. **End**: a launched process is killed with `session.kill()`; an attached one is released with `session.detach()`
 
 ### Attaching to a Process
 
 1. **User invokes**: `ferros attach <pid>`
-2. **CLI parses command**: [`crates/ferros/src/main.rs:148-157`](../crates/ferros/src/main.rs#L148-L157)
+2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
 3. **Create backend**: `create_backend()` supplies the platform mechanism
 4. **Attach to process**: `session.attach(pid)` gets Mach task port (macOS) or uses ptrace (Linux)
-5. **Show information & detach**: while the interactive front end is being rebuilt, the CLI prints target state, threads, and memory regions, then detaches
+5. **Run commands & detach**: the REPL drives the session; at `quit` or the end of input `session.detach()` releases the process, which keeps running
 
 ### Reading Registers
 

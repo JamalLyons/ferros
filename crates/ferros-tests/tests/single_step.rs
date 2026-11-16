@@ -8,6 +8,7 @@
 //! the backend *Stopped* or the process gone, so the session's drop works.
 #![cfg(target_os = "macos")]
 
+use std::fmt::Write as _;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -862,11 +863,13 @@ fn thread_created_before_pthread_is_published_stays_at_the_trap()
             "a thread ran before pthread's entry was trapped, stdout: {}",
             d.stdout()
         );
-        assert_eq!(
-            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
-            None,
-            "dyld's image notifier was delivered to the client"
-        );
+        let stray = backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait");
+        if let Some(event) = stray {
+            panic!(
+                "dyld's image notifier was delivered to the client: {}",
+                describe_stray_stop(&mut d, &fixture, &event)
+            );
+        }
         backend(&mut d).interrupt().expect("interrupt");
         assert!(matches!(
             backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
@@ -1014,6 +1017,33 @@ fn armed_birth_trap_is_hidden_from_reads_and_breakpoints()
             d.stdout()
         );
     });
+}
+
+/// Where a stop nobody expected was raised: its image, whether it is the executable entry
+/// (the birth policy's internal trap), and what memory holds there now. A `brk` stop where
+/// memory no longer has one was a stale instruction fetch (issue #80).
+fn describe_stray_stop(d: &mut Debuggee, fixture: &Fixture, event: &StopEvent) -> String
+{
+    let StopEvent::Breakpoint { pc, .. } = event else {
+        return format!("{event:?}");
+    };
+    let entry = executable_entry(d, fixture);
+    let image = backend(d)
+        .images()
+        .ok()
+        .and_then(|images| {
+            images
+                .into_iter()
+                .filter(|image| image.load_address <= *pc)
+                .max_by_key(|image| image.load_address)
+        })
+        .map_or_else(|| "no image".to_owned(), |image| image.path.display().to_string());
+    let live = diagnostics::raw_memory(d.pid(), *pc, 4).map_or_else(|err| err.to_string(), |bytes| format!("{bytes:02x?}"));
+    // Built with `write!`: one `format!` with every argument trips `large_stack_arrays`.
+    let mut description = format!("{event:?} in {image}");
+    let _ = write!(description, ", executable entry {entry} (match: {})", *pc == entry);
+    let _ = write!(description, ", memory there now {live}");
+    description
 }
 
 /// The executable entry (`LC_MAIN`) of `fixture`, in the running process.

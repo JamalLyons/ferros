@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines twelve fixture binaries:
+The crate defines thirteen fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -34,6 +34,9 @@ The crate defines twelve fixture binaries:
 - `ferros-fixture-spawn_thread`: Starts one worker before a breakpoint location and another afterward.
   `pause=<milliseconds>` delays the second thread so a test can attach first. The second thread
   is a normal pthread and must stay stopped while the default resume action is `Suspend`.
+- `ferros-fixture-hot_loop`: Threads (first argument, default 8, main included) that call `spin_site`
+  in a tight loop with no sleep, keeping it hot in every core's instruction cache. It prints the
+  address of the counter `spin_site` increments (`calls=<address>`) before spinning.
 - `ferros-fixture-workqueue`: Runs two GCD work items in turn, so the second normally reuses the
   first one's parked workqueue thread, which re-enters `_start_wqthread`. It prints whether it did (macOS).
 
@@ -130,6 +133,8 @@ fn resume_runs_hello()
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
   executable's Mach-O symbol table (no DWARF) and translates through the Session image mapping.
+- `tests/code_writes.rs` checks that code the backend writes is what the target executes next
+  (issue #80): a `brk` planted over an instruction the `hot_loop` threads have cached stops them.
 - `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
   counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
   breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and

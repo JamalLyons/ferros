@@ -91,6 +91,11 @@ path = "fixtures/step_races.rs"
 test = false
 
 [[bin]]
+name = "ferros-fixture-hot_loop"
+path = "fixtures/hot_loop.rs"
+test = false
+
+[[bin]]
 name = "ferros-fixture-symbols"
 path = "fixtures/symbols.rs"
 test = false

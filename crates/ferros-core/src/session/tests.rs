@@ -749,6 +749,59 @@ fn runtime_address_reports_the_original_header_failure_once_read()
     assert_eq!(session.runtime_address(&moved, 0x1_0000_0000).expect("not loaded"), None);
 }
 
+/// A 64-bit Mach-O header with one `__TEXT` segment (vmaddr 0x1_0000_0000, 0x1000 bytes
+/// at file offset 0), as the loader would map it.
+fn mapped_text_header() -> Vec<u8>
+{
+    let mut bytes = vec![0; 32 + 72];
+    bytes[0..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&72_u32.to_le_bytes());
+    let command = &mut bytes[32..];
+    command[0..4].copy_from_slice(&0x19_u32.to_le_bytes());
+    command[4..8].copy_from_slice(&72_u32.to_le_bytes());
+    command[8..14].copy_from_slice(b"__TEXT");
+    command[24..32].copy_from_slice(&0x1_0000_0000_u64.to_le_bytes());
+    command[32..40].copy_from_slice(&0x1000_u64.to_le_bytes());
+    command[48..56].copy_from_slice(&0x1000_u64.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn symbolicate_reports_an_unreadable_image_every_time_and_stack_traces_continue()
+{
+    // Issue #85: a mapped image whose file cannot be read is an error carrying the
+    // original failure on every request, not a silent `Ok(None)` cached after the first.
+    const IMAGE: u64 = 0x10_0000;
+    let image = LoadedImage {
+        path: "/nonexistent/ferros-session-test-image".into(),
+        load_address: Address::new(IMAGE),
+    };
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(IMAGE + 0x40))
+        .with_region(Address::new(IMAGE), "r-x", mapped_text_header())
+        .with_image(image.clone());
+    let mut session = launched(&mock);
+    for _ in 0..2 {
+        let error = session.symbolicate(Address::new(IMAGE + 0x40)).expect_err("unreadable image");
+        let DebuggerError::SymbolLoad { path, source } = &error else {
+            panic!("unexpected error {error}");
+        };
+        assert_eq!(path, &image.path);
+        assert!(
+            matches!(&**source, DebuggerError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{source}"
+        );
+        assert!(error.to_string().contains("ferros-session-test-image"), "{error}");
+    }
+    // Stack traces still return raw frames.
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(frames[0].pc, Address::new(IMAGE + 0x40));
+    assert!(frames[0].symbol.is_none());
+}
+
 #[test]
 fn stack_trace_ignores_unsupported_image_listing()
 {

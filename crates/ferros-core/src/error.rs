@@ -91,6 +91,19 @@ pub enum DebuggerError
         detail: String,
     },
 
+    /// Symbols for a loaded image could not be loaded for a reason other than missing
+    /// debug information, for example because its file could not be read while Cargo
+    /// replaced it. `source` is the original failure. The failure is not cached: the
+    /// next request for an address in the image tries again.
+    #[error("Cannot load symbols for {path}: {source}")]
+    SymbolLoad
+    {
+        /// Loader-reported path of the image.
+        path: std::path::PathBuf,
+        /// The original failure.
+        source: Box<DebuggerError>,
+    },
+
     /// Failed to attach to a process
     ///
     /// This is a general error for attachment failures that don't fit

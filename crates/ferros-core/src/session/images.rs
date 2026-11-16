@@ -15,8 +15,15 @@ pub(super) struct SessionImage
     /// Mapped memory does not change while the image stays loaded at this address, so
     /// the result is kept until the loader reports it unloaded or moved.
     mapping: std::result::Result<ImageMapping, String>,
-    attempted: bool,
+    /// Symbols were loaded into the session's [`SymbolCache`].
+    loaded: bool,
+    /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
+    /// without repeatedly running dsymutil.
     no_debug_info: Option<String>,
+    /// The symbol request (see [`Session::begin_symbol_request`]) whose load of this
+    /// image last failed for another reason. Such failures are not kept: a later request
+    /// reads the image again, but one request does not retry it.
+    failed_in_request: Option<u64>,
 }
 
 impl Session
@@ -118,8 +125,9 @@ impl Session
                 self.loaded_images.push(SessionImage {
                     descriptor,
                     mapping,
-                    attempted: false,
+                    loaded: false,
                     no_debug_info: None,
+                    failed_in_request: None,
                 });
             }
         }
@@ -143,10 +151,24 @@ impl Session
         ImageMapping::from_header(&header, load_address).map_err(|error| format!("header at {address}: {error}"))
     }
 
-    /// Load only the image needed for a lookup. Cache a typed failure so the diagnostic
-    /// survives subsequent requests without repeatedly running dsymutil.
+    /// Start a request that may load symbols. Within one request an image whose load
+    /// failed is not read again; the next request retries it.
+    pub(super) fn begin_symbol_request(&mut self)
+    {
+        self.symbol_request = self.symbol_request.wrapping_add(1);
+    }
+
+    /// Load only the image needed for a lookup. Returns whether symbols were newly
+    /// loaded; `Ok(false)` when no mapped image contains `address`, its symbols are
+    /// already loaded, or its load already failed in the current request.
+    ///
+    /// # Errors
+    /// [`DebuggerError::NoDebugInfo`] when the image has no usable DWARF (kept for later
+    /// requests), or [`DebuggerError::SymbolLoad`] with the original failure for any
+    /// other load error (not kept).
     pub(super) fn load_symbols_for_address(&mut self, address: Address) -> Result<bool>
     {
+        let request = self.symbol_request;
         let Some(image) = self
             .loaded_images
             .iter_mut()
@@ -160,19 +182,25 @@ impl Session
                 detail: detail.clone(),
             });
         }
-        if image.attempted {
+        if image.loaded || image.failed_in_request == Some(request) {
             return Ok(false);
         }
-        image.attempted = true;
         match self.symbols.load_image(image.descriptor.clone()) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                image.loaded = true;
+                image.failed_in_request = None;
+                Ok(true)
+            }
             Err(DebuggerError::NoDebugInfo { detail, path }) => {
                 image.no_debug_info = Some(detail.clone());
                 Err(DebuggerError::NoDebugInfo { path, detail })
             }
             Err(error) => {
-                tracing::debug!("could not load symbols for {}: {error}", image.descriptor.path.display());
-                Ok(false)
+                image.failed_in_request = Some(request);
+                Err(DebuggerError::SymbolLoad {
+                    path: image.descriptor.path.clone(),
+                    source: Box::new(error),
+                })
             }
         }
     }

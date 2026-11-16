@@ -54,13 +54,16 @@ impl Session
         let thread = self.selected_or_error()?;
         let registers = self.backend.read_registers(thread)?;
         self.load_images()?;
+        self.begin_symbol_request();
 
         // Missing symbols never prevent returning raw stack frames.
-        let _ = self.load_symbols_for_address(registers.pc);
+        self.load_symbols_for_frame(registers.pc);
         let architecture = self.backend.architecture();
-        // Each successful load marks one live image as attempted. Thus this loop
-        // terminates after at most the live image count, even when a caller's newly
-        // available CFI reveals further images that the frame-pointer pass missed.
+        // Each pass repeats only after a successful load, which marks one live image as
+        // loaded. Thus this loop terminates after at most the live image count, even when
+        // a caller's newly available CFI reveals further images that the frame-pointer
+        // pass missed. A failed load is not retried within this request, so a bad image
+        // is read at most once per trace.
         loop {
             let frames = {
                 let memory = BackendMemory {
@@ -70,12 +73,22 @@ impl Session
             };
             let mut added = false;
             for frame in &frames {
-                added |= self.load_symbols_for_address(frame.pc).unwrap_or(false);
+                added |= self.load_symbols_for_frame(frame.pc);
             }
             if !added {
                 return Ok(frames);
             }
         }
+    }
+
+    /// Load symbols for a frame's image. A failure leaves the frame without a symbol and
+    /// is logged, since a stack trace still returns raw frames.
+    fn load_symbols_for_frame(&mut self, pc: Address) -> bool
+    {
+        self.load_symbols_for_address(pc).unwrap_or_else(|error| {
+            tracing::debug!("stack trace continues without symbols at {pc}: {error}");
+            false
+        })
     }
 
     /// Map `address` to function names and source locations.
@@ -85,12 +98,15 @@ impl Session
     /// # Errors
     ///
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
-    /// while running, the backend's enumeration error, or [`DebuggerError::NoDebugInfo`]
-    /// when the owning image has no usable DWARF.
+    /// while running, the backend's enumeration error, [`DebuggerError::NoDebugInfo`]
+    /// when the owning image has no usable DWARF, or [`DebuggerError::SymbolLoad`] with
+    /// the original failure when the owning image's symbols could not be loaded for
+    /// another reason. That failure is not cached: a later call tries again.
     pub fn symbolicate(&mut self, address: Address) -> Result<Option<Symbolication>>
     {
         self.require_stopped()?;
         self.load_images()?;
+        self.begin_symbol_request();
         self.load_symbols_for_address(address)?;
         Ok(self.symbols.symbolicate(address))
     }

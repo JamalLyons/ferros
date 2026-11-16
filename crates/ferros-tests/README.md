@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines fourteen fixture binaries:
+The crate defines fifteen fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -46,6 +46,9 @@ The crate defines fourteen fixture binaries:
   address of the counter `spin_site` increments (`calls=<address>`) before spinning.
 - `ferros-fixture-workqueue`: Runs two GCD work items in turn, so the second normally reuses the
   first one's parked workqueue thread, which re-enters `_start_wqthread`. It prints whether it did (macOS).
+- `ferros-fixture-read_line`: Reads one line from stdin (marker `read_stdin`) and prints `read: <line>`,
+  or `read: <eof>` at end of file. Used by `tests/cli.rs` to check which stdin `ferros launch` gives
+  the program (issue #95).
 
 ## Marker Convention
 
@@ -164,6 +167,9 @@ fn resume_runs_hello()
   binary instead). `transcript::launch_batch(&tag, &fixture, &args, &commands)` runs it with
   `--command`s and returns stdout, stderr and the exit status; `transcript::Interactive` drives it
   over pipes with `send(cmd)`, which returns the output up to the next `(ferros) ` prompt.
+  `transcript::launch_batch_with` and `Interactive::launch_with_options` add `launch` options such
+  as `--stdin <file>`; `launch_batch_with` can also write bytes to ferros's own stdin (the program
+  inherits it in batch mode).
   `transcript::normalize` replaces addresses, pids and thread ids with placeholders. Reserve the
   identifying argument with `t.tag()`: the helpers pass it to the fixture after `--`, and the
   harness kills every process carrying it on the deadline and when the `Tag` is dropped.

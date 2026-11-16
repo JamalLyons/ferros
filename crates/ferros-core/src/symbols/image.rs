@@ -41,7 +41,7 @@ use super::debuginfo::{self, DebugInfoOptions};
 use super::demangle::make_symbol_name;
 use super::extractor::{TypeExtractor, TypeSummary};
 use super::functions::FunctionIndex;
-use super::lines::LineIndex;
+use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation};
@@ -429,10 +429,12 @@ pub struct BinaryImage
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
     context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
     type_cache: RwLock<HashMap<String, Arc<TypeSummary>>>,
-    /// Built on the first source lookup (see `symbols::lines`).
-    line_index: OnceCell<LineIndex>,
-    /// Built on the first function lookup (see `symbols::functions`).
-    function_index: OnceCell<FunctionIndex>,
+    /// Built on the first source lookup (see `symbols::lines`); a failure to load the
+    /// DWARF sections is cached too.
+    line_index: OnceCell<std::result::Result<LineIndex, SourceLookupError>>,
+    /// Built on the first function lookup (see `symbols::functions`); a failure to load the
+    /// DWARF sections is cached too.
+    function_index: OnceCell<std::result::Result<FunctionIndex, SourceLookupError>>,
 }
 
 impl BinaryImage
@@ -687,14 +689,16 @@ impl BinaryImage
         self.mapping.runtime_address(address)
     }
 
-    /// The lazily built line-table index slot, filled by `symbols::lines`.
-    pub(super) fn line_index_cell(&self) -> &OnceCell<LineIndex>
+    /// The lazily built line-table index slot, filled once by `symbols::lines` with the
+    /// index or with the error that prevented building it.
+    pub(super) fn line_index_cell(&self) -> &OnceCell<std::result::Result<LineIndex, SourceLookupError>>
     {
         &self.line_index
     }
 
-    /// The lazily built function index slot, filled by `symbols::functions`.
-    pub(super) fn function_index_cell(&self) -> &OnceCell<FunctionIndex>
+    /// The lazily built function index slot, filled once by `symbols::functions` with the
+    /// index or with the error that prevented building it.
+    pub(super) fn function_index_cell(&self) -> &OnceCell<std::result::Result<FunctionIndex, SourceLookupError>>
     {
         &self.function_index
     }

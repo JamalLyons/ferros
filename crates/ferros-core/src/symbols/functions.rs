@@ -32,6 +32,20 @@
 //! paths equals the whole query, which then wins (so `main` picks a function whose whole
 //! path is `main`, such as a C entry point, over `my_crate::main`).
 //!
+//! A function's entry is `DW_AT_low_pc`, else `DW_AT_entry_pc`, else the start of the first
+//! range in `DW_AT_ranges`, and its end is the end of the range holding the entry. With
+//! hot/cold splitting, the first range is the hot (entry) part and can lie above the cold
+//! part, so the lowest address is not used.
+//!
+//! # Unreadable debug info
+//!
+//! A compilation unit whose header or root entry cannot be parsed is skipped; a DIE whose
+//! attributes, strings or range list cannot be read is skipped alone; when the DIE tree
+//! itself cannot be walked further, the rest of that unit is skipped. Every other unit is
+//! still indexed, and each skip is recorded and reported as for the line index (see
+//! [`BinaryImage::skipped_debug_info`] and the `lines` module documentation). The built
+//! index is cached, and so is a failure to load the DWARF sections at all.
+//!
 //! All public lookups return runtime [`Address`]es; the index stores file virtual addresses
 //! and translates through the image mapping.
 
@@ -40,7 +54,7 @@ use std::collections::{BTreeSet, HashMap};
 use gimli::{AttributeValue, DwAt, Reader as _, Unit, UnitSectionOffset, constants};
 
 use super::image::BinaryImage;
-use super::lines::{LineIndex, SourceLookupError};
+use super::lines::{LineIndex, SkippedDebugInfo, SourceLookupError, warn_skipped};
 use super::{OwnedDwarf, OwnedReader};
 use crate::types::Address;
 
@@ -54,15 +68,18 @@ pub struct FunctionAddress
     /// Normalized path the query was matched against, segments joined with `::`
     /// (`my_crate::generic_identity`, `my_crate::Counter::bump`).
     pub path: String,
-    /// Runtime address of the function's first instruction (`DW_AT_low_pc`, or the lowest
-    /// start of its `DW_AT_ranges`).
+    /// Runtime address of the function's entry: `DW_AT_low_pc`, else `DW_AT_entry_pc`, else
+    /// the start of the first range listed in `DW_AT_ranges`. For a function split into hot
+    /// and cold parts this is the entry of the hot part, which need not be its lowest
+    /// address.
     pub entry: Address,
     /// Runtime address of the first instruction after the prologue: `entry` when the entry
     /// row itself is flagged `prologue_end` (no prologue); otherwise the first line-table
     /// row after `entry` and before `end` flagged `prologue_end`; otherwise the first row
     /// after `entry` whose line differs from the entry row's line; otherwise `entry`.
     pub after_prologue: Address,
-    /// Runtime end (exclusive) of the address range that contains `entry`.
+    /// Runtime end (exclusive) of the address range that contains `entry` (for a split
+    /// function, the end of the part that holds the entry only).
     pub end: Address,
 }
 
@@ -84,6 +101,8 @@ pub(crate) struct FunctionIndex
     by_last: HashMap<String, Vec<usize>>,
     /// Sorted, distinct entry addresses of every indexed function.
     starts: Vec<u64>,
+    /// Units (or entries of them) that could not be parsed and were left out.
+    skipped: Vec<SkippedDebugInfo>,
 }
 
 /// Name attributes of one subprogram DIE.
@@ -99,79 +118,65 @@ struct DieName
 
 impl FunctionIndex
 {
-    fn build(dwarf: &OwnedDwarf) -> Result<Self, SourceLookupError>
+    /// Index the concrete subprograms of every compilation unit that can be parsed,
+    /// skipping the others (see the module documentation).
+    pub(crate) fn build(dwarf: &OwnedDwarf) -> Self
     {
         let mut names = HashMap::<usize, DieName>::new();
         // (own DIE offset, entry, end) of every concrete subprogram.
         let mut concrete = Vec::<(usize, u64, u64)>::new();
+        let mut skipped = Vec::new();
         let mut units = dwarf.units();
-        while let Some(header) = units.next().map_err(dwarf_error)? {
-            let base = match header.offset() {
-                UnitSectionOffset::DebugInfoOffset(offset) => offset.0,
-                UnitSectionOffset::DebugTypesOffset(_) => continue,
+        loop {
+            let header = match units.next() {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(error) => {
+                    // Without a readable header, the next unit's offset is unknown.
+                    skipped.push(SkippedDebugInfo::new(None, "unit header", error));
+                    break;
+                }
             };
-            let unit = dwarf.unit(header).map_err(dwarf_error)?;
+            let UnitSectionOffset::DebugInfoOffset(base) = header.offset() else {
+                continue;
+            };
+            let base = base.0;
+            let offset = Some(base as u64);
+            let unit = match dwarf.unit(header) {
+                Ok(unit) => unit,
+                Err(error) => {
+                    skipped.push(SkippedDebugInfo::new(offset, "unit", error));
+                    continue;
+                }
+            };
             let mut scopes = Vec::<Option<String>>::new();
             let mut depth = 0_isize;
             let mut entries = unit.entries();
-            while let Some((delta, entry)) = entries.next_dfs().map_err(dwarf_error)? {
+            loop {
+                let (delta, entry) = match entries.next_dfs() {
+                    Ok(Some(next)) => next,
+                    Ok(None) => break,
+                    Err(error) => {
+                        // The tree cannot be walked past an entry that does not parse.
+                        skipped.push(SkippedDebugInfo::new(offset, "DIE tree", error));
+                        break;
+                    }
+                };
                 depth += delta;
                 scopes.truncate(usize::try_from(depth).unwrap_or(0));
-                let tag = entry.tag();
-                let own_name = match entry.attr_value(constants::DW_AT_name).map_err(dwarf_error)? {
-                    Some(value) => Some(attr_string(dwarf, &unit, value)?),
-                    None => None,
-                };
-                if tag == constants::DW_TAG_subprogram {
-                    let offset = base + entry.offset().0;
-                    let scope: Vec<&str> = scopes.iter().flatten().map(String::as_str).collect();
-                    let scoped = own_name.as_ref().map(|name| {
-                        let mut path = scope.join("::");
-                        if !path.is_empty() {
-                            path.push_str("::");
-                        }
-                        path.push_str(name);
-                        path
-                    });
-                    let linkage = match entry
-                        .attr_value(constants::DW_AT_linkage_name)
-                        .map_err(dwarf_error)?
-                        .or(entry.attr_value(constants::DW_AT_MIPS_linkage_name).map_err(dwarf_error)?)
-                    {
-                        Some(value) => Some(attr_string(dwarf, &unit, value)?),
-                        None => None,
-                    };
-                    let reference = reference(entry, constants::DW_AT_specification, base)?.or(reference(
-                        entry,
-                        constants::DW_AT_abstract_origin,
-                        base,
-                    )?);
-                    names.insert(
-                        offset,
-                        DieName {
-                            linkage,
-                            scoped,
-                            reference,
-                        },
-                    );
-                    let declaration = matches!(
-                        entry.attr_value(constants::DW_AT_declaration).map_err(dwarf_error)?,
-                        Some(AttributeValue::Flag(true))
-                    );
-                    if !declaration && let Some((start, end)) = entry_range(dwarf, &unit, entry)? {
-                        concrete.push((offset, start, end));
+                let die_offset = base + entry.offset().0;
+                let scope_name = match index_die(dwarf, &unit, entry, base, &scopes, &mut names, &mut concrete) {
+                    Ok(scope_name) => scope_name,
+                    Err(error) => {
+                        // Only this entry is lost; its children still get a scope slot.
+                        skipped.push(SkippedDebugInfo::new(
+                            offset,
+                            &format!("DIE at .debug_info+{die_offset:#x}"),
+                            error,
+                        ));
+                        None
                     }
-                }
-                let scope_name = matches!(
-                    tag,
-                    constants::DW_TAG_namespace
-                        | constants::DW_TAG_structure_type
-                        | constants::DW_TAG_enumeration_type
-                        | constants::DW_TAG_union_type
-                        | constants::DW_TAG_class_type
-                )
-                .then_some(own_name)
-                .flatten();
+                };
                 scopes.push(scope_name);
             }
         }
@@ -194,11 +199,18 @@ impl FunctionIndex
         }
         let mut starts: Vec<u64> = functions.iter().map(|function| function.entry).collect();
         starts.dedup();
-        Ok(Self {
+        Self {
             functions,
             by_last,
             starts,
-        })
+            skipped,
+        }
+    }
+
+    /// Debug info left out of this index because it could not be parsed.
+    pub(crate) fn skipped(&self) -> &[SkippedDebugInfo]
+    {
+        &self.skipped
     }
 
     /// Sorted, distinct entry addresses (file virtual addresses) of every indexed function.
@@ -239,6 +251,77 @@ impl FunctionIndex
     }
 }
 
+/// Record one DIE: a subprogram's names in `names` and, when it has code and is not a
+/// declaration, its `(offset, entry, end)` in `concrete`. Returns the name the DIE gives
+/// to the scope of its children (`Some` for a namespace or a named type).
+fn index_die(
+    dwarf: &OwnedDwarf,
+    unit: &Unit<OwnedReader>,
+    entry: &gimli::DebuggingInformationEntry<'_, '_, OwnedReader>,
+    base: usize,
+    scopes: &[Option<String>],
+    names: &mut HashMap<usize, DieName>,
+    concrete: &mut Vec<(usize, u64, u64)>,
+) -> gimli::Result<Option<String>>
+{
+    let tag = entry.tag();
+    let own_name = match entry.attr_value(constants::DW_AT_name)? {
+        Some(value) => Some(attr_string(dwarf, unit, value)?),
+        None => None,
+    };
+    if tag == constants::DW_TAG_subprogram {
+        let offset = base + entry.offset().0;
+        let scope: Vec<&str> = scopes.iter().flatten().map(String::as_str).collect();
+        let scoped = own_name.as_ref().map(|name| {
+            let mut path = scope.join("::");
+            if !path.is_empty() {
+                path.push_str("::");
+            }
+            path.push_str(name);
+            path
+        });
+        let linkage = match entry
+            .attr_value(constants::DW_AT_linkage_name)?
+            .or(entry.attr_value(constants::DW_AT_MIPS_linkage_name)?)
+        {
+            Some(value) => Some(attr_string(dwarf, unit, value)?),
+            None => None,
+        };
+        let reference = reference(entry, constants::DW_AT_specification, base)?.or(reference(
+            entry,
+            constants::DW_AT_abstract_origin,
+            base,
+        )?);
+        let declaration = matches!(
+            entry.attr_value(constants::DW_AT_declaration)?,
+            Some(AttributeValue::Flag(true))
+        );
+        let range = if declaration { None } else { entry_range(dwarf, unit, entry)? };
+        names.insert(
+            offset,
+            DieName {
+                linkage,
+                scoped,
+                reference,
+            },
+        );
+        if let Some((start, end)) = range {
+            concrete.push((offset, start, end));
+        }
+    }
+    let scope_name = matches!(
+        tag,
+        constants::DW_TAG_namespace
+            | constants::DW_TAG_structure_type
+            | constants::DW_TAG_enumeration_type
+            | constants::DW_TAG_union_type
+            | constants::DW_TAG_class_type
+    )
+    .then_some(own_name)
+    .flatten();
+    Ok(scope_name)
+}
+
 /// The name of subprogram `offset`: its own linkage name, demangled, or that of the DIE
 /// it refers to; otherwise the first scoped `DW_AT_name` along the same chain.
 fn resolve_name(names: &HashMap<usize, DieName>, offset: usize) -> Option<String>
@@ -264,35 +347,80 @@ fn reference(
     entry: &gimli::DebuggingInformationEntry<'_, '_, OwnedReader>,
     name: DwAt,
     base: usize,
-) -> Result<Option<usize>, SourceLookupError>
+) -> gimli::Result<Option<usize>>
 {
-    Ok(match entry.attr_value(name).map_err(dwarf_error)? {
+    Ok(match entry.attr_value(name)? {
         Some(AttributeValue::UnitRef(offset)) => Some(base + offset.0),
         Some(AttributeValue::DebugInfoRef(offset)) => Some(offset.0),
         _ => None,
     })
 }
 
-/// `(entry, end)` of a DIE with code: the lowest non-empty range start and the end of
-/// that range. `None` when the DIE has no non-empty range (or only ranges at address 0,
-/// left behind by dead-stripped code).
+/// `(entry, end)` of a DIE with code. The entry is `DW_AT_low_pc`, else `DW_AT_entry_pc`,
+/// else the start of the first listed non-empty range (not the lowest: with hot/cold
+/// splitting the lowest range can be the cold part). `end` is the end of the non-empty
+/// range that contains the entry; an attribute entry outside every such range is ignored.
+/// `None` when the DIE has no non-empty range (or only ranges at address 0, left behind by
+/// dead-stripped code).
 fn entry_range(
     dwarf: &OwnedDwarf,
     unit: &Unit<OwnedReader>,
     entry: &gimli::DebuggingInformationEntry<'_, '_, OwnedReader>,
-) -> Result<Option<(u64, u64)>, SourceLookupError>
+) -> gimli::Result<Option<(u64, u64)>>
 {
-    let mut best: Option<(u64, u64)> = None;
-    let mut ranges = dwarf.die_ranges(unit, entry).map_err(dwarf_error)?;
-    while let Some(range) = ranges.next().map_err(dwarf_error)? {
-        if range.begin == 0 || range.begin >= range.end {
-            continue;
-        }
-        if best.is_none_or(|(start, _)| range.begin < start) {
-            best = Some((range.begin, range.end));
+    let mut ranges = Vec::new();
+    let mut iter = dwarf.die_ranges(unit, entry)?;
+    while let Some(range) = iter.next()? {
+        if range.begin != 0 && range.begin < range.end {
+            ranges.push(range);
         }
     }
-    Ok(best)
+    let Some(first) = ranges.first() else {
+        return Ok(None);
+    };
+    let containing = |start: u64| {
+        ranges
+            .iter()
+            .find(|range| range.begin <= start && start < range.end)
+            .map(|range| (start, range.end))
+    };
+    for name in [constants::DW_AT_low_pc, constants::DW_AT_entry_pc] {
+        let Some(value) = entry.attr_value(name)? else {
+            continue;
+        };
+        let start = match (dwarf.attr_address(unit, value.clone())?, value.udata_value()) {
+            (Some(address), _) => Some(address),
+            // DWARF 5 allows a constant `DW_AT_entry_pc`: an offset from the beginning
+            // address of the function.
+            (None, Some(offset)) if name == constants::DW_AT_entry_pc => {
+                Some(entry_base(dwarf, unit, entry, &ranges)?.wrapping_add(offset))
+            }
+            (None, _) => None,
+        };
+        // An attribute entry outside every non-empty range (an address of 0 left by
+        // dead-stripped code, for example) is not trusted.
+        if let Some(found) = start.and_then(containing) {
+            return Ok(Some(found));
+        }
+    }
+    Ok(Some((first.begin, first.end)))
+}
+
+/// The address a DWARF 5 constant `DW_AT_entry_pc` is relative to: the DIE's
+/// `DW_AT_low_pc`, else the lowest start of its non-empty `ranges`.
+fn entry_base(
+    dwarf: &OwnedDwarf,
+    unit: &Unit<OwnedReader>,
+    entry: &gimli::DebuggingInformationEntry<'_, '_, OwnedReader>,
+    ranges: &[gimli::Range],
+) -> gimli::Result<u64>
+{
+    if let Some(value) = entry.attr_value(constants::DW_AT_low_pc)?
+        && let Some(address) = dwarf.attr_address(unit, value)?
+    {
+        return Ok(address);
+    }
+    Ok(ranges.iter().map(|range| range.begin).min().unwrap_or(0))
 }
 
 /// The first address after the prologue of the function at `[entry, end)` (see
@@ -463,32 +591,29 @@ fn strip_generics(segment: &str) -> Option<String>
     (depth == 0).then(|| plain.trim().to_owned())
 }
 
-fn attr_string(
-    dwarf: &OwnedDwarf,
-    unit: &Unit<OwnedReader>,
-    value: AttributeValue<OwnedReader>,
-) -> Result<String, SourceLookupError>
+fn attr_string(dwarf: &OwnedDwarf, unit: &Unit<OwnedReader>, value: AttributeValue<OwnedReader>) -> gimli::Result<String>
 {
-    let string = dwarf.attr_string(unit, value).map_err(dwarf_error)?;
-    Ok(string.to_string_lossy().map_err(dwarf_error)?.into_owned())
-}
-
-fn dwarf_error(error: gimli::Error) -> SourceLookupError
-{
-    SourceLookupError::DebugInfo(error.to_string())
+    Ok(dwarf.attr_string(unit, value)?.to_string_lossy()?.into_owned())
 }
 
 impl BinaryImage
 {
-    /// The image's function index, built from every compilation unit on first use.
+    /// The image's function index, built on first use from every compilation unit that can
+    /// be parsed. The result is cached, including a failure to load the DWARF sections (see
+    /// the module documentation).
     pub(crate) fn function_index(&self) -> Result<&FunctionIndex, SourceLookupError>
     {
-        self.function_index_cell().get_or_try_init(|| {
-            let dwarf = self
-                .dwarf()
-                .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
-            FunctionIndex::build(dwarf)
-        })
+        self.function_index_cell()
+            .get_or_init(|| {
+                let dwarf = self
+                    .dwarf()
+                    .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
+                let index = FunctionIndex::build(dwarf);
+                warn_skipped(self, "function", index.skipped());
+                Ok(index)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// Every function whose path matches `name`, with its entry and post-prologue
@@ -510,7 +635,9 @@ impl BinaryImage
     /// [`SourceLookupError::UnknownFunction`] when nothing matches,
     /// [`SourceLookupError::AmbiguousFunction`] when the matches have more than one
     /// distinct path and none of them equals the whole of `name`, and
-    /// [`SourceLookupError::DebugInfo`] when the DWARF cannot be read.
+    /// [`SourceLookupError::DebugInfo`] when the DWARF sections cannot be loaded. Units and
+    /// entries that cannot be parsed are skipped rather than failing the lookup (see
+    /// [`BinaryImage::skipped_debug_info`]).
     pub fn function_addresses(&self, name: &str) -> Result<Vec<FunctionAddress>, SourceLookupError>
     {
         let matches = self.function_index()?.lookup(name)?;
@@ -534,6 +661,51 @@ impl BinaryImage
 mod tests
 {
     use super::*;
+
+    /// AC1 (issue #88, L4): a unit that does not parse is skipped; functions of the good
+    /// unit are still found and the skip is recorded.
+    #[test]
+    fn a_corrupt_unit_does_not_hide_the_good_one()
+    {
+        let (dwarf, bad_offset) = super::super::lines::synthetic::corrupt_then_good();
+        let index = FunctionIndex::build(&dwarf);
+        let found = index.lookup("good_fn").expect("good_fn");
+        assert_eq!(found.iter().map(|function| function.entry).collect::<Vec<_>>(), vec![0x2000]);
+        assert!(matches!(
+            index.lookup("bad_fn"),
+            Err(SourceLookupError::UnknownFunction { .. })
+        ));
+        assert_eq!(index.skipped().len(), 1, "{:?}", index.skipped());
+        assert_eq!(index.skipped()[0].unit_offset, Some(bad_offset));
+    }
+
+    /// AC3 (issue #88, L7): the hot range listed first is the entry even though the cold
+    /// range listed after it is lower; `DW_AT_entry_pc` wins over the first range.
+    #[test]
+    fn split_function_entry_is_the_first_listed_range()
+    {
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.functions = vec![
+            ("split", vec![(0x3000, 0x3040), (0x1000, 0x1010)], None),
+            ("with_entry_pc", vec![(0x5000, 0x5010), (0x4000, 0x4020)], Some(0x4008)),
+            // Dead-stripped ranges (at address 0) are ignored.
+            ("stripped", vec![(0, 0x10), (0x6100, 0x6110)], None),
+        ];
+        let dwarf = write(&[unit]).load();
+        let index = FunctionIndex::build(&dwarf);
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        let found = |name| {
+            let found = index.lookup(name).expect(name);
+            assert_eq!(found.len(), 1, "{name}");
+            (found[0].entry, found[0].end)
+        };
+        assert_eq!(found("split"), (0x3000, 0x3040));
+        assert_eq!(found("with_entry_pc"), (0x4008, 0x4020));
+        assert_eq!(found("stripped"), (0x6100, 0x6110));
+        assert_eq!(index.starts(), &[0x3000, 0x4008, 0x6100]);
+    }
 
     fn path(name: &str) -> Option<String>
     {
@@ -596,6 +768,7 @@ mod tests
             functions,
             by_last,
             starts: Vec::new(),
+            skipped: Vec::new(),
         };
         let entries = |query| {
             index

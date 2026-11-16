@@ -101,6 +101,13 @@ impl PtyFerros
     /// first prompt.
     fn launch(tag: &Tag, fixture: &Fixture, scratch: &Scratch) -> Self
     {
+        Self::launch_with(tag, fixture, scratch, &[], &[])
+    }
+
+    /// [`PtyFerros::launch`] with `ferros launch` `options` (before the program) and
+    /// program `args` (before the tag).
+    fn launch_with(tag: &Tag, fixture: &Fixture, scratch: &Scratch, options: &[&str], args: &[&str]) -> Self
+    {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -111,8 +118,14 @@ impl PtyFerros
             .expect("open a pty");
         let mut command = CommandBuilder::new(transcript::ferros_bin());
         command.arg("launch");
+        for option in options {
+            command.arg(option);
+        }
         command.arg(fixture.path());
         command.arg("--");
+        for arg in args {
+            command.arg(arg);
+        }
         command.arg(tag.as_str());
         command.cwd(scratch.home());
         command.env("HOME", scratch.home());
@@ -346,5 +359,120 @@ fn history_goes_to_ferros_history_not_home()
             default_history.display()
         );
         assert!(tagged(&tag).is_empty(), "processes left running: {:?}", tagged(&tag));
+    });
+}
+
+/// Type Ctrl-D at the prompt and check that `ferros` exits 0 and leaves nothing behind.
+fn end_with_ctrl_d(ferros: &mut PtyFerros, tag: &Tag)
+{
+    ferros.type_keys(CTRL_D);
+    let status = ferros.wait_exit();
+    assert!(
+        status.success(),
+        "ferros exited with {status:?}; terminal output:\n{}",
+        ferros.text()
+    );
+    assert!(tagged(tag).is_empty(), "processes left running: {:?}", tagged(tag));
+}
+
+/// In terminal mode the program reads the terminal: rustyline gives the terminal back
+/// (cooked mode, echo on) while the program runs, so a typed line reaches it.
+#[test]
+fn the_program_reads_a_line_typed_at_the_terminal()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch(&tag, &fixture!("read_line"), &scratch);
+
+        ferros.type_line("continue");
+        ferros.expect("continue");
+        // Let the program block in its read; a line typed earlier would also be queued.
+        thread::sleep(Duration::from_millis(300));
+        ferros.type_line("hello from tty");
+        ferros.expect("read: hello from tty");
+        ferros.expect("process exited with status 0");
+        ferros.expect(PROMPT);
+
+        end_with_ctrl_d(&mut ferros, &tag);
+    });
+}
+
+/// `launch --stdin FILE` in terminal mode: the program reads the file, not the terminal.
+#[test]
+fn stdin_file_wins_over_the_terminal()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let input = scratch.home().join("input.txt");
+        fs::write(&input, "from the file\n").expect("write the stdin file");
+        let input = input.to_str().expect("utf-8 path");
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture!("read_line"), &scratch, &["--stdin", input], &[]);
+
+        ferros.type_line("continue");
+        ferros.expect("read: from the file");
+        ferros.expect("process exited with status 0");
+        ferros.expect(PROMPT);
+
+        end_with_ctrl_d(&mut ferros, &tag);
+        assert!(
+            !ferros.text().contains("read: hello"),
+            "the program read the terminal:\n{}",
+            ferros.text()
+        );
+    });
+}
+
+/// Ctrl-C typed while the program runs stops it and returns to the prompt.
+///
+/// The terminal is in cooked mode with `ISIG` on while the program runs, and the program
+/// shares ferros's process group (it is spawned without `POSIX_SPAWN_SETPGROUP`), so the
+/// terminal sends `SIGINT` to both. ferros survives and interrupts the program; the stop
+/// is reported as `stopped: interrupted` or, when the program's own `SIGINT` is seen
+/// first, `stopped: signal 2` (see `crates/ferros/src/repl/interrupt.rs`).
+#[test]
+fn ctrl_c_while_the_program_runs_stops_it()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
+
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: ");
+        ferros.expect(PROMPT);
+        thread::sleep(Duration::from_millis(200));
+        assert!(ferros.is_running(), "ferros died on Ctrl-C:\n{}", ferros.text());
+        let text = ferros.text();
+        assert!(
+            text.contains("stopped: interrupted") || text.contains("stopped: signal 2 "),
+            "not an interrupt stop:\n{text}"
+        );
+        assert!(!text.contains("process killed"), "the program died:\n{text}");
+
+        ferros.type_line("status");
+        ferros.expect("status: stopped (pid ");
+        ferros.expect(PROMPT);
+        ferros.type_line("backtrace");
+        ferros.expect("#0 ");
+        ferros.expect(PROMPT);
+
+        // `continue` does not pass the `SIGINT` on: the program keeps counting, and a
+        // second Ctrl-C stops it again.
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        thread::sleep(Duration::from_millis(100));
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: ");
+        ferros.expect(PROMPT);
+        let text = ferros.text();
+        assert!(!text.contains("process killed"), "the program died:\n{text}");
+        assert!(!text.contains("process exited"), "the program ended:\n{text}");
+
+        end_with_ctrl_d(&mut ferros, &tag);
+        assert!(ferros.text().contains("killed process "), "{}", ferros.text());
     });
 }

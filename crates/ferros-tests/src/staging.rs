@@ -6,15 +6,17 @@
 //! copies a fixture once into Cargo's per-target temporary directory, which Cargo never
 //! rewrites, and uses that copy for the rest of the run.
 //!
-//! A copy lives in `<root>/ferros-fixtures/<binary>-<Mach-O UUID>/`, next to a copy of its
-//! dSYM, under the same file name as the original. The UUID changes with every build, so
-//! processes testing the same build share one directory, and a rebuild gets a new one. A
+//! A copy lives in `<root>/ferros-fixtures/<binary>-<Mach-O UUID>-<DWARF hash>/`, next to
+//! its dSYM under the original file name. Line-only rebuilds can keep the executable
+//! UUID, so the DWARF content also identifies the build. Identical builds share a copy. A
 //! directory is published by renaming a complete private staging directory, so no process
 //! sees a partial copy. Copies are removed by `cargo clean`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,24 +96,23 @@ fn attempt(built: &Path, file_name: &OsStr, directory: &Path) -> Result<PathBuf,
     fs::copy(built, &executable).map_err(|error| io_failure("copy", built, &error))?;
     let bytes = fs::read(&executable).map_err(|error| io_failure("read", &executable, &error))?;
     let uuid = mach_uuid(&bytes).map_err(|error| Failure::Fatal(format!("{}: {error}", built.display())))?;
-    let mut published_name = file_name.to_os_string();
-    published_name.push(format!("-{}", hex(uuid)));
-    let published = directory.join(published_name);
-    if published.join(file_name).is_file() {
-        // An earlier test process staged this build; directories are only ever published
-        // complete.
-        return Ok(published.join(file_name));
-    }
-
     let built_dsym = with_suffix(built, ".dSYM");
-    copy_tree(&built_dsym, &with_suffix(&executable, ".dSYM"))?;
-    if !dsym_matches(&with_suffix(&executable, ".dSYM"), uuid)? {
+    let staged_dsym = with_suffix(&executable, ".dSYM");
+    copy_tree(&built_dsym, &staged_dsym)?;
+    let Some(dwarf_hash) = dwarf_fingerprint(&staged_dsym, uuid)? else {
         // Cargo rebuilt the fixture between the two copies.
         return Err(Failure::Transient(format!(
             "{} has no DWARF member for UUID {}",
             built_dsym.display(),
             hex(uuid)
         )));
+    };
+    let mut published_name = file_name.to_os_string();
+    published_name.push(format!("-{}-{dwarf_hash:016x}", hex(uuid)));
+    let published = directory.join(published_name);
+    if published.join(file_name).is_file() {
+        // Reuse only when both executable identity and source locations match.
+        return Ok(published.join(file_name));
     }
 
     match fs::rename(&staging.0, &published) {
@@ -185,7 +186,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), Failure>
     Ok(())
 }
 
-fn dsym_matches(dsym: &Path, uuid: [u8; 16]) -> Result<bool, Failure>
+fn dwarf_fingerprint(dsym: &Path, uuid: [u8; 16]) -> Result<Option<u64>, Failure>
 {
     let members = dsym.join("Contents/Resources/DWARF");
     let entries = fs::read_dir(&members).map_err(|error| io_failure("list", &members, &error))?;
@@ -193,10 +194,12 @@ fn dsym_matches(dsym: &Path, uuid: [u8; 16]) -> Result<bool, Failure>
         let path = entry.map_err(|error| io_failure("list", &members, &error))?.path();
         let bytes = fs::read(&path).map_err(|error| io_failure("read", &path, &error))?;
         if mach_uuid(&bytes).is_ok_and(|member| member == uuid) {
-            return Ok(true);
+            let mut hash = DefaultHasher::new();
+            bytes.hash(&mut hash);
+            return Ok(Some(hash.finish()));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn mach_uuid(bytes: &[u8]) -> Result<[u8; 16], String>

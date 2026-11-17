@@ -370,6 +370,70 @@ pub fn install_sigusr1_handler(handler: extern "C" fn(libc::c_int)) -> std::io::
     }
 }
 
+/// Install `handler` for SIGUSR1 to run on an alternate signal stack (`sigaltstack` and
+/// `SA_ONSTACK`), then call `run`. The alternate stack is a buffer in this function's
+/// frame; `run` and its callees are deeper on the same stack, so a signal interrupting
+/// them has an interrupted `sp` below the handler's frames. Returns only if the stack or
+/// the handler could not be installed; the previous stack and disposition are then back
+/// in place. If `run` unwinds, they are restored before the buffer goes away. The
+/// handler must stay async-signal-safe. Tests only.
+#[doc(hidden)]
+#[inline(never)]
+pub fn run_with_sigusr1_on_alternate_stack(handler: extern "C" fn(libc::c_int), run: fn() -> !) -> std::io::Error
+{
+    /// Puts back the previous alternate stack and SIGUSR1 disposition when dropped.
+    struct Restore
+    {
+        stack: libc::stack_t,
+        action: Option<libc::sigaction>,
+    }
+
+    impl Drop for Restore
+    {
+        fn drop(&mut self)
+        {
+            if let Some(action) = &self.action {
+                // SAFETY: `action` was returned by `sigaction` for SIGUSR1.
+                unsafe { libc::sigaction(libc::SIGUSR1, action, std::ptr::null_mut()) };
+            }
+            // SAFETY: `stack` was returned by `sigaltstack`; restoring it (or a disabled
+            // stack) stops the kernel from using this frame's buffer.
+            unsafe { libc::sigaltstack(&raw const self.stack, std::ptr::null_mut()) };
+        }
+    }
+
+    let mut buffer = [0u8; libc::SIGSTKSZ];
+    let alternate = libc::stack_t {
+        ss_sp: buffer.as_mut_ptr().cast(),
+        ss_size: buffer.len(),
+        ss_flags: 0,
+    };
+    // SAFETY: a zeroed `stack_t` is a valid value; `sigaltstack` fills it in.
+    let mut previous_stack: libc::stack_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `buffer` outlives every use of the alternate stack: `restore` below puts the
+    // previous stack back before `buffer` is dropped, on every path out of this frame.
+    if unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous_stack) } != 0 {
+        return std::io::Error::last_os_error();
+    }
+    let mut restore = Restore {
+        stack: previous_stack,
+        action: None,
+    };
+    // SAFETY: a zeroed `sigaction` is a valid value; every field used is set below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_ONSTACK;
+    // SAFETY: as above; `sigaction` fills in the previous disposition.
+    let mut previous_action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: `handler` is a plain C-ABI function; installing it changes only this
+    // process's disposition for SIGUSR1.
+    if unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, &raw mut previous_action) } != 0 {
+        return std::io::Error::last_os_error();
+    }
+    restore.action = Some(previous_action);
+    run()
+}
+
 /// Raise SIGUSR1 on the calling fixture worker. Tests only.
 #[doc(hidden)]
 pub fn raise_sigusr1() -> std::io::Result<()>

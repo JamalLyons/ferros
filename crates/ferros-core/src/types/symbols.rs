@@ -65,6 +65,21 @@ impl fmt::Display for SymbolLanguage
     }
 }
 
+/// Where a [`SymbolName`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SymbolSource
+{
+    /// Debug information (DWARF): the name of the function or inlined call, usually with
+    /// a source location.
+    #[default]
+    DebugInfo,
+    /// Only the image's symbol table (Mach-O `LC_SYMTAB`), for code without DWARF: the
+    /// nearest symbol at or before the address. Such a name has no source location, and
+    /// in a stripped or shared-cache image it can be the name of an earlier function when
+    /// the containing one has no symbol of its own.
+    SymbolTable,
+}
+
 /// A function or type name with demangling metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolName
@@ -72,6 +87,7 @@ pub struct SymbolName
     raw: String,
     demangled: Option<String>,
     language: SymbolLanguage,
+    source: SymbolSource,
 }
 
 impl SymbolName
@@ -83,7 +99,23 @@ impl SymbolName
             raw,
             demangled,
             language,
+            source: SymbolSource::DebugInfo,
         }
+    }
+
+    /// The same name, marked as coming from `source`.
+    #[must_use]
+    pub fn with_source(mut self, source: SymbolSource) -> Self
+    {
+        self.source = source;
+        self
+    }
+
+    /// Where the name came from: debug information unless set by
+    /// [`with_source`](Self::with_source).
+    pub fn source(&self) -> SymbolSource
+    {
+        self.source
     }
 
     /// Raw (mangled) name emitted in the object file.

@@ -1,10 +1,12 @@
 //! Live image mappings and on-demand symbols for the portable session.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use super::Session;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
+use crate::symbols::symtab::{SymbolTable, SymtabLayout};
 use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageMapping, SymbolCache};
 use crate::types::Address;
 
@@ -24,6 +26,50 @@ pub(super) struct SessionImage
     /// image last failed for another reason. Such failures are not kept: a later request
     /// reads the image again, but one request does not retry it.
     failed_in_request: Option<u64>,
+    /// The image's symbol table layout as mapped in the target, read on the first frame
+    /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
+    /// it holds until the image is unloaded or moved.
+    pub(super) symtab: Option<SessionSymtab>,
+    /// The symbol request whose read of the symbol table layout last failed. As with
+    /// `failed_in_request`, the failure is not kept past that request.
+    pub(super) symtab_failed_in_request: Option<u64>,
+}
+
+/// An image's symbol table and the names read from it so far.
+///
+/// Only what was read is kept. A failed read is retried by the next symbol request, not
+/// within the one where it failed (`table`), or on the next lookup (names).
+pub(super) struct SessionSymtab
+{
+    pub(super) layout: SymtabLayout,
+    /// Unset until a pc in the image's code needs a name.
+    pub(super) table: Option<SymbolTable>,
+    /// The symbol request whose read of the `nlist` entries or function starts failed.
+    pub(super) table_failed_in_request: Option<u64>,
+    /// Names read from the target, by string table index; `None` for one that is empty or
+    /// not UTF-8.
+    pub(super) names: HashMap<u32, Option<String>>,
+}
+
+impl SessionSymtab
+{
+    pub(super) fn new(layout: SymtabLayout) -> Self
+    {
+        Self {
+            layout,
+            table: None,
+            table_failed_in_request: None,
+            names: HashMap::new(),
+        }
+    }
+}
+
+impl SessionImage
+{
+    pub(super) fn descriptor_load_address(&self) -> u64
+    {
+        self.descriptor.load_address
+    }
 }
 
 impl Session
@@ -147,6 +193,8 @@ impl Session
                     loaded: false,
                     no_debug_info: None,
                     failed_in_request: None,
+                    symtab: None,
+                    symtab_failed_in_request: None,
                 });
             }
         }
@@ -157,17 +205,23 @@ impl Session
     /// irrelevant: breakpoints are never planted in a Mach-O header.
     fn map_loaded_image(&mut self, load_address: u64) -> std::result::Result<ImageMapping, String>
     {
+        let header = self.read_mapped_header(load_address)?;
+        ImageMapping::from_header(&header, load_address)
+            .map_err(|error| format!("header at {}: {error}", Address::new(load_address)))
+    }
+
+    /// The Mach-O header and load commands mapped at `load_address`.
+    pub(super) fn read_mapped_header(&mut self, load_address: u64) -> std::result::Result<Vec<u8>, String>
+    {
         let address = Address::new(load_address);
         let header = self
             .backend
             .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
             .map_err(|error| format!("reading the Mach-O header at {address}: {error}"))?;
         let size = ImageMapping::header_size(&header).map_err(|error| format!("header at {address}: {error}"))?;
-        let header = self
-            .backend
+        self.backend
             .read_memory(address, size)
-            .map_err(|error| format!("reading {size} bytes of load commands at {address}: {error}"))?;
-        ImageMapping::from_header(&header, load_address).map_err(|error| format!("header at {address}: {error}"))
+            .map_err(|error| format!("reading {size} bytes of load commands at {address}: {error}"))
     }
 
     /// Start a request that may load symbols. Within one request an image whose load

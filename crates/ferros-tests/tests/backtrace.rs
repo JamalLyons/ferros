@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent};
+use ferros_core::{Address, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address};
 use ferros_tests::transcript::{self, Interactive};
@@ -108,6 +108,18 @@ fn assert_starts_with(frames: &[StackFrame], fixture: &Fixture, expected: &[(&st
     }
 }
 
+/// `frame` is named from a symbol table only: a name, marked so, and no source location.
+fn assert_symbol_table_frame(frame: &StackFrame)
+{
+    let symbol = frame
+        .symbol
+        .as_ref()
+        .unwrap_or_else(|| panic!("frame {} has no name: {frame:#?}", frame.index));
+    assert_eq!(symbol.source(), SymbolSource::SymbolTable, "{frame:#?}");
+    assert!(frame.location.is_none(), "{frame:#?}");
+    assert!(!frame.is_inlined(), "{frame:#?}");
+}
+
 fn nested_expected(fixture: &Fixture, in_c: u32) -> Vec<(&'static str, u32)>
 {
     vec![
@@ -143,6 +155,60 @@ fn backtrace_in_level_c_lists_the_callers_at_their_call_sites()
     });
 }
 
+/// Below `main` in `nested_calls`, the runtime frames without DWARF (`main` calls through
+/// `std::rt::lang_start_internal`, which std ships without debug info, then the C `main`
+/// shim and dyld's `start`) are named from their image's symbol table: a demangled name,
+/// marked as a symbol-table name, with no source location. The frames named from DWARF
+/// above them are marked as such and keep their locations (issue #104).
+#[test]
+fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
+{
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let in_c = marker_address(&mut d, &fixture, "in_c");
+        run_to(&mut d, in_c);
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let names: Vec<String> = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .symbol
+                    .as_ref()
+                    .map_or_else(|| "??".to_owned(), |s| s.display_name().to_owned())
+            })
+            .collect();
+        assert!(names.iter().all(|name| name != "??"), "every frame is named: {names:#?}");
+        for frame in &frames[..4] {
+            let symbol = frame.symbol.as_ref().expect("a DWARF name");
+            assert_eq!(symbol.source(), SymbolSource::DebugInfo, "{frame:#?}");
+            assert!(frame.location.is_some(), "{frame:#?}");
+        }
+        let below: Vec<&StackFrame> = frames[4..]
+            .iter()
+            .filter(|frame| frame.symbol.as_ref().is_some_and(|s| s.source() == SymbolSource::SymbolTable))
+            .collect();
+        for frame in &below {
+            assert_symbol_table_frame(frame);
+        }
+        let below_names: Vec<&str> = below
+            .iter()
+            .filter_map(|frame| frame.symbol.as_ref().map(ferros_core::SymbolName::display_name))
+            .collect();
+        // Demangled: `std::rt::lang_start_internal`, not `__ZN3std2rt19lang_start_internal...`.
+        assert!(
+            below_names
+                .iter()
+                .any(|name| name.starts_with("std::rt::lang_start_internal")),
+            "{names:#?}"
+        );
+        assert!(below_names.iter().all(|name| !name.starts_with("_ZN")), "{names:#?}");
+        assert_eq!(below_names.last(), Some(&"start"), "dyld's start is the base: {names:#?}");
+    });
+}
+
 /// Stopped on the first instruction of `level_c`, before its prologue saved anything, the
 /// caller is still `level_b` at its call site (the return address is in the link
 /// register), and the rest of the trace is unchanged.
@@ -167,8 +233,10 @@ fn backtrace_at_the_first_instruction_of_level_c_still_finds_level_b()
 
 /// A stop in `worker_body` on a spawned thread of `threads` gives `worker_body`, the spawn
 /// closure, std's thread-start path down to `Thread::new::thread_start` (the function
-/// `pthread_create` runs), and then only the unsymbolicated `libsystem_pthread` frames that
-/// call it, after which the trace ends.
+/// `pthread_create` runs), and then the two `libsystem_pthread` frames that call it,
+/// `_pthread_start` and `thread_start`, after which the trace ends. `libsystem_pthread`
+/// lives in the dyld shared cache and has no DWARF: its names come from the symbol table
+/// in the cache's `__LINKEDIT`, so they carry no source location.
 #[test]
 fn backtrace_on_a_spawned_thread_reaches_the_thread_base()
 {
@@ -222,10 +290,11 @@ fn backtrace_on_a_spawned_thread_reaches_the_thread_base()
         assert!(1 < spawn && spawn < base, "{names:#?}");
         let below = &frames[base + 1..];
         assert_eq!(below.len(), PTHREAD_FRAMES, "{names:#?}");
-        assert!(
-            below.iter().all(|frame| frame.symbol.is_none() && frame.pc.value() != 0),
-            "{names:#?}"
-        );
+        assert_eq!(&names[base + 1..], ["_pthread_start", "thread_start"], "{names:#?}");
+        for frame in below {
+            assert_symbol_table_frame(frame);
+            assert_ne!(frame.pc.value(), 0, "{names:#?}");
+        }
     });
 }
 

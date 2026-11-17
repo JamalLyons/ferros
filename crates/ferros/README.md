@@ -132,9 +132,12 @@ A real `SIGINT` sent directly to the program (for example, `kill -INT <pid>`) re
 `stopped: signal 2`. `continue` suppresses that held `SIGINT` rather than delivering it.
 
 The trade-off is terminal input: a background program reading inherited terminal stdin stops with
-`SIGTTIN`, reported as `stopped: signal 21`. Use `ferros launch --stdin FILE <program>` to supply
-input. Batch-mode stdin from a pipe or file still works; batch-mode terminal reads have the same
-background-group restriction. Attaching leaves the target's process group unchanged.
+`SIGTTIN`, reported as `stopped: signal 21`; one that changes terminal settings (`tcsetattr`, as
+password prompts and full-screen programs do) stops with `SIGTTOU`, `stopped: signal 22`. `continue`
+passes the signal back, so the program stops again at the same point; ferros prints a hint. Use
+`ferros launch --stdin FILE <program>` to supply input. Batch-mode stdin from a pipe or file still works; batch-mode terminal reads have the same
+background-group restriction. Attaching leaves the target's process group unchanged. Ctrl-Z
+suspends only ferros: the program keeps running until `fg`, so interrupt it first.
 
 ### Adding a command
 

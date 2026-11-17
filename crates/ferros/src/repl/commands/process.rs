@@ -180,8 +180,8 @@ impl ReplCommand for Status
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
     {
         no_args("status", args)?;
-        let last = ctx.debugger.session.last_stop().cloned();
         let session = ctx.session();
+        let last = session.last_stop().cloned();
         let (head, detail) = match session.state() {
             SessionState::Stopped => {
                 let pid = session.pid().map_or(0, |pid| pid.0);

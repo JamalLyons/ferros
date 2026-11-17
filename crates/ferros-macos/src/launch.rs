@@ -196,6 +196,7 @@ impl LaunchManager
             debug!("Setting POSIX_SPAWN_START_SUSPENDED flag");
             let mut flags = ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED;
             if spec.process_group == Some(ProcessGroup::New) {
+                // SAFETY: `attr` was initialized above; group 0 makes the child its own group leader.
                 let result = ffi::posix_spawnattr_setpgroup(&mut attr.0, 0);
                 if result != 0 {
                     return Err(spawn_error("set process group", result));

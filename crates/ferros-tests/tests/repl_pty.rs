@@ -388,6 +388,7 @@ fn terminal_stdin_stops_the_background_program_with_sigttin()
 
         ferros.type_line("continue");
         ferros.expect("stopped: signal 21 ");
+        ferros.expect("relaunch with `--stdin FILE`");
         ferros.expect(PROMPT);
         assert!(!ferros.text().contains("read: "), "{}", ferros.text());
         ferros.type_line("status");
@@ -501,13 +502,9 @@ fn sigint_to_ferros_process_group_always_reports_interrupted()
         for _ in 0..5 {
             ferros.type_line("continue");
             ferros.expect("tick: ");
-            // Python's safe os.killpg binding explicitly targets the whole group.
-            let status = std::process::Command::new("python3")
-                .args([
-                    "-c",
-                    "import os, signal, sys; os.killpg(int(sys.argv[1]), signal.SIGINT)",
-                    &group.0.to_string(),
-                ])
+            // A negative pid makes kill(1) signal the whole process group.
+            let status = std::process::Command::new("/bin/kill")
+                .args(["-INT", "--", &format!("-{}", group.0)])
                 .status()
                 .expect("killpg");
             assert!(status.success(), "killpg failed: {status}");

@@ -540,16 +540,7 @@ impl BinaryImage
     /// [`SourceLookupError::DebugInfo`] when the image's DWARF sections cannot be loaded.
     pub fn skipped_debug_info(&self) -> Result<Vec<SkippedDebugInfo>, SourceLookupError>
     {
-        let mut skipped: Vec<SkippedDebugInfo> = self
-            .line_index()?
-            .skipped()
-            .iter()
-            .chain(self.function_index()?.skipped())
-            .cloned()
-            .collect();
-        skipped.sort();
-        skipped.dedup();
-        Ok(skipped)
+        Ok(merge_skipped(self.line_index()?.skipped(), self.function_index()?.skipped()))
     }
 
     /// Every statement address of `file:line`, across all compilation units.
@@ -664,6 +655,16 @@ impl BinaryImage
     }
 }
 
+/// The skips of the line and function indexes together, sorted and distinct: a unit that
+/// neither index could load is reported once.
+pub(crate) fn merge_skipped(lines: &[SkippedDebugInfo], functions: &[SkippedDebugInfo]) -> Vec<SkippedDebugInfo>
+{
+    let mut skipped: Vec<SkippedDebugInfo> = lines.iter().chain(functions).cloned().collect();
+    skipped.sort();
+    skipped.dedup();
+    skipped
+}
+
 /// Log every skipped part of the debug info of `image`'s `kind` index.
 pub(crate) fn warn_skipped(image: &BinaryImage, kind: &str, skipped: &[SkippedDebugInfo])
 {
@@ -688,7 +689,7 @@ pub(crate) mod synthetic
         Address, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Range, RangeList, Sections, UnitEntryId,
     };
     use gimli::{
-        DW_AT_comp_dir, DW_AT_entry_pc, DW_AT_linkage_name, DW_AT_name, DW_AT_ranges, DW_TAG_subprogram, Encoding,
+        DW_AT_comp_dir, DW_AT_entry_pc, DW_AT_linkage_name, DW_AT_name, DW_AT_ranges, DW_TAG_subprogram, DwAt, Encoding,
         EndianArcSlice, Format, LineEncoding, LittleEndian, RunTimeEndian, SectionId,
     };
 
@@ -711,8 +712,13 @@ pub(crate) mod synthetic
         pub(crate) file: &'static str,
         pub(crate) rows: Vec<(u64, u64)>,
         pub(crate) end: u64,
+        /// More sequences `(rows, end)` in the same file, written after the first.
+        pub(crate) more_sequences: Vec<(Vec<(u64, u64)>, u64)>,
         /// Subprograms of the unit.
         pub(crate) functions: Vec<TestFunction>,
+        /// Extra attributes `(function name, attribute, value)` set on a subprogram after
+        /// its usual ones (replacing an attribute it already has).
+        pub(crate) attributes: Vec<(&'static str, DwAt, AttributeValue)>,
     }
 
     /// One subprogram: `(name, [start, end) ranges in listed order, DW_AT_entry_pc)`. The
@@ -728,7 +734,9 @@ pub(crate) mod synthetic
                 file,
                 rows: Vec::new(),
                 end: 0,
+                more_sequences: Vec::new(),
                 functions: Vec::new(),
+                attributes: Vec::new(),
             }
         }
     }
@@ -754,10 +762,13 @@ pub(crate) mod synthetic
             );
             let directory = line_program.default_directory();
             let file = line_program.add_file(LineString::String(spec.file.into()), directory, None);
-            if !spec.rows.is_empty() {
-                let base = spec.rows[0].0;
+            let first = (spec.rows.clone(), spec.end);
+            for (rows, end) in std::iter::once(&first).chain(&spec.more_sequences) {
+                let Some(&(base, _)) = rows.first() else {
+                    continue;
+                };
                 line_program.begin_sequence(Some(Address::Constant(base)));
-                for &(address, line) in &spec.rows {
+                for &(address, line) in rows {
                     let row = line_program.row();
                     row.address_offset = address - base;
                     row.file = file;
@@ -765,7 +776,7 @@ pub(crate) mod synthetic
                     row.is_statement = true;
                     line_program.generate_row();
                 }
-                line_program.end_sequence(spec.end - base);
+                line_program.end_sequence(end - base);
             }
             let mut unit = DwarfUnit::new(ENCODING);
             unit.unit.line_program = line_program;
@@ -793,6 +804,9 @@ pub(crate) mod synthetic
                 die.set(DW_AT_ranges, AttributeValue::RangeListRef(list));
                 if let Some(entry_pc) = entry_pc {
                     die.set(DW_AT_entry_pc, AttributeValue::Address(Address::Constant(*entry_pc)));
+                }
+                for (_, attribute, value) in spec.attributes.iter().filter(|(function, ..)| function == name) {
+                    die.set(*attribute, value.clone());
                 }
             }
             dwarf.units.add(unit.unit);
@@ -854,7 +868,71 @@ pub(crate) mod synthetic
         /// Overwrite one byte of `.debug_info`.
         pub(crate) fn corrupt_info(&mut self, offset: usize, byte: u8)
         {
-            self.sections.get_mut(&SectionId::DebugInfo).expect(".debug_info")[offset] = byte;
+            self.corrupt(SectionId::DebugInfo, offset, byte);
+        }
+
+        /// Overwrite one byte of section `id`.
+        pub(crate) fn corrupt(&mut self, id: SectionId, offset: usize, byte: u8)
+        {
+            self.sections.get_mut(&id).expect("written section")[offset] = byte;
+        }
+
+        /// Offsets of the units of section `id` (`.debug_info` or `.debug_line`, both
+        /// starting each unit with a 32-bit length), in order.
+        pub(crate) fn unit_starts(&self, id: SectionId) -> Vec<usize>
+        {
+            let bytes = self.sections.get(&id).map_or(&[][..], Vec::as_slice);
+            let mut starts = Vec::new();
+            let mut next = 0;
+            while next + 4 <= bytes.len() {
+                starts.push(next);
+                let length = u32::from_le_bytes(bytes[next..next + 4].try_into().expect("4 bytes"));
+                next += 4 + length as usize;
+            }
+            starts
+        }
+
+        /// Make the line-program header of unit `unit` unparseable (an unknown version),
+        /// leaving its `.debug_info` intact.
+        pub(crate) fn corrupt_line_header(&mut self, unit: usize)
+        {
+            let start = self.unit_starts(SectionId::DebugLine)[unit];
+            // The 2-byte version follows the 4-byte length.
+            self.corrupt(SectionId::DebugLine, start + 4, 0x99);
+            self.corrupt(SectionId::DebugLine, start + 5, 0);
+        }
+
+        /// Make the `.debug_info` unit header of unit `unit` unparseable (an unknown
+        /// version), so neither it nor any later unit can be located.
+        pub(crate) fn corrupt_unit_header(&mut self, unit: usize)
+        {
+            let start = self.unit_starts(SectionId::DebugInfo)[unit];
+            self.corrupt(SectionId::DebugInfo, start + 4, 0x99);
+            self.corrupt(SectionId::DebugInfo, start + 5, 0);
+        }
+
+        /// `.debug_info` offset of the subprogram DIE named `name`.
+        pub(crate) fn subprogram_offset(&self, name: &str) -> usize
+        {
+            let dwarf = self.load();
+            let mut units = dwarf.units();
+            while let Some(header) = units.next().expect("unit header") {
+                let base = header.offset().as_debug_info_offset().expect("info unit").0;
+                let unit = dwarf.unit(header).expect("unit");
+                let mut entries = unit.entries();
+                while let Some((_, entry)) = entries.next_dfs().expect("entry") {
+                    if entry.tag() != DW_TAG_subprogram {
+                        continue;
+                    }
+                    let Some(value) = entry.attr_value(DW_AT_name).expect("name") else {
+                        continue;
+                    };
+                    if dwarf.attr_string(&unit, value).ok().as_deref() == Some(name.as_bytes()) {
+                        return base + entry.offset().0;
+                    }
+                }
+            }
+            panic!("no subprogram {name}");
         }
     }
 }
@@ -881,6 +959,71 @@ mod tests
         ));
         assert_eq!(lines.skipped().len(), 1, "{:?}", lines.skipped());
         assert_eq!(lines.skipped()[0].unit_offset, Some(bad_offset));
+    }
+
+    /// Issue #93: when the rows of a line program stop parsing part-way, the sequences
+    /// completed before the error are kept and a `line program` skip is recorded.
+    #[test]
+    fn a_line_program_cut_short_keeps_its_completed_sequences()
+    {
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.rows = vec![(0x1000, 3), (0x1008, 4)];
+        unit.end = 0x1010;
+        unit.more_sequences = vec![(vec![(0x2000, 7), (0x2008, 8)], 0x2010)];
+        let mut written = write(&[unit]);
+        // Shorten the program by one byte: the final `DW_LNE_end_sequence` (opcode 0,
+        // length 1, then the sub-opcode) loses its sub-opcode and no longer parses.
+        let start = written.unit_starts(gimli::SectionId::DebugLine)[0];
+        let line = written.sections.get_mut(&gimli::SectionId::DebugLine).expect(".debug_line");
+        assert_eq!(&line[line.len() - 3..], &[0, 1, 1], "the program ends with end_sequence");
+        let length = u32::from_le_bytes(line[start..start + 4].try_into().expect("4 bytes")) - 1;
+        line[start..start + 4].copy_from_slice(&length.to_le_bytes());
+        let dwarf = written.load();
+        let lines = LineIndex::build(&dwarf, &[]);
+        assert_eq!(
+            lines
+                .sequences
+                .iter()
+                .map(|sequence| sequence.start..sequence.end)
+                .collect::<Vec<_>>(),
+            vec![0x1000..0x1010]
+        );
+        let file = lines.resolve_file("lib.rs").expect("lib.rs");
+        assert_eq!(lines.lines[file as usize].get(&4), Some(&vec![0x1008]));
+        assert_eq!(lines.lines[file as usize].get(&8), None);
+        assert_eq!(lines.skipped().len(), 1, "{:?}", lines.skipped());
+        assert_eq!(lines.skipped()[0].unit_offset, Some(0));
+        assert!(
+            lines.skipped()[0].reason.starts_with("line program: "),
+            "{:?}",
+            lines.skipped()
+        );
+    }
+
+    /// Issue #93: the skips of both indexes are merged sorted, and a skip both report is
+    /// kept once.
+    #[test]
+    fn skips_of_both_indexes_are_merged_and_deduplicated()
+    {
+        let skip = |unit_offset, reason: &str| SkippedDebugInfo {
+            unit_offset,
+            reason: reason.to_owned(),
+        };
+        let lines = [skip(Some(0x40), "unit: bad"), skip(Some(0x10), "line program: eof")];
+        let functions = [
+            skip(Some(0x40), "unit: bad"),
+            skip(None, "unit header: bad"),
+            skip(Some(0x10), "DIE tree: eof"),
+        ];
+        assert_eq!(
+            merge_skipped(&lines, &functions),
+            vec![
+                skip(None, "unit header: bad"),
+                skip(Some(0x10), "DIE tree: eof"),
+                skip(Some(0x10), "line program: eof"),
+                skip(Some(0x40), "unit: bad"),
+            ]
+        );
     }
 
     /// AC2 (issue #88, L5): two spellings of one path are one file, found by an absolute

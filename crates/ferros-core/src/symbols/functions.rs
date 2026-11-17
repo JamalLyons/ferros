@@ -43,9 +43,10 @@
 //!
 //! # Unreadable debug info
 //!
-//! A compilation unit whose header, root entry or line-program header cannot be parsed is
-//! skipped (`gimli` reads the line-program header while loading the unit, so such a unit is
-//! lost to this index too, although functions need no line program); a DIE whose
+//! A compilation unit whose header or root entry cannot be parsed is skipped. A unit whose
+//! line-program header alone cannot be parsed is still indexed: `gimli` reads that header
+//! while loading the unit, so such a unit is loaded again without its line program, which
+//! functions do not need (the line index still skips and reports it). A DIE whose
 //! attributes, strings or range list cannot be read is skipped alone; when the DIE tree
 //! itself cannot be walked further, the rest of that unit is skipped. Every other unit is
 //! still indexed, and each skip is recorded and reported as for the line index (see
@@ -58,7 +59,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
-use gimli::{AttributeValue, DwAt, Reader as _, Unit, UnitSectionOffset, constants};
+use gimli::{
+    AttributeValue, DebugAddrBase, DebugLocListsBase, DebugRngListsBase, DebugStrOffsetsBase, DwAt, Reader as _, Unit,
+    UnitHeader, UnitSectionOffset, UnitType, constants,
+};
 
 use super::image::BinaryImage;
 use super::lines::{LineIndex, SkippedDebugInfo, SourceLookupError, warn_skipped};
@@ -162,7 +166,8 @@ impl FunctionIndex
             };
             let base = base.0;
             let offset = Some(base as u64);
-            let unit = match dwarf.unit(header) {
+            // A unit whose line-program header does not parse still has readable functions.
+            let unit = match dwarf.unit(header.clone()).or_else(|_| unit_without_lines(dwarf, header)) {
                 Ok(unit) => unit,
                 Err(error) => {
                     skipped.push(SkippedDebugInfo::new(offset, "unit", error));
@@ -286,6 +291,61 @@ impl FunctionIndex
         matches.sort_by_key(|function| function.entry);
         Ok(matches)
     }
+}
+
+/// Load a unit as `gimli::Dwarf::unit` does, but without its line program (and without the
+/// unit's `DW_AT_name` and `DW_AT_comp_dir`, which only the line program uses): the root
+/// entry's `DW_AT_low_pc` and section bases, which addresses, strings and range lists of
+/// its DIEs depend on, are read the same way.
+fn unit_without_lines(dwarf: &OwnedDwarf, header: UnitHeader<OwnedReader>) -> gimli::Result<Unit<OwnedReader>>
+{
+    let encoding = header.encoding();
+    let mut unit = Unit {
+        abbreviations: dwarf.abbreviations(&header)?,
+        name: None,
+        comp_dir: None,
+        low_pc: 0,
+        str_offsets_base: DebugStrOffsetsBase::default_for_encoding_and_file(encoding, dwarf.file_type),
+        addr_base: DebugAddrBase(0),
+        loclists_base: DebugLocListsBase::default_for_encoding_and_file(encoding, dwarf.file_type),
+        rnglists_base: DebugRngListsBase::default_for_encoding_and_file(encoding, dwarf.file_type),
+        line_program: None,
+        dwo_id: match header.type_() {
+            UnitType::Skeleton(dwo_id) | UnitType::SplitCompilation(dwo_id) => Some(dwo_id),
+            _ => None,
+        },
+        header,
+    };
+    let mut low_pc = None;
+    {
+        let mut cursor = unit.header.entries(&unit.abbreviations);
+        cursor.next_dfs()?;
+        let root = cursor.current().ok_or(gimli::Error::MissingUnitDie)?;
+        let mut attrs = root.attrs();
+        while let Some(attr) = attrs.next()? {
+            match (attr.name(), attr.value()) {
+                (constants::DW_AT_low_pc, value) => low_pc = Some(value),
+                (constants::DW_AT_str_offsets_base, AttributeValue::DebugStrOffsetsBase(base)) => {
+                    unit.str_offsets_base = base;
+                }
+                (constants::DW_AT_addr_base | constants::DW_AT_GNU_addr_base, AttributeValue::DebugAddrBase(base)) => {
+                    unit.addr_base = base;
+                }
+                (constants::DW_AT_loclists_base, AttributeValue::DebugLocListsBase(base)) => unit.loclists_base = base,
+                (
+                    constants::DW_AT_rnglists_base | constants::DW_AT_GNU_ranges_base,
+                    AttributeValue::DebugRngListsBase(base),
+                ) => unit.rnglists_base = base,
+                _ => {}
+            }
+        }
+    }
+    if let Some(value) = low_pc
+        && let Some(address) = dwarf.attr_address(&unit, value)?
+    {
+        unit.low_pc = address;
+    }
+    Ok(unit)
 }
 
 /// Record one DIE: a subprogram's names in `names` and, when it has code and is not a
@@ -758,6 +818,220 @@ mod tests
         assert_eq!(
             index.fragments(),
             &[0x1000..0x1010, 0x3000..0x3040, 0x4000..0x4020, 0x5000..0x5010, 0x6100..0x6110]
+        );
+    }
+
+    /// Issue #93: a unit whose line-program header does not parse and whose `.debug_info`
+    /// is sound still has its functions indexed; the line index skips the unit.
+    #[test]
+    fn a_bad_line_program_header_keeps_the_units_functions()
+    {
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut bad = TestUnit::new("/w", "src/bad.rs");
+        bad.rows = vec![(0x1000, 3), (0x1004, 4)];
+        bad.end = 0x1010;
+        bad.functions = vec![("in_bad_lines", vec![(0x1000, 0x1010)], None)];
+        let mut good = TestUnit::new("/w", "src/good.rs");
+        good.rows = vec![(0x2000, 7)];
+        good.end = 0x2010;
+        good.functions = vec![("in_good_lines", vec![(0x2000, 0x2010)], None)];
+        let mut written = write(&[bad, good]);
+        written.corrupt_line_header(0);
+        let dwarf = written.load();
+
+        let index = FunctionIndex::build(&dwarf);
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        let found = index.lookup("in_bad_lines").expect("in_bad_lines");
+        assert_eq!((found[0].entry, found[0].end), (0x1000, 0x1010));
+        assert_eq!(index.lookup("in_good_lines").expect("in_good_lines")[0].entry, 0x2000);
+
+        let lines = LineIndex::build(&dwarf, index.fragments());
+        assert_eq!(lines.skipped().len(), 1, "{:?}", lines.skipped());
+        assert_eq!(lines.skipped()[0].unit_offset, Some(0));
+        assert!(lines.skipped()[0].reason.starts_with("unit: "), "{:?}", lines.skipped());
+    }
+
+    /// One function's code, looked up by name: `(entry, end)`.
+    fn code_of(index: &FunctionIndex, name: &str) -> (u64, u64)
+    {
+        let found = index.lookup(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(found.len(), 1, "{name}");
+        (found[0].entry, found[0].end)
+    }
+
+    /// Issue #93: a DWARF 5 constant `DW_AT_entry_pc` is an offset from `DW_AT_low_pc`, or,
+    /// without one, from the lowest start of the DIE's ranges (not the first listed).
+    #[test]
+    fn a_constant_entry_pc_is_relative_to_the_entry_base()
+    {
+        use gimli::write::{Address as WriteAddress, AttributeValue as Write};
+        use gimli::{DW_AT_entry_pc, DW_AT_low_pc};
+
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.functions = vec![
+            // Lowest start 0x1000: 0x1000 + 0x2008 is in the hot part. Relative to the
+            // first listed range it would be 0x5008, outside every range.
+            ("from_ranges", vec![(0x3000, 0x3040), (0x1000, 0x1010)], None),
+            // `DW_AT_low_pc` 0x5000 (outside the ranges, so not the entry itself):
+            // 0x5000 + 0x2008 is in the hot part. Relative to the lowest start (0x6000) it
+            // would be 0x8008, outside every range.
+            ("from_low_pc", vec![(0x7000, 0x7020), (0x6000, 0x6010)], None),
+        ];
+        unit.attributes = vec![
+            ("from_ranges", DW_AT_entry_pc, Write::Udata(0x2008)),
+            ("from_low_pc", DW_AT_low_pc, Write::Address(WriteAddress::Constant(0x5000))),
+            ("from_low_pc", DW_AT_entry_pc, Write::Udata(0x2008)),
+        ];
+        let dwarf = write(&[unit]).load();
+        let index = FunctionIndex::build(&dwarf);
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        assert_eq!(code_of(&index, "from_ranges"), (0x3008, 0x3040));
+        assert_eq!(code_of(&index, "from_low_pc"), (0x7008, 0x7020));
+    }
+
+    /// Issue #93: a `DW_AT_low_pc` or `DW_AT_entry_pc` outside every non-empty range is not
+    /// the entry: the next attribute is tried, then the first listed range is used.
+    #[test]
+    fn an_entry_outside_every_range_falls_back_to_the_first_range()
+    {
+        use gimli::DW_AT_low_pc;
+        use gimli::write::{Address as WriteAddress, AttributeValue as Write};
+
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let address = |address| Write::Address(WriteAddress::Constant(address));
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.functions = vec![
+            ("bad_low_pc", vec![(0x8000, 0x8010), (0x7800, 0x7810)], None),
+            ("bad_entry_pc", vec![(0x9000, 0x9010), (0x8800, 0x8810)], Some(0x9999)),
+            ("bad_low_good_entry", vec![(0xa000, 0xa010), (0x9800, 0x9810)], Some(0x9808)),
+        ];
+        unit.attributes = vec![
+            ("bad_low_pc", DW_AT_low_pc, address(0x8888)),
+            ("bad_low_good_entry", DW_AT_low_pc, address(0x1)),
+        ];
+        let dwarf = write(&[unit]).load();
+        let index = FunctionIndex::build(&dwarf);
+        assert!(index.skipped().is_empty(), "{:?}", index.skipped());
+        assert_eq!(code_of(&index, "bad_low_pc"), (0x8000, 0x8010));
+        assert_eq!(code_of(&index, "bad_entry_pc"), (0x9000, 0x9010));
+        assert_eq!(code_of(&index, "bad_low_good_entry"), (0x9808, 0x9810));
+    }
+
+    /// Issue #93: a DIE whose attributes cannot be read is skipped alone; the functions
+    /// around it are indexed.
+    #[test]
+    fn an_unreadable_die_is_skipped_alone()
+    {
+        use gimli::write::AttributeValue as Write;
+        use gimli::{DW_AT_name, DebugStrOffset};
+
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.functions = vec![
+            ("before", vec![(0x1000, 0x1010)], None),
+            ("unreadable", vec![(0x2000, 0x2010)], None),
+            ("after", vec![(0x3000, 0x3010)], None),
+        ];
+        // A string in a supplementary object file that is not there.
+        unit.attributes = vec![("unreadable", DW_AT_name, Write::DebugStrRefSup(DebugStrOffset(0)))];
+        let written = write(&[unit]);
+        let dwarf = written.load();
+        let index = FunctionIndex::build(&dwarf);
+        assert_eq!(code_of(&index, "before"), (0x1000, 0x1010));
+        assert_eq!(code_of(&index, "after"), (0x3000, 0x3010));
+        assert!(matches!(
+            index.lookup("unreadable"),
+            Err(SourceLookupError::UnknownFunction { .. })
+        ));
+        assert_eq!(index.skipped().len(), 1, "{:?}", index.skipped());
+        assert_eq!(index.skipped()[0].unit_offset, Some(0));
+        // The reported DIE lies between its readable neighbours.
+        let reason = &index.skipped()[0].reason;
+        let die = reason
+            .strip_prefix("DIE at .debug_info+0x")
+            .and_then(|rest| rest.split_once(':'))
+            .and_then(|(hex, _)| usize::from_str_radix(hex, 16).ok())
+            .unwrap_or_else(|| panic!("{reason:?}"));
+        assert!(
+            written.subprogram_offset("before") < die && die < written.subprogram_offset("after"),
+            "{reason:?}"
+        );
+    }
+
+    /// Issue #93: when the DIE tree cannot be walked past an entry, the functions before it
+    /// are kept, the rest of the unit is skipped, and later units are indexed.
+    #[test]
+    fn an_unwalkable_die_tree_skips_the_rest_of_the_unit()
+    {
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut first = TestUnit::new("/w", "src/lib.rs");
+        first.functions = vec![
+            ("before", vec![(0x1000, 0x1010)], None),
+            ("broken", vec![(0x2000, 0x2010)], None),
+            ("after", vec![(0x3000, 0x3010)], None),
+        ];
+        let mut second = TestUnit::new("/w", "src/other.rs");
+        second.functions = vec![("next_unit", vec![(0x4000, 0x4010)], None)];
+        let mut written = write(&[first, second]);
+        let broken = written.subprogram_offset("broken");
+        // An abbreviation code that is not in the table.
+        written.corrupt_info(broken, 0x7f);
+        let dwarf = written.load();
+        let index = FunctionIndex::build(&dwarf);
+        assert_eq!(code_of(&index, "before"), (0x1000, 0x1010));
+        assert_eq!(code_of(&index, "next_unit"), (0x4000, 0x4010));
+        for lost in ["broken", "after"] {
+            assert!(
+                matches!(index.lookup(lost), Err(SourceLookupError::UnknownFunction { .. })),
+                "{lost}"
+            );
+        }
+        assert_eq!(index.skipped().len(), 1, "{:?}", index.skipped());
+        assert_eq!(index.skipped()[0].unit_offset, Some(0));
+        assert!(index.skipped()[0].reason.starts_with("DIE tree: "), "{:?}", index.skipped());
+    }
+
+    /// Issue #93: a unit header that does not parse stops indexing, with a skip that has no
+    /// unit offset, in both indexes; units before it are kept.
+    #[test]
+    fn an_unreadable_unit_header_stops_indexing()
+    {
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut first = TestUnit::new("/w", "src/first.rs");
+        first.rows = vec![(0x1000, 3)];
+        first.end = 0x1010;
+        first.functions = vec![("in_first", vec![(0x1000, 0x1010)], None)];
+        let mut second = TestUnit::new("/w", "src/second.rs");
+        second.rows = vec![(0x2000, 5)];
+        second.end = 0x2010;
+        second.functions = vec![("in_second", vec![(0x2000, 0x2010)], None)];
+        let mut written = write(&[first, second]);
+        written.corrupt_unit_header(1);
+        let dwarf = written.load();
+
+        let index = FunctionIndex::build(&dwarf);
+        assert_eq!(code_of(&index, "in_first"), (0x1000, 0x1010));
+        assert!(matches!(
+            index.lookup("in_second"),
+            Err(SourceLookupError::UnknownFunction { .. })
+        ));
+        let lines = LineIndex::build(&dwarf, index.fragments());
+        for skipped in [index.skipped(), lines.skipped()] {
+            assert_eq!(skipped.len(), 1, "{skipped:?}");
+            assert_eq!(skipped[0].unit_offset, None);
+            assert!(skipped[0].reason.starts_with("unit header: "), "{skipped:?}");
+        }
+        // The same skip from both indexes is reported once.
+        assert_eq!(
+            super::super::lines::merge_skipped(lines.skipped(), index.skipped()),
+            index.skipped()
         );
     }
 

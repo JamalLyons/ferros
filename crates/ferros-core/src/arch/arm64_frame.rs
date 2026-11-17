@@ -70,6 +70,9 @@ pub(crate) enum FrameOp
         /// The general registers transferred, in memory order (`None` for the zero
         /// register or a SIMD/FP register).
         registers: [Option<u8>; 2],
+        /// Registers transferred: 2 for a pair, 1 for a single register (whose second
+        /// `registers` entry is unused).
+        count: u8,
         /// Bytes per register.
         size: u8,
         /// Signed byte offset.
@@ -257,7 +260,7 @@ fn decode_pair(insn: u32) -> Option<FrameOp>
     if load && !simd && rt == rt2 {
         return None;
     }
-    access(load, registers, size, register(insn, 5), offset, indexing)
+    access(load, registers, 2, size, register(insn, 5), offset, indexing)
 }
 
 /// `str`/`ldr` and their byte, half-word, signed, unscaled and SIMD/FP forms.
@@ -286,16 +289,16 @@ fn decode_single(insn: u32) -> Option<FrameOp>
     let rn = register(insn, 5);
     if bits(insn, 24, 2) == 0b01 {
         let offset = i64::from(bits(insn, 10, 12)) * i64::from(size);
-        return access(load, registers, size, rn, offset, Indexing::Offset);
+        return access(load, registers, 1, size, rn, offset, Indexing::Offset);
     }
     if bits(insn, 24, 2) != 0 {
         return None;
     }
     let offset = sign_extend(bits(insn, 12, 9), 9);
     match (bits(insn, 21, 1), bits(insn, 10, 2)) {
-        (0, 0b00 | 0b10) => access(load, registers, size, rn, offset, Indexing::Offset),
-        (0, 0b01) => access(load, registers, size, rn, offset, Indexing::PostIndex),
-        (0, _) => access(load, registers, size, rn, offset, Indexing::PreIndex),
+        (0, 0b00 | 0b10) => access(load, registers, 1, size, rn, offset, Indexing::Offset),
+        (0, 0b01) => access(load, registers, 1, size, rn, offset, Indexing::PostIndex),
+        (0, _) => access(load, registers, 1, size, rn, offset, Indexing::PreIndex),
         // Register offset: the address is not known.
         (1, 0b10) if rn != SP => {
             if load && !simd {
@@ -309,7 +312,15 @@ fn decode_single(insn: u32) -> Option<FrameOp>
 }
 
 /// A load or store through `rn`.
-fn access(load: bool, registers: [Option<u8>; 2], size: u8, rn: u8, offset: i64, indexing: Indexing) -> Option<FrameOp>
+fn access(
+    load: bool,
+    registers: [Option<u8>; 2],
+    count: u8,
+    size: u8,
+    rn: u8,
+    offset: i64,
+    indexing: Indexing,
+) -> Option<FrameOp>
 {
     // Register 31 as a transfer register is the zero register.
     let registers = registers.map(|r| r.filter(|&r| r != SP));
@@ -321,6 +332,7 @@ fn access(load: bool, registers: [Option<u8>; 2], size: u8, rn: u8, offset: i64,
         return Some(FrameOp::SpAccess {
             load,
             registers,
+            count,
             size,
             offset,
             indexing,
@@ -408,6 +420,7 @@ pub(crate) fn epilogue(
             FrameOp::SpAccess {
                 load,
                 registers,
+                count,
                 size,
                 offset,
                 indexing,
@@ -415,7 +428,7 @@ pub(crate) fn epilogue(
                 let shifted = state.sp.checked_add_signed(offset)?;
                 let address = if indexing == Indexing::PostIndex { state.sp } else { shifted };
                 let size = u64::from(size);
-                for (slot, register) in (0u64..).zip(registers) {
+                for (slot, register) in (0u64..).zip(registers).take(usize::from(count)) {
                     let at = address.checked_add(slot * size)?;
                     if load {
                         let Some(register) = register else {
@@ -534,6 +547,7 @@ pub(crate) fn prologue(
             FrameOp::SpAccess {
                 load: false,
                 registers,
+                count,
                 size,
                 offset,
                 indexing,
@@ -542,7 +556,7 @@ pub(crate) fn prologue(
                 let shifted = allocated.checked_add_signed(negated)?;
                 // The store's address as bytes below the CFA.
                 let below = if indexing == Indexing::PostIndex { allocated } else { shifted };
-                for (slot, register) in (0u64..).zip(registers) {
+                for (slot, register) in (0u64..).zip(registers).take(usize::from(count)) {
                     let slot_below = below.checked_sub(slot * u64::from(size)).filter(|&b| b > 0)?;
                     let Some(register) = register else {
                         continue;
@@ -641,9 +655,16 @@ mod tests
 
     fn access(load: bool, registers: [Option<u8>; 2], size: u8, offset: i64, indexing: Indexing) -> Option<FrameOp>
     {
+        // The tests' single-register forms name one general register; the SIMD pairs name none.
+        let count = if registers[1].is_some() || registers[0].is_none() {
+            2
+        } else {
+            1
+        };
         Some(FrameOp::SpAccess {
             load,
             registers,
+            count,
             size,
             offset,
             indexing,
@@ -919,5 +940,33 @@ mod tests
         assert_eq!(state.x[19], 0x1919);
         let unreadable = Machine::new(&[LDP_FP_LR_POST_0X10, RET]);
         assert_eq!(unreadable.epilogue(0, &registers(0xfd0, 0xfd0, 0)), None);
+    }
+
+    /// A single-register store touches only its own slot: the word above it is not marked
+    /// as stored, so the frame record loaded from there keeps its value.
+    #[test]
+    fn epilogue_single_store_below_the_frame_record_leaves_the_record_readable()
+    {
+        // `str x0, [sp, #8]; ldp x29, x30, [sp, #0x10]; add sp, sp, #0x20; ret`.
+        const STR_X0_SP_8: u32 = 0xF900_07E0;
+        let mut machine = Machine::new(&[STR_X0_SP_8, LDP_FP_LR_SP_0X10, ADD_SP_0X20, RET]);
+        machine.stack.insert(0xff0, 0x2000);
+        machine.stack.insert(0xff8, 0x5555);
+        let state = machine.epilogue(0, &registers(0xfe0, 0xff0, 0)).expect("epilogue");
+        assert_ne!(state.known & (1 << 29), 0, "x29 is known");
+        assert_eq!((state.sp, state.x[29], state.x[30]), (0x1000, 0x2000, 0x5555));
+    }
+
+    /// A single-register store in the top slot of the allocation is understood.
+    #[test]
+    fn prologue_single_store_in_the_top_slot()
+    {
+        // `sub sp, sp, #0x10; str x30, [sp, #8]`, stopped after the store.
+        const SUB_SP_0X10: u32 = 0xD100_43FF;
+        const STR_X30_SP_8: u32 = 0xF900_07FE;
+        let mut machine = Machine::new(&[SUB_SP_0X10, STR_X30_SP_8, NOP]);
+        machine.stack.insert(0xff8, 0x5555);
+        let state = caller(machine.prologue(2, &registers(0xff0, 0x2000, 0x7777)));
+        assert_eq!((state.sp, state.x[30]), (0x1000, 0x5555));
     }
 }

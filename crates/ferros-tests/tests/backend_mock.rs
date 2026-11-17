@@ -424,6 +424,35 @@ fn successful_detach_preserves_source_breakpoint_intent()
 }
 
 #[test]
+fn retried_detach_after_a_backend_failure_keeps_source_breakpoint_intent()
+{
+    use ferros_core::backend::BackendError;
+
+    let (_image, mock, mut session, id) = multi_site_session();
+    let explicit = session.set_breakpoint(BreakpointLocation::Function("multi".into())).unwrap();
+    mock.fail_next(
+        MockCallKind::Detach,
+        BackendError::Os {
+            code: 1,
+            message: "detach refused".into(),
+        },
+    );
+    session.detach().expect_err("injected detach error");
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert!(
+        session.logical_breakpoints().iter().all(|bp| !bp.enabled),
+        "every trap is out"
+    );
+    // Disabled explicitly between the attempts: stays disabled.
+    session.disable_logical_breakpoint(explicit).unwrap();
+    session.detach().expect("retry detach");
+    let enabled: Vec<_> = session.logical_breakpoints().iter().map(|bp| (bp.id, bp.enabled)).collect();
+    assert_eq!(enabled, [(id, true), (explicit, false)]);
+    session.launch(&LaunchSpec::new("/bin/prog")).unwrap();
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+}
+
+#[test]
 fn failed_detach_restore_disables_every_owner_of_restored_sites()
 {
     let (_image, mock, mut session, _) = multi_site_session();

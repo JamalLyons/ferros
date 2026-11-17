@@ -87,18 +87,23 @@ impl Session
     /// is marked disabled, even if its other sites remain armed. If the backend's
     /// `detach` fails, every breakpoint is left disabled and the session stays stopped,
     /// except for [`BackendError::DetachCleanup`]: local teardown completed, so the session is
-    /// cleared and becomes [`SessionState::NotStarted`] while returning the error.
+    /// cleared and becomes [`SessionState::NotStarted`] while returning the error. After
+    /// a failed attempt, a later successful detach still re-enables, for the next run,
+    /// the logical breakpoints that were enabled before the first attempt, unless they
+    /// were disabled explicitly in between.
     pub fn detach(&mut self) -> Result<()>
     {
         self.require_stopped()?;
         // Restoring traps disables their logical owners while the process is still
-        // ours. Successful teardown keeps source-breakpoint intent across runs.
-        let enabled: Vec<_> = self
-            .logical
-            .iter()
-            .filter(|breakpoint| breakpoint.enabled)
-            .map(|breakpoint| breakpoint.id)
-            .collect();
+        // ours. Successful teardown keeps source-breakpoint intent across runs, also
+        // when an earlier detach attempt failed after it had disabled them.
+        let mut enabled = self.detach_intent.take().unwrap_or_default();
+        for breakpoint in &self.logical {
+            if breakpoint.enabled && !enabled.contains(&breakpoint.id) {
+                enabled.push(breakpoint.id);
+            }
+        }
+        self.detach_intent = Some(enabled.clone());
         self.restore_all_traps()?;
         let detached = match self.backend.detach() {
             Err(err @ BackendError::DetachCleanup(_)) => Err(err),

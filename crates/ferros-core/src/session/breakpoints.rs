@@ -73,8 +73,9 @@ pub struct LogicalBreakpoint
     pub id: LogicalBreakpointId,
     /// What was asked for.
     pub location: BreakpointLocation,
-    /// Whether all its sites are armed (or requested while pending). Cleared if any
-    /// site cannot be re-armed; other sites may still trap until deleted or re-enabled.
+    /// Whether it is meant to trap. `true` only when every site is armed (or, while
+    /// pending, once resolved). Cleared if any site cannot be re-armed; other sites may
+    /// still trap until it is deleted or enabled again.
     pub enabled: bool,
     /// Stops at any of its sites while it was enabled, over every run.
     pub hit_count: u64,
@@ -232,7 +233,8 @@ impl Session
     }
 
     /// Restore a breakpoint's original bytes and keep it in the table, disabled.
-    /// Disabling a disabled breakpoint does nothing.
+    /// Disabling a disabled breakpoint does nothing. Every logical breakpoint with a
+    /// site at this address is disabled too, since that site no longer traps.
     ///
     /// # Errors
     ///
@@ -512,6 +514,9 @@ impl Session
     {
         self.require_not_running()?;
         let index = self.logical_index(id)?;
+        if let Some(intent) = &mut self.detach_intent {
+            intent.retain(|&enabled| enabled != id);
+        }
         if !self.logical[index].enabled {
             return Ok(());
         }

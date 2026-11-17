@@ -91,12 +91,14 @@ fn symbol(frame: &StackFrame) -> Option<(&str, SymbolSource)>
 fn failed_symbol_table_reads_are_retried_by_a_later_trace()
 {
     // Issue #104 review: a failed `nlist` or string read leaves the frame unnamed for
-    // that trace only; a later trace reads again and names it.
+    // that trace only; a later trace reads again and names it. The image is mapped
+    // without execute permission so the unlisted-header search cannot find it: the name
+    // must come from the listed image's own symbol table state.
     const IMAGE: u64 = 0x10_0000;
     let (header, nlists, strings) = image();
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
-        .with_region(Address::new(IMAGE), "r-x", header)
+        .with_region(Address::new(IMAGE), "r--", header)
         .with_image(image_at("ferros-symtab-image", IMAGE));
     let mut session = launched(&mock);
 
@@ -134,6 +136,38 @@ fn header_search_skips_a_false_magic_word_before_the_real_header()
     let mut session = launched(&mock);
     let frames = session.stack_trace(4).expect("stack trace");
     assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
+}
+
+#[test]
+fn a_failed_header_search_does_not_hide_a_later_frames_image()
+{
+    // Issue #104 re-review: a frame below an unlisted image's header finds nothing; a
+    // later frame inside that image, in the same region, must still find its header.
+    const LISTED: u64 = 0x10_0000;
+    const CODE: u64 = 0x40_0000;
+    let (listed, ..) = image();
+    let (header, nlists, strings) = image();
+    let mut region = vec![0u8; 0x1000];
+    region.extend(header);
+    let mut registers = regs_at(CODE + 0x10);
+    registers.fp = Address::new(0x2000);
+    registers.sp = Address::new(0x2000);
+    let mut stack = vec![0u8; 16];
+    stack[8..].copy_from_slice(&(CODE + 0x1000 + 0x1014).to_le_bytes());
+    let mock = MockBackend::new()
+        .with_thread(T1, registers)
+        .with_region(Address::new(LISTED), "r-x", listed)
+        .with_region(Address::new(CODE), "r-x", region)
+        .with_region(Address::new(CODE + 0x5000), "r--", nlists)
+        .with_region(Address::new(CODE + 0x6000), "r--", strings)
+        .with_region(Address::new(0x2000), "rw-", stack)
+        .with_image(image_at("ferros-symtab-listed", LISTED));
+    let mut session = launched(&mock);
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(frames[0].pc.value(), CODE + 0x10, "{frames:?}");
+    assert_eq!(symbol(&frames[0]), None, "below the header: {frames:?}");
+    assert_eq!(frames[1].pc.value(), CODE + 0x2014, "{frames:?}");
+    assert_eq!(symbol(&frames[1]), Some(("foo", SymbolSource::SymbolTable)), "{frames:?}");
 }
 
 #[test]

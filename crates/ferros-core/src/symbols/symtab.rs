@@ -20,10 +20,11 @@
 //! A symbol names a pc only up to the next function start. The starts come from the
 //! image's `LC_FUNCTION_STARTS` (ULEB128 deltas in `__LINKEDIT`, as lldb reads them;
 //! shared-cache images keep theirs in the cache's mapped `__LINKEDIT` too): a pc in a
-//! function whose start has no symbol, or in padding after the last instruction of a
-//! named one that the starts mark, gets no name rather than the previous symbol's. An
-//! image without `LC_FUNCTION_STARTS` falls back to the nearest preceding symbol in the
-//! section, which can misname such a pc.
+//! function whose start has no symbol gets no name rather than the previous symbol's.
+//! The starts give no function ends, so padding after a function's last instruction, up to
+//! the next start (or the section end for the last function), still takes that function's
+//! name. An image without `LC_FUNCTION_STARTS` falls back to the nearest preceding symbol
+//! in the section, which can also misname a pc in an unnamed function.
 //!
 //! Only symbols in executable sections (`S_ATTR_PURE_INSTRUCTIONS` or
 //! `S_ATTR_SOME_INSTRUCTIONS`) count, and only for a pc in the same section, so a pc
@@ -132,15 +133,22 @@ impl SymtabLayout
         }
         let slide = load_address.wrapping_sub(text);
         let linkedit_end = linkedit_offset.checked_add(linkedit_size);
+        // `__LINKEDIT`'s runtime address: its `vmaddr` moved by the (possibly negative)
+        // slide, computed wide so a corrupt header cannot wrap it into other memory.
+        let linkedit_runtime = i128::from(linkedit_address) + i128::from(load_address) - i128::from(text);
         // A file range `[offset, offset + size)` within `__LINKEDIT`, as its runtime
-        // address: `fileoff` to `vmaddr` within the segment, then the slide.
+        // address: `fileoff` to `vmaddr` within the segment, then the slide. The whole
+        // runtime range must fit in the address space.
         let linkedit = |what: &str, offset: u32, size: u64| {
             let offset = u64::from(offset);
             offset
                 .checked_add(size)
                 .zip(linkedit_end)
                 .filter(|&(end, linkedit_end)| offset >= linkedit_offset && end <= linkedit_end)
-                .map(|_| linkedit_address.wrapping_add(offset - linkedit_offset).wrapping_add(slide))
+                .and_then(|_| {
+                    let at = u64::try_from(linkedit_runtime + i128::from(offset - linkedit_offset)).ok()?;
+                    at.checked_add(size).map(|_| at)
+                })
                 .ok_or_else(|| {
                     DebuggerError::InvalidArgument(format!(
                         "image header's {what} at file offset {offset:#x} ({size:#x} bytes) lies outside __LINKEDIT"
@@ -214,7 +222,8 @@ impl SymtabLayout
                 let Some(&byte) = bytes.next() else {
                     return starts;
                 };
-                if shift >= 64 {
+                // The tenth byte holds bit 63 only; more is an overflow, not a delta.
+                if shift >= 64 || (shift == 63 && byte & 0x7f > 1) {
                     return starts;
                 }
                 delta |= u64::from(byte & 0x7f) << shift;
@@ -509,6 +518,10 @@ mod tests
         assert_eq!(layout.parse_function_starts(&[0x10, 0, 0x10]), [0x1_0000_0010]);
         assert_eq!(layout.parse_function_starts(&[0x10, 0x80]), [0x1_0000_0010], "truncated");
         assert_eq!(layout.parse_function_starts(&[0xff; 12]), Vec::<u64>::new(), "overlong");
+        // A tenth byte with payload above bit 63 overflows: decoding stops before it
+        // instead of truncating it into a false start.
+        let overflow = [0x80, 0x20, 0x80, 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x00];
+        assert_eq!(layout.parse_function_starts(&overflow), [0x1_0000_1000], "payload overflow");
     }
 
     #[test]
@@ -525,6 +538,9 @@ mod tests
         rejected(header_with(0x8100, 5, u32::MAX, u32::MAX, None));
         rejected(header_with(0x8100, 5, 0x8200, 0x40, Some((0xbffc, 8))));
         rejected(header_with(0x8100, 5, 0x8200, 0x40, Some((0x10, 8))));
+        // A load address whose slide moves `__LINKEDIT` past the end of the address space.
+        let error = SymtabLayout::from_header(&header(), u64::MAX - 0x2000).expect_err("runtime range wraps");
+        assert!(error.to_string().contains("outside __LINKEDIT"), "{error}");
         // Exactly filling the segment is accepted.
         SymtabLayout::from_header(&header_with(0xbff0, 1, 0x8200, 0x3e00, Some((0xbff8, 8))), 0x1_0000_0000)
             .expect("at the end of __LINKEDIT");

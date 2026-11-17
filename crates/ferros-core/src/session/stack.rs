@@ -1,6 +1,7 @@
 //! Stack traces and symbolication.
 
 use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 
 use super::Session;
 use super::images::SessionSymtab;
@@ -160,8 +161,9 @@ impl Session
     /// of every main-thread trace (on current macOS dyld itself lives in the shared cache).
     /// The header is searched for at 4 KiB boundaries, from `address` back to the start of
     /// its region. A candidate that does not parse, or whose executable sections do not
-    /// contain `address`, is skipped. A region searched without success is not searched
-    /// again in this trace.
+    /// contain `address`, is skipped. Each probed page's result is kept for the rest of the
+    /// trace, so later frames in the same region reuse the probes instead of reading again;
+    /// a search that failed for one pc does not stop another pc's search.
     fn unlisted_symbol_table_name(&mut self, unlisted: &mut UnlistedImages, address: Address) -> Option<SymbolName>
     {
         // A backend that lists no images (one that cannot, or a mock) gets no search either.
@@ -171,13 +173,6 @@ impl Session
         let request = self.symbol_request;
         if let Some(entry) = unlisted.images.iter_mut().find(|entry| entry.layout.contains(address)) {
             return name_in(self.backend.as_mut(), entry, address, request);
-        }
-        if unlisted
-            .searched
-            .iter()
-            .any(|&(start, end)| start <= address.value() && address.value() < end)
-        {
-            return None;
         }
         if unlisted.regions.is_none() {
             match self.backend.memory_regions() {
@@ -200,12 +195,8 @@ impl Session
             .as_deref()?
             .iter()
             .find(|region| region.start <= address && address < region.end)?;
-        let (start, end) = (region.start.value(), region.end.value());
-        let found = self.search_image_header(start, address);
-        let Some(layout) = found else {
-            unlisted.searched.push((start, end));
-            return None;
-        };
+        let start = region.start.value();
+        let layout = self.search_image_header(&mut unlisted.probes, start, address)?;
         unlisted.images.push(SessionSymtab::new(layout));
         let entry = unlisted.images.last_mut()?;
         name_in(self.backend.as_mut(), entry, address, request)
@@ -213,33 +204,59 @@ impl Session
 
     /// The layout of the nearest image header at or before `address`, on a 4 KiB boundary
     /// no lower than `start`, whose executable sections contain `address`.
-    fn search_image_header(&mut self, start: u64, address: Address) -> Option<SymtabLayout>
+    fn search_image_header(&mut self, probes: &mut HashMap<u64, Probe>, start: u64, address: Address)
+    -> Option<SymtabLayout>
     {
         let mut page = address.value() & !(PAGE_SIZE - 1);
         for _ in 0..MAX_HEADER_SEARCH_PAGES {
             if page < start {
                 return None;
             }
-            let magic = match self.backend.read_memory(Address::new(page), 4) {
-                Ok(magic) => magic,
-                Err(error) => {
-                    tracing::debug!("image header search for {address} stops at 0x{page:x}: {error}");
-                    return None;
+            let probe = match probes.get(&page) {
+                Some(probe) => probe.clone(),
+                None => {
+                    let probe = self.probe_image_header(page);
+                    probes.insert(page, probe.clone());
+                    probe
                 }
             };
-            if magic == MH_MAGIC_64.to_le_bytes() {
-                let layout = self
-                    .read_mapped_header(page)
-                    .and_then(|header| SymtabLayout::from_header(&header, page).map_err(|error| error.to_string()));
-                match layout {
-                    Ok(layout) if layout.contains(address) => return Some(layout),
-                    Ok(_) => tracing::debug!("image header at 0x{page:x} does not contain {address}"),
-                    Err(detail) => tracing::debug!("skipping a candidate image header for {address}: {detail}"),
+            match probe {
+                Probe::Header(layout) if layout.contains(address) => return Some(layout),
+                Probe::Header(_) => tracing::debug!("image header at 0x{page:x} does not contain {address}"),
+                Probe::Nothing => {}
+                Probe::Unreadable => {
+                    tracing::debug!("image header search for {address} stops at unreadable 0x{page:x}");
+                    return None;
                 }
             }
             page = page.checked_sub(PAGE_SIZE)?;
         }
         None
+    }
+
+    /// Whether a usable Mach-O header starts at `page`.
+    fn probe_image_header(&mut self, page: u64) -> Probe
+    {
+        let magic = match self.backend.read_memory(Address::new(page), 4) {
+            Ok(magic) => magic,
+            Err(error) => {
+                tracing::debug!("image header probe at 0x{page:x}: {error}");
+                return Probe::Unreadable;
+            }
+        };
+        if magic != MH_MAGIC_64.to_le_bytes() {
+            return Probe::Nothing;
+        }
+        match self
+            .read_mapped_header(page)
+            .and_then(|header| SymtabLayout::from_header(&header, page).map_err(|error| error.to_string()))
+        {
+            Ok(layout) => Probe::Header(layout),
+            Err(detail) => {
+                tracing::debug!("skipping a candidate image header at 0x{page:x}: {detail}");
+                Probe::Nothing
+            }
+        }
     }
 
     /// Load symbols for a frame's image. A failure leaves the frame without a symbol and
@@ -325,10 +342,22 @@ impl Session
 struct UnlistedImages
 {
     images: Vec<SessionSymtab>,
-    /// Executable regions `[start, end)` searched without finding a header.
-    searched: Vec<(u64, u64)>,
+    /// What each 4 KiB page probed for a header held.
+    probes: HashMap<u64, Probe>,
     /// The executable regions, listed on the first search.
     regions: Option<Vec<MemoryRegion>>,
+}
+
+/// The result of probing one page for an image header.
+#[derive(Clone)]
+enum Probe
+{
+    /// No `MH_MAGIC_64`, or a candidate that does not parse.
+    Nothing,
+    /// A header whose layout parsed.
+    Header(SymtabLayout),
+    /// The page could not be read; a search stops here.
+    Unreadable,
 }
 
 /// Alignment of Mach-O headers searched for: images in the dyld shared cache start on

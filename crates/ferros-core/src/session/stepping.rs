@@ -102,7 +102,7 @@ impl Session
     {
         let trap = self.arch()?.trap_instruction();
         if let Err(error) = self.backend.write_memory(entry.info.address, trap) {
-            // Memory still contains originals. Keep the table honest if rearming fails.
+            // Memory still contains originals. Disable the entry and all logical owners.
             self.mark_disabled(entry.info.id);
             return Err(error.into());
         }
@@ -124,7 +124,8 @@ impl Session
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, [`DebuggerError::ThreadNotFound`] for an unknown thread, or a
     /// backend error. Failed starts follow the trap-restoration rules of
-    /// [`resume`](Self::resume) and stay stopped.
+    /// [`resume`](Self::resume) and stay stopped. A failed re-arm disables the address
+    /// entry and every logical owner; their other sites may remain armed.
     pub fn step_instruction(&mut self, thread: ThreadId) -> Result<()>
     {
         self.require_stopped()?;

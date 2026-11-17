@@ -134,6 +134,9 @@ pub struct Session
     logical: Vec<LogicalBreakpoint>,
     /// Number of the last logical breakpoint id handed out.
     next_logical: u64,
+    /// Logical breakpoints enabled when a `detach` that has not finished yet began.
+    /// Restoring traps disables them; a retried detach puts this intent back.
+    detach_intent: Option<Vec<LogicalBreakpointId>>,
     symbols: SymbolCache,
     /// Live executable mappings and their symbol-loading state.
     loaded_images: Vec<images::SessionImage>,
@@ -292,6 +295,7 @@ impl Session
             breakpoints: BreakpointStore::new(),
             logical: Vec::new(),
             next_logical: 0,
+            detach_intent: None,
             symbols: SymbolCache::new(),
             loaded_images: Vec::new(),
             symbol_request: 0,
@@ -419,6 +423,7 @@ impl Session
         self.deferred_error = None;
         self.stale_step = None;
         self.carried_signals.clear();
+        self.detach_intent = None;
         self.breakpoints.drain();
         self.forget_logical_sites();
     }

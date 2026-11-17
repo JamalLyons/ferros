@@ -83,13 +83,27 @@ impl Session
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, or the backend's error. If restoring a trap fails, the process is
     /// not detached: breakpoints already restored are left disabled, the others stay
-    /// inserted, and the session stays stopped. If the backend's `detach` fails, every
-    /// breakpoint is left disabled and the session stays stopped, except for
-    /// [`BackendError::DetachCleanup`]: local teardown completed, so the session is
-    /// cleared and becomes [`SessionState::NotStarted`] while returning the error.
+    /// inserted, and the session stays stopped. Every logical owner of a restored site
+    /// is marked disabled, even if its other sites remain armed. If the backend's
+    /// `detach` fails, every breakpoint is left disabled and the session stays stopped,
+    /// except for [`BackendError::DetachCleanup`]: local teardown completed, so the session is
+    /// cleared and becomes [`SessionState::NotStarted`] while returning the error. After
+    /// a failed attempt, a later successful detach still re-enables, for the next run,
+    /// the logical breakpoints that were enabled before the first attempt, unless they
+    /// were disabled explicitly in between.
     pub fn detach(&mut self) -> Result<()>
     {
         self.require_stopped()?;
+        // Restoring traps disables their logical owners while the process is still
+        // ours. Successful teardown keeps source-breakpoint intent across runs, also
+        // when an earlier detach attempt failed after it had disabled them.
+        let mut enabled = self.detach_intent.take().unwrap_or_default();
+        for breakpoint in &self.logical {
+            if breakpoint.enabled && !enabled.contains(&breakpoint.id) {
+                enabled.push(breakpoint.id);
+            }
+        }
+        self.detach_intent = Some(enabled.clone());
         self.restore_all_traps()?;
         let detached = match self.backend.detach() {
             Err(err @ BackendError::DetachCleanup(_)) => Err(err),
@@ -97,6 +111,9 @@ impl Session
             Ok(()) => Ok(()),
         };
         self.clear_process();
+        for breakpoint in &mut self.logical {
+            breakpoint.enabled = enabled.contains(&breakpoint.id);
+        }
         self.state = SessionState::NotStarted;
         self.ownership = None;
         self.last_stop = None;
@@ -132,9 +149,11 @@ impl Session
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotStopped`]
     /// while running, or the backend's error (the session then stays stopped).
     /// A failed initial step start restores the removed trap before returning the
-    /// error; if that restoration also fails, the breakpoint is disabled and its
-    /// restoration error is returned. If a later step or the final continue fails to start
-    /// after an internal step completed, the session is stopped (threads refreshed,
+    /// error; if that restoration also fails, the address entry and every logical owner
+    /// are disabled (other sites may remain armed) and the restoration error is returned.
+    /// A failed re-arm after step completion disables owners the same way. If a later
+    /// step or the final continue fails to start after an internal step completed, the
+    /// session is stopped (threads refreshed,
     /// [`last_stop`](Self::last_stop) `None`) and that error is returned.
     pub fn resume(&mut self) -> Result<()>
     {
@@ -293,6 +312,8 @@ impl Session
     /// [`DebuggerError::NotAttached`] with no process, [`DebuggerError::NotRunning`] as
     /// described above, or the backend's error. A failed backend wait leaves the state
     /// unchanged; failures after an internal stop follow the stopped-state rule above.
+    /// A failed trap re-arm disables the address entry and every logical owner; their
+    /// other sites may remain armed.
     pub fn wait(&mut self, timeout: Option<Duration>) -> Result<Option<StopEvent>>
     {
         self.require_process()?;

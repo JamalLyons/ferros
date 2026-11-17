@@ -325,20 +325,41 @@ fn overlap(
     (start < end).then(|| ((start - a) as usize, (start - b) as usize, (end - start) as usize))
 }
 
+/// The saved original bytes of every enabled software breakpoint, by trap address, so
+/// memory read past the session (the stack unwinder's) can hide traps too.
+pub(super) type TrapOriginals = Vec<(crate::types::Address, Vec<u8>)>;
+
+/// Replace the trap bytes in `data`, read at `address`, with their saved originals.
+pub(super) fn overlay_traps(traps: &TrapOriginals, address: crate::types::Address, data: &mut [u8])
+{
+    for (base, original_bytes) in traps {
+        if let Some((offset, original, len)) = overlap(address, data.len(), *base, original_bytes.len()) {
+            data[offset..offset + len].copy_from_slice(&original_bytes[original..original + len]);
+        }
+    }
+}
+
 impl Session
 {
+    pub(super) fn trap_originals(&self) -> TrapOriginals
+    {
+        self.breakpoints
+            .list()
+            .into_iter()
+            .filter(|info| info.enabled)
+            .filter_map(|info| match self.breakpoints.get(info.id) {
+                Some(BreakpointEntry {
+                    payload: BreakpointPayload::Software { original_bytes },
+                    ..
+                }) => Some((info.address, original_bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn overlay_originals(&self, address: crate::types::Address, data: &mut [u8])
     {
-        for info in self.breakpoints.list().into_iter().filter(|info| info.enabled) {
-            if let Some(BreakpointEntry {
-                payload: BreakpointPayload::Software { original_bytes },
-                ..
-            }) = self.breakpoints.get(info.id)
-                && let Some((offset, original, len)) = overlap(address, data.len(), info.address, original_bytes.len())
-            {
-                data[offset..offset + len].copy_from_slice(&original_bytes[original..original + len]);
-            }
-        }
+        overlay_traps(&self.trap_originals(), address, data);
     }
 
     pub(super) fn write_through_breakpoints(&mut self, address: crate::types::Address, data: &[u8]) -> Result<()>

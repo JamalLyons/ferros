@@ -4,6 +4,7 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 
 use super::Session;
+use super::breakpoints::{TrapOriginals, overlay_traps};
 use super::images::SessionSymtab;
 use crate::backend::Backend;
 use crate::error::{DebuggerError, Result};
@@ -22,19 +23,25 @@ use crate::types::{Address, MemoryRegion, StackFrame, SymbolName, SymbolSource};
 /// Executable regions are listed once per trace, on the first question, so a trace that
 /// never needs them (a single frame) does not ask the backend. A backend that cannot list
 /// regions answers every address as executable.
+///
+/// Enabled software breakpoints read as their original bytes, as through
+/// [`Session::read_memory`]: the unwinder decodes prologue and epilogue instructions, and
+/// a stop at a breakpoint is often on one of them.
 struct BackendMemory<'a>
 {
     backend: RefCell<&'a mut dyn Backend>,
     executable: OnceCell<Option<Vec<MemoryRegion>>>,
+    traps: TrapOriginals,
 }
 
 impl<'a> BackendMemory<'a>
 {
-    fn new(backend: &'a mut dyn Backend) -> Self
+    fn new(backend: &'a mut dyn Backend, traps: TrapOriginals) -> Self
     {
         Self {
             backend: RefCell::new(backend),
             executable: OnceCell::new(),
+            traps,
         }
     }
 }
@@ -43,7 +50,8 @@ impl MemoryAccess for BackendMemory<'_>
 {
     fn read_u64(&self, address: Address) -> Result<u64>
     {
-        let bytes = self.backend.borrow_mut().read_memory(address, 8)?;
+        let mut bytes = self.backend.borrow_mut().read_memory(address, 8)?;
+        overlay_traps(&self.traps, address, &mut bytes);
         let bytes: [u8; 8] = bytes.try_into().map_err(|bytes: Vec<u8>| {
             DebuggerError::InvalidArgument(format!(
                 "read {} bytes instead of 8 at 0x{:016x}",
@@ -115,7 +123,8 @@ impl Session
         // is read at most once per trace.
         loop {
             let frames = {
-                let memory = BackendMemory::new(self.backend.as_mut());
+                let traps = self.trap_originals();
+                let memory = BackendMemory::new(self.backend.as_mut(), traps);
                 StackUnwinder::new(arch, &self.symbols, &memory).unwind(thread, &registers, max_frames)?
             };
             let mut added = false;

@@ -21,6 +21,10 @@ The crate defines fifteen fixture binaries:
 - `ferros-fixture-recursion`: `descend` recurses to the depth given by the first argument (default 60);
   marker `bottom` is reached at the deepest call. Used for deep backtraces.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
+  With `--step-resume`, raises SIGUSR1 at itself and stops after the handler (marker `after_signal`).
+  With `--interrupt`, `main` (marker `call_spin`) calls `spin`, which loops forever on marker
+  `spin_line` until a SIGUSR1 sent from outside runs the handler `on_sigusr1` (marker
+  `in_handler`). Used for backtraces through `_sigtramp`.
 - `ferros-fixture-signal_tracing`: Keeps two threads alive and acknowledges SIGUSR1 through
   files in a test-owned directory (macOS).
 - `ferros-fixture-thread_signals`: Two workers raise thread-directed SIGUSR1 independently and report
@@ -182,8 +186,10 @@ fn resume_runs_hello()
 
 ## Tests without a real process
 
-`tests/backend_mock.rs` is the one test file that launches no process and does not use the
-harness. It drives `ferros_core::backend::mock::MockBackend`, an in-memory, scripted backend
+`tests/backend_mock.rs` and `tests/unwind_eh_frame.rs` launch no process and do not use the
+harness. `tests/unwind_eh_frame.rs` runs the stack unwinder over a synthetic Mach-O image and fake
+stack memory, pinning that `__eh_frame` FDEs are matched by runtime address. `tests/backend_mock.rs`
+drives `ferros_core::backend::mock::MockBackend`, an in-memory, scripted backend
 enabled through the `test-util` feature, to prove the portable `Backend` trait and the mock work
 from outside `ferros-core`. With nothing to launch it needs no entitlement, no fixtures and no
 `#![cfg(target_os = "macos")]` gate.

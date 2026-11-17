@@ -70,6 +70,7 @@
 mod breakpoints;
 mod images;
 mod lifecycle;
+mod line_stepping;
 mod location;
 mod stack;
 mod stepping;
@@ -117,6 +118,7 @@ pub struct Session
     /// A stop event drained from the backend by `resume`, returned by the next `wait`.
     deferred: Option<StopEvent>,
     step_plan: Option<stepping::StepPlan>,
+    line_plan: Option<line_stepping::LinePlan>,
     interrupt_requested: bool,
     /// A backend `wait` error met while `resume` drove a step-over, returned by the
     /// next `wait`.
@@ -189,6 +191,7 @@ impl Drop for Session
     fn drop(&mut self)
     {
         self.step_plan = None;
+        self.line_plan = None;
         self.interrupt_requested = false;
         match (self.ownership, self.state) {
             (Some(ProcessOwnership::Launched), SessionState::Stopped) => {
@@ -281,6 +284,7 @@ impl Session
             last_stop: None,
             deferred: None,
             step_plan: None,
+            line_plan: None,
             interrupt_requested: false,
             deferred_error: None,
             stale_step: None,
@@ -410,6 +414,7 @@ impl Session
         self.selected = None;
         self.deferred = None;
         self.step_plan = None;
+        self.line_plan = None;
         self.interrupt_requested = false;
         self.deferred_error = None;
         self.stale_step = None;

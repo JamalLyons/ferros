@@ -3,10 +3,10 @@
 use std::collections::VecDeque;
 
 use super::{Session, SessionState};
-use crate::backend::{ResumeRequest, StopEvent};
+use crate::backend::{ResumeRequest, StopEvent, ThreadAction};
 use crate::breakpoints::{BreakpointEntry, BreakpointKind};
 use crate::error::{DebuggerError, Result};
-use crate::types::ThreadId;
+use crate::types::{Address, ThreadId};
 
 pub(super) struct StepSite
 {
@@ -20,6 +20,7 @@ pub(super) struct StepPlan
     remaining: VecDeque<StepSite>,
     // None means the user requested a single step: report its completion.
     final_request: Option<ResumeRequest>,
+    signal_return_sp: Option<Address>,
 }
 
 impl Session
@@ -49,6 +50,9 @@ impl Session
         }
         let mut sites = VecDeque::new();
         for thread in self.threads.clone() {
+            if request.action_for(thread) == ThreadAction::Suspend {
+                continue;
+            }
             if let Some(site) = self.breakpoint_at_pc(thread)? {
                 sites.push_back(site);
             }
@@ -58,6 +62,7 @@ impl Session
                 current,
                 remaining: sites,
                 final_request: Some(request),
+                signal_return_sp: None,
             })
         } else {
             Ok(self.backend.resume(&request)?)
@@ -67,13 +72,22 @@ impl Session
     fn start_plan(&mut self, mut plan: StepPlan) -> Result<()>
     {
         let site = &plan.current;
-        self.restore_original(&site.entry)?;
         let mut request = ResumeRequest::step(site.thread);
         if let Some(final_request) = &mut plan.final_request
             && let Some(signal) = final_request.signal_for(site.thread)
         {
-            request = request.with_signal(site.thread, signal);
+            // Deliver the signal with the original trap still armed. A Step with a
+            // signal executes the handler's first instruction, not the instruction
+            // under this trap. Wait for the handler to return to this exact frame
+            // before removing the trap and executing the original instruction.
+            plan.signal_return_sp = Some(self.backend.read_registers(site.thread)?.sp);
+            request = ResumeRequest::all(ThreadAction::Suspend)
+                .with_thread(site.thread, ThreadAction::Continue)
+                .with_signal(site.thread, signal);
             final_request.signals.retain(|(thread, _)| *thread != site.thread);
+        } else {
+            plan.signal_return_sp = None;
+            self.restore_original(&site.entry)?;
         }
         if let Err(error) = self.backend.resume(&request) {
             // The backend guarantees that a failed resume ran nothing.
@@ -131,6 +145,7 @@ impl Session
                 current,
                 remaining: VecDeque::new(),
                 final_request: None,
+                signal_return_sp: None,
             })?;
         } else {
             self.backend.resume(&ResumeRequest::step(thread))?;
@@ -211,10 +226,40 @@ impl Session
     /// None means an internal completion was consumed and execution resumed.
     pub(super) fn finish_step(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
     {
+        let event = match self.finish_breakpoint_step(event) {
+            Ok(event) => event,
+            Err(error) => {
+                self.cancel_line_step()?;
+                return Err(error);
+            }
+        };
+        match event {
+            Some(event) => self.finish_line_step(event),
+            None => Ok(None),
+        }
+    }
+
+    fn finish_breakpoint_step(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
+    {
         let Some(mut plan) = self.step_plan.take() else {
             return Ok(Some(event));
         };
         if event.is_terminal() {
+            return Ok(Some(event));
+        }
+        if let Some(sp) = plan.signal_return_sp {
+            if let StopEvent::Breakpoint { thread, pc } = event
+                && thread == plan.current.thread
+                && self.arch()?.pc_after_trap(pc) == plan.current.entry.info.address
+                && self.backend.read_registers(thread)?.sp == sp
+            {
+                // This trap is the step-resume rendezvous, not another user hit.
+                plan.signal_return_sp = None;
+                self.start_plan(plan)?;
+                return Ok(None);
+            }
+            // No instruction step was started, so there can be no stale completion.
+            self.abandon(plan, true);
             return Ok(Some(event));
         }
         self.rearm(&plan.current.entry)?;

@@ -47,6 +47,15 @@ pub trait Arch: Send + Sync + std::fmt::Debug
     /// None; infallible.
     fn trap_instruction(&self) -> &'static [u8];
 
+    /// Return pc of a call encoded by `instruction` at `pc`, if recognized.
+    ///
+    /// The default recognizes no calls. This is instruction decoding only: it does
+    /// not read target memory or follow a branch.
+    fn call_return_address(&self, _pc: Address, _instruction: &[u8]) -> Option<Address>
+    {
+        None
+    }
+
     /// Program counter held in `registers`.
     ///
     /// # Preconditions

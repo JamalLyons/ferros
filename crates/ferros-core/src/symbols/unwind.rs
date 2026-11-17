@@ -30,24 +30,54 @@
 //!    evaluated, the frame-pointer chain.
 //! 2. **`MODE_FRAMELESS`**: in the innermost frame, the caller is the link register and
 //!    its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
-//!    allocation). Past the allocation's release in the epilogue the `sp` is off by
-//!    `stack_size`; compact unwind cannot describe that window. A frameless leaf makes no calls, so it cannot be a
-//!    caller frame; there the walk stops instead of guessing.
+//!    allocation). Elsewhere the instructions are analysed first (see *Prologues and
+//!    epilogues* below), so a stop after the epilogue released the allocation gets the
+//!    caller's `sp` right. A frameless leaf makes no calls, so it cannot be a caller frame;
+//!    there the walk stops instead of guessing.
 //! 3. **`MODE_FRAME`**: the frame-pointer chain: the record at `fp` holds the caller's
 //!    `fp` and the return address. On the function's first instruction (innermost frame
 //!    only) the record is not built yet, so the caller is the link register. The linker
 //!    merges a run of adjacent functions with the same encoding into one entry (33 such
 //!    function starts under a `MODE_FRAME` entry in this build), so a first instruction is
-//!    recognized from the entry or from the DWARF function index. Elsewhere inside the
-//!    prologue or epilogue, or in a shrink-wrapped function before its record is built,
-//!    the frame record is not there and the caller is skipped: compact unwind cannot
-//!    describe those windows.
+//!    recognized from the entry or from the DWARF function index. Elsewhere in the
+//!    innermost frame the instructions are analysed first (see *Prologues and epilogues*),
+//!    which covers the rest of the prologue, the epilogue after `x29`/`x30` are reloaded,
+//!    and a shrink-wrapped path before the record is built.
 //! 4. **Encoding 0, no entry, or no `__unwind_info`** (for example an ELF image or a
 //!    synthetic one): `.eh_frame_hdr` lookup, else a linear scan of `__eh_frame` (FDE
 //!    ranges as runtime addresses), then of `.debug_frame` (FDE ranges as file addresses,
 //!    since it lives in the unslid dSYM); then, in the innermost frame on the first
 //!    instruction of a function known to DWARF, the link register; then the frame-pointer
 //!    chain.
+//!
+//! ## Prologues and epilogues
+//!
+//! Compact unwind cannot describe the instructions of a `MODE_FRAME` function before
+//! `x29` is set to its frame record or after the epilogue reloads `x29`/`x30`, nor a
+//! `MODE_FRAMELESS` function after its epilogue released the stack. For an innermost
+//! frame in those modes, past the first instruction, the unwinder decodes the code around
+//! the pc ([`arch::arm64_frame`](crate::arch::arm64_frame)), read with
+//! [`MemoryAccess::read_u32`]:
+//!
+//! 1. **Epilogue**: from the pc forward, the straight-line code to the `ret` (`ret`,
+//!    `retaa`, `retab`) is executed on the instructions that move `sp` or reload
+//!    registers from the stack. The registers at the `ret` are the caller's: the return
+//!    address in `x30`, `sp`, `x29` and the reloaded `x19`-`x28`.
+//! 2. **Prologue**: otherwise, from the function's start up to the pc. The start is the
+//!    later of the compact entry's function and the nearest DWARF function start (the
+//!    linker merges entries). If an instruction sets `x29` from `sp`, the record is built
+//!    and the frame-pointer chain applies. Otherwise the caller's `sp` is `sp` plus what
+//!    the code allocated, and `x29`, `x30`, `x19`-`x28` come from where it stored them,
+//!    else they still hold the caller's values.
+//! 3. If neither is understood (a branch or call on the way, an instruction that is not
+//!    decoded, an unreadable word), the mode's rule above applies unchanged.
+//!
+//! Recognized instructions include `stp`/`ldp`/`str`/`ldr` through `sp` (offset,
+//! pre-index, post-index), `sub`/`add sp, sp, #N`, `add x29, sp, #N` and `mov x29, sp`,
+//! `mov sp, x29`, and hints such as `pacibsp`/`autibsp`; ordinary data processing is
+//! neutral. The session's [`MemoryAccess`] hides enabled software breakpoints behind
+//! their original bytes, so a stop at a breakpoint inside a prologue or epilogue still
+//! decodes the real instructions.
 //!
 //! Images whose files could not be loaded (for example libraries in the dyld shared cache)
 //! have none of this, and use the frame-pointer chain.
@@ -137,6 +167,7 @@ use gimli::{
 };
 
 use crate::arch::Arch;
+use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
 use crate::error::Result;
 use crate::symbols::compact_unwind::{self, Arm64Mode};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
@@ -153,6 +184,21 @@ pub trait MemoryAccess
     ///
     /// An error if the address is invalid or unreadable.
     fn read_u64(&self, address: Address) -> Result<u64>;
+
+    /// Read a 32-bit little-endian value (an arm64 instruction) from a 4-byte aligned
+    /// address. The default reads the aligned 64-bit word containing it, which never
+    /// crosses a page.
+    ///
+    /// # Errors
+    ///
+    /// An error if the address is invalid or unreadable.
+    fn read_u32(&self, address: Address) -> Result<u32>
+    {
+        let value = address.value();
+        let word = self.read_u64(Address::new(value & !7))?;
+        let shift = (value & 4) * 8;
+        Ok(u32::try_from((word >> shift) & 0xFFFF_FFFF).unwrap_or_default())
+    }
 
     /// Whether `address` lies in executable memory. The unwinder stops before a frame
     /// whose pc is not. The default accepts every address.
@@ -184,6 +230,15 @@ struct Cursor
     is_caller: bool,
 }
 
+/// What [`StackUnwinder::code_step`] found.
+enum CodeStep
+{
+    /// The caller, from the epilogue or the prologue.
+    Caller(UnwindStep),
+    /// The prologue built the frame record: the frame-pointer chain applies.
+    FrameBuilt,
+}
+
 /// `x0`-`x30`.
 const ALL_GENERAL: u32 = (1 << 31) - 1;
 /// Callee-saved registers under the arm64 Apple ABI: `x19`-`x29` (`x29` is the frame
@@ -206,10 +261,13 @@ enum Compact
 {
     /// No `__unwind_info`, no entry, or encoding 0.
     Absent,
-    /// The function's mode, and whether the address is its first instruction.
+    /// The function's mode, whether the address is its first instruction, and the
+    /// runtime address of the entry's first function.
     Mode
     {
-        mode: Arm64Mode, at_entry: bool
+        mode: Arm64Mode,
+        at_entry: bool,
+        start: Address,
     },
 }
 
@@ -327,26 +385,31 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             Compact::Mode {
                 mode: Arm64Mode::Frameless { stack_size },
                 at_entry,
+                start,
             } => {
                 // On the first instruction the leaf has not allocated its stack yet.
-                let allocated = if at_entry || self.is_dwarf_function_start(image, cursor) {
-                    0
-                } else {
-                    stack_size
-                };
-                self.frameless_step(cursor, allocated)
+                if at_entry || self.is_dwarf_function_start(image, cursor) {
+                    return self.frameless_step(cursor, 0);
+                }
+                match self.code_step(cursor, self.function_start(image, cursor, start)) {
+                    Some(CodeStep::Caller(step)) => Some(step),
+                    _ => self.frameless_step(cursor, stack_size),
+                }
             }
             Compact::Mode {
                 mode: Arm64Mode::Frame,
                 at_entry,
+                start,
             } => {
                 // The linker gives one compact entry to a run of adjacent functions with
                 // the same encoding, so only the first of them is recognized from the
                 // entry; the others are recognized from the DWARF function index.
                 if at_entry || self.is_dwarf_function_start(image, cursor) {
-                    self.entry_step(cursor)
-                } else {
-                    self.frame_pointer_step(cursor)
+                    return self.entry_step(cursor);
+                }
+                match self.code_step(cursor, self.function_start(image, cursor, start)) {
+                    Some(CodeStep::Caller(step)) => Some(step),
+                    _ => self.frame_pointer_step(cursor),
                 }
             }
             Compact::Mode {
@@ -636,6 +699,67 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             .is_ok_and(|index| index.starts().binary_search(&file).is_ok())
     }
 
+    /// The start of the function containing the innermost frame's pc: the later of the
+    /// compact entry's first function (`entry_start`) and the nearest DWARF function start
+    /// at or below the pc, since the linker merges adjacent functions into one entry.
+    fn function_start(&self, image: &BinaryImage, cursor: &Cursor, entry_start: Address) -> Address
+    {
+        let dwarf = image.file_address(cursor.regs.pc).and_then(|file| {
+            let index = image.function_index().ok()?;
+            let starts = index.starts();
+            let at = starts.partition_point(|&start| start <= file).checked_sub(1)?;
+            image.runtime_address(*starts.get(at)?)
+        });
+        dwarf.filter(|&start| start > entry_start).unwrap_or(entry_start)
+    }
+
+    /// The innermost frame's caller from the instructions of its function (see the
+    /// module documentation, *Prologues and epilogues*): the epilogue from the pc to the
+    /// `ret`, else the prologue from `start` to the pc. `None` for a caller frame, a
+    /// non-arm64 target, or code that is not understood.
+    fn code_step(&self, cursor: &Cursor, start: Address) -> Option<CodeStep>
+    {
+        if cursor.is_caller || cursor.known != ALL_GENERAL || self.arch.architecture() != Architecture::Arm64 {
+            return None;
+        }
+        let regs = &cursor.regs;
+        let mut x = [0; 31];
+        for (slot, value) in x.iter_mut().zip(&regs.general) {
+            *slot = *value;
+        }
+        x[29] = regs.fp.value();
+        let current = FrameRegisters {
+            x,
+            sp: regs.sp.value(),
+            known: ALL_GENERAL,
+        };
+        let read_code = |address| self.memory.read_u32(Address::new(address)).ok();
+        let read_stack = |address| self.memory.read_u64(Address::new(address)).ok();
+        let pc = regs.pc.value();
+        let caller = match arm64_frame::epilogue(pc, &current, read_code, read_stack) {
+            Some(caller) => caller,
+            None => match arm64_frame::prologue(start.value(), pc, &current, read_code, read_stack)? {
+                Prologue::FrameBuilt => return Some(CodeStep::FrameBuilt),
+                Prologue::Caller(caller) => *caller,
+            },
+        };
+        if caller.known & LINK_REGISTER == 0 {
+            return None;
+        }
+        let mut next = regs.clone();
+        for (slot, value) in next.general.iter_mut().zip(caller.x) {
+            *slot = value;
+        }
+        self.arch.set_fp(&mut next, Address::new(caller.x[29]));
+        next.sp = Address::new(caller.sp);
+        next.pc = self.arch.strip_pointer_auth(Address::new(caller.x[30]));
+        Some(CodeStep::Caller(UnwindStep {
+            next,
+            known: caller.known & CALLEE_SAVED,
+            status: FrameStatus::CfiFallback,
+        }))
+    }
+
     /// Follow the frame record at `fp`: `[fp]` is the caller's `fp`, `[fp + 8]` the return
     /// address.
     fn frame_pointer_step(&self, cursor: &Cursor) -> Option<UnwindStep>
@@ -812,6 +936,7 @@ fn compact_entry(image: &BinaryImage, lookup: Address) -> Compact
         Some(entry) if entry.encoding != 0 => Compact::Mode {
             mode: Arm64Mode::decode(entry.encoding),
             at_entry: entry.function_offset == offset,
+            start: Address::new(header + u64::from(entry.function_offset)),
         },
         _ => Compact::Absent,
     }

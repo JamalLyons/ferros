@@ -556,3 +556,111 @@ fn backtrace_in_a_signal_handler_shows_the_interrupted_function()
         d.kill().expect("kill");
     });
 }
+
+/// The instruction word at `address`, as the program sees it (traps hidden).
+fn instruction(session: &mut Session, address: Address) -> u32
+{
+    let bytes = session.read_memory(address, 4).expect("read code");
+    u32::from_le_bytes(bytes.try_into().expect("4 bytes"))
+}
+
+/// Address of the first instruction at or after `start` that `matches`, within 64
+/// instructions.
+fn find_instruction(session: &mut Session, start: Address, matches: impl Fn(u32) -> bool) -> Address
+{
+    (0..64)
+        .map(|index| Address::new(start.value() + 4 * index))
+        .find(|&address| matches(instruction(session, address)))
+        .unwrap_or_else(|| panic!("no matching instruction within 64 after {start}"))
+}
+
+/// `add x29, sp, #imm` (`mov x29, sp` included): the instruction that sets the frame
+/// pointer to the new frame record.
+fn sets_frame_pointer(insn: u32) -> bool
+{
+    insn & 0xFF80_03FF == 0x9100_03FD
+}
+
+/// Resume until the next breakpoint stop, which must be at `address`.
+fn continue_to(session: &mut Session, address: Address)
+{
+    session.resume().expect("resume");
+    match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
+        Some(StopEvent::Breakpoint { pc, thread }) if pc == address => {
+            session.select_thread(thread).expect("select the stopped thread");
+        }
+        other => panic!("expected a breakpoint stop at {address}, got {other:?}"),
+    }
+}
+
+/// Stopped inside the prologue of `exit_success` (compact unwind `MODE_FRAME`, merged into
+/// `exit_failure`'s entry), past its first instruction and up to the instruction that
+/// sets `x29`, the frame record is not built yet: the caller is `main` at the call, with
+/// the `sp` the prologue allocated added back. The frame-pointer chain would follow
+/// `main`'s own record and skip `main`. Both stops have a breakpoint on an analysed
+/// instruction, so the unwinder must read the original code under the traps.
+#[test]
+fn backtrace_in_the_prologue_of_a_frame_function_keeps_its_caller()
+{
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let entry = function_address(&mut d, &fixture, "exit_success");
+        let sets_fp = find_instruction(&mut d, entry, sets_frame_pointer);
+        let stops: Vec<Address> = (entry.value() + 4..=sets_fp.value()).step_by(4).map(Address::new).collect();
+        assert!(!stops.is_empty(), "exit_success has a prologue after its entry");
+        for &stop in &stops {
+            d.add_breakpoint(BreakpointRequest::Software { address: stop })
+                .unwrap_or_else(|err| panic!("add_breakpoint at {stop}: {err}"));
+        }
+
+        for &stop in &stops {
+            continue_to(&mut d, stop);
+            let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+            assert_sane(&mut d, &frames);
+            assert_eq!(frames[0].pc, stop, "{frames:#?}");
+            assert_eq!(
+                summary(&frames, &fixture)[1],
+                ("main".to_owned(), Some(fixture.marker_line("call_exit"))),
+                "stopped at {stop}: {frames:#?}"
+            );
+            assert!(frames[1].sp > frames[0].sp, "the prologue allocated stack: {frames:#?}");
+        }
+    });
+}
+
+/// Stopped on the `ret` of the C `_main` shim (compact unwind `MODE_FRAME`, no FDE) after
+/// the fixture's `main` returned: its epilogue already reloaded `x29` and `x30`, so `fp` is
+/// dyld's and the frame record is gone. The caller is dyld's `start`, through the link
+/// register, with `sp` unchanged; the frame-pointer chain would skip `start`.
+#[test]
+fn backtrace_after_the_epilogue_of_a_frame_function_keeps_its_caller()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hello");
+        let mut d = t.launch(&fixture);
+        let print = marker_address(&mut d, &fixture, "hello_print");
+        run_to(&mut d, print);
+        // `_main` is the frame below Rust's runtime start; its pc is the return address of
+        // the call to `lang_start`, a few instructions before its `ret`.
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        let shim = frames
+            .iter()
+            .find(|frame| frame.symbol.as_ref().is_some_and(|symbol| symbol.display_name() == "main"))
+            .unwrap_or_else(|| panic!("no C `main` frame: {frames:#?}"));
+        let ret = find_instruction(&mut d, shim.pc, |insn| insn == 0xD65F_03C0);
+        let start = frames[shim.index + 1].pc;
+        let breakpoints: Vec<_> = d.breakpoints().into_iter().map(|info| info.id).collect();
+        for id in breakpoints {
+            d.remove_breakpoint(id).expect("remove breakpoint");
+        }
+        run_to(&mut d, ret);
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        assert_eq!(frames[0].pc, ret, "{frames:#?}");
+        assert!(frames.len() >= 2, "the caller of `_main` is missing: {frames:#?}");
+        assert_eq!(frames[1].pc, start, "the caller is dyld's `start` at the call: {frames:#?}");
+        assert_eq!(frames[0].sp, frames[1].sp, "the epilogue released the frame");
+    });
+}

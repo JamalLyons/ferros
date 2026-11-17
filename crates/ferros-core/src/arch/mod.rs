@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod arm64;
+pub(crate) mod arm64_frame;
 mod x86_64;
 
 pub use arm64::Arm64;

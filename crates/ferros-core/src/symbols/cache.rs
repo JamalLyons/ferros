@@ -41,7 +41,7 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::debuginfo::DebugInfoOptions;
@@ -117,7 +117,7 @@ impl SymbolCache
     /// Drop metadata for images no longer reported by the loader.
     pub fn retain_images(&mut self, descriptors: &[ImageDescriptor])
     {
-        let ids: std::collections::HashSet<_> = descriptors
+        let ids: HashSet<_> = descriptors
             .iter()
             .filter_map(|descriptor| {
                 let path = if descriptor.path.is_absolute() {
@@ -128,6 +128,16 @@ impl SymbolCache
                 Some(ImageId::from_parts(&path, descriptor.load_address))
             })
             .collect();
+        self.retain_ids(&ids);
+    }
+
+    /// Drop metadata for every image whose id is not in `ids`.
+    ///
+    /// Unlike [`retain_images`](Self::retain_images), this does not resolve paths again, so
+    /// an image loaded from a relative path that no longer resolves is kept while its
+    /// owner still reports it mapped.
+    pub fn retain_ids(&mut self, ids: &HashSet<ImageId>)
+    {
         self.images.retain(|id, _| ids.contains(id));
     }
 

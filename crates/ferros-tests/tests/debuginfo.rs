@@ -118,6 +118,27 @@ fn assert_source_line(image: &BinaryImage, executable: &Path, fixture: &Fixture)
     );
 }
 
+/// `path` relative to the current directory, through `..` components.
+fn relative_to_cwd(path: &Path) -> PathBuf
+{
+    let current = std::env::current_dir().expect("cwd");
+    let relative = current
+        .ancestors()
+        .enumerate()
+        .find_map(|(levels, ancestor)| {
+            let suffix = path.strip_prefix(ancestor).ok()?;
+            let mut relative = PathBuf::new();
+            for _ in 0..levels {
+                relative.push("..");
+            }
+            relative.push(suffix);
+            Some(relative)
+        })
+        .expect("relative path");
+    assert!(!relative.is_absolute());
+    relative
+}
+
 fn expect_no_debug_info(result: ferros_core::Result<std::sync::Arc<BinaryImage>>)
 {
     let Err(error) = result else {
@@ -416,21 +437,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
 {
     harness::run(|_| {
         let fixture = fixture!("hello");
-        let current = std::env::current_dir().expect("cwd");
-        let relative = current
-            .ancestors()
-            .enumerate()
-            .find_map(|(levels, ancestor)| {
-                let suffix = fixture.path().strip_prefix(ancestor).ok()?;
-                let mut path = PathBuf::new();
-                for _ in 0..levels {
-                    path.push("..");
-                }
-                path.push(suffix);
-                Some(path)
-            })
-            .expect("relative fixture path");
-        assert!(!relative.is_absolute());
+        let relative = relative_to_cwd(fixture.path());
         let image = LoadedImage {
             path: relative.clone(),
             load_address: Address::new(0x2_0000_0000),
@@ -447,6 +454,60 @@ fn relative_image_paths_keep_symbols_across_refreshes()
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         assert!(session.symbolicate(address).expect("first lookup").is_some());
         assert!(session.symbolicate(address).expect("second lookup").is_some());
+    });
+}
+
+/// Issue #99: an image the loader reports at a relative path keeps its loaded symbols
+/// when that path stops resolving (its file is removed, as while Cargo re-uplifts a
+/// fixture), as long as the image stays mapped. The session must never treat the symbols
+/// as loaded while the cache has dropped them, which made lookups return `Ok(None)`.
+#[test]
+fn relative_image_keeps_symbols_after_its_path_stops_resolving()
+{
+    harness::run(|_| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        let directory = fs::canonicalize(&scratch.0).expect("canonical scratch directory");
+        let executable = directory.join("program");
+        std::os::unix::fs::symlink(fixture.path(), &executable).expect("link the executable");
+        std::os::unix::fs::symlink(fixture.dsym_path(), directory.join("program.dSYM")).expect("link the dSYM");
+        let relative = relative_to_cwd(&executable);
+        let load_address = 0x2_0000_0000;
+        let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
+        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+            .expect("mapping")
+            .runtime_address(file)
+            .expect("runtime");
+        let mock = with_mapped_header(MockBackend::new(), fixture.path(), load_address)
+            .with_thread(ThreadId(1), Registers::default())
+            .with_image(LoadedImage {
+                path: relative.clone(),
+                load_address: Address::new(load_address),
+            });
+        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
+        let is_main = |symbolication: &ferros_core::Symbolication| {
+            symbolication.frames.iter().any(|frame| {
+                rustc_demangle::try_demangle(frame.symbol.raw())
+                    .is_ok_and(|name| format!("{name:#}") == "ferros_fixture_hello::main")
+            })
+        };
+        let loaded = session
+            .symbolicate(address)
+            .expect("first lookup")
+            .expect("main has a symbol");
+        assert!(is_main(&loaded), "{loaded:?}");
+
+        fs::remove_file(&executable).expect("remove the executable link");
+        assert!(relative.canonicalize().is_err(), "the relative path must stop resolving");
+        for _ in 0..2 {
+            match session.symbolicate(address) {
+                Ok(Some(symbolication)) => assert!(is_main(&symbolication), "{symbolication:?}"),
+                Err(DebuggerError::SymbolLoad { path, .. }) => assert_eq!(path, relative),
+                Ok(None) => panic!("symbols silently missing while the image is still mapped"),
+                Err(error) => panic!("unexpected error {error}"),
+            }
+        }
     });
 }
 

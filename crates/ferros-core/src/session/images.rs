@@ -7,7 +7,7 @@ use super::Session;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
 use crate::symbols::symtab::{SymbolTable, SymtabLayout};
-use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageMapping, SymbolCache};
+use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::Address;
 
 pub(super) struct SessionImage
@@ -17,8 +17,10 @@ pub(super) struct SessionImage
     /// Mapped memory does not change while the image stays loaded at this address, so
     /// the result is kept until the loader reports it unloaded or moved.
     mapping: std::result::Result<ImageMapping, String>,
-    /// Symbols were loaded into the session's [`SymbolCache`].
-    loaded: bool,
+    /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
+    /// images by the canonical path resolved at load time; a relative loader path may stop
+    /// resolving later (issue #99), so retention follows this id, not the path.
+    symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
     /// without repeatedly running dsymutil.
     no_debug_info: Option<String>,
@@ -178,7 +180,6 @@ impl Session
                 load_address: image.load_address.value(),
             })
             .collect();
-        self.symbols.retain_images(&descriptors);
         let mut previous = std::mem::take(&mut self.loaded_images);
         for descriptor in descriptors {
             if let Some(index) = previous.iter().position(|entry| {
@@ -190,7 +191,7 @@ impl Session
                 self.loaded_images.push(SessionImage {
                     descriptor,
                     mapping,
-                    loaded: false,
+                    symbols: None,
                     no_debug_info: None,
                     failed_in_request: None,
                     symtab: None,
@@ -198,6 +199,8 @@ impl Session
                 });
             }
         }
+        self.symbols
+            .retain_ids(&self.loaded_images.iter().filter_map(|image| image.symbols).collect());
         Ok(())
     }
 
@@ -255,12 +258,12 @@ impl Session
                 detail: detail.clone(),
             });
         }
-        if image.loaded || image.failed_in_request == Some(request) {
+        if image.symbols.is_some() || image.failed_in_request == Some(request) {
             return Ok(false);
         }
         match self.symbols.load_image(image.descriptor.clone()) {
-            Ok(_) => {
-                image.loaded = true;
+            Ok(loaded) => {
+                image.symbols = Some(loaded.id());
                 image.failed_in_request = None;
                 Ok(true)
             }

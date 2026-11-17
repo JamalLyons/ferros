@@ -279,7 +279,17 @@ impl Session
     /// while running, the backend's enumeration error, [`DebuggerError::NoDebugInfo`]
     /// when the owning image has no usable DWARF, or [`DebuggerError::SymbolLoad`] with
     /// the original failure when the owning image's symbols could not be loaded for
-    /// another reason. That failure is not cached: a later call tries again.
+    /// another reason.
+    ///
+    /// # Failed loads
+    ///
+    /// Missing debug info is kept while the image stays loaded. Any other failure is
+    /// kept with a stamp (size and timestamps) of the files the load read: the image, its
+    /// `.dSYM` bundle's DWARF members and the debug cache directory. While those are
+    /// unchanged, later calls (and [`stack_trace`](Self::stack_trace)) return the same
+    /// [`DebuggerError::SymbolLoad`] without reading the image again; once one of them
+    /// appears, disappears or changes, the next call loads the image again. A file
+    /// rewritten in place with the same size and timestamps is not noticed.
     pub fn symbolicate(&mut self, address: Address) -> Result<Option<Symbolication>>
     {
         self.require_stopped()?;

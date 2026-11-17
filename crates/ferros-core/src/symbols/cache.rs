@@ -44,7 +44,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::debuginfo::DebugInfoOptions;
+use super::debuginfo::{DebugInfoOptions, LoadInputs};
 use super::extractor::TypeSummary;
 use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use crate::error::{DebuggerError, Result};
@@ -189,6 +189,18 @@ impl SymbolCache
         )?);
         self.images.insert(id, image.clone());
         Ok(image)
+    }
+
+    /// Stamp the files [`load_image`](Self::load_image) would read for `descriptor`,
+    /// without reading them. A relative path that no longer resolves is stamped as given.
+    pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor) -> LoadInputs
+    {
+        let path = if descriptor.path.is_absolute() {
+            descriptor.path.clone()
+        } else {
+            descriptor.path.canonicalize().unwrap_or_else(|_| descriptor.path.clone())
+        };
+        LoadInputs::of(&path, &self.debug_info_options)
     }
 
     /// Find the binary image containing the given address.

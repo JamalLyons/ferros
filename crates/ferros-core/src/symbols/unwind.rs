@@ -312,12 +312,22 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         };
         let mut status = FrameStatus::Complete;
         let mut depth: u32 = 0;
+        // At most one step may move `sp` down: the step out of a signal frame on an
+        // alternate signal stack. A second one would let a corrupt context loop back
+        // into frames already walked, so it is not taken.
+        let mut moved_down = false;
 
         while frames.len() < max_frames && cursor.regs.pc != Address::ZERO {
             let lookup = self.lookup_address(&cursor);
             let symbolication = self.symbols.symbolicate(lookup);
-            let (next, interrupted) = match self.signal_frame_step(&cursor) {
-                Some(step) => (Some(step), true),
+            let signal = self
+                .signal_frame_step(&cursor)
+                .filter(|step| !(moved_down && step.next.sp < cursor.regs.sp));
+            let (next, interrupted) = match signal {
+                Some(step) => {
+                    moved_down |= step.next.sp < cursor.regs.sp;
+                    (Some(step), true)
+                }
                 None => (self.step(&cursor), false),
             };
             let return_address = next.as_ref().map(|step| step.next.pc);
@@ -1484,6 +1494,26 @@ mod tests
         assert!(rejected(&|memory| {
             memory.words.insert(0x9110 + sigframe::UCONTEXT + sigframe::UC_MCSIZE, 512);
         }));
+    }
+
+    #[test]
+    fn a_corrupt_alternate_stack_context_cannot_loop_the_trace()
+    {
+        // The saved context points back at the handler's own frame on the alternate
+        // stack, so taking it again and again would repeat the same frames until
+        // `max_frames`. Only the first downward signal step is taken.
+        let mut memory = alternate_signal_stack();
+        let mcontext = 0x9110 + sigframe::MCONTEXT;
+        memory.words.insert(mcontext + sigframe::SS_SP, 0x8f00);
+        memory.words.insert(mcontext + sigframe::SS_FP, 0x9000);
+        memory.words.insert(mcontext + sigframe::SS_PC, 0x4000_0000);
+        let trace = pcs(&memory, &regs(0x4000_0000, 0x8f00, 0x9000, 0));
+        assert!(trace.len() < 8, "the trace loops: {trace:x?}");
+        assert_eq!(
+            trace.iter().filter(|&&pc| pc == 0x5000_0044).count(),
+            2,
+            "`_sigtramp` is reached at most twice: {trace:x?}"
+        );
     }
 
     #[test]

@@ -71,6 +71,9 @@ the current stack. `next` (`n`) reaches the call on line 9 without entering help
 call. `next` reaches the print on line 10. `continue` prints `result: 41` and reports
 `process exited with status 0`. `quit` ends the debugger.
 
+Every breakpoint and step stop prints the function and `file:line` it stopped at, and
+the source line itself, below the `stopped:` line.
+
 Addresses, process/thread IDs, runtime frame names and stack lengths vary by build
 and OS. Source lines 8, 9, 3 and 10 identify the expected source stops. Backtraces
 can include runtime frames with unknown names. `break main.rs:9` is an alternative

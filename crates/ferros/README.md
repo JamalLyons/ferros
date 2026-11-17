@@ -114,7 +114,8 @@ keeps whatever stdin it already has.
 | `images` | | Load address and path of each loaded image (the address includes the ASLR slide) |
 | `help [command]` | `h`, `?` | List the commands, or show one command's usage |
 
-Stops print as one stable line each:
+Stops print as one stable first line each. A breakpoint or step stop with source information
+adds the function and `file:line`, then the source line, on the lines after it:
 
 ```text
 stopped: breakpoint 1 at 0x100000f2c (thread 8963)

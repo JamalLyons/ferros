@@ -20,8 +20,9 @@ pub const HEXDUMP_ROW: usize = 16;
 ///
 /// A breakpoint stop names the logical breakpoint, then, when known, the function and
 /// `file:line` of the stop on a second line and that source line's text on a third (when
-/// the file is readable). A single-step stop reads the stepped thread's pc. Every lookup
-/// is best effort.
+/// the file is readable). A single-step stop (`stepi`, `next`, `step`, `finish`) reads the
+/// stepped thread's pc and adds the same function, `file:line` and source text when known.
+/// Every lookup is best effort.
 pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
 {
     match event {
@@ -53,7 +54,20 @@ pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
             text
         }
         StopEvent::SingleStep { thread } => match session.read_registers_for(*thread) {
-            Ok(registers) => format!("stopped: step at {:#x} (thread {})", registers.pc.value(), thread.raw()),
+            Ok(registers) => {
+                let pc = registers.pc;
+                let mut text = format!("stopped: step at {:#x} (thread {})", pc.value(), thread.raw());
+                // After a source-level step, show where it landed, as a breakpoint stop does.
+                let position = session.source_position(pc).unwrap_or_default();
+                let described = describe_position(&position);
+                if !described.is_empty() {
+                    let _ = write!(text, "\n  {described}");
+                }
+                if let Some(source) = source_line(&position) {
+                    let _ = write!(text, "\n  {source}");
+                }
+                text
+            }
             Err(_) => format!("stopped: step (thread {})", thread.raw()),
         },
         StopEvent::Signal { thread, signal } => format!("stopped: signal {signal} (thread {})", thread.raw()),

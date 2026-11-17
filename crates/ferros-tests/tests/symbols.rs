@@ -713,6 +713,56 @@ fn function_lookups_after_first_load_take_under_a_second()
 /// library's, so the fixture's code stays readable in every layout.
 fn load_with_corrupt_last_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<BinaryImage>, u64)
 {
+    let mut corrupted = 0;
+    let image = load_with_corrupt_dwarf(fixture, scratch, |dwarf| {
+        let (info, info_end) = section_range(dwarf, ".debug_info");
+        let last = *unit_starts(dwarf, info, info_end).last().expect("a unit");
+        // After the length: 2-byte version, then 5 more bytes in version 4 and 6 more in
+        // version 5. The root entry's abbreviation code follows.
+        let version = u16::from_le_bytes([dwarf[last + 4], dwarf[last + 5]]);
+        let root = last + if version >= 5 { 12 } else { 11 };
+        // ULEB128 0x1f_ffff: far more abbreviations than any unit declares.
+        dwarf[root..root + 3].copy_from_slice(&[0xff, 0xff, 0x7f]);
+        corrupted = u64::try_from(last - info).expect("unit offset");
+    });
+    (image, corrupted)
+}
+
+/// File range `[start, end)` of section `name` in a DWARF companion file.
+fn section_range(dwarf: &[u8], name: &str) -> (usize, usize)
+{
+    let (start, size) = object::File::parse(dwarf)
+        .expect("parse DWARF file")
+        .section_by_name(name)
+        .unwrap_or_else(|| panic!("{name} section"))
+        .file_range()
+        .unwrap_or_else(|| panic!("{name} file range"));
+    let start = usize::try_from(start).expect("offset");
+    (start, start + usize::try_from(size).expect("size"))
+}
+
+/// File offsets of the 32-bit DWARF units (4-byte length, not counting itself) in
+/// `[start, end)`: `.debug_info` units or `.debug_line` programs.
+fn unit_starts(dwarf: &[u8], start: usize, end: usize) -> Vec<usize>
+{
+    let mut starts = Vec::new();
+    let mut next = start;
+    while next < end {
+        let length = u32::from_le_bytes(dwarf[next..next + 4].try_into().expect("4 bytes"));
+        assert!(
+            length < 0xffff_fff0,
+            "64-bit DWARF units are not expected in the fixture dSYM"
+        );
+        starts.push(next);
+        next += 4 + usize::try_from(length).expect("length");
+    }
+    starts
+}
+
+/// A copy of `fixture`'s executable and its dSYM in `scratch`, with the dSYM's DWARF file
+/// changed by `corrupt`, loaded as an image.
+fn load_with_corrupt_dwarf(fixture: &Fixture, scratch: &Scratch, corrupt: impl FnOnce(&mut [u8])) -> Arc<BinaryImage>
+{
     let executable = scratch.0.join(fixture.path().file_name().expect("executable name"));
     fs::copy(fixture.path(), &executable).expect("copy executable");
     let dwarf_dir = PathBuf::from(format!("{}.dSYM", executable.display())).join("Contents/Resources/DWARF");
@@ -723,32 +773,7 @@ fn load_with_corrupt_last_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<Bin
         .next()
         .expect("DWARF file in the fixture dSYM");
     let mut dwarf = fs::read(&companion).expect("read DWARF file");
-    let (info, info_size) = object::File::parse(&*dwarf)
-        .expect("parse DWARF file")
-        .section_by_name(".debug_info")
-        .expect(".debug_info section")
-        .file_range()
-        .expect(".debug_info file range");
-    let info = usize::try_from(info).expect("offset");
-    let info_end = info + usize::try_from(info_size).expect("size");
-    // Walk the 32-bit DWARF unit headers (4-byte length, not counting itself) to the last.
-    let mut last = info;
-    let mut next = info;
-    while next < info_end {
-        let length = u32::from_le_bytes(dwarf[next..next + 4].try_into().expect("4 bytes"));
-        assert!(
-            length < 0xffff_fff0,
-            "64-bit DWARF units are not expected in the fixture dSYM"
-        );
-        last = next;
-        next += 4 + usize::try_from(length).expect("length");
-    }
-    // After the length: 2-byte version, then 5 more bytes in version 4 and 6 more in
-    // version 5. The root entry's abbreviation code follows.
-    let version = u16::from_le_bytes([dwarf[last + 4], dwarf[last + 5]]);
-    let root = last + if version >= 5 { 12 } else { 11 };
-    // ULEB128 0x1f_ffff: far more abbreviations than any unit declares.
-    dwarf[root..root + 3].copy_from_slice(&[0xff, 0xff, 0x7f]);
+    corrupt(&mut dwarf);
     fs::write(dwarf_dir.join(companion.file_name().expect("DWARF file name")), dwarf).expect("write DWARF file");
 
     let bytes = fs::read(&executable).expect("read executable");
@@ -758,13 +783,12 @@ fn load_with_corrupt_last_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<Bin
         .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
         .expect("__TEXT segment");
     let mut cache = SymbolCache::with_debug_info_options(scratch.options());
-    let image = cache
+    cache
         .load_image(ImageDescriptor {
             path: executable,
             load_address: text.address(),
         })
-        .expect("image with a partly unreadable dSYM");
-    (image, u64::try_from(last - info).expect("unit offset"))
+        .expect("image with a partly unreadable dSYM")
 }
 
 /// Functions of the `symbols` fixture looked up by `one_unreadable_unit_does_not_hide_the_others`.
@@ -834,4 +858,49 @@ fn one_unreadable_unit_does_not_hide_the_others()
         )
         .count();
     assert!(found > 0, "no function resolved from the readable units");
+}
+
+/// Issue #93: when no line-program header of the dSYM parses (every `.debug_line` program
+/// has an unknown version) while `.debug_info` is intact, every unit is reported skipped
+/// by the line index, and functions still resolve, by name, to their intact entries.
+#[test]
+fn functions_resolve_without_readable_line_programs()
+{
+    let fixture = fixture!("symbols");
+    let intact = load(&fixture);
+    let scratch = Scratch::new();
+    let mut programs = 0;
+    let image = load_with_corrupt_dwarf(&fixture, &scratch, |dwarf| {
+        let (line, line_end) = section_range(dwarf, ".debug_line");
+        for start in unit_starts(dwarf, line, line_end) {
+            // The 2-byte version follows the 4-byte length; 0x99 is no DWARF version.
+            dwarf[start + 4..start + 6].copy_from_slice(&[0x99, 0]);
+            programs += 1;
+        }
+    });
+    assert!(programs > 0, "the fixture dSYM has line programs");
+
+    let skipped = image.skipped_debug_info().expect("indexes build from .debug_info");
+    assert!(!skipped.is_empty(), "units without a line program are reported");
+    assert!(
+        skipped.iter().all(|skip| skip.reason.starts_with("unit: ")),
+        "only the line index skips units: {skipped:?}"
+    );
+    assert!(matches!(
+        image.line_addresses(&source_query(&fixture), fixture.marker_line(&markers(&source(&fixture))[0])),
+        Err(SourceLookupError::UnknownFile { .. })
+    ));
+    for name in FUNCTIONS {
+        let entries = |image: &BinaryImage| {
+            image
+                .function_addresses(name)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .into_iter()
+                .map(|function| (function.path, function.entry, function.end))
+                .collect::<Vec<_>>()
+        };
+        let found = entries(&image);
+        assert!(!found.is_empty(), "{name}");
+        assert_eq!(found, entries(&intact), "{name}");
+    }
 }

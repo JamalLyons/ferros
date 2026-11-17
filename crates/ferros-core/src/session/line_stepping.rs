@@ -54,6 +54,16 @@ impl Session
     /// new line, a user breakpoint, another intervening stop, or process exit.
     /// Without line information at the starting pc this executes one instruction.
     ///
+    /// Known limits:
+    /// - A call is recognised by `BL`/`BLR`; pointer-authenticated calls (`BLRAA` and
+    ///   relatives, arm64e only) are stepped into one instruction at a time.
+    /// - Line ranges use every line-table row, not only `is_stmt` rows, so optimised code
+    ///   can stop more often than expected.
+    /// - The return trap is matched by stack pointer. A callee that unwinds past its
+    ///   caller (a caught panic, `longjmp`) never returns there, so the step becomes a
+    ///   continue with other threads suspended; interrupt it.
+    /// - Inlined callees are stepped over, never entered.
+    ///
     /// # Errors
     ///
     /// As for [`step_instruction`](Self::step_instruction), plus errors reading debug
@@ -65,7 +75,9 @@ impl Session
 
     /// Advance the selected thread into a call that has source information.
     ///
-    /// Stops after the callee's prologue. Calls without line information are run to
+    /// Stops after the callee's prologue. The prologue end comes from looking the callee
+    /// up by name; if that lookup fails (for example an ambiguous name), the call is run
+    /// to its return address as if it had no line information. Calls without line information are run to
     /// their return address. Other threads stay suspended, with the same blocking,
     /// stop reporting and no-line fallback policy as [`step_over`](Self::step_over).
     ///
@@ -78,7 +90,8 @@ impl Session
     }
 
     /// Run the selected thread to its caller, using the caller's SP to distinguish
-    /// recursive invocations of the same return address.
+    /// recursive invocations of the same return address. Inside an inlined frame this
+    /// returns to the physical caller, past the inlined function's own caller.
     ///
     /// Other threads stay suspended. [`wait`](Self::wait) reports `SingleStep` at
     /// the return pc, a user breakpoint, another intervening stop, or process exit.
@@ -98,10 +111,17 @@ impl Session
         let thread = self.selected_or_error()?;
         self.interrupt_requested = false;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
-            self.deferred = Some(event);
-            self.state = SessionState::Running;
-            self.last_stop = None;
-            return Ok(());
+            // The session is stopped, so a queued single-step completion of this thread
+            // (an interrupted step's late completion) or a trap from a return breakpoint
+            // that is already gone belongs to no request; drop it and start the step.
+            // Anything else is reported first.
+            let stale_step = event == (StopEvent::SingleStep { thread });
+            if !stale_step && !self.stale_trap(thread, &event)? {
+                self.deferred = Some(event);
+                self.state = SessionState::Running;
+                self.last_stop = None;
+                return Ok(());
+            }
         }
         self.stale_step = None;
         self.carried_signals.retain(|(carried, _)| *carried != thread);
@@ -133,7 +153,7 @@ impl Session
         };
         if let Err(error) = result {
             self.state = SessionState::Stopped;
-            self.release_line_site(&mut plan)?;
+            self.release_after_error(&mut plan);
             return Err(error);
         }
         self.line_plan = Some(plan);
@@ -202,6 +222,15 @@ impl Session
         Ok(())
     }
 
+    /// Release the plan's temporary site after another error, keeping that error: a
+    /// cleanup failure is logged rather than replacing it.
+    fn release_after_error(&mut self, plan: &mut LinePlan)
+    {
+        if let Err(cleanup) = self.release_line_site(plan) {
+            tracing::warn!("could not remove a temporary step breakpoint: {cleanup}");
+        }
+    }
+
     pub(super) fn cancel_line_step(&mut self) -> Result<()>
     {
         if let Some(mut plan) = self.line_plan.take() {
@@ -237,10 +266,32 @@ impl Session
                 Ok(Some(event))
             }
             Err(error) => {
-                self.release_line_site(&mut plan)?;
+                self.release_after_error(&mut plan);
                 Err(error)
             }
         }
+    }
+
+    /// Whether `event` is a breakpoint stop of `thread` left over from a private return
+    /// trap this session already removed: an interrupt can stop the thread just as it
+    /// reaches the trap, so the trap's exception is delivered later, when no trap is at
+    /// that address any more (none in the table and no trap instruction in memory).
+    fn stale_trap(&mut self, thread: ThreadId, event: &StopEvent) -> Result<bool>
+    {
+        let StopEvent::Breakpoint { thread: stopped, pc } = *event else {
+            return Ok(false);
+        };
+        if stopped != thread {
+            return Ok(false);
+        }
+        let arch = self.arch()?;
+        let address = arch.pc_after_trap(pc);
+        if self.breakpoints.id_for_kind(address, BreakpointKind::Software).is_some() {
+            return Ok(false);
+        }
+        let trap = arch.trap_instruction();
+        let memory = self.backend.read_memory(address, trap.len())?;
+        Ok(memory != trap)
     }
 
     fn line_stopped(&mut self, plan: &mut LinePlan, event: StopEvent) -> Result<Option<StopEvent>>
@@ -253,6 +304,11 @@ impl Session
             {
                 let registers = self.backend.read_registers(thread)?;
                 if registers.sp != site.sp {
+                    // An interrupt the backend dropped because this trap was queued
+                    // ends the operation here; the caller releases the private site.
+                    if self.interrupt_requested {
+                        return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
+                    }
                     // The same instruction in a deeper recursive frame. Step off
                     // the private trap and continue waiting for the guarded frame.
                     self.start_continue(
@@ -264,9 +320,16 @@ impl Session
                 if plan.mode == Mode::Out {
                     return Ok(Some(StopEvent::SingleStep { thread }));
                 }
+            } else if self.stale_trap(plan.thread, &event)? {
+                self.advance_line(plan)?;
+                return Ok(None);
             } else {
                 return Ok(Some(event));
             }
+        } else if self.stale_trap(plan.thread, &event)? {
+            // The thread has not executed the instruction at the old trap's address yet.
+            self.advance_line(plan)?;
+            return Ok(None);
         } else if event != (StopEvent::SingleStep { thread: plan.thread }) {
             return Ok(Some(event));
         }

@@ -229,7 +229,9 @@ impl Session
         let event = match self.finish_breakpoint_step(event) {
             Ok(event) => event,
             Err(error) => {
-                self.cancel_line_step()?;
+                if let Err(cleanup) = self.cancel_line_step() {
+                    tracing::warn!("could not cancel a source step: {cleanup}");
+                }
                 return Err(error);
             }
         };

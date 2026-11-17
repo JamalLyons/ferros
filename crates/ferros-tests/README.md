@@ -42,7 +42,7 @@ The crate defines fifteen fixture binaries:
   `pause=<milliseconds>` delays the second thread so a test can attach first. The second thread
   is a normal pthread and must stay stopped while the default resume action is `Suspend`.
 - `ferros-fixture-hot_loop`: Threads (first argument, default 8, main included) that call `spin_site`
-  in a tight loop with no sleep, keeping it hot in every core's instruction cache. It prints the
+  in a tight loop with no sleep, keeping it hot in every core's instruction cache (`one-line`: main only, in a loop on one source line, marker `spin_line`). It prints the
   address of the counter `spin_site` increments (`calls=<address>`) before spinning.
 - `ferros-fixture-workqueue`: Runs two GCD work items in turn, so the second normally reuses the
   first one's parked workqueue thread, which re-enters `_start_wqthread`. It prints whether it did (macOS).

@@ -446,3 +446,42 @@ fn next_holds_other_threads_even_when_their_pc_is_a_user_breakpoint()
         }
     });
 }
+
+/// `next` on a line that never ends (a loop calling a function forever) keeps stepping;
+/// `interrupt` must stop it. The engine is driven directly, so no terminal `SIGINT` reaches
+/// the program, as when attached: only the session's own interrupt can end the step.
+#[test]
+fn interrupt_ends_a_next_that_never_leaves_its_line()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hot_loop");
+        let mut d = t.launch_with_args(&fixture, &["one-line"]);
+        start(&mut d, &fixture, "spin_line");
+        for _ in 0..5 {
+            d.step_over().expect("next");
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                d.wait(Some(Duration::ZERO)).expect("still stepping"),
+                None,
+                "next left the endless line"
+            );
+            d.interrupt().expect("interrupt");
+            let event = stop(&mut d);
+            assert!(
+                matches!(event, StopEvent::Interrupted { .. }),
+                "interrupt must end the step, got {event:?}"
+            );
+            // While `next` runs over a call, the interrupt can stop the thread inside the
+            // callee; `finish` brings it back to the loop line for the next round.
+            // It can be two calls deep (`spin_site` calling std's atomic add).
+            for _ in 0..4 {
+                if line(&mut d) == fixture.marker_line("spin_line") {
+                    break;
+                }
+                d.step_out().expect("finish");
+                stepped(&mut d);
+            }
+            assert_eq!(line(&mut d), fixture.marker_line("spin_line"), "still on the endless line");
+        }
+    });
+}

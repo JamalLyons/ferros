@@ -81,8 +81,8 @@ source-line breakpoint; `breakpoints`, `disable <id>`, `enable <id>` and
 `delete <id>` inspect or manage it. `stepi` (`si`) executes one machine instruction.
 
 All stepping commands hold other threads suspended, including while running over
-a call or back to a caller. A call that needs a suspended thread can block; Ctrl-C
-interrupts it. A user breakpoint, signal or other exception ends the current step;
+a call or back to a caller. A call that needs a suspended thread can block, and a
+`next` on a line that never ends (`loop {}`) keeps stepping; Ctrl-C interrupts either. A user breakpoint, signal or other exception ends the current step;
 a process exit is reported as an exit. `finish` distinguishes recursive frames by
 their stack pointer, even when their return addresses are identical.
 

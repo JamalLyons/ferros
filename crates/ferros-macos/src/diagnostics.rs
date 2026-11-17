@@ -370,6 +370,39 @@ pub fn install_sigusr1_handler(handler: extern "C" fn(libc::c_int)) -> std::io::
     }
 }
 
+/// Install `handler` for SIGUSR1 to run on an alternate signal stack (`sigaltstack` and
+/// `SA_ONSTACK`), then call `run`. The alternate stack is a buffer in this function's
+/// frame, which stays live because `run` never returns; `run` and its callees are deeper
+/// on the same stack, so a signal interrupting them has an interrupted `sp` below the
+/// handler's frames. Returns only if the stack or the handler could not be installed.
+/// The handler must stay async-signal-safe. Tests only.
+#[doc(hidden)]
+#[inline(never)]
+pub fn run_with_sigusr1_on_alternate_stack(handler: extern "C" fn(libc::c_int), run: fn() -> !) -> std::io::Error
+{
+    let mut stack = [0u8; libc::SIGSTKSZ];
+    let alternate = libc::stack_t {
+        ss_sp: stack.as_mut_ptr().cast(),
+        ss_size: stack.len(),
+        ss_flags: 0,
+    };
+    // SAFETY: `stack` outlives every use of the alternate stack: this frame never returns
+    // once the handler is installed, because `run` does not return.
+    if unsafe { libc::sigaltstack(&raw const alternate, std::ptr::null_mut()) } != 0 {
+        return std::io::Error::last_os_error();
+    }
+    // SAFETY: a zeroed `sigaction` is a valid value; every field is set below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as *const () as libc::sighandler_t;
+    action.sa_flags = libc::SA_ONSTACK;
+    // SAFETY: `handler` is a plain C-ABI function; installing it changes only this
+    // process's disposition for SIGUSR1.
+    if unsafe { libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()) } != 0 {
+        return std::io::Error::last_os_error();
+    }
+    run()
+}
+
 /// Raise SIGUSR1 on the calling fixture worker. Tests only.
 #[doc(hidden)]
 pub fn raise_sigusr1() -> std::io::Result<()>

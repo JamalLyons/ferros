@@ -127,18 +127,29 @@
 //! its image is usually not loaded: a caller frame (arm64 only) whose call instruction
 //! (`pc - 4`) is an indirect call (`blr`, `blraa`, `blraaz`, `blrab`, `blrabz`), and whose
 //! `fp + 16` holds a `ucontext` whose `uc_mcsize` is 816 and whose `uc_mcontext` points just
-//! past it, with an interrupted `sp` above the signal frame. Its caller is then the
+//! past it, with an interrupted `sp` above the signal frame or, for a handler on an
+//! alternate signal stack (`sigaltstack` and `SA_ONSTACK`), below `_sigtramp`'s `sp`. Its
+//! caller is then the
 //! interrupted frame, with every register restored from `__ss` (all known, `x30`
 //! included), and it is treated like an innermost frame: its pc is the interrupted
 //! instruction, not a return address, so it is looked up at `pc` rather than `pc - 4`,
 //! and the innermost-frame rules (link register, first instruction, frameless leaf) apply
 //! to it. Its status is [`FrameStatus::Complete`]: the whole register state is known.
 //!
+//! On an alternate signal stack the kernel builds the signal frame there instead, so the
+//! handler and `_sigtramp` frames are on one stack and the interrupted frame on another,
+//! possibly at lower addresses. That step alone is exempt from the rule that `sp` never
+//! moves down (see [Termination](#termination)): the interrupted `sp` must instead be
+//! non-zero, 16-byte aligned and outside the frames from `_sigtramp`'s `sp` to the end of
+//! the signal frame, and the interrupted pc executable. Every later step is checked
+//! against the interrupted `sp` again.
+//!
 //! ## Termination
 //!
 //! The walk stops cleanly, without an error, when the return address is zero, when no
 //! source applies, when the frame-pointer chain ends (`fp == 0`) or is not strictly
-//! increasing, when the stack pointer would move down, when memory cannot be read, or when
+//! increasing, when the stack pointer would move down (except into the frame a signal
+//! on an alternate signal stack interrupted), when memory cannot be read, or when
 //! the next pc is not in executable memory ([`MemoryAccess::is_executable`]). This is how
 //! the thread base (`thread_start`, dyld's `start`) ends a trace.
 //!
@@ -827,9 +838,17 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             return None;
         }
         let sp = read(sigframe::SS_SP)?;
-        if sp < mcontext.checked_add(sigframe::MCONTEXT_SIZE)? {
+        // On the interrupted stack the signal frame lies below the interrupted `sp`. On an
+        // alternate signal stack the interrupted `sp` is on another stack, and may be below
+        // the handler's frames; it can never be among them, from `_sigtramp`'s `sp` to the
+        // end of the signal frame.
+        let on_alternate_stack = if sp >= mcontext.checked_add(sigframe::MCONTEXT_SIZE)? {
+            false
+        } else if sp < cursor.regs.sp.value() {
+            true
+        } else {
             return None;
-        }
+        };
 
         let mut next = cursor.regs.clone();
         for (index, slot) in next.general.iter_mut().enumerate().take(29) {
@@ -847,7 +866,28 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             known: ALL_GENERAL,
             status: FrameStatus::Complete,
         };
-        self.accept(cursor, step)
+        if on_alternate_stack {
+            self.accept_alternate_stack(step)
+        } else {
+            self.accept(cursor, step)
+        }
+    }
+
+    /// The checks of [`accept`](Self::accept) for the one step that may move the stack
+    /// pointer down: from `_sigtramp` on an alternate signal stack to the frame the signal
+    /// interrupted. The interrupted state comes from a validated `ucontext`, so instead of
+    /// `sp` growing, its `sp` must be a non-zero, 16-byte aligned (arm64 requires it)
+    /// address and its pc executable. Later steps compare against the interrupted `sp`.
+    fn accept_alternate_stack(&self, step: UnwindStep) -> Option<UnwindStep>
+    {
+        let next = &step.next;
+        if next.pc == Address::ZERO || next.sp == Address::ZERO || !next.sp.value().is_multiple_of(16) {
+            return None;
+        }
+        if !self.memory.is_executable(next.pc) {
+            return None;
+        }
+        Some(step)
     }
 
     fn register_value(&self, cursor: &Cursor, register: Register) -> Option<u64>
@@ -1333,6 +1373,148 @@ mod tests
             StackUnwinder::new(&ARCH, &symbols, &memory)
                 .signal_frame_step(&innermost)
                 .is_none()
+        );
+    }
+
+    /// [`signal_stack`] with the signal frame on an alternate signal stack at 0x9000:
+    /// the handler's frame record at 0x9000 returns into `_sigtramp`, whose record at
+    /// 0x9100 sits right below the signal frame. The interrupted frame (sp 0x2000, fp
+    /// 0x2100) is on the thread's own stack, below every frame on the alternate stack.
+    fn alternate_signal_stack() -> FakeMemory
+    {
+        let original = signal_stack();
+        let mut memory = FakeMemory::default();
+        for (&address, &word) in &original.words {
+            let moved = if (0x1000..0x2000).contains(&address) {
+                address + 0x8000
+            } else {
+                address
+            };
+            memory.words.insert(moved, word);
+        }
+        memory.words.insert(0x9000, 0x9100);
+        let mcontext = 0x9110 + sigframe::MCONTEXT;
+        memory
+            .words
+            .insert(0x9110 + sigframe::UCONTEXT + sigframe::UC_MCONTEXT, mcontext);
+        memory
+    }
+
+    fn alternate_stack_sigtramp() -> Cursor
+    {
+        Cursor {
+            known: 1 << 29,
+            is_caller: true,
+            ..innermost(regs(0x5000_0044, 0x90f0, 0x9100, 0))
+        }
+    }
+
+    #[test]
+    fn a_signal_frame_on_an_alternate_stack_restores_the_interrupted_frame()
+    {
+        let memory = alternate_signal_stack();
+        let symbols = SymbolCache::new();
+        let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
+            .expect("unwind");
+        let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+        assert_eq!(pcs, [0x4000_0000, 0x5000_0044, 0x4000_0100, 0x4000_0200]);
+        assert_eq!(frames[1].sp, Address::new(0x9010));
+        assert_eq!(frames[2].sp, Address::new(0x2000), "sp moves down across the signal frame");
+        assert_eq!(frames[2].fp, Address::new(0x2100));
+        assert_eq!(frames[2].status, FrameStatus::Complete);
+        assert_eq!(frames[3].sp, Address::new(0x2110), "checked against the interrupted sp");
+    }
+
+    #[test]
+    fn after_an_alternate_stack_signal_frame_sp_must_grow_again()
+    {
+        // The interrupted frame's record links to a record below the interrupted sp
+        // (0x2000): the chain is checked against the interrupted frame and ends there.
+        let mut memory = alternate_signal_stack();
+        memory.words.insert(0x2100, 0x1f00);
+        memory.words.insert(0x1f00, 0);
+        memory.words.insert(0x1f08, 0x4000_0300);
+        let symbols = SymbolCache::new();
+        let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
+            .expect("unwind");
+        let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+        assert_eq!(pcs, [0x4000_0000, 0x5000_0044, 0x4000_0100]);
+    }
+
+    #[test]
+    fn an_alternate_stack_signal_frame_still_needs_a_plausible_interrupted_state()
+    {
+        let symbols = SymbolCache::new();
+        let mcontext = 0x9110 + sigframe::MCONTEXT;
+        let cursor = alternate_stack_sigtramp();
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &alternate_signal_stack())
+                .signal_frame_step(&cursor)
+                .is_some()
+        );
+        let rejected = |change: &dyn Fn(&mut FakeMemory)| {
+            let mut memory = alternate_signal_stack();
+            change(&mut memory);
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .signal_frame_step(&cursor)
+                .is_none()
+        };
+        // An interrupted sp among the handler's frames on the alternate stack.
+        assert!(rejected(&|memory| {
+            memory.words.insert(mcontext + sigframe::SS_SP, 0x9200);
+        }));
+        // A zero or misaligned interrupted sp.
+        assert!(rejected(&|memory| {
+            memory.words.insert(mcontext + sigframe::SS_SP, 0);
+        }));
+        assert!(rejected(&|memory| {
+            memory.words.insert(mcontext + sigframe::SS_SP, 0x2008);
+        }));
+        // An interrupted pc outside code.
+        assert!(rejected(&|memory| {
+            memory.code = Some((0x4000_0000, 0x4000_0100));
+        }));
+        // An unreadable mcontext.
+        assert!(rejected(&|memory| {
+            memory.words.remove(&(mcontext + sigframe::SS_X + 8 * 7));
+        }));
+        // A wrong `uc_mcsize`.
+        assert!(rejected(&|memory| {
+            memory.words.insert(0x9110 + sigframe::UCONTEXT + sigframe::UC_MCSIZE, 512);
+        }));
+    }
+
+    #[test]
+    fn a_decreasing_sp_is_rejected_on_any_step_but_the_signal_frame()
+    {
+        // The same downward move as the alternate-stack signal step (from 0x9000 to the
+        // 0x1f00 region), through a frame record instead: the record at 0x9000 is not
+        // followed.
+        let mut memory = FakeMemory::default();
+        memory.words.insert(0x8f00, 0x9000);
+        memory.words.insert(0x8f08, 0x4000_0010);
+        memory.words.insert(0x9000, 0x1f00);
+        memory.words.insert(0x9008, 0x4000_0020);
+        memory.words.insert(0x1f00, 0);
+        memory.words.insert(0x1f08, 0x4000_0030);
+        assert_eq!(
+            pcs(&memory, &regs(0x4000_0000, 0x8e00, 0x8f00, 0)),
+            [0x4000_0000, 0x4000_0010]
+        );
+
+        // Any other step that would restore that state (a CFI row, for example) is
+        // rejected by `accept`, which the signal step bypasses only on an alternate stack.
+        let symbols = SymbolCache::new();
+        let memory = alternate_signal_stack();
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let caller = alternate_stack_sigtramp();
+        let signal = unwinder.signal_frame_step(&caller).expect("the alternate-stack signal step");
+        assert_eq!(signal.next.sp, Address::new(0x2000));
+        assert!(
+            unwinder.accept(&caller, signal).is_none(),
+            "accept keeps sp monotonic for every other step"
         );
     }
 

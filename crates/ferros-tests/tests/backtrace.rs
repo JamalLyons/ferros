@@ -557,6 +557,94 @@ fn backtrace_in_a_signal_handler_shows_the_interrupted_function()
     });
 }
 
+/// Like [`backtrace_in_a_signal_handler_shows_the_interrupted_function`], with the handler
+/// on an alternate signal stack (`signal_handler --alt-stack`, issue #129) that lies above
+/// the interrupted `spin`: the step from `_sigtramp` to `spin` moves `sp` down. The trace
+/// is the handler, one frame for `_sigtramp`, `spin` at the interrupted line, its caller
+/// at the call, then `main` at the call into the helper that installed the handler.
+/// Rejecting the downward step falls back to `_sigtramp`'s frame record and skips `spin`.
+#[test]
+fn backtrace_in_a_signal_handler_on_an_alternate_stack_shows_the_interrupted_function()
+{
+    /// `SIGUSR1` on macOS; the test harness uses no raw FFI.
+    const SIGUSR1: i32 = 30;
+    harness::run(|t| {
+        let fixture = fixture!("signal_handler");
+        let mut d = t.launch_with_args(&fixture, &["--alt-stack"]);
+        let pid = d.pid().0;
+        let spin_line = marker_address(&mut d, &fixture, "spin_line");
+        run_to(&mut d, spin_line);
+        let ids: Vec<_> = d.breakpoints().iter().map(|bp| bp.id).collect();
+        for id in ids {
+            d.remove_breakpoint(id).expect("remove the spin breakpoint");
+        }
+        let in_handler = marker_address(&mut d, &fixture, "in_handler");
+        d.add_breakpoint(BreakpointRequest::Software { address: in_handler })
+            .expect("break in the handler");
+
+        // Sent while stopped; the spinning thread takes it once resumed.
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-USR1", &pid.to_string()])
+            .status()
+            .expect("run /bin/kill");
+        assert!(status.success());
+        d.resume().expect("resume into the signal");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait for the signal") {
+            Some(StopEvent::Signal { signal: SIGUSR1, .. }) => {}
+            other => panic!("expected the SIGUSR1 stop, got {other:?}"),
+        }
+        let interrupted = d.read_registers().expect("registers at the signal");
+        d.resume_with_signal().expect("deliver SIGUSR1");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait for the handler") {
+            Some(StopEvent::Breakpoint { pc, thread }) if pc == in_handler => {
+                d.select_thread(thread).expect("select the handler thread");
+            }
+            other => panic!("expected a stop in the handler, got {other:?}"),
+        }
+        // The handler runs on the alternate stack, above the interrupted frame.
+        let handler_sp = d.read_registers().expect("registers in the handler").sp;
+        assert!(
+            handler_sp > interrupted.sp,
+            "handler sp {handler_sp} interrupted sp {}",
+            interrupted.sp
+        );
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let summary = summary(&frames, &fixture);
+        assert!(summary.len() > 4, "{summary:#?}");
+        assert_eq!(
+            summary[0],
+            ("on_sigusr1".to_owned(), Some(fixture.marker_line("in_handler"))),
+            "{summary:#?}"
+        );
+        assert!(
+            fixture_function(&frames[1], &fixture).is_none(),
+            "frame 1 is _sigtramp, outside the fixture: {summary:#?}"
+        );
+        assert_eq!(
+            summary[2..4],
+            vec![
+                ("spin".to_owned(), Some(fixture.marker_line("spin_line"))),
+                (
+                    "spin_below_alternate_stack".to_owned(),
+                    Some(fixture.marker_line("call_spin_alt"))
+                ),
+            ],
+            "{summary:#?}"
+        );
+        assert!(
+            summary[4..].contains(&("main".to_owned(), Some(fixture.marker_line("call_alt")))),
+            "{summary:#?}"
+        );
+        assert_eq!(frames[2].pc, interrupted.pc, "{frames:#?}");
+        assert_eq!(frames[2].sp, interrupted.sp, "{frames:#?}");
+        assert!(frames[2].sp < frames[1].sp, "the signal step moved sp down: {frames:#?}");
+        assert_eq!(frames[1].return_address, Some(frames[2].pc), "{frames:#?}");
+        d.kill().expect("kill");
+    });
+}
+
 /// The instruction word at `address`, as the program sees it (traps hidden).
 fn instruction(session: &mut Session, address: Address) -> u32
 {

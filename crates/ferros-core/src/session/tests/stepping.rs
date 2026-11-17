@@ -274,11 +274,20 @@ fn passed_signal_moves_only_to_its_own_step()
     for thread in [T1, T2] {
         let (mock, mut session, _) = at_breakpoint();
         session.last_stop = Some(StopEvent::Signal { thread, signal: 11 });
-        let step_request = if thread == T1 {
-            ResumeRequest::step(T1).with_signal(T1, 11)
-        } else {
-            ResumeRequest::step(T1)
-        };
+        if thread == T1 {
+            mock.script(
+                MockStop::new(StopEvent::Breakpoint {
+                    thread: T1,
+                    pc: Address::new(BP),
+                })
+                .expect_resume(
+                    ResumeRequest::all(crate::backend::ThreadAction::Suspend)
+                        .with_thread(T1, crate::backend::ThreadAction::Continue)
+                        .with_signal(T1, 11),
+                ),
+            );
+        }
+        let step_request = ResumeRequest::step(T1);
         let final_request = if thread == T2 {
             ResumeRequest::continue_all().with_signal(T2, 11)
         } else {
@@ -528,7 +537,18 @@ fn signal_for_another_thread_survives_an_abandoned_step_over()
 
     // T1 is still at the breakpoint: it steps over with its own signal, and T2's signal
     // goes on the final continue.
-    step(&mock, T1, BP + 4, ResumeRequest::step(T1).with_signal(T1, 14));
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: T1,
+            pc: Address::new(BP),
+        })
+        .expect_resume(
+            ResumeRequest::all(crate::backend::ThreadAction::Suspend)
+                .with_thread(T1, crate::backend::ThreadAction::Continue)
+                .with_signal(T1, 14),
+        ),
+    );
+    step(&mock, T1, BP + 4, ResumeRequest::step(T1));
     mock.script(
         MockStop::new(StopEvent::Breakpoint {
             thread: T1,

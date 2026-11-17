@@ -137,7 +137,7 @@ pub use self::breakpoints::describe_position;
 
 registry! {
     process: [Run, Continue, Interrupt, Kill, Status, Quit],
-    step: [StepInstruction],
+    step: [Next, Step, Finish, StepInstruction],
     breakpoints: [Break, Delete, Enable, Disable, Breakpoints],
     inspect: [Registers, Memory],
     threads: [Threads, Thread],

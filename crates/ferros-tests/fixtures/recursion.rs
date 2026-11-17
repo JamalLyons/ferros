@@ -18,7 +18,7 @@ fn descend(remaining: u64) -> u64
         return std::hint::black_box(7); // BREAK: bottom
     }
     let below = descend(std::hint::black_box(remaining - 1)); // BREAK: recurse
-    std::hint::black_box(below.wrapping_add(1))
+    std::hint::black_box(below.wrapping_add(1)) // BREAK: after_recurse
 }
 
 fn main()

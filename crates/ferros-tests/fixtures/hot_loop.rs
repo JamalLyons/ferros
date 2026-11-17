@@ -6,8 +6,15 @@
 //! execute next. Before spinning, the fixture prints `calls=<address>`: the address of
 //! the counter that `spin_site` increments once per call.
 //!
+//! With the first argument `one-line`, only the main thread runs, in a loop written on a
+//! single source line (`spin_line`), so a source `next` there never reaches another line.
+//!
 //! Functions:
 //! - `spin_site`
+//! - `spin_on_one_line`
+//!
+//! Markers:
+//! - `spin_line`
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +34,18 @@ fn spin() -> !
     }
 }
 
+#[rustfmt::skip]
+#[inline(never)]
+fn spin_on_one_line() -> !
+{
+    loop { std::hint::black_box(CALLS.load(Ordering::Relaxed)); spin_site(); } // BREAK: spin_line
+}
+
 fn main()
 {
+    if std::env::args().nth(1).as_deref() == Some("one-line") {
+        spin_on_one_line();
+    }
     let threads = std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse::<usize>().ok())

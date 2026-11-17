@@ -100,6 +100,9 @@ keeps whatever stdin it already has.
 | `kill` | | Terminate the program with `SIGKILL` |
 | `status` | | `status: stopped (pid <pid>, thread <tid>)` and the last stop, `status: exited` and how, or `status: no process` |
 | `quit` | `q`, `exit` | End the session |
+| `next` | `n` | Advance one source line, stepping over calls; other threads stay suspended |
+| `step` | `s` | Enter a call with line information after its prologue; skip calls without it |
+| `finish` | | Run to the caller of the current frame, including under recursion |
 | `stepi` | `si` | Execute one instruction of the selected thread |
 | `break *<address>` | `b` | Add a software breakpoint at a runtime address (`0x` hex or decimal) |
 | `delete <id>` | `d` | Remove a breakpoint |
@@ -111,7 +114,8 @@ keeps whatever stdin it already has.
 | `images` | | Load address and path of each loaded image (the address includes the ASLR slide) |
 | `help [command]` | `h`, `?` | List the commands, or show one command's usage |
 
-Stops print as one stable line each:
+Stops print as one stable first line each. A breakpoint or step stop with source information
+adds the function and `file:line`, then the source line, on the lines after it:
 
 ```text
 stopped: breakpoint 1 at 0x100000f2c (thread 8963)

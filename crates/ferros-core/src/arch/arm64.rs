@@ -86,6 +86,13 @@ impl Arch for Arm64
         &Self::TRAP_INSTRUCTION
     }
 
+    fn call_return_address(&self, pc: Address, instruction: &[u8]) -> Option<Address>
+    {
+        let word = u32::from_le_bytes(instruction.try_into().ok()?);
+        // BL imm26 and BLR Xn. B/BR and RET do not create a return address.
+        (word & 0xfc00_0000 == 0x9400_0000 || word & 0xffff_fc1f == 0xd63f_0000).then(|| pc + 4)
+    }
+
     fn pc(&self, registers: &Registers) -> Address
     {
         registers.pc
@@ -165,6 +172,20 @@ mod tests
         let mut regs = Registers::new().with_arch(Architecture::Arm64);
         regs.general = vec![0; 31];
         regs
+    }
+
+    #[test]
+    fn calls_have_a_return_address_but_other_branches_do_not()
+    {
+        let arch = Arm64::new();
+        let pc = Address::new(0x1000);
+        for word in [0x9400_0000_u32, 0x97ff_ffff, 0xd63f_0000, 0xd63f_03c0] {
+            assert_eq!(arch.call_return_address(pc, &word.to_le_bytes()), Some(pc + 4));
+        }
+        for word in [0x1400_0000_u32, 0xd61f_0000, 0xd65f_03c0, 0xd420_0000] {
+            assert_eq!(arch.call_return_address(pc, &word.to_le_bytes()), None);
+        }
+        assert_eq!(arch.call_return_address(pc, &[0x94]), None);
     }
 
     #[test]

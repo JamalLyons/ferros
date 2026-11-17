@@ -125,6 +125,39 @@ fn breakpoint_stop_shows_pc_at_the_breakpoint()
     });
 }
 
+/// `step`, `finish` and `next` print where they stopped: the function and `file:line`
+/// below the `stopped: step` line, as a breakpoint stop does (issue #39).
+#[test]
+fn source_steps_name_the_line_they_stop_on()
+{
+    run(|t| {
+        let tag = t.tag();
+        let fixture = fixture!("nested_calls");
+        let file = |marker: &str| format!("/fixtures/nested_calls.rs:{}\n", fixture.marker_line(marker));
+        let break_at = format!("break nested_calls.rs:{}", fixture.marker_line("call_a"));
+        let commands = vec![break_at.as_str(), "continue", "step", "finish", "next"];
+        let run = transcript::launch_batch(&tag, &fixture, &[], &commands);
+        assert!(run.status.success(), "status {}: {run:?}", run.status);
+        let replies: Vec<&str> = run.stdout.split("(ferros) ").collect();
+        let reply = |command: &str| {
+            replies
+                .iter()
+                .find(|reply| reply.starts_with(&format!("{command}\n")))
+                .unwrap_or_else(|| panic!("no reply to {command}: {run:?}"))
+        };
+        let step = reply("step");
+        assert!(step.contains("stopped: step at "), "{step:?}");
+        assert!(step.contains("level_a at "), "step enters level_a: {step:?}");
+        assert!(step.contains(&file("in_a")), "{step:?}");
+        let finish = reply("finish");
+        assert!(finish.contains("main at "), "finish returns to main: {finish:?}");
+        assert!(finish.contains(&file("call_a")), "{finish:?}");
+        let next = reply("next");
+        assert!(next.contains(&file("after_calls")), "{next:?}");
+        assert_eq!(harness::tagged_pids(tag.as_str()), Vec::<u32>::new());
+    });
+}
+
 /// An unknown command prints an error on stderr, the next command still runs, and ferros
 /// exits 1.
 #[test]

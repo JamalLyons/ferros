@@ -147,6 +147,13 @@ impl Session
     /// (`ResumeRequest::continue_all().with_signal(thread, signal)`), so the program
     /// receives it. After any other stop it is the same as `resume`.
     ///
+    /// A signal passed to a thread stopped at an enabled breakpoint runs that thread's
+    /// whole handler with the other threads suspended, so the breakpoint is not counted
+    /// again when the handler returns. A handler that waits for another thread blocks
+    /// until interrupted. If the handler stops before returning (another breakpoint, an
+    /// interrupt), the original breakpoint stays armed and its address is counted as a
+    /// hit when the handler later returns to it.
+    ///
     /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
     /// because another stop cut its step-over sequence short (the signal is still held),
     /// that signal is passed again now, together with the last stop's.
@@ -198,7 +205,10 @@ impl Session
             SessionState::Stopped => Ok(()),
             SessionState::Running => {
                 self.backend.interrupt()?;
-                self.interrupt_requested = self.step_plan.is_some();
+                // A step plan or a source step may already have an internal stop queued, in
+                // which case the backend does not deliver another; remember the request so
+                // that stop ends the operation instead of starting the next instruction.
+                self.interrupt_requested = self.step_plan.is_some() || self.line_plan.is_some();
                 Ok(())
             }
             SessionState::NotStarted | SessionState::Exited => Err(DebuggerError::NotAttached),

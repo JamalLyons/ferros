@@ -36,6 +36,10 @@ pub const PROMPT: &str = "(ferros) ";
 
 /// `SIGINT`: a stop for this signal is not passed back to the program by `continue`.
 const SIGINT: i32 = 2;
+/// `SIGTTIN` and `SIGTTOU`: a launched program, in a background process group, used the
+/// terminal. `continue` passes the signal back and the program stops again.
+const SIGTTIN: i32 = 21;
+const SIGTTOU: i32 = 22;
 
 /// How the session got its process, and how `run` starts it again.
 #[derive(Debug, Clone)]
@@ -172,6 +176,16 @@ impl Ctx<'_>
     {
         let line = output::describe_stop(&mut self.debugger.session, event);
         writeln!(self.out, "{line}")?;
+        if let StopEvent::Signal {
+            signal: SIGTTIN | SIGTTOU,
+            ..
+        } = event
+        {
+            writeln!(
+                self.out,
+                "  the program used the terminal from its background process group; relaunch with `--stdin FILE`"
+            )?;
+        }
         Ok(())
     }
 }

@@ -23,7 +23,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr;
 
-use ferros_core::backend::{Environment, LaunchSpec, StdioSpec};
+use ferros_core::backend::{Environment, LaunchSpec, ProcessGroup, StdioSpec};
 use ferros_core::error::{DebuggerError, Result};
 use libc::c_int;
 
@@ -194,7 +194,16 @@ impl LaunchManager
             }
 
             debug!("Setting POSIX_SPAWN_START_SUSPENDED flag");
-            let flags_result = ffi::posix_spawnattr_setflags(&mut attr.0, ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED);
+            let mut flags = ffi::spawn_flags::POSIX_SPAWN_START_SUSPENDED;
+            if spec.process_group == Some(ProcessGroup::New) {
+                // SAFETY: `attr` was initialized above; group 0 makes the child its own group leader.
+                let result = ffi::posix_spawnattr_setpgroup(&mut attr.0, 0);
+                if result != 0 {
+                    return Err(spawn_error("set process group", result));
+                }
+                flags |= ffi::spawn_flags::POSIX_SPAWN_SETPGROUP;
+            }
+            let flags_result = ffi::posix_spawnattr_setflags(&mut attr.0, flags);
             if flags_result != 0 {
                 return Err(spawn_error("set spawn flags", flags_result));
             }
@@ -375,6 +384,20 @@ pub(crate) fn reap_child(pid: libc::pid_t, timeout: std::time::Duration) -> ferr
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// Look up a process's group ID using `getpgid`.
+///
+/// # Errors
+/// Returns an OS error if `pid` does not name an accessible process.
+pub fn process_group(pid: ferros_core::ProcessId) -> std::io::Result<ferros_core::ProcessId>
+{
+    let pid = libc::pid_t::try_from(pid.0).map_err(|_| Error::other("process ID out of range"))?;
+    // SAFETY: getpgid takes a process ID and retains no pointers.
+    let group = unsafe { libc::getpgid(pid) };
+    u32::try_from(group)
+        .map(ferros_core::ProcessId)
+        .map_err(|_| Error::last_os_error())
 }
 
 #[cfg(test)]

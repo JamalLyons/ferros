@@ -144,7 +144,8 @@ fn resume_runs_hello()
   removes and recreates the uplifted `target/debug/ferros-fixture-*` files, so a test reading or
   launching that path while another Cargo command runs could find it missing. The copy keeps the
   executable's file name, and `fixture.path()` is the path the loader reports. Copies are keyed
-  by Mach-O UUID and removed by `cargo clean`. `tests/fixture_staging.rs` covers this.
+  by Mach-O UUID and DWARF content (line-only rebuilds can keep the UUID), and removed by
+  `cargo clean`. `tests/fixture_staging.rs` covers this.
 - `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the

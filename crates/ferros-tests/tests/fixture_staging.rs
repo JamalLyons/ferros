@@ -102,3 +102,61 @@ fn staged_fixture_survives_removal_of_the_built_files()
         assert!(d.wait_for_stdout("hello from ferros fixture", Duration::from_secs(10)));
     });
 }
+
+/// A line-only rebuild can keep the executable UUID while changing its dSYM. Never
+/// reuse the old source locations just because the machine code did not change.
+#[test]
+fn same_executable_with_new_dwarf_gets_a_new_stable_copy()
+{
+    harness::run(|_| {
+        let scratch = Scratch::new();
+        let original = fixture!("hello");
+        let root = leak(&scratch.0.join("tmp"));
+        let mut copies = Vec::new();
+        for version in ["before", "after"] {
+            let built = scratch.0.join(version);
+            fs::create_dir(&built).expect("create built directory");
+            let executable = built.join("ferros-fixture-hello");
+            fs::copy(original.path(), &executable).expect("copy executable");
+            let dsym = built.join("ferros-fixture-hello.dSYM");
+            copy_tree(&original.dsym_path(), &dsym);
+            if version == "after" {
+                // Change a source filename without changing the Mach-O UUID, just as
+                // line-table-only changes leave the executable's machine code intact.
+                let members = dsym.join("Contents/Resources/DWARF");
+                let member = fs::read_dir(members)
+                    .expect("DWARF members")
+                    .next()
+                    .expect("member")
+                    .expect("entry")
+                    .path();
+                let mut bytes = fs::read(&member).expect("read DWARF");
+                let offset = bytes
+                    .windows(b"hello.rs".len())
+                    .position(|bytes| bytes == b"hello.rs")
+                    .expect("source filename");
+                bytes[offset] = b'j';
+                fs::write(member, bytes).expect("write updated DWARF");
+            }
+            copies.push(Fixture::stable("hello", leak(&executable), root));
+        }
+        assert_ne!(
+            copies[0].path(),
+            copies[1].path(),
+            "new DWARF must not reuse stale source locations"
+        );
+        assert_eq!(
+            fs::read(copies[0].path()).expect("old executable"),
+            fs::read(copies[1].path()).expect("new executable")
+        );
+        let dwarf = |fixture: &Fixture| {
+            let member = fs::read_dir(fixture.dsym_path().join("Contents/Resources/DWARF"))
+                .expect("members")
+                .next()
+                .expect("member")
+                .expect("entry");
+            fs::read(member.path()).expect("read staged DWARF")
+        };
+        assert_ne!(dwarf(&copies[0]), dwarf(&copies[1]));
+    });
+}

@@ -214,3 +214,23 @@ fn public_nth_failure_is_one_shot_and_counts_matching_calls()
     assert_eq!(mock.read_memory(BREAKPOINT, 4), Err(error));
     assert!(mock.read_memory(BREAKPOINT, 4).is_ok());
 }
+
+#[test]
+fn session_carries_process_group_to_backend()
+{
+    use ferros_core::Session;
+    use ferros_core::backend::ProcessGroup;
+
+    for group in [None, Some(ProcessGroup::New)] {
+        let mock = MockBackend::new();
+        let mut session = Session::new(Box::new(mock.clone()));
+        let mut spec = LaunchSpec::new("/bin/prog");
+        assert_eq!(spec.process_group, None, "default must inherit");
+        if let Some(group) = group {
+            spec = spec.process_group(group);
+        }
+        session.launch(&spec).expect("launch");
+        assert_eq!(spec.process_group, group);
+        assert_eq!(mock.take_calls().first(), Some(&MockCall::Launch(spec)));
+    }
+}

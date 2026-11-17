@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use ferros_core::backend::StdioSpec;
+use ferros_core::backend::{ProcessGroup, StdioSpec};
 use ferros_core::{LaunchSpec, ProcessId};
 use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
 
@@ -43,8 +43,8 @@ enum Commands
     {
         #[command(flatten)]
         script: Script,
-        /// Feed FILE to the program's stdin. Without it the program shares the terminal or
-        /// the batch-mode stdin, and reads /dev/null when commands come from a pipe
+        /// Feed FILE to the program's stdin. Terminal reads otherwise stop the background
+        /// program with SIGTTIN; piped commands give it /dev/null; batch stdin is inherited
         #[arg(long, value_name = "FILE")]
         stdin: Option<PathBuf>,
         /// Path to the executable to launch
@@ -137,7 +137,9 @@ fn main() -> ExitCode
             program,
             args,
         } => {
-            let spec = LaunchSpec::new(absolute(&program)).args(args);
+            let spec = LaunchSpec::new(absolute(&program))
+                .args(args)
+                .process_group(ProcessGroup::New);
             (script, Target::Launch(spec), stdin)
         }
         Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid)), None),
@@ -226,12 +228,27 @@ fn debuggee_stdin(file: Option<PathBuf>, mode: &Mode) -> StdioSpec
 /// Start the session and run the command loop. Returns `true` when nothing failed.
 fn run_session(target: Target, mode: Mode) -> bool
 {
-    let interrupt = repl::interrupt::install();
     let stdout = io::stdout();
     let stderr = io::stderr();
     let mut out = stdout.lock();
     let mut err = stderr.lock();
 
+    let stdin = io::stdin();
+    let input = match mode {
+        Mode::Batch(lines) => Input::Lines(lines.into()),
+        Mode::Terminal => match repl::editor() {
+            Ok(editor) => editor,
+            Err(error) => {
+                let _ = writeln!(err, "error: cannot start the line editor: {error}");
+                Input::Reader(stdin.lock())
+            }
+        },
+        Mode::Pipe => Input::Reader(stdin.lock()),
+    };
+    // rustyline installs its own SIGINT handler when the editor is created. Install
+    // ours afterwards so signals received while a command runs reach wait_for_stop.
+    // At the prompt Ctrl-C is a raw-mode key, handled by the editor itself.
+    let interrupt = repl::interrupt::install();
     let started = create_backend().and_then(|backend| Debugger::start(backend, target));
     let (mut debugger, message) = match started {
         Ok(started) => started,
@@ -243,21 +260,9 @@ fn run_session(target: Target, mode: Mode) -> bool
     info!("{message}");
     let _ = writeln!(out, "{message}");
 
-    let stdin = io::stdin();
-    let input = match mode {
-        Mode::Batch(lines) => Input::Lines(lines.into()),
-        Mode::Terminal => match repl::editor() {
-            Ok(editor) => {
-                let _ = writeln!(out, "Type 'help' for the commands; 'quit' or Ctrl-D ends the session.");
-                editor
-            }
-            Err(error) => {
-                let _ = writeln!(err, "error: cannot start the line editor: {error}");
-                Input::Reader(stdin.lock())
-            }
-        },
-        Mode::Pipe => Input::Reader(stdin.lock()),
-    };
+    if matches!(&input, Input::Editor(..)) {
+        let _ = writeln!(out, "Type 'help' for the commands; 'quit' or Ctrl-D ends the session.");
+    }
     repl::run(&mut debugger, input, &mut out, &mut err, &interrupt)
 }
 

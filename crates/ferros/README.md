@@ -82,12 +82,12 @@ A launched program's stdin depends on where `ferros` reads its commands:
 
 | Mode | Program's stdin |
 |---|---|
-| Interactive (terminal) | The terminal, shared with `ferros` |
+| Interactive (terminal) | The terminal, in a background process group (see [Ctrl-C](#ctrl-c)) |
 | Piped | `/dev/null`: the commands on the pipe are for `ferros` only, so the program reads end of file |
 | Batch (`--batch`, `--command`) | `ferros`'s stdin, which `ferros` does not read in this mode |
 | Any mode with `--stdin <FILE>` | FILE |
 
-To give a program input while driving `ferros` over a pipe, use `--stdin`. An attached process
+To give a program input in interactive or piped mode, use `--stdin`. An attached process
 keeps whatever stdin it already has.
 
 ## Commands
@@ -129,10 +129,19 @@ process killed by signal 9
 ### Ctrl-C
 
 Ctrl-C never ends `ferros`. While the program runs (`continue`, `run`, `stepi`) it interrupts the
-program and returns to the prompt; at an interactive prompt it discards the line. The program runs in
-the same process group as `ferros`, so a Ctrl-C typed in the terminal also sends it `SIGINT`
-directly; that may be reported as `stopped: signal 2` instead of `stopped: interrupted`, and
-`continue` does not pass it on to the program.
+program and returns to the prompt; at an interactive prompt it discards the line. Launched programs
+have a separate background process group. Ferros keeps the terminal foreground, so terminal Ctrl-C
+reaches only ferros. Its handler calls `Session::interrupt`, reported as `stopped: interrupted`.
+A real `SIGINT` sent directly to the program (for example, `kill -INT <pid>`) remains
+`stopped: signal 2`. `continue` suppresses that held `SIGINT` rather than delivering it.
+
+The trade-off is terminal input: a background program reading inherited terminal stdin stops with
+`SIGTTIN`, reported as `stopped: signal 21`; one that changes terminal settings (`tcsetattr`, as
+password prompts and full-screen programs do) stops with `SIGTTOU`, `stopped: signal 22`. `continue`
+passes the signal back, so the program stops again at the same point; ferros prints a hint. Use
+`ferros launch --stdin FILE <program>` to supply input. Batch-mode stdin from a pipe or file still works; batch-mode terminal reads have the same
+background-group restriction. Attaching leaves the target's process group unchanged. Ctrl-Z
+suspends only ferros: the program keeps running until `fg`, so interrupt it first.
 
 ### Adding a command
 

@@ -100,6 +100,9 @@ keeps whatever stdin it already has.
 | `kill` | | Terminate the program with `SIGKILL` |
 | `status` | | `status: stopped (pid <pid>, thread <tid>)` and the last stop, `status: exited` and how, or `status: no process` |
 | `quit` | `q`, `exit` | End the session |
+| `next` | `n` | Advance one source line, stepping over calls; other threads stay suspended |
+| `step` | `s` | Enter a call with line information after its prologue; skip calls without it |
+| `finish` | | Run to the caller of the current frame, including under recursion |
 | `stepi` | `si` | Execute one instruction of the selected thread |
 | `break *<address>` | `b` | Add a software breakpoint at a runtime address (`0x` hex or decimal) |
 | `delete <id>` | `d` | Remove a breakpoint |

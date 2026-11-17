@@ -77,11 +77,19 @@ ferros/
 Not published to crates.io yet. Build from source:
 
 ```bash
-cargo build --workspace
-cargo run -p ferros -- launch <program> [-- args...]
-# or non-interactively:
-cargo run -p ferros -- launch --command continue <program>
+cargo build -p ferros-tests --bin ferros-fixture-nested_calls
+cargo run -p ferros -- launch \
+  --command 'break level_a' --command continue --command bt \
+  --command next --command step --command finish --command quit \
+  target/debug/ferros-fixture-nested_calls
 ```
+
+`next` (`n`) steps over calls, `step` (`s`) enters a callee after its prologue,
+`finish` returns to the caller, and `stepi` (`si`) executes one instruction.
+Other threads stay suspended during stepping. Any user breakpoint ends the step.
+
+See the [complete walkthrough](./docs/walkthrough.md) to build a small standalone
+example and run a full session, interactively or through a batch file.
 
 ### Requirements
 

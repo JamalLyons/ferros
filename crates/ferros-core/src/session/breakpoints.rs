@@ -6,7 +6,10 @@
 //! bytes in a [`BreakpointStore`](crate::breakpoints::BreakpointStore) entry. A
 //! breakpoint is *inserted* (its trap is in memory) exactly when it is enabled.
 //!
-//! Every mutation is all or nothing: if a memory access fails, the table is unchanged.
+//! Logical delete/disable rolls back earlier trap writes if a later write fails. If
+//! rollback itself fails, or a step-over cannot re-arm a trap, the unarmed entry and
+//! every logical owner are marked disabled. Other sites can remain armed; enabling
+//! the logical breakpoint again repairs them, and deleting it releases them.
 
 //!
 //! # Logical breakpoints
@@ -70,7 +73,8 @@ pub struct LogicalBreakpoint
     pub id: LogicalBreakpointId,
     /// What was asked for.
     pub location: BreakpointLocation,
-    /// Whether its sites trap.
+    /// Whether all its sites are armed (or requested while pending). Cleared if any
+    /// site cannot be re-armed; other sites may still trap until deleted or re-enabled.
     pub enabled: bool,
     /// Stops at any of its sites while it was enabled, over every run.
     pub hit_count: u64,
@@ -277,6 +281,12 @@ impl Session
         if let Some(entry) = self.breakpoints.get_mut(id) {
             entry.info.state = BreakpointState::Disabled;
             entry.info.enabled = false;
+            let address = entry.info.address;
+            for breakpoint in &mut self.logical {
+                if breakpoint.site_at(address).is_some() {
+                    breakpoint.enabled = false;
+                }
+            }
         }
     }
 
@@ -291,7 +301,10 @@ impl Session
 
     /// Restore every inserted trap, marking each restored breakpoint disabled.
     ///
-    /// Stops at the first failed write and returns its error.
+    /// # Errors
+    ///
+    /// Stops at the first failed write and returns its error. Already restored entries
+    /// and all their logical owners are disabled; remaining traps stay inserted.
     pub(super) fn restore_all_traps(&mut self) -> Result<()>
     {
         let mut inserted: Vec<BreakpointEntry> = self
@@ -440,7 +453,10 @@ impl Session
     /// # Errors
     ///
     /// [`DebuggerError::NotStopped`] while running, [`DebuggerError::BreakpointIdNotFound`]
-    /// for an unknown id, or an error restoring a trap (the breakpoint is then kept).
+    /// for an unknown id, or an error restoring a trap. The breakpoint is kept and
+    /// earlier writes are rolled back, preserving its sites and table entries. If a
+    /// rollback write also fails, that site and every logical owner are marked disabled
+    /// (other sites may remain armed); the original restoration error is returned.
     pub fn delete_breakpoint(&mut self, id: LogicalBreakpointId) -> Result<()>
     {
         self.require_not_running()?;
@@ -489,8 +505,9 @@ impl Session
     ///
     /// # Errors
     ///
-    /// As for [`delete_breakpoint`](Self::delete_breakpoint); on a failed write the
-    /// breakpoint stays enabled.
+    /// As for [`delete_breakpoint`](Self::delete_breakpoint): a failed write rolls back
+    /// earlier sites and keeps the breakpoint enabled, unless rollback also fails, in
+    /// which case logical owners of any unarmed site are marked disabled.
     pub fn disable_logical_breakpoint(&mut self, id: LogicalBreakpointId) -> Result<()>
     {
         self.require_not_running()?;
@@ -646,9 +663,11 @@ impl Session
 
     /// Take out the traps at `addresses` that no enabled logical breakpoint other than
     /// `owner` uses: removed when no other logical breakpoint has a site there, otherwise
-    /// disabled.
+    /// disabled. Write originals before changing the table so failure can roll back
+    /// without losing ids, metadata, or the original bytes.
     fn release_sites(&mut self, owner: LogicalBreakpointId, addresses: &[Address]) -> Result<()>
     {
+        let mut released: Vec<(BreakpointEntry, bool)> = Vec::new();
         for &address in addresses {
             let others = self
                 .logical
@@ -665,10 +684,28 @@ impl Session
             let Some(id) = self.breakpoints.id_for_kind(address, BreakpointKind::Software) else {
                 continue;
             };
+            let entry = self.entry(id)?.clone();
+            if entry.info.enabled
+                && let Err(error) = self.restore_original(&entry)
+            {
+                for (previous, _) in released.iter().rev().filter(|(entry, _)| entry.info.enabled) {
+                    let rollback = self
+                        .arch()
+                        .and_then(|arch| Ok(self.backend.write_memory(previous.info.address, arch.trap_instruction())?));
+                    if let Err(rollback_error) = rollback {
+                        self.mark_disabled(previous.info.id);
+                        tracing::warn!("could not roll back breakpoint {}: {rollback_error}", previous.info.id.raw());
+                    }
+                }
+                return Err(error);
+            }
+            released.push((entry, shared));
+        }
+        for (entry, shared) in released {
             if shared {
-                self.disable_breakpoint(id)?;
+                self.mark_disabled(entry.info.id);
             } else {
-                self.remove_breakpoint(id)?;
+                self.breakpoints.remove(entry.info.id);
             }
         }
         Ok(())

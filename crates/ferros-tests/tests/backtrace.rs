@@ -484,3 +484,75 @@ fn bt_prints_the_frames()
         assert!(status.success(), "{status}");
     });
 }
+
+/// Stopped in `on_sigusr1`, the SIGUSR1 handler of `signal_handler --interrupt`, after the
+/// signal interrupted `spin` on `spin_line`: the trace is the handler at its line, one
+/// frame for `_sigtramp` (outside the fixture, named or not), then `spin` at the
+/// interrupted line (looked up at its pc, not as a return address), then `main` at the
+/// call. Following `_sigtramp`'s frame record instead skips `spin`.
+#[test]
+fn backtrace_in_a_signal_handler_shows_the_interrupted_function()
+{
+    /// `SIGUSR1` on macOS; the test harness uses no raw FFI.
+    const SIGUSR1: i32 = 30;
+    harness::run(|t| {
+        let fixture = fixture!("signal_handler");
+        let mut d = t.launch_with_args(&fixture, &["--interrupt"]);
+        let pid = d.pid().0;
+        let spin_line = marker_address(&mut d, &fixture, "spin_line");
+        run_to(&mut d, spin_line);
+        let ids: Vec<_> = d.breakpoints().iter().map(|bp| bp.id).collect();
+        for id in ids {
+            d.remove_breakpoint(id).expect("remove the spin breakpoint");
+        }
+        let in_handler = marker_address(&mut d, &fixture, "in_handler");
+        d.add_breakpoint(BreakpointRequest::Software { address: in_handler })
+            .expect("break in the handler");
+
+        // Sent while stopped; the spinning thread takes it once resumed.
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-USR1", &pid.to_string()])
+            .status()
+            .expect("run /bin/kill");
+        assert!(status.success());
+        d.resume().expect("resume into the signal");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait for the signal") {
+            Some(StopEvent::Signal { signal: SIGUSR1, .. }) => {}
+            other => panic!("expected the SIGUSR1 stop, got {other:?}"),
+        }
+        let interrupted = d.read_registers().expect("registers at the signal").pc;
+        d.resume_with_signal().expect("deliver SIGUSR1");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait for the handler") {
+            Some(StopEvent::Breakpoint { pc, thread }) if pc == in_handler => {
+                d.select_thread(thread).expect("select the handler thread");
+            }
+            other => panic!("expected a stop in the handler, got {other:?}"),
+        }
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let summary = summary(&frames, &fixture);
+        assert_eq!(
+            summary[0],
+            ("on_sigusr1".to_owned(), Some(fixture.marker_line("in_handler"))),
+            "{summary:#?}"
+        );
+        assert!(
+            fixture_function(&frames[1], &fixture).is_none(),
+            "frame 1 is _sigtramp, outside the fixture: {summary:#?}"
+        );
+        assert_starts_with(
+            &frames[2..],
+            &fixture,
+            &[
+                ("spin", fixture.marker_line("spin_line")),
+                ("main", fixture.marker_line("call_spin")),
+            ],
+        );
+        // The interrupted frame's pc is the instruction the signal interrupted, a pc in
+        // the spin loop, not a return address.
+        assert_eq!(frames[2].pc, interrupted, "{frames:#?}");
+        assert_eq!(frames[1].return_address, Some(frames[2].pc), "{frames:#?}");
+        d.kill().expect("kill");
+    });
+}

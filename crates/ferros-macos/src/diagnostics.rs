@@ -353,6 +353,23 @@ pub fn signal_workers_handled() -> usize
     SIGNAL_HANDLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Install `handler` for SIGUSR1 in the calling process, so a fixture can own the handler
+/// a test stops in. The handler must stay async-signal-safe. Tests only.
+///
+/// # Errors
+/// Returns the OS error if the handler could not be installed.
+#[doc(hidden)]
+pub fn install_sigusr1_handler(handler: extern "C" fn(libc::c_int)) -> std::io::Result<()>
+{
+    // SAFETY: `handler` is a plain C-ABI function; installing it changes only this
+    // process's disposition for SIGUSR1.
+    if unsafe { libc::signal(libc::SIGUSR1, handler as *const () as libc::sighandler_t) } == libc::SIG_ERR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Raise SIGUSR1 on the calling fixture worker. Tests only.
 #[doc(hidden)]
 pub fn raise_sigusr1() -> std::io::Result<()>

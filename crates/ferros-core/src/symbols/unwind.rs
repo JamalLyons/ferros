@@ -52,6 +52,9 @@
 //! Images whose files could not be loaded (for example libraries in the dyld shared cache)
 //! have none of this, and use the frame-pointer chain.
 //!
+//! Before any of these, a caller frame is checked for a signal trampoline (see
+//! [Signal handler frames](#signal-handler-frames)).
+//!
 //! The link register only holds a return address for the innermost frame (its value is
 //! known only there); a caller frame never uses it. There is no stack-scan heuristic: a
 //! frame is either derived from unwind information or not produced.
@@ -62,6 +65,44 @@
 //! callee left alone, plus registers its CFI restores. Caller-saved registers (`x0`-`x18`,
 //! and `x30` except through the return-address rule) and registers whose rule is
 //! `Undefined` are unknown and read as zero. Rules that use an unknown register fail.
+//!
+//! ## Signal handler frames
+//!
+//! On arm64 Darwin the kernel delivers a signal by building a signal frame on the
+//! interrupted thread's stack and starting the thread in `_sigtramp`
+//! (`libsystem_platform`, in the dyld shared cache), which calls the handler. xnu's
+//! `sendsig` (`bsd/dev/arm/unix_signal.c`) lays the frame out as `struct user_sigframe64`
+//! at the new `sp`, 16-byte aligned below the interrupted `sp` and a 128-byte red zone:
+//!
+//! | offset | size | field |
+//! |-------:|-----:|-------|
+//! | 0      | 104  | `siginfo_t` |
+//! | 104    | 56   | `ucontext_t`; `uc_mcsize` at +40 (816), `uc_mcontext` at +48 |
+//! | 160    | 816  | `__darwin_mcontext64`: `__es` (16: far, esr, exception), `__ss` at +16, `__ns` at +288 |
+//!
+//! `__ss` is the interrupted thread state: `x0`-`x28` at +0, `fp` at +232, `lr` at +240,
+//! `sp` at +248, `pc` at +256, `cpsr` at +264. The kernel passes the handler, `siginfo`
+//! and `ucontext` pointers in `x0`, `x3` and `x4`, and leaves every other register,
+//! `x29` and `x30` included, as the interrupted code had them. `_sigtramp` (disassembled
+//! with `otool -tV`; compact unwind `MODE_FRAME`) runs `stp x22, x21, [sp, #-0x30]!`,
+//! `stp x29, x30, [sp, #0x20]`, `add x29, sp, #0x20`, then calls the handler with
+//! `blraaz x8`. So in the `_sigtramp` frame the signal frame starts at `fp + 16`, and its
+//! frame record holds the interrupted `fp` and the interrupted `x30`: following that
+//! record gives the interrupted function's own caller (or a stale link register), and the
+//! interrupted function is skipped. (Offsets checked with `offsetof` against the macOS
+//! SDK's `<sys/ucontext.h>` and a handler printing its `ucontext` pointer on this
+//! machine: `ucontext - (_sigtramp fp + 16) = 104`, `uc_mcsize = 816`.)
+//!
+//! The trampoline is recognized by what it leaves in memory rather than by its name, since
+//! its image is usually not loaded: a caller frame (arm64 only) whose call instruction
+//! (`pc - 4`) is an indirect call (`blr`, `blraa`, `blraaz`, `blrab`, `blrabz`), and whose
+//! `fp + 16` holds a `ucontext` whose `uc_mcsize` is 816 and whose `uc_mcontext` points just
+//! past it, with an interrupted `sp` above the signal frame. Its caller is then the
+//! interrupted frame, with every register restored from `__ss` (all known, `x30`
+//! included), and it is treated like an innermost frame: its pc is the interrupted
+//! instruction, not a return address, so it is looked up at `pc` rather than `pc - 4`,
+//! and the innermost-frame rules (link register, first instruction, frameless leaf) apply
+//! to it. Its status is [`FrameStatus::Complete`]: the whole register state is known.
 //!
 //! ## Termination
 //!
@@ -87,6 +128,8 @@
 //!
 //! - [DWARF 5, section 6.4 Call Frame Information](https://dwarfstd.org/doc/DWARF5.pdf)
 //! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
+//! - [xnu `bsd/dev/arm/unix_signal.c`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/dev/arm/unix_signal.c)
+//!   (`sendsig`, `struct user_sigframe64`)
 
 use gimli::{
     BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset, EndianSlice, Register, RegisterRule,
@@ -204,7 +247,10 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         while frames.len() < max_frames && cursor.regs.pc != Address::ZERO {
             let lookup = self.lookup_address(&cursor);
             let symbolication = self.symbols.symbolicate(lookup);
-            let next = self.step(&cursor);
+            let (next, interrupted) = match self.signal_frame_step(&cursor) {
+                Some(step) => (Some(step), true),
+                None => (self.step(&cursor), false),
+            };
             let return_address = next.as_ref().map(|step| step.next.pc);
             append_logical_frames(
                 &mut frames,
@@ -231,7 +277,9 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             cursor = Cursor {
                 regs,
                 known: step.known,
-                is_caller: true,
+                // The frame a signal interrupted is stopped at an instruction, not at a
+                // return address.
+                is_caller: !interrupted,
             };
             depth += 1;
         }
@@ -620,6 +668,64 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         })
     }
 
+    /// A caller frame in `_sigtramp`: the frame the signal interrupted, with every register
+    /// restored from the signal frame's `__darwin_mcontext64` (see
+    /// [Signal handler frames](self#signal-handler-frames)). `None` for any other frame.
+    fn signal_frame_step(&self, cursor: &Cursor) -> Option<UnwindStep>
+    {
+        if !cursor.is_caller || self.arch.architecture() != Architecture::Arm64 || cursor.known & (1 << 29) == 0 {
+            return None;
+        }
+        // Little-endian: the low half of the word at `pc - 4` is the call instruction.
+        let call = self
+            .memory
+            .read_u64(Address::new(cursor.regs.pc.value().checked_sub(4)?))
+            .ok()?;
+        if !is_indirect_call(call as u32) {
+            return None;
+        }
+        let frame = cursor.regs.fp.value().checked_add(16)?;
+        let ucontext = frame.checked_add(sigframe::UCONTEXT)?;
+        let mcontext = frame.checked_add(sigframe::MCONTEXT)?;
+        let read = |offset: u64| {
+            let address = mcontext.checked_add(offset)?;
+            self.memory.read_u64(Address::new(address)).ok()
+        };
+        let mcsize = self
+            .memory
+            .read_u64(Address::new(ucontext.checked_add(sigframe::UC_MCSIZE)?))
+            .ok()?;
+        let mcontext_pointer = self
+            .memory
+            .read_u64(Address::new(ucontext.checked_add(sigframe::UC_MCONTEXT)?))
+            .ok()?;
+        if mcsize != sigframe::MCONTEXT_SIZE || mcontext_pointer != mcontext {
+            return None;
+        }
+        let sp = read(sigframe::SS_SP)?;
+        if sp < mcontext.checked_add(sigframe::MCONTEXT_SIZE)? {
+            return None;
+        }
+
+        let mut next = cursor.regs.clone();
+        for (index, slot) in next.general.iter_mut().enumerate().take(29) {
+            *slot = read(sigframe::SS_X + 8 * index as u64)?;
+        }
+        self.arch.set_fp(&mut next, Address::new(read(sigframe::SS_FP)?));
+        let lr = read(sigframe::SS_LR)?;
+        if let Some(slot) = next.general.get_mut(30) {
+            *slot = lr;
+        }
+        next.sp = Address::new(sp);
+        next.pc = self.arch.strip_pointer_auth(Address::new(read(sigframe::SS_PC)?));
+        let step = UnwindStep {
+            next,
+            known: ALL_GENERAL,
+            status: FrameStatus::Complete,
+        };
+        self.accept(cursor, step)
+    }
+
     fn register_value(&self, cursor: &Cursor, register: Register) -> Option<u64>
     {
         if let Some(bit) = general_bit(register)
@@ -647,6 +753,39 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             _ => {}
         }
     }
+}
+
+/// Offsets in xnu's arm64 `struct user_sigframe64` (see
+/// [Signal handler frames](self#signal-handler-frames)).
+mod sigframe
+{
+    /// The `ucontext_t`, after the 104-byte `siginfo_t`.
+    pub(super) const UCONTEXT: u64 = 104;
+    /// `uc_mcsize` in `ucontext_t`.
+    pub(super) const UC_MCSIZE: u64 = 40;
+    /// `uc_mcontext` (a pointer) in `ucontext_t`.
+    pub(super) const UC_MCONTEXT: u64 = 48;
+    /// The `__darwin_mcontext64`, after the 56-byte `ucontext_t`.
+    pub(super) const MCONTEXT: u64 = UCONTEXT + 56;
+    /// `sizeof(__darwin_mcontext64)`, the kernel's `uc_mcsize` (`UC_FLAVOR_SIZE64`).
+    pub(super) const MCONTEXT_SIZE: u64 = 816;
+    /// `__ss.__x[0]` in the mcontext, after the 16-byte `__es`.
+    pub(super) const SS_X: u64 = 16;
+    /// `__ss.__fp`.
+    pub(super) const SS_FP: u64 = SS_X + 232;
+    /// `__ss.__lr`.
+    pub(super) const SS_LR: u64 = SS_X + 240;
+    /// `__ss.__sp`.
+    pub(super) const SS_SP: u64 = SS_X + 248;
+    /// `__ss.__pc`.
+    pub(super) const SS_PC: u64 = SS_X + 256;
+}
+
+/// Whether an arm64 instruction is a register-indirect call: `blr`, or the pointer
+/// authenticating `blraa`, `blraaz`, `blrab`, `blrabz`.
+fn is_indirect_call(instruction: u32) -> bool
+{
+    instruction & 0xffff_fc1f == 0xd63f_0000 || instruction & 0xfeff_f800 == 0xd63f_0800
 }
 
 /// The `known` bit of an arm64 DWARF register number `x0`-`x30`.
@@ -954,6 +1093,135 @@ mod tests
             unwinder.recover(&cursor, &RegisterRule::SameValue, 0, Register(29)),
             Some(Some(0x1000))
         );
+    }
+
+    /// `blraaz x8`, the call in `_sigtramp`, and `bl` (a direct call).
+    const BLRAAZ_X8: u64 = 0xd63f_091f;
+    const BL: u64 = 0x9400_0010;
+
+    /// A handler frame record at 0x1000 returning into a `_sigtramp` at 0x5000_0040 whose
+    /// frame record (0x1100) sits right below an xnu signal frame; the interrupted frame
+    /// is at pc 0x4000_0100 with sp 0x2000, fp 0x2100, lr 0x4000_0aa0, and its own frame
+    /// record at 0x2100 returns to 0x4000_0200 (fp chain end).
+    fn signal_stack() -> FakeMemory
+    {
+        let mut memory = FakeMemory::default();
+        memory.words.insert(0x1000, 0x1100);
+        memory.words.insert(0x1008, 0x5000_0044);
+        // `_sigtramp`'s frame record: the interrupted fp and x30, not a caller of it.
+        memory.words.insert(0x1100, 0x2100);
+        memory.words.insert(0x1108, 0x4000_0aa0);
+        memory.words.insert(0x5000_0040, BLRAAZ_X8);
+        let frame = 0x1110;
+        let ucontext = frame + sigframe::UCONTEXT;
+        let mcontext = frame + sigframe::MCONTEXT;
+        memory.words.insert(ucontext + sigframe::UC_MCSIZE, sigframe::MCONTEXT_SIZE);
+        memory.words.insert(ucontext + sigframe::UC_MCONTEXT, mcontext);
+        for index in 0..29 {
+            memory.words.insert(mcontext + sigframe::SS_X + 8 * index, 0x100 + index);
+        }
+        memory.words.insert(mcontext + sigframe::SS_FP, 0x2100);
+        memory.words.insert(mcontext + sigframe::SS_LR, 0x4000_0aa0);
+        memory.words.insert(mcontext + sigframe::SS_SP, 0x2000);
+        memory.words.insert(mcontext + sigframe::SS_PC, 0x8012_0000_4000_0100);
+        memory.words.insert(0x2100, 0);
+        memory.words.insert(0x2108, 0x4000_0200);
+        memory
+    }
+
+    #[test]
+    fn a_signal_frame_restores_the_interrupted_frame()
+    {
+        let memory = signal_stack();
+        let symbols = SymbolCache::new();
+        let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 64)
+            .expect("unwind");
+        let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+        assert_eq!(pcs, [0x4000_0000, 0x5000_0044, 0x4000_0100, 0x4000_0200]);
+        assert_eq!(frames[2].sp, Address::new(0x2000));
+        assert_eq!(frames[2].fp, Address::new(0x2100));
+        assert_eq!(frames[2].status, FrameStatus::Complete);
+        assert_eq!(frames[1].return_address, Some(Address::new(0x4000_0100)));
+    }
+
+    #[test]
+    fn the_interrupted_frame_keeps_every_register_and_is_not_a_caller()
+    {
+        let memory = signal_stack();
+        let symbols = SymbolCache::new();
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let sigtramp = Cursor {
+            known: 1 << 29,
+            is_caller: true,
+            ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
+        };
+        let step = unwinder.signal_frame_step(&sigtramp).expect("a signal frame");
+        assert_eq!(step.known, ALL_GENERAL);
+        assert_eq!(step.next.general[0], 0x100);
+        assert_eq!(step.next.general[28], 0x100 + 28);
+        assert_eq!(ARCH.link_register(&step.next), Some(Address::new(0x4000_0aa0)));
+        assert_eq!(step.next.pc, Address::new(0x4000_0100), "PAC bits stripped");
+        // Looked up at its pc, like an innermost frame.
+        let interrupted = Cursor {
+            regs: step.next,
+            known: step.known,
+            is_caller: false,
+        };
+        assert_eq!(unwinder.lookup_address(&interrupted), Address::new(0x4000_0100));
+    }
+
+    #[test]
+    fn a_frame_without_a_signal_frame_is_not_a_trampoline()
+    {
+        let symbols = SymbolCache::new();
+        let sigtramp = Cursor {
+            known: 1 << 29,
+            is_caller: true,
+            ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
+        };
+        // A direct call before the return address.
+        let mut memory = signal_stack();
+        memory.words.insert(0x5000_0040, BL);
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .signal_frame_step(&sigtramp)
+                .is_none()
+        );
+        // A `uc_mcontext` that does not point just past the `ucontext`.
+        let mut memory = signal_stack();
+        memory
+            .words
+            .insert(0x1110 + sigframe::UCONTEXT + sigframe::UC_MCONTEXT, 0x9999);
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .signal_frame_step(&sigtramp)
+                .is_none()
+        );
+        // The innermost frame is never a trampoline's caller frame.
+        let memory = signal_stack();
+        let innermost = Cursor {
+            is_caller: false,
+            ..sigtramp
+        };
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .signal_frame_step(&innermost)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn indirect_calls_are_recognized()
+    {
+        // blr x8, blraa x8, x9, blraaz x8, blrab x8, x9, blrabz x8.
+        for call in [0xd63f_0100, 0xd73f_0909, 0xd63f_091f, 0xd73f_0d09, 0xd63f_0d1f] {
+            assert!(is_indirect_call(call), "{call:#x}");
+        }
+        // bl, br x8, ret.
+        for other in [0x9400_0010, 0xd61f_0100, 0xd65f_03c0] {
+            assert!(!is_indirect_call(other), "{other:#x}");
+        }
     }
 
     #[test]

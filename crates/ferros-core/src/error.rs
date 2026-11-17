@@ -94,8 +94,10 @@ pub enum DebuggerError
 
     /// Symbols for a loaded image could not be loaded for a reason other than missing
     /// debug information, for example because its file could not be read while Cargo
-    /// replaced it. `source` is the original failure. The failure is not cached: the
-    /// next request for an address in the image tries again.
+    /// replaced it. `source` is the original failure. The session keeps the failure
+    /// only while the files the load read are unchanged: later requests return it again
+    /// without reading them, and the first request after the image, its `.dSYM` or the
+    /// debug cache changes on disk tries the load again.
     #[error("Cannot load symbols for {path}: {source}")]
     SymbolLoad
     {
@@ -290,6 +292,64 @@ pub enum DebuggerError
     /// info. The [`SourceLookupError`] is kept as is, so callers can match on it.
     #[error(transparent)]
     SourceLookup(#[from] SourceLookupError),
+}
+
+impl DebuggerError
+{
+    /// A copy of this error, so a kept failure can be reported again. An [`Io`](Self::Io)
+    /// error keeps its kind and OS code (or, without one, its message) but not a custom
+    /// payload's type.
+    pub(crate) fn duplicate(&self) -> Self
+    {
+        match self {
+            Self::ProcessNotFound(pid) => Self::ProcessNotFound(*pid),
+            Self::PermissionDenied(message) => Self::PermissionDenied(message.clone()),
+            Self::InvalidArgument(message) => Self::InvalidArgument(message.clone()),
+            Self::NoDebugInfo { path, detail } => Self::NoDebugInfo {
+                path: path.clone(),
+                detail: detail.clone(),
+            },
+            Self::ImageMapping { path, detail } => Self::ImageMapping {
+                path: path.clone(),
+                detail: detail.clone(),
+            },
+            Self::SymbolLoad { path, source } => Self::SymbolLoad {
+                path: path.clone(),
+                source: Box::new(source.duplicate()),
+            },
+            Self::AttachFailed(message) => Self::AttachFailed(message.clone()),
+            Self::NotAttached => Self::NotAttached,
+            Self::NotStopped => Self::NotStopped,
+            Self::NoBreakpoint(address) => Self::NoBreakpoint(*address),
+            Self::BreakpointIdNotFound(id) => Self::BreakpointIdNotFound(*id),
+            Self::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
+            Self::SuspendFailed(message) => Self::SuspendFailed(message.clone()),
+            Self::ResumeFailed(message) => Self::ResumeFailed(message.clone()),
+            Self::ReadRegistersFailed {
+                operation,
+                thread_id,
+                details,
+            } => Self::ReadRegistersFailed {
+                operation: operation.clone(),
+                thread_id: *thread_id,
+                details: details.clone(),
+            },
+            Self::Os { code, message } => Self::Os {
+                code: *code,
+                message: message.clone(),
+            },
+            Self::Io(error) => Self::Io(match error.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::new(error.kind(), error.to_string()),
+            }),
+            Self::AlreadyAttached => Self::AlreadyAttached,
+            Self::NotRunning => Self::NotRunning,
+            Self::ThreadNotFound(id) => Self::ThreadNotFound(*id),
+            Self::NoThreadSelected => Self::NoThreadSelected,
+            Self::Backend(error) => Self::Backend(error.clone()),
+            Self::SourceLookup(error) => Self::SourceLookup(error.clone()),
+        }
+    }
 }
 
 impl From<BackendError> for DebuggerError

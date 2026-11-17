@@ -6,10 +6,35 @@ use std::path::PathBuf;
 use super::Session;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
+use crate::symbols::debuginfo::LoadInputs;
 use crate::symbols::symtab::{SymbolTable, SymtabLayout};
 use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::Address;
 
+/// The image's symbols could not be loaded (see [`SessionImage`]).
+///
+/// Failures other than missing debug info are kept with a stamp of the files the load
+/// read, taken just before it read them. Later requests compare a fresh stamp (a few
+/// `stat` calls) and, while it is equal, return `error` again without reading or parsing
+/// the image. A file that appears, disappears or changes makes the next request load
+/// the image again.
+struct FailedLoad
+{
+    /// The symbol request in which `error` was last reported. Within one request the
+    /// failure is reported once and the image is not read again.
+    request: u64,
+    inputs: LoadInputs,
+    error: DebuggerError,
+}
+
+/// A loaded image and what the session learned about it while it stays mapped at its
+/// load address: its mapping, its symbols, and why they could not be loaded.
+///
+/// Symbol loading keeps one of three outcomes: the loaded symbols; missing debug info
+/// (kept until the image is unloaded); or another failure, kept only while the files it
+/// read are unchanged ([`FailedLoad`]). So a persistent failure, such as a corrupt image
+/// file or a malformed dSYM, costs one read and parse, not one per request, and a
+/// transient one, such as a file Cargo is replacing, recovers once the file is back.
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
@@ -24,16 +49,14 @@ pub(super) struct SessionImage
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
     /// without repeatedly running dsymutil.
     no_debug_info: Option<String>,
-    /// The symbol request (see [`Session::begin_symbol_request`]) whose load of this
-    /// image last failed for another reason. Such failures are not kept: a later request
-    /// reads the image again, but one request does not retry it.
-    failed_in_request: Option<u64>,
+    /// Why the image's last symbol load failed for another reason, and what it read.
+    failed_load: Option<FailedLoad>,
     /// The image's symbol table layout as mapped in the target, read on the first frame
     /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
     /// it holds until the image is unloaded or moved.
     pub(super) symtab: Option<SessionSymtab>,
-    /// The symbol request whose read of the symbol table layout last failed. As with
-    /// `failed_in_request`, the failure is not kept past that request.
+    /// The symbol request whose read of the symbol table layout last failed. The failure
+    /// is not kept past that request.
     pub(super) symtab_failed_in_request: Option<u64>,
 }
 
@@ -193,7 +216,7 @@ impl Session
                     mapping,
                     symbols: None,
                     no_debug_info: None,
-                    failed_in_request: None,
+                    failed_load: None,
                     symtab: None,
                     symtab_failed_in_request: None,
                 });
@@ -239,9 +262,10 @@ impl Session
     /// already loaded, or its load already failed in the current request.
     ///
     /// # Errors
-    /// [`DebuggerError::NoDebugInfo`] when the image has no usable DWARF (kept for later
-    /// requests), or [`DebuggerError::SymbolLoad`] with the original failure for any
-    /// other load error (not kept).
+    /// [`DebuggerError::NoDebugInfo`] when the image has no usable DWARF (kept while the
+    /// image stays loaded), or [`DebuggerError::SymbolLoad`] with the original failure
+    /// for any other load error (kept while the files the load read are unchanged; see
+    /// [`SessionImage`]).
     pub(super) fn load_symbols_for_address(&mut self, address: Address) -> Result<bool>
     {
         let request = self.symbol_request;
@@ -258,24 +282,39 @@ impl Session
                 detail: detail.clone(),
             });
         }
-        if image.symbols.is_some() || image.failed_in_request == Some(request) {
+        if image.symbols.is_some() {
             return Ok(false);
+        }
+        let inputs = self.symbols.load_inputs(&image.descriptor);
+        if let Some(failed) = &mut image.failed_load {
+            if failed.request == request {
+                return Ok(false);
+            }
+            if failed.inputs == inputs {
+                failed.request = request;
+                return Err(DebuggerError::SymbolLoad {
+                    path: image.descriptor.path.clone(),
+                    source: Box::new(failed.error.duplicate()),
+                });
+            }
         }
         match self.symbols.load_image(image.descriptor.clone()) {
             Ok(loaded) => {
                 image.symbols = Some(loaded.id());
-                image.failed_in_request = None;
+                image.failed_load = None;
                 Ok(true)
             }
             Err(DebuggerError::NoDebugInfo { detail, path }) => {
+                image.failed_load = None;
                 image.no_debug_info = Some(detail.clone());
                 Err(DebuggerError::NoDebugInfo { path, detail })
             }
             Err(error) => {
-                image.failed_in_request = Some(request);
+                let source = Box::new(error.duplicate());
+                image.failed_load = Some(FailedLoad { request, inputs, error });
                 Err(DebuggerError::SymbolLoad {
                     path: image.descriptor.path.clone(),
-                    source: Box::new(error),
+                    source,
                 })
             }
         }

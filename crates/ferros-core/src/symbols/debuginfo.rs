@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use object::{Object, ObjectSection};
@@ -113,10 +113,7 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
         .ok_or_else(|| no_debug_info(path, "executable has no Mach-O UUID for companion lookup"))?;
     let architecture = file.architecture();
 
-    let mut bundle = path.as_os_str().to_os_string();
-    bundle.push(".dSYM");
-    let dwarf_directory = PathBuf::from(bundle).join("Contents/Resources/DWARF");
-    if let Ok(entries) = fs::read_dir(dwarf_directory) {
+    if let Ok(entries) = fs::read_dir(dwarf_directory(path)) {
         // UUID and architecture, not the DWARF member's name, establish identity.
         for entry in entries.flatten() {
             if let Some(bytes) = companion(&entry.path(), uuid, architecture) {
@@ -192,6 +189,84 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
         return Err(no_debug_info(path, format!("cannot publish debug cache: {error}")));
     }
     Ok(bytes)
+}
+
+/// What can be observed of the files one symbol load reads, without reading them: the
+/// image itself, its `.dSYM` bundle's DWARF members and the debug cache directory. Two
+/// equal stamps mean none of those files was created, removed, resized or modified in
+/// between, as far as the filesystem's size and timestamps tell.
+///
+/// A file rewritten in place with the same size and its timestamps restored is not
+/// seen as changed; neither is one changed within the filesystem's timestamp resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoadInputs(Vec<(PathBuf, FileStamp)>);
+
+/// One path's stamp: the link itself and what it resolves to (equal for a regular
+/// file), so retargeting a symlink is seen too. `None` when the path does not exist or
+/// cannot be inspected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp
+{
+    link: Option<MetadataStamp>,
+    target: Option<MetadataStamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetadataStamp
+{
+    is_dir: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+impl MetadataStamp
+{
+    fn of(metadata: std::io::Result<fs::Metadata>) -> Option<Self>
+    {
+        let metadata = metadata.ok()?;
+        Some(Self {
+            is_dir: metadata.is_dir(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        })
+    }
+}
+
+impl LoadInputs
+{
+    /// Stamp the inputs [`discover`] and the image parse read for the image at `path`
+    /// (the path the load reads, after canonicalization).
+    pub(crate) fn of(path: &Path, options: &DebugInfoOptions) -> Self
+    {
+        let mut stamps = Vec::new();
+        let mut stamp = |path: PathBuf| {
+            let stamp = FileStamp {
+                link: MetadataStamp::of(fs::symlink_metadata(&path)),
+                target: MetadataStamp::of(fs::metadata(&path)),
+            };
+            stamps.push((path, stamp));
+        };
+        stamp(path.to_path_buf());
+        let dwarf_directory = dwarf_directory(path);
+        let mut members: Vec<_> = fs::read_dir(&dwarf_directory)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        members.sort();
+        stamp(dwarf_directory);
+        members.into_iter().for_each(&mut stamp);
+        stamp(options.cache_directory.clone());
+        Self(stamps)
+    }
+}
+
+/// The directory of DWARF members in the `.dSYM` bundle next to `path`.
+fn dwarf_directory(path: &Path) -> PathBuf
+{
+    let mut bundle = path.as_os_str().to_os_string();
+    bundle.push(".dSYM");
+    PathBuf::from(bundle).join("Contents/Resources/DWARF")
 }
 
 struct Workspace(PathBuf);

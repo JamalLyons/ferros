@@ -393,6 +393,74 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
     });
 }
 
+/// Issue #100: a symbol load that keeps failing (here a corrupt image file) is read and
+/// parsed once, not on every request. While the file is unchanged, every request returns
+/// the original error: after the file is made unreadable, a re-read would report
+/// permission denied instead. Once the file changes, the next request reads it again.
+#[test]
+fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
+{
+    harness::run(|_| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        let executable = scratch.0.join("program");
+        fs::write(&executable, b"not a Mach-O image").expect("write a corrupt image");
+        let load_address = 0x2_0000_0000;
+        let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
+        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+            .expect("mapping")
+            .runtime_address(file)
+            .expect("runtime");
+        let mut registers = Registers::default();
+        registers.pc = address;
+        let mock = with_mapped_header(MockBackend::new(), fixture.path(), load_address)
+            .with_thread(ThreadId(1), registers)
+            .with_image(LoadedImage {
+                path: executable.clone(),
+                load_address: Address::new(load_address),
+            });
+        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
+        let assert_parse_failure = |error: DebuggerError| {
+            let DebuggerError::SymbolLoad { path, source } = &error else {
+                panic!("unexpected result {error}");
+            };
+            assert_eq!(path, &executable);
+            assert!(
+                matches!(&**source, DebuggerError::InvalidArgument(detail) if detail.contains("failed to parse")),
+                "the original failure must be kept, not a new read's: {source}"
+            );
+        };
+
+        assert_parse_failure(session.symbolicate(address).expect_err("corrupt image"));
+        // Permissions are not part of the file's identity (size and timestamps), so the
+        // kept failure still applies; reading the file now would fail differently.
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o000)).expect("make unreadable");
+        for _ in 0..3 {
+            assert_parse_failure(session.symbolicate(address).expect_err("kept failure"));
+        }
+        assert!(session.stack_trace(1).expect("raw stack")[0].symbol.is_none());
+        assert_parse_failure(session.symbolicate(address).expect_err("kept failure after a stack trace"));
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).expect("make readable");
+        fs::remove_file(&executable).expect("remove corrupt image");
+        fs::copy(fixture.path(), &executable).expect("replace with the real executable");
+        std::os::unix::fs::symlink(fixture.dsym_path(), scratch.0.join("program.dSYM")).expect("link the dSYM");
+        let symbolication = session
+            .symbolicate(address)
+            .expect("symbols once the file changed")
+            .expect("main has a symbol");
+        assert!(
+            symbolication
+                .frames
+                .iter()
+                .any(|frame| rustc_demangle::try_demangle(frame.symbol.raw())
+                    .is_ok_and(|name| format!("{name:#}") == "ferros_fixture_hello::main")),
+            "{symbolication:?}"
+        );
+    });
+}
+
 #[test]
 fn session_refreshes_unloaded_and_relocated_images()
 {

@@ -37,6 +37,10 @@
 //! hot/cold splitting, the first range is the hot (entry) part and can lie above the cold
 //! part, so the lowest address is not used.
 //!
+//! Separately from entries, the index keeps every non-empty range of every concrete
+//! function (its fragments: the hot and cold parts of a split function, for example), which
+//! the line index uses to tell functions apart within one line-table sequence.
+//!
 //! # Unreadable debug info
 //!
 //! A compilation unit whose header, root entry or line-program header cannot be parsed is
@@ -52,6 +56,7 @@
 //! and translates through the image mapping.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 use gimli::{AttributeValue, DwAt, Reader as _, Unit, UnitSectionOffset, constants};
 
@@ -95,6 +100,17 @@ struct FunctionEntry
     end: u64,
 }
 
+/// The code of one concrete subprogram (file virtual addresses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FunctionCode
+{
+    entry: u64,
+    /// End of the range that holds `entry`.
+    end: u64,
+    /// Every non-empty range, in listed order.
+    ranges: Vec<Range<u64>>,
+}
+
 /// The concrete functions of one image, by the last segment of their path.
 #[derive(Debug, Default)]
 pub(crate) struct FunctionIndex
@@ -103,6 +119,8 @@ pub(crate) struct FunctionIndex
     by_last: HashMap<String, Vec<usize>>,
     /// Sorted, distinct entry addresses of every indexed function.
     starts: Vec<u64>,
+    /// Every non-empty range of every concrete function, sorted and distinct.
+    fragments: Vec<Range<u64>>,
     /// Units (or entries of them) that could not be parsed and were left out.
     skipped: Vec<SkippedDebugInfo>,
 }
@@ -125,8 +143,8 @@ impl FunctionIndex
     pub(crate) fn build(dwarf: &OwnedDwarf) -> Self
     {
         let mut names = HashMap::<usize, DieName>::new();
-        // (own DIE offset, entry, end) of every concrete subprogram.
-        let mut concrete = Vec::<(usize, u64, u64)>::new();
+        // (own DIE offset, code) of every concrete subprogram.
+        let mut concrete = Vec::<(usize, FunctionCode)>::new();
         let mut skipped = Vec::new();
         let mut units = dwarf.units();
         loop {
@@ -183,12 +201,21 @@ impl FunctionIndex
             }
         }
 
+        // Fragments of every concrete function, named or not.
+        let mut fragments: Vec<Range<u64>> = concrete.iter().flat_map(|(_, code)| code.ranges.iter().cloned()).collect();
+        fragments.sort_by_key(|range| (range.start, range.end));
+        fragments.dedup();
         let mut functions: Vec<FunctionEntry> = concrete
             .into_iter()
-            .filter_map(|(offset, entry, end)| {
+            .filter_map(|(offset, code)| {
                 let name = resolve_name(&names, offset)?;
                 let path = normalize(&name)?;
-                Some(FunctionEntry { name, path, entry, end })
+                Some(FunctionEntry {
+                    name,
+                    path,
+                    entry: code.entry,
+                    end: code.end,
+                })
             })
             .collect();
         functions.sort_by(|a, b| (a.entry, &a.path, &a.name).cmp(&(b.entry, &b.path, &b.name)));
@@ -205,6 +232,7 @@ impl FunctionIndex
             functions,
             by_last,
             starts,
+            fragments,
             skipped,
         }
     }
@@ -219,6 +247,13 @@ impl FunctionIndex
     pub(crate) fn starts(&self) -> &[u64]
     {
         &self.starts
+    }
+
+    /// Every non-empty range (file virtual addresses) of every concrete function, named or
+    /// not, sorted and distinct: one per part of a function split into hot and cold parts.
+    pub(crate) fn fragments(&self) -> &[Range<u64>]
+    {
+        &self.fragments
     }
 
     /// Every function matching `query` (see the module documentation), sorted by entry.
@@ -254,8 +289,8 @@ impl FunctionIndex
 }
 
 /// Record one DIE: a subprogram's names in `names` and, when it has code and is not a
-/// declaration, its `(offset, entry, end)` in `concrete`. Returns the name the DIE gives
-/// to the scope of its children (`Some` for a namespace or a named type).
+/// declaration, its offset and code in `concrete`. Returns the name the DIE gives to the
+/// scope of its children (`Some` for a namespace or a named type).
 fn index_die(
     dwarf: &OwnedDwarf,
     unit: &Unit<OwnedReader>,
@@ -263,7 +298,7 @@ fn index_die(
     base: usize,
     scopes: &[Option<String>],
     names: &mut HashMap<usize, DieName>,
-    concrete: &mut Vec<(usize, u64, u64)>,
+    concrete: &mut Vec<(usize, FunctionCode)>,
 ) -> gimli::Result<Option<String>>
 {
     let tag = entry.tag();
@@ -298,7 +333,11 @@ fn index_die(
             entry.attr_value(constants::DW_AT_declaration)?,
             Some(AttributeValue::Flag(true))
         );
-        let range = if declaration { None } else { entry_range(dwarf, unit, entry)? };
+        let code = if declaration {
+            None
+        } else {
+            function_code(dwarf, unit, entry)?
+        };
         names.insert(
             offset,
             DieName {
@@ -307,8 +346,8 @@ fn index_die(
                 reference,
             },
         );
-        if let Some((start, end)) = range {
-            concrete.push((offset, start, end));
+        if let Some(code) = code {
+            concrete.push((offset, code));
         }
     }
     let scope_name = matches!(
@@ -362,17 +401,17 @@ fn reference(
     })
 }
 
-/// `(entry, end)` of a DIE with code. The entry is `DW_AT_low_pc`, else `DW_AT_entry_pc`,
+/// The code of a DIE: entry, end and non-empty ranges. The entry is `DW_AT_low_pc`, else `DW_AT_entry_pc`,
 /// else the start of the first listed non-empty range (not the lowest: with hot/cold
 /// splitting the lowest range can be the cold part). `end` is the end of the non-empty
 /// range that contains the entry; an attribute entry outside every such range is ignored.
 /// `None` when the DIE has no non-empty range (or only ranges at address 0, left behind by
 /// dead-stripped code).
-fn entry_range(
+fn function_code(
     dwarf: &OwnedDwarf,
     unit: &Unit<OwnedReader>,
     entry: &gimli::DebuggingInformationEntry<'_, '_, OwnedReader>,
-) -> gimli::Result<Option<(u64, u64)>>
+) -> gimli::Result<Option<FunctionCode>>
 {
     let mut ranges = Vec::new();
     let mut iter = dwarf.die_ranges(unit, entry)?;
@@ -381,14 +420,19 @@ fn entry_range(
             ranges.push(range);
         }
     }
-    let Some(first) = ranges.first() else {
+    let Some(&first) = ranges.first() else {
         return Ok(None);
+    };
+    let code = |entry, end| FunctionCode {
+        entry,
+        end,
+        ranges: ranges.iter().map(|range| range.begin..range.end).collect(),
     };
     let containing = |start: u64| {
         ranges
             .iter()
             .find(|range| range.begin <= start && start < range.end)
-            .map(|range| (start, range.end))
+            .map(|range| code(start, range.end))
     };
     for name in [constants::DW_AT_low_pc, constants::DW_AT_entry_pc] {
         let Some(value) = entry.attr_value(name)? else {
@@ -409,7 +453,7 @@ fn entry_range(
             return Ok(Some(found));
         }
     }
-    Ok(Some((first.begin, first.end)))
+    Ok(Some(code(first.begin, first.end)))
 }
 
 /// The address a DWARF 5 constant `DW_AT_entry_pc` is relative to: the DIE's
@@ -711,6 +755,10 @@ mod tests
         assert_eq!(found("with_entry_pc"), (0x4008, 0x4020));
         assert_eq!(found("stripped"), (0x6100, 0x6110));
         assert_eq!(index.starts(), &[0x3000, 0x4008, 0x6100]);
+        assert_eq!(
+            index.fragments(),
+            &[0x1000..0x1010, 0x3000..0x3040, 0x4000..0x4020, 0x5000..0x5010, 0x6100..0x6110]
+        );
     }
 
     /// A function with no linkage name is named by its scoped `DW_AT_name`, also when the
@@ -797,6 +845,7 @@ mod tests
             functions,
             by_last,
             starts: Vec::new(),
+            fragments: Vec::new(),
             skipped: Vec::new(),
         };
         let entries = |query| {

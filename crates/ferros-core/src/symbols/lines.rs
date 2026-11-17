@@ -229,9 +229,11 @@ pub(crate) struct LineIndex
     pub(crate) sequences: Vec<LineSequence>,
     /// Per file (same index as `files`): line -> canonical statement file addresses.
     lines: Vec<BTreeMap<u32, Vec<u64>>>,
-    /// Sorted, distinct entry addresses of every concrete function. One line-table sequence
-    /// can hold several functions back to back, so runs and line ranges stop at these.
-    function_starts: Vec<u64>,
+    /// Sorted, distinct starts and ends of every non-empty range of every concrete function
+    /// (its fragments: both parts of a function split into hot and cold parts). One
+    /// line-table sequence can hold several functions back to back, so runs and line ranges
+    /// stop at these.
+    boundaries: Vec<u64>,
     /// Units (or parts of them) that could not be parsed and were left out.
     skipped: Vec<SkippedDebugInfo>,
 }
@@ -239,14 +241,11 @@ pub(crate) struct LineIndex
 impl LineIndex
 {
     /// Index every compilation unit's line program that can be parsed, skipping the others
-    /// (see the module documentation). `function_starts` (sorted, distinct) are the entry
-    /// addresses of the image's concrete functions.
-    pub(crate) fn build(dwarf: &OwnedDwarf, function_starts: Vec<u64>) -> Self
+    /// (see the module documentation). `fragments` are the non-empty ranges of the image's
+    /// concrete functions.
+    pub(crate) fn build(dwarf: &OwnedDwarf, fragments: &[Range<u64>]) -> Self
     {
-        let mut index = Self {
-            function_starts,
-            ..Self::default()
-        };
+        let mut index = Self::with_fragments(fragments);
         let mut paths = HashMap::<String, u32>::new();
         let mut units = dwarf.units();
         loop {
@@ -280,7 +279,7 @@ impl LineIndex
         index.sequences.sort_by_key(|sequence| (sequence.start, sequence.end));
         index.lines = vec![BTreeMap::new(); index.files.len()];
         for sequence in &index.sequences {
-            index_statements(&mut index.lines, sequence, &index.function_starts);
+            index_statements(&mut index.lines, sequence, &index.boundaries);
         }
         index
     }
@@ -357,13 +356,26 @@ impl LineIndex
         &self.skipped
     }
 
-    /// `[start, end)` of the function containing `address`: from the closest function
-    /// entry at or below it to the next entry (unbounded when there is none).
+    /// An empty index that splits sequences at the starts and ends of `fragments`.
+    fn with_fragments(fragments: &[Range<u64>]) -> Self
+    {
+        let mut boundaries: Vec<u64> = fragments.iter().flat_map(|range| [range.start, range.end]).collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        Self {
+            boundaries,
+            ..Self::default()
+        }
+    }
+
+    /// `[start, end)` of the function fragment containing `address`: from the closest
+    /// fragment boundary (start or end) at or below it to the next boundary (unbounded when
+    /// there is none). For an address in a cold part, that is the cold part's range.
     fn function_bounds(&self, address: u64) -> Range<u64>
     {
-        let next = self.function_starts.partition_point(|&start| start <= address);
-        let start = next.checked_sub(1).map_or(0, |at| self.function_starts[at]);
-        let end = self.function_starts.get(next).copied().unwrap_or(u64::MAX);
+        let next = self.boundaries.partition_point(|&boundary| boundary <= address);
+        let start = next.checked_sub(1).map_or(0, |at| self.boundaries[at]);
+        let end = self.boundaries.get(next).copied().unwrap_or(u64::MAX);
         start..end
     }
 
@@ -416,17 +428,17 @@ impl LineIndex
 /// Record the canonical statement address of every run of rows for one line.
 ///
 /// A run is a maximal stretch of consecutive rows with the same file and line within one
-/// function; its canonical address is its first `is_stmt` row. Rows with line 0 end a run,
-/// and a function entry (`function_starts`, sorted) starts a new one, so functions laid
-/// out back to back in one sequence (two instantiations of a one-line generic) each get
-/// their own address.
-fn index_statements(lines: &mut [BTreeMap<u32, Vec<u64>>], sequence: &LineSequence, function_starts: &[u64])
+/// function fragment; its canonical address is its first `is_stmt` row. Rows with line 0
+/// end a run, and a fragment boundary (`boundaries`, sorted) starts a new one, so functions
+/// or fragments laid out back to back in one sequence (two instantiations of a one-line
+/// generic, two cold parts) each get their own address.
+fn index_statements(lines: &mut [BTreeMap<u32, Vec<u64>>], sequence: &LineSequence, boundaries: &[u64])
 {
     let mut run: Option<(u32, u32)> = None;
     let mut recorded = false;
     for row in sequence.rows.iter().filter(|row| !row.end_sequence) {
         let key = (row.file, row.line);
-        if run != Some(key) || function_starts.binary_search(&row.address).is_ok() {
+        if run != Some(key) || boundaries.binary_search(&row.address).is_ok() {
             run = Some(key);
             recorded = false;
         }
@@ -507,7 +519,7 @@ impl BinaryImage
                 let dwarf = self
                     .dwarf()
                     .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
-                let index = LineIndex::build(dwarf, self.function_index()?.starts().to_vec());
+                let index = LineIndex::build(dwarf, self.function_index()?.fragments());
                 warn_skipped(self, "line", index.skipped());
                 Ok(index)
             })
@@ -598,8 +610,10 @@ impl BinaryImage
 
     /// The source line containing `address`, from the line-table row that covers it, and
     /// every address range of that line in the same line-table sequence and the same
-    /// function (one sequence can hold several functions, such as two instantiations of a
-    /// generic function, that share line numbers).
+    /// function fragment (one sequence can hold several functions, such as two
+    /// instantiations of a generic function, or the cold parts of several split functions,
+    /// that share line numbers; a split function's hot and cold parts are separate
+    /// fragments).
     ///
     /// Returns `Ok(None)` when the address is outside the image, outside every line-table
     /// sequence, or in a row with no source line (line 0, compiler-generated code).
@@ -857,7 +871,7 @@ mod tests
     fn a_corrupt_unit_does_not_hide_the_good_one()
     {
         let (dwarf, bad_offset) = super::synthetic::corrupt_then_good();
-        let lines = LineIndex::build(&dwarf, Vec::new());
+        let lines = LineIndex::build(&dwarf, &[]);
         let file = lines.resolve_file("good.rs").expect("good.rs");
         assert_eq!(lines.files[file as usize], "/w/src/good.rs");
         assert_eq!(lines.lines[file as usize].get(&8), Some(&vec![0x2008]));
@@ -881,7 +895,7 @@ mod tests
         second.rows = vec![(0x2000, 5)];
         second.end = 0x2004;
         let dwarf = write(&[first, second]).load();
-        let lines = LineIndex::build(&dwarf, Vec::new());
+        let lines = LineIndex::build(&dwarf, &[]);
         for query in ["/w/src/lib.rs", "/w/./src/lib.rs", "src/lib.rs", "lib.rs"] {
             let file = lines.resolve_file(query).unwrap_or_else(|error| panic!("{query}: {error}"));
             assert_eq!(lines.files[file as usize], "/w/src/lib.rs", "{query}");
@@ -905,7 +919,7 @@ mod tests
             files: paths.iter().map(|path| (*path).to_owned()).collect(),
             sequences: Vec::new(),
             lines: paths.iter().map(|_| BTreeMap::from([(1, vec![0x1000])])).collect(),
-            function_starts: Vec::new(),
+            boundaries: Vec::new(),
             skipped: Vec::new(),
         }
     }
@@ -971,7 +985,7 @@ mod tests
         assert_eq!(lines[0].get(&6), Some(&vec![0x10]));
         assert_eq!(lines[0].get(&0), None);
 
-        // A function entry inside a run (two copies of a one-line function laid out back
+        // A fragment boundary inside a run (two copies of a one-line function laid out back
         // to back in one sequence) starts a new run.
         let mut lines = vec![BTreeMap::new()];
         index_statements(&mut lines, &sequence, &[0x0, 0x8]);
@@ -979,14 +993,57 @@ mod tests
     }
 
     #[test]
-    fn function_bounds_split_a_sequence_at_function_entries()
+    fn function_bounds_split_a_sequence_at_fragment_starts()
     {
-        let index = LineIndex {
-            function_starts: vec![0x100, 0x120],
-            ..LineIndex::default()
-        };
+        let index = LineIndex::with_fragments(&[0x100..0x120, 0x120..0x140]);
         assert_eq!(index.function_bounds(0x110), 0x100..0x120);
-        assert_eq!(index.function_bounds(0x120), 0x120..u64::MAX);
+        assert_eq!(index.function_bounds(0x120), 0x120..0x140);
+        assert_eq!(index.function_bounds(0x150), 0x140..u64::MAX);
         assert_eq!(index.function_bounds(0x10), 0..0x100);
+    }
+
+    /// Issue #92: two split functions whose cold parts are laid out back to back in one
+    /// sequence (`G.cold`, then `F.cold`) and share a file and line, with hot parts (and
+    /// entries) elsewhere. `F` also has a `DW_AT_entry_pc` inside its hot part.
+    fn split_functions() -> LineIndex
+    {
+        use super::super::functions::FunctionIndex;
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.rows = vec![(0x1000, 9), (0x1010, 9), (0x1020, 3), (0x1030, 3), (0x1040, 5)];
+        unit.end = 0x1050;
+        unit.functions = vec![
+            ("g", vec![(0x1030, 0x1040), (0x1000, 0x1010)], None),
+            ("f", vec![(0x1040, 0x1050), (0x1010, 0x1020)], Some(0x1048)),
+            ("h", vec![(0x1020, 0x1030)], None),
+        ];
+        let dwarf = write(&[unit]).load();
+        let functions = FunctionIndex::build(&dwarf);
+        assert!(functions.skipped().is_empty(), "{:?}", functions.skipped());
+        LineIndex::build(&dwarf, functions.fragments())
+    }
+
+    /// AC1 (issue #92): adjacent cold fragments that share a file and line each get an
+    /// address from the line map.
+    #[test]
+    fn adjacent_cold_fragments_each_get_an_address()
+    {
+        let lines = split_functions();
+        let file = lines.resolve_file("lib.rs").expect("lib.rs");
+        assert_eq!(lines.lines[file as usize].get(&9), Some(&vec![0x1000, 0x1010]));
+        // `h` follows `F.cold` with another line, and `g`'s hot part repeats line 3.
+        assert_eq!(lines.lines[file as usize].get(&3), Some(&vec![0x1020, 0x1030]));
+    }
+
+    /// AC2 (issue #92): the bounds of an address in a cold fragment are that fragment's,
+    /// and the bytes of a hot part before its `DW_AT_entry_pc` are bounded by the part.
+    #[test]
+    fn function_bounds_of_a_cold_fragment_is_the_fragment()
+    {
+        let lines = split_functions();
+        assert_eq!(lines.function_bounds(0x1004), 0x1000..0x1010);
+        assert_eq!(lines.function_bounds(0x1018), 0x1010..0x1020);
+        assert_eq!(lines.function_bounds(0x1044), 0x1040..0x1050);
+        assert_eq!(lines.function_bounds(0x104c), 0x1040..0x1050);
     }
 }

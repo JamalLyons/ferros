@@ -105,6 +105,46 @@ fn step_enters_the_callee_after_its_prologue()
     });
 }
 
+/// `step` at `call` stops on `inside`, at the same post-prologue pc a breakpoint on
+/// that line gets: the callee is found by its address, not its name.
+fn step_into_stops_after_the_prologue(call: &'static str, inside: &'static str)
+{
+    harness::run(move |t| {
+        let fixture = fixture!("step_targets");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, call);
+        d.step_into().expect("step into the call");
+        stepped(&mut d);
+        assert_eq!(line(&mut d), fixture.marker_line(inside), "stopped in the callee from {call}");
+        let pc = d.read_registers().expect("registers").pc;
+        let bp = d.set_breakpoint(location(&fixture, inside)).expect("callee line");
+        let sites = &d
+            .logical_breakpoints()
+            .iter()
+            .find(|logical| logical.id == bp)
+            .expect("breakpoint")
+            .sites;
+        assert!(
+            sites.iter().any(|site| site.address == pc),
+            "{pc} is not the line's statement address {sites:?}"
+        );
+    });
+}
+
+/// Issue #120 (3): a trait-impl method whose demangled name does not parse as a path.
+#[test]
+fn step_enters_a_trait_method_after_its_prologue()
+{
+    step_into_stops_after_the_prologue("call_trait", "in_trait");
+}
+
+/// Issue #120 (3): a closure whose demangled name does not parse as a path.
+#[test]
+fn step_enters_a_closure_after_its_prologue()
+{
+    step_into_stops_after_the_prologue("call_closure", "in_closure");
+}
+
 #[test]
 fn finish_returns_to_the_caller()
 {

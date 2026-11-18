@@ -120,6 +120,9 @@ struct FunctionCode
 pub(crate) struct FunctionIndex
 {
     functions: Vec<FunctionEntry>,
+    /// Every concrete function by entry, including those whose name does not normalize to
+    /// a path (`path` is then empty): what [`containing`](Self::containing) searches.
+    by_address: Vec<FunctionEntry>,
     by_last: HashMap<String, Vec<usize>>,
     /// Sorted, distinct entry addresses of every indexed function.
     starts: Vec<u64>,
@@ -210,11 +213,11 @@ impl FunctionIndex
         let mut fragments: Vec<Range<u64>> = concrete.iter().flat_map(|(_, code)| code.ranges.iter().cloned()).collect();
         fragments.sort_by_key(|range| (range.start, range.end));
         fragments.dedup();
-        let mut functions: Vec<FunctionEntry> = concrete
+        let mut by_address: Vec<FunctionEntry> = concrete
             .into_iter()
             .filter_map(|(offset, code)| {
                 let name = resolve_name(&names, offset)?;
-                let path = normalize(&name)?;
+                let path = normalize(&name).unwrap_or_default();
                 Some(FunctionEntry {
                     name,
                     path,
@@ -222,6 +225,13 @@ impl FunctionIndex
                     end: code.end,
                 })
             })
+            .collect();
+        by_address.sort_by(|a, b| (a.entry, &a.path, &a.name).cmp(&(b.entry, &b.path, &b.name)));
+        by_address.dedup_by(|a, b| a.entry == b.entry && a.path == b.path);
+        let mut functions: Vec<FunctionEntry> = by_address
+            .iter()
+            .filter(|function| !function.path.is_empty())
+            .cloned()
             .collect();
         functions.sort_by(|a, b| (a.entry, &a.path, &a.name).cmp(&(b.entry, &b.path, &b.name)));
         functions.dedup_by(|a, b| a.entry == b.entry && a.path == b.path);
@@ -235,6 +245,7 @@ impl FunctionIndex
         starts.dedup();
         Self {
             functions,
+            by_address,
             by_last,
             starts,
             fragments,
@@ -259,6 +270,15 @@ impl FunctionIndex
     pub(crate) fn fragments(&self) -> &[Range<u64>]
     {
         &self.fragments
+    }
+
+    /// The function whose entry range (the part holding its entry) contains `address` (a
+    /// file virtual address), whether or not its name parses as a path; the one with the
+    /// latest entry when ranges nest.
+    fn containing(&self, address: u64) -> Option<&FunctionEntry>
+    {
+        let below = self.by_address.partition_point(|function| function.entry <= address);
+        self.by_address[..below].iter().rev().find(|function| address < function.end)
     }
 
     /// Every function matching `query` (see the module documentation), sorted by entry.
@@ -754,16 +774,42 @@ impl BinaryImage
         let lines = self.line_index()?;
         Ok(matches
             .into_iter()
-            .filter_map(|function| {
-                Some(FunctionAddress {
-                    name: function.name.clone(),
-                    path: function.path.join("::"),
-                    entry: self.runtime_address(function.entry)?,
-                    after_prologue: self.runtime_address(after_prologue(lines, function.entry, function.end))?,
-                    end: self.runtime_address(function.end - 1)? + 1,
-                })
-            })
+            .filter_map(|function| self.function_address(lines, function))
             .collect())
+    }
+
+    /// The function whose code holds `address`, found by address rather than by name, so
+    /// trait-impl methods, closures and names shared by several functions are found too.
+    ///
+    /// Only the part of a function that holds its entry counts (for a function split into
+    /// hot and cold parts, an address in the cold part finds nothing). When ranges nest,
+    /// the function with the latest entry at or before `address` wins. Functions that were
+    /// only ever inlined have no code of their own and are not found.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceLookupError::DebugInfo`] when the DWARF sections cannot be loaded.
+    pub fn function_containing(&self, address: Address) -> Result<Option<FunctionAddress>, SourceLookupError>
+    {
+        let Some(file_address) = self.file_address(address) else {
+            return Ok(None);
+        };
+        let lines = self.line_index()?;
+        Ok(self
+            .function_index()?
+            .containing(file_address)
+            .and_then(|function| self.function_address(lines, function)))
+    }
+
+    fn function_address(&self, lines: &LineIndex, function: &FunctionEntry) -> Option<FunctionAddress>
+    {
+        Some(FunctionAddress {
+            name: function.name.clone(),
+            path: function.path.join("::"),
+            entry: self.runtime_address(function.entry)?,
+            after_prologue: self.runtime_address(after_prologue(lines, function.entry, function.end))?,
+            end: self.runtime_address(function.end - 1)? + 1,
+        })
     }
 }
 
@@ -1092,6 +1138,37 @@ mod tests
         }
     }
 
+    /// Issue #120 (3): a function is found by address whatever its name looks like, and
+    /// only through the part of its code that holds its entry.
+    #[test]
+    fn a_function_is_found_by_an_address_in_its_entry_part()
+    {
+        use super::super::lines::synthetic::{TestUnit, write};
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.functions = vec![
+            ("<my_crate::Counter as my_crate::Bump>::bump", vec![(0x1000, 0x1020)], None),
+            ("my_crate::main::{{closure}}", vec![(0x1020, 0x1040)], None),
+            ("split", vec![(0x3000, 0x3040), (0x2000, 0x2010)], None),
+            ("<my_crate::Gate<'<'> as my_crate::Bump>::bump", vec![(0x4000, 0x4010)], None),
+        ];
+        let dwarf = write(&[unit]).load();
+        let index = FunctionIndex::build(&dwarf);
+        assert!(
+            index.lookup("Gate::bump").is_err(),
+            "a bracket in a const argument does not parse as a path"
+        );
+        let name = |address| index.containing(address).map(|function| function.name.as_str());
+        assert_eq!(name(0x1000), Some("<my_crate::Counter as my_crate::Bump>::bump"));
+        assert_eq!(name(0x101c), Some("<my_crate::Counter as my_crate::Bump>::bump"));
+        assert_eq!(name(0x1020), Some("my_crate::main::{{closure}}"));
+        assert_eq!(name(0x3010), Some("split"));
+        assert_eq!(name(0x2004), None, "a cold part is not the entry part");
+        assert_eq!(name(0x4008), Some("<my_crate::Gate<'<'> as my_crate::Bump>::bump"));
+        assert_eq!(name(0x0fff), None);
+        assert_eq!(name(0x1040), None);
+    }
+
     #[test]
     fn lookup_matches_trailing_segments_and_prefers_an_exact_path()
     {
@@ -1117,6 +1194,7 @@ mod tests
         }
         let index = FunctionIndex {
             functions,
+            by_address: Vec::new(),
             by_last,
             starts: Vec::new(),
             fragments: Vec::new(),

@@ -57,8 +57,8 @@ impl Session
     /// Known limits:
     /// - A call is recognised by `BL`/`BLR`; pointer-authenticated calls (`BLRAA` and
     ///   relatives, arm64e only) are stepped into one instruction at a time.
-    /// - Line ranges use every line-table row, not only `is_stmt` rows, so optimised code
-    ///   can stop more often than expected.
+    /// - Only `is_stmt` line-table rows start a line: a step does not stop at a row
+    ///   without it, which belongs to the statement before it.
     /// - The return trap is matched by stack pointer. A callee that unwinds past its
     ///   caller (a caught panic, `longjmp`) never returns there, so the step becomes a
     ///   continue with other threads suspended; interrupt it.
@@ -75,10 +75,9 @@ impl Session
 
     /// Advance the selected thread into a call that has source information.
     ///
-    /// Stops after the callee's prologue. The prologue end comes from looking the callee
-    /// up by name; if that lookup fails (for example an ambiguous name), the call is run
-    /// to its return address as if it had no line information. Calls without line information are run to
-    /// their return address. Other threads stay suspended, with the same blocking,
+    /// Stops after the callee's prologue, found from the function whose code holds the
+    /// callee's first instruction (so trait methods and closures are entered too). Calls
+    /// without line information are run to their return address. Other threads stay suspended, with the same blocking,
     /// stop reporting and no-line fallback policy as [`step_over`](Self::step_over).
     ///
     /// # Errors
@@ -164,7 +163,7 @@ impl Session
     {
         self.symbols
             .image_for_address(pc)
-            .and_then(|image| image.line_at_address(pc).ok().flatten())
+            .and_then(|image| image.statement_at_address(pc).ok().flatten())
             .map_or_else(Vec::new, |line| line.ranges)
     }
 
@@ -351,14 +350,10 @@ impl Session
         }
         if let Some((return_pc, sp)) = plan.call.take() {
             let position = self.position_at(registers.pc, None);
-            let function = self.symbols.image_for_address(registers.pc).and_then(|image| {
-                let name = position.function.as_deref()?;
-                image
-                    .function_addresses(name)
-                    .ok()?
-                    .into_iter()
-                    .find(|function| function.entry <= registers.pc && registers.pc < function.end)
-            });
+            let function = self
+                .symbols
+                .image_for_address(registers.pc)
+                .and_then(|image| image.function_containing(registers.pc).ok().flatten());
             if let Some(function) = function.filter(|_| position.line.is_some()) {
                 plan.prologue_end = Some(function.after_prologue);
             } else {

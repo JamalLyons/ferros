@@ -28,6 +28,14 @@ pub(super) struct HandlerReturn
     request: Option<ResumeRequest>,
 }
 
+impl HandlerReturn
+{
+    pub(super) fn address(&self) -> Address
+    {
+        self.address
+    }
+}
+
 pub(super) struct StepPlan
 {
     current: StepSite,
@@ -147,13 +155,13 @@ impl Session
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
         self.interrupt_requested = false;
+        // An instruction step reports a handler's return like any other stop.
+        self.handler_return = None;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             self.deferred = Some(event);
             return self.enter_running();
         }
         self.stale_step = None;
-        // An instruction step reports a handler's return like any other stop.
-        self.handler_return = None;
         // The stepping thread's held signal is discarded by this step; other threads stay
         // suspended, so a signal carried for them is still held.
         self.carried_signals.retain(|(carried, _)| *carried != thread);

@@ -100,8 +100,9 @@ impl Session
     /// Known limits:
     /// - A call is recognised by `BL`/`BLR`; pointer-authenticated calls (`BLRAA` and
     ///   relatives, arm64e only) are stepped into one instruction at a time.
-    /// - Only `is_stmt` line-table rows start a line: a step does not stop at a row
-    ///   without it, which belongs to the statement before it.
+    /// - Only `is_stmt` line-table rows start a line: the statement being stepped runs
+    ///   on through rows without it that follow it. Leaving that statement's code for
+    ///   another line still stops wherever it lands, statement row or not.
     /// - The return trap is matched by stack pointer. A callee that unwinds past its
     ///   caller through the system unwinder (a panic caught by an outer `catch_unwind`)
     ///   is caught where the unwinder resumes at a landing pad: a landing pad in the
@@ -389,6 +390,18 @@ impl Session
             resuming.steps += 1;
             self.step_instruction(thread)?;
             return Ok(None);
+        }
+        // A user breakpoint on the landing pad's first instruction is that breakpoint's
+        // hit, as on any line-step stop; it must not be stepped over by the continue.
+        if landed
+            && let Some(id) = self.breakpoints.id_for_kind(registers.pc, BreakpointKind::Software)
+            && self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled)
+        {
+            self.release_line_site(plan)?;
+            return Ok(Some(StopEvent::Breakpoint {
+                thread,
+                pc: registers.pc,
+            }));
         }
         if landed && registers.sp >= site.sp {
             self.release_line_site(plan)?;

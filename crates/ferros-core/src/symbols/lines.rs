@@ -414,17 +414,20 @@ impl LineIndex
     }
 
     /// `(file, line)` of each row of `sequence` as a line step sees it: a row that is not
-    /// `is_stmt` takes the key of the closest `is_stmt` row before it, if any. A fragment
-    /// boundary does not carry a statement into the next function.
+    /// `is_stmt` takes the key of the closest `is_stmt` row before it in the same function
+    /// fragment, if any. No statement carries across a fragment boundary.
     fn statement_keys(&self, sequence: &LineSequence) -> Vec<((u32, u32), u32)>
     {
         let mut current: Option<((u32, u32), u32)> = None;
+        let mut fragment = None;
         sequence
             .rows
             .iter()
             .map(|row| {
-                if self.boundaries.binary_search(&row.address).is_ok() {
+                let bounds = self.function_bounds(row.address);
+                if fragment.as_ref() != Some(&bounds) {
                     current = None;
+                    fragment = Some(bounds);
                 }
                 if row.is_stmt {
                     current = Some(((row.file, row.line), row.column));
@@ -1255,6 +1258,19 @@ mod tests
         assert_eq!(index.statement_ranges(sequence, at, 0x100c), vec![0x1008..0x1010]);
         let (_, at) = index.row_at(0x1004).expect("row");
         assert_eq!(index.statement_at(sequence, at).map(|(key, _)| key.1), Some(5));
+
+        // A statement does not carry into the next function's leading non-statement rows,
+        // even with no row exactly at the function's start.
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.rows = vec![(0x2000, 3), (0x200c, 9), (0x2010, 10)];
+        unit.end = 0x2014;
+        unit.non_statements = vec![0x200c];
+        unit.functions = vec![("f", vec![(0x2000, 0x2008)], None), ("g", vec![(0x2008, 0x2014)], None)];
+        let dwarf = write(&[unit]).load();
+        let functions = FunctionIndex::build(&dwarf);
+        let index = LineIndex::build(&dwarf, functions.fragments());
+        let (sequence, at) = index.row_at(0x200c).expect("row");
+        assert_eq!(index.statement_at(sequence, at).map(|(key, _)| key.1), Some(9));
     }
 
     #[test]

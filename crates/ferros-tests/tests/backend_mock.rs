@@ -649,3 +649,71 @@ fn enabling_a_breakpoint_at_a_line_step_site_keeps_it_enabled_and_armed()
     assert!(session.breakpoints()[0].enabled);
     assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
 }
+
+/// Complement the real signal-handler step-resume test with the exact ordering: a user hit, a signal
+/// interrupting the instruction step before it executes, then handler return to
+/// that same pc. This ordering cannot be forced by sending a signal to a stopped
+/// process: the kernel may deliver it after the instruction completes instead. The real
+/// handler test is `tests/stepping.rs::signal_handler_return_does_not_count_the_step_resume_breakpoint`.
+#[test]
+fn signal_during_breakpoint_step_does_not_report_or_count_a_second_hit()
+{
+    use ferros_core::BreakpointRequest;
+    use ferros_core::backend::ThreadAction;
+
+    let thread = ThreadId(1);
+    let address = Address::new(0x1000);
+    let next = address + 4;
+    let mut registers = arm64_registers();
+    registers.pc = address + 16;
+    registers.sp = Address::new(0x8000);
+    let mock = MockBackend::new()
+        .with_thread(thread, registers)
+        .with_region(address, "r-x", vec![0; 64]);
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("scripted-signal-step")).expect("launch mock");
+    let id = session
+        .add_breakpoint(BreakpointRequest::Software { address })
+        .expect("breakpoint");
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint { thread, pc: address })
+            .set_pc(thread, address)
+            .expect_resume(ResumeRequest::continue_all()),
+    );
+    session.resume().expect("run to user hit");
+    assert!(matches!(
+        session.wait(None).expect("wait").expect("stop"),
+        StopEvent::Breakpoint { .. }
+    ));
+    assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
+    mock.script(MockStop::new(StopEvent::Signal { thread, signal: 30 }).expect_resume(ResumeRequest::step(thread)));
+    session.resume().expect("signal interrupts original instruction");
+    assert!(matches!(
+        session.wait(None).expect("wait").expect("stop"),
+        StopEvent::Signal { .. }
+    ));
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint { thread, pc: address })
+            .set_pc(thread, address)
+            .expect_resume(
+                ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(thread, ThreadAction::Continue)
+                    .with_signal(thread, 30),
+            ),
+    );
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread })
+            .set_pc(thread, next)
+            .expect_resume(ResumeRequest::step(thread)),
+    );
+    mock.script(MockStop::new(StopEvent::Interrupted { thread: Some(thread) }).expect_resume(ResumeRequest::continue_all()));
+    session
+        .resume_with_signal()
+        .expect("handler returns, original instruction executes");
+    assert_eq!(
+        session.wait(None).expect("wait").expect("stop"),
+        StopEvent::Interrupted { thread: Some(thread) }
+    );
+    assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
+    assert_eq!(mock.peek_registers(thread).expect("registers").pc, next);
+}

@@ -155,11 +155,16 @@ fn backtrace_in_level_c_lists_the_callers_at_their_call_sites()
     });
 }
 
-/// Below `main` in `nested_calls`, the runtime frames without DWARF (`main` calls through
-/// `std::rt::lang_start_internal`, which std ships without debug info, then the C `main`
-/// shim and dyld's `start`) are named from their image's symbol table: a demangled name,
-/// marked as a symbol-table name, with no source location. The frames named from DWARF
-/// above them are marked as such and keep their locations (issue #104).
+/// Below `main` in `nested_calls`, the runtime frames without DWARF are named from their
+/// image's symbol table: a demangled name, marked as a symbol-table name, with no source
+/// location. The frames named from DWARF are marked as such and keep their locations
+/// (issue #104).
+///
+/// Whether std's frames (`std::rt::lang_start_internal` and the shims around it) carry
+/// DWARF depends on the toolchain and machine, so they may be named either way (issue
+/// #135). dyld's `start` never has DWARF from any Rust toolchain, so it is the frame the
+/// symbol-table naming is checked on for certain. Any frame that does come from a symbol
+/// table under a mangled name must show it demangled.
 #[test]
 fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
 {
@@ -186,26 +191,30 @@ fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
             assert_eq!(symbol.source(), SymbolSource::DebugInfo, "{frame:#?}");
             assert!(frame.location.is_some(), "{frame:#?}");
         }
-        let below: Vec<&StackFrame> = frames[4..]
-            .iter()
-            .filter(|frame| frame.symbol.as_ref().is_some_and(|s| s.source() == SymbolSource::SymbolTable))
-            .collect();
-        for frame in &below {
-            assert_symbol_table_frame(frame);
+        for frame in &frames[4..] {
+            let symbol = frame.symbol.as_ref().expect("a name");
+            match symbol.source() {
+                SymbolSource::DebugInfo => assert!(frame.location.is_some(), "{frame:#?}"),
+                SymbolSource::SymbolTable => {
+                    assert_symbol_table_frame(frame);
+                    // Demangled: `std::rt::lang_start_internal`, not `__ZN3std2rt19...`.
+                    let name = symbol.display_name();
+                    assert!(!name.starts_with("_ZN") && !name.starts_with("__ZN"), "{names:#?}");
+                    if symbol.raw().trim_start_matches('_').starts_with("ZN") {
+                        assert_ne!(name, symbol.raw(), "a mangled name is shown demangled: {frame:#?}");
+                    }
+                }
+            }
         }
-        let below_names: Vec<&str> = below
-            .iter()
-            .filter_map(|frame| frame.symbol.as_ref().map(ferros_core::SymbolName::display_name))
-            .collect();
-        // Demangled: `std::rt::lang_start_internal`, not `__ZN3std2rt19lang_start_internal...`.
-        assert!(
-            below_names
-                .iter()
-                .any(|name| name.starts_with("std::rt::lang_start_internal")),
-            "{names:#?}"
+        // dyld's `start` is the base, and no Rust toolchain ships DWARF for it: it is
+        // certain to be named from the symbol table, demangled (no `_ZN` prefix).
+        let base = frames.last().expect("a base frame");
+        assert_symbol_table_frame(base);
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("start"),
+            "dyld's start is the base: {names:#?}"
         );
-        assert!(below_names.iter().all(|name| !name.starts_with("_ZN")), "{names:#?}");
-        assert_eq!(below_names.last(), Some(&"start"), "dyld's start is the base: {names:#?}");
     });
 }
 

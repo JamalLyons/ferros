@@ -89,8 +89,14 @@ impl Arch for Arm64
     fn call_return_address(&self, pc: Address, instruction: &[u8]) -> Option<Address>
     {
         let word = u32::from_le_bytes(instruction.try_into().ok()?);
-        // BL imm26 and BLR Xn. B/BR and RET do not create a return address.
-        (word & 0xfc00_0000 == 0x9400_0000 || word & 0xffff_fc1f == 0xd63f_0000).then(|| pc + 4)
+        // BL imm26, BLR Xn, the pointer-authenticated BLRAA/BLRAB Xn, Xm and
+        // BLRAAZ/BLRABZ Xn (arm64e). B/BR, their authenticated forms and RET do not
+        // create a return address.
+        let bl = word & 0xfc00_0000 == 0x9400_0000;
+        let blr = word & 0xffff_fc1f == 0xd63f_0000;
+        let blra = word & 0xffff_f800 == 0xd73f_0800;
+        let blraz = word & 0xffff_f81f == 0xd63f_081f;
+        (bl || blr || blra || blraz).then(|| pc + 4)
     }
 
     fn pc(&self, registers: &Registers) -> Address
@@ -186,6 +192,33 @@ mod tests
             assert_eq!(arch.call_return_address(pc, &word.to_le_bytes()), None);
         }
         assert_eq!(arch.call_return_address(pc, &[0x94]), None);
+    }
+
+    /// Issue #120 (4): the arm64e pointer-authenticated calls return to `pc + 4`; their
+    /// branch-only forms (BRAA, BRAAZ, RETAA) are not calls.
+    #[test]
+    fn pointer_authenticated_calls_have_a_return_address()
+    {
+        let arch = Arm64::new();
+        let pc = Address::new(0x1_0000_4000);
+        let calls = [
+            ("BLRAA x16, x17", 0xd73f_0a11_u32),
+            ("BLRAB x8, sp", 0xd73f_0d1f),
+            ("BLRAAZ x16", 0xd63f_0a1f),
+            ("BLRABZ x1", 0xd63f_0c3f),
+        ];
+        for (name, word) in calls {
+            assert_eq!(arch.call_return_address(pc, &word.to_le_bytes()), Some(pc + 4), "{name}");
+        }
+        let branches = [
+            ("BRAA x16, x17", 0xd71f_0a11_u32),
+            ("BRAAZ x16", 0xd61f_0a1f),
+            ("RETAA", 0xd65f_0bff),
+            ("BLR with a nonzero low field", 0xd63f_0201),
+        ];
+        for (name, word) in branches {
+            assert_eq!(arch.call_return_address(pc, &word.to_le_bytes()), None, "{name}");
+        }
     }
 
     #[test]

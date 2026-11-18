@@ -298,6 +298,15 @@ impl Session
         if let BreakpointPayload::Software { original_bytes } = &entry.payload {
             self.backend.write_memory(entry.info.address, original_bytes)?;
         }
+        // With its trap gone, a stopped handler cannot return to it as a rendezvous; a
+        // trap enabled there later counts its hits.
+        if self
+            .handler_return
+            .as_ref()
+            .is_some_and(|pending| pending.address() == entry.info.address)
+        {
+            self.handler_return = None;
+        }
         Ok(())
     }
 

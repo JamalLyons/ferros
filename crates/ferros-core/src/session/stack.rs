@@ -430,7 +430,8 @@ fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Addres
 }
 
 /// Read an image's `nlist` entries and, when it records them, its function starts.
-fn read_symbol_table(backend: &mut dyn Backend, layout: &SymtabLayout) -> std::result::Result<SymbolTable, String>
+pub(super) fn read_symbol_table(backend: &mut dyn Backend, layout: &SymtabLayout)
+-> std::result::Result<SymbolTable, String>
 {
     let (at, size) = layout.nlist_range();
     let nlists = backend
@@ -452,7 +453,7 @@ const MAX_SYMBOL_NAME: usize = 4096;
 /// Read the NUL-terminated string at `strx` of an image's string table, in pages so a
 /// short name near the end of mapped memory still reads. `Ok(None)` for an empty or
 /// non-UTF-8 name, or an index outside the table; `Err` when memory could not be read.
-fn read_symbol_string(
+pub(super) fn read_symbol_string(
     backend: &mut dyn Backend,
     layout: &SymtabLayout,
     strx: u32,

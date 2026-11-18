@@ -14,6 +14,28 @@ pub(super) struct StepSite
     entry: BreakpointEntry,
 }
 
+/// A step-resume whose signal handler stopped before returning (another breakpoint, an
+/// interrupt): the handler's later return to `address` with `sp` is the rendezvous, not a
+/// user hit.
+pub(super) struct HandlerReturn
+{
+    thread: ThreadId,
+    address: Address,
+    sp: Address,
+    /// The continue the user resumed with since the handler stopped (signals removed: they
+    /// were delivered then), reissued after stepping over the original instruction. `None`
+    /// until a plain continue runs the handler on.
+    request: Option<ResumeRequest>,
+}
+
+impl HandlerReturn
+{
+    pub(super) fn address(&self) -> Address
+    {
+        self.address
+    }
+}
+
 pub(super) struct StepPlan
 {
     current: StepSite,
@@ -133,6 +155,8 @@ impl Session
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
         self.interrupt_requested = false;
+        // An instruction step reports a handler's return like any other stop.
+        self.handler_return = None;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             self.deferred = Some(event);
             return self.enter_running();
@@ -237,9 +261,56 @@ impl Session
             }
         };
         match event {
+            Some(event) if self.line_plan.is_none() => self.finish_handler_return(event),
             Some(event) => self.finish_line_step(event),
             None => Ok(None),
         }
+    }
+
+    /// Note the continue `request` for a pending handler return (see `HandlerReturn`).
+    pub(super) fn note_handler_continue(&mut self, request: &ResumeRequest)
+    {
+        if let Some(pending) = &mut self.handler_return {
+            let mut request = request.clone();
+            request.signals.clear();
+            pending.request = Some(request);
+        }
+    }
+
+    /// A breakpoint stop that is a stopped handler's return to its step-resume trap, in the
+    /// frame it interrupted, is consumed: the original instruction is stepped over and the
+    /// user's continue reissued. Any other event is returned.
+    fn finish_handler_return(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
+    {
+        if event.is_terminal() {
+            self.handler_return = None;
+            return Ok(Some(event));
+        }
+        let Some(pending) = &self.handler_return else {
+            return Ok(Some(event));
+        };
+        let StopEvent::Breakpoint { thread, pc } = event else {
+            return Ok(Some(event));
+        };
+        if thread != pending.thread || self.arch()?.pc_after_trap(pc) != pending.address {
+            return Ok(Some(event));
+        }
+        let Some(request) = pending.request.clone() else {
+            return Ok(Some(event));
+        };
+        if self.backend.read_registers(thread)?.sp != pending.sp {
+            return Ok(Some(event));
+        }
+        self.handler_return = None;
+        if self.interrupt_requested {
+            return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
+        }
+        // Other threads' events reported with this stop are the caller's.
+        if let Some(other) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+            return Ok(Some(other));
+        }
+        self.start_continue(request)?;
+        Ok(None)
     }
 
     fn finish_breakpoint_step(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
@@ -261,6 +332,14 @@ impl Session
                 self.start_plan(plan)?;
                 return Ok(None);
             }
+            // The handler stopped before returning. Remember the rendezvous so its later
+            // return to this trap, in this frame, is not reported as a second hit.
+            self.handler_return = Some(HandlerReturn {
+                thread: plan.current.thread,
+                address: plan.current.entry.info.address,
+                sp,
+                request: None,
+            });
             // No instruction step was started, so there can be no stale completion.
             self.abandon(plan, true);
             return Ok(Some(event));

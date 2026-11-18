@@ -105,6 +105,46 @@ fn step_enters_the_callee_after_its_prologue()
     });
 }
 
+/// `step` at `call` stops on `inside`, at the same post-prologue pc a breakpoint on
+/// that line gets: the callee is found by its address, not its name.
+fn step_into_stops_after_the_prologue(call: &'static str, inside: &'static str)
+{
+    harness::run(move |t| {
+        let fixture = fixture!("step_targets");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, call);
+        d.step_into().expect("step into the call");
+        stepped(&mut d);
+        assert_eq!(line(&mut d), fixture.marker_line(inside), "stopped in the callee from {call}");
+        let pc = d.read_registers().expect("registers").pc;
+        let bp = d.set_breakpoint(location(&fixture, inside)).expect("callee line");
+        let sites = &d
+            .logical_breakpoints()
+            .iter()
+            .find(|logical| logical.id == bp)
+            .expect("breakpoint")
+            .sites;
+        assert!(
+            sites.iter().any(|site| site.address == pc),
+            "{pc} is not the line's statement address {sites:?}"
+        );
+    });
+}
+
+/// Issue #120 (3): a trait-impl method whose demangled name does not parse as a path.
+#[test]
+fn step_enters_a_trait_method_after_its_prologue()
+{
+    step_into_stops_after_the_prologue("call_trait", "in_trait");
+}
+
+/// Issue #120 (3): a closure whose demangled name does not parse as a path.
+#[test]
+fn step_enters_a_closure_after_its_prologue()
+{
+    step_into_stops_after_the_prologue("call_closure", "in_closure");
+}
+
 #[test]
 fn finish_returns_to_the_caller()
 {
@@ -251,66 +291,94 @@ fn signal_handler_return_does_not_count_the_step_resume_breakpoint()
     });
 }
 
-/// Complement the real handler test with the exact ordering: a user hit, a signal
-/// interrupting the instruction step before it executes, then handler return to
-/// that same pc. This ordering cannot be forced by sending a signal to a stopped
-/// process: the kernel may deliver it after the instruction completes instead.
+/// Issue #120 (2): the handler of a signal passed at a breakpoint stops at another
+/// breakpoint before it returns. When the user continues, the handler's return to the
+/// original breakpoint's address is the step-resume rendezvous, not a second hit.
 #[test]
-fn signal_during_breakpoint_step_does_not_report_or_count_a_second_hit()
+fn a_handler_stop_during_step_resume_does_not_count_the_return_as_a_hit()
 {
-    use ferros_core::backend::mock::{MockBackend, MockStop, arm64_registers};
-    use ferros_core::backend::{ResumeRequest, ThreadAction};
-    use ferros_core::{Address, BreakpointRequest, LaunchSpec, ThreadId};
+    harness::run(|t| {
+        let fixture = fixture!("signal_handler");
+        let mut d = t.launch_with_args(&fixture, &["--handler-stop"]);
+        d.resume().expect("run to signal");
+        assert!(matches!(stop(&mut d), StopEvent::Signal { signal: 30, .. }));
+        let pc = d.read_registers().expect("signal registers").pc;
+        let id = d
+            .add_breakpoint(ferros_core::BreakpointRequest::Software { address: pc })
+            .expect("break at signal pc");
+        let handler = d.set_breakpoint(location(&fixture, "in_handler")).expect("in handler");
+        let after = d.set_breakpoint(location(&fixture, "after_signal")).expect("after handler");
+        d.resume_with_signal().expect("pass SIGUSR1 through step-resume");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("handler hit").id, handler);
+        d.resume().expect("let the handler return");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("after handler hit").id, after);
+        assert_eq!(d.breakpoint_info(id).expect("original breakpoint").hit_count, 0);
+        d.remove_breakpoint(id).expect("remove original breakpoint");
+        d.delete_breakpoint(handler).expect("remove handler breakpoint");
+        d.delete_breakpoint(after).expect("remove after breakpoint");
+        d.resume().expect("finish");
+        assert_eq!(stop(&mut d), StopEvent::Exited { code: 0 });
+        assert!(d.wait_for_stdout("signal handled: true", TIMEOUT));
+    });
+}
 
-    harness::run(|_| {
-        let thread = ThreadId(1);
-        let address = Address::new(0x1000);
-        let next = address + 4;
-        let mut registers = arm64_registers();
-        registers.pc = address + 16;
-        registers.sp = Address::new(0x8000);
-        let mock = MockBackend::new()
-            .with_thread(thread, registers)
-            .with_region(address, "r-x", vec![0; 64]);
-        let mut session = Session::new(Box::new(mock.clone()));
-        session.launch(&LaunchSpec::new("scripted-signal-step")).expect("launch mock");
-        let id = session
-            .add_breakpoint(BreakpointRequest::Software { address })
-            .expect("breakpoint");
-        mock.script(
-            MockStop::new(StopEvent::Breakpoint { thread, pc: address })
-                .set_pc(thread, address)
-                .expect_resume(ResumeRequest::continue_all()),
+/// Issue #120 (1): `next` over a call whose panic is caught further out never sees the
+/// call return. It stops in the frame that catches it instead of running on.
+#[test]
+fn next_over_a_call_that_unwinds_past_its_caller_stops_in_the_outer_frame()
+{
+    harness::run(|t| {
+        let fixture = fixture!("caught_panic");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, "call_inner");
+        let before = d.stack_trace(64).expect("trace").len();
+        d.step_over().expect("next over a panicking call");
+        stepped(&mut d);
+        let after = d.stack_trace(64).expect("trace").len();
+        assert!(
+            after < before,
+            "stopped in a frame outer than middle ({after} >= {before} frames)"
         );
-        session.resume().expect("run to user hit");
-        assert!(matches!(stop(&mut session), StopEvent::Breakpoint { .. }));
-        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
-        mock.script(MockStop::new(StopEvent::Signal { thread, signal: 30 }).expect_resume(ResumeRequest::step(thread)));
-        session.resume().expect("signal interrupts original instruction");
-        assert!(matches!(stop(&mut session), StopEvent::Signal { .. }));
-        mock.script(
-            MockStop::new(StopEvent::Breakpoint { thread, pc: address })
-                .set_pc(thread, address)
-                .expect_resume(
-                    ResumeRequest::all(ThreadAction::Suspend)
-                        .with_thread(thread, ThreadAction::Continue)
-                        .with_signal(thread, 30),
-                ),
+        assert!(
+            d.breakpoints().is_empty(),
+            "private breakpoints leaked: {:?}",
+            d.breakpoints()
         );
-        mock.script(
-            MockStop::new(StopEvent::SingleStep { thread })
-                .set_pc(thread, next)
-                .expect_resume(ResumeRequest::step(thread)),
+        let at = d.set_breakpoint(location(&fixture, "after_catch")).expect("after catch");
+        d.resume().expect("continue");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("hit").id, at);
+        d.delete_breakpoint(at).expect("remove");
+        d.resume().expect("finish");
+        assert_eq!(stop(&mut d), StopEvent::Exited { code: 0 });
+        assert!(d.wait_for_stdout("caught panic: true", TIMEOUT));
+    });
+}
+
+/// Issue #120 (1): `finish` from a frame that unwinds past its caller stops in the frame
+/// that catches it.
+#[test]
+fn finish_from_a_frame_that_unwinds_stops_in_the_outer_frame()
+{
+    harness::run(|t| {
+        let fixture = fixture!("caught_panic");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, "in_inner");
+        let before = d.stack_trace(64).expect("trace").len();
+        d.step_out().expect("finish from a panicking frame");
+        stepped(&mut d);
+        let after = d.stack_trace(64).expect("trace").len();
+        assert!(
+            after + 1 < before,
+            "stopped in a frame outer than middle ({after} vs {before} frames)"
         );
-        mock.script(
-            MockStop::new(StopEvent::Interrupted { thread: Some(thread) }).expect_resume(ResumeRequest::continue_all()),
+        assert!(
+            d.breakpoints().is_empty(),
+            "private breakpoints leaked: {:?}",
+            d.breakpoints()
         );
-        session
-            .resume_with_signal()
-            .expect("handler returns, original instruction executes");
-        assert_eq!(stop(&mut session), StopEvent::Interrupted { thread: Some(thread) });
-        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
-        assert_eq!(mock.peek_registers(thread).expect("registers").pc, next);
     });
 }
 

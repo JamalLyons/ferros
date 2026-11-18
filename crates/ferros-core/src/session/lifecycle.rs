@@ -170,8 +170,14 @@ impl Session
     /// whole handler with the other threads suspended, so the breakpoint is not counted
     /// again when the handler returns. A handler that waits for another thread blocks
     /// until interrupted. If the handler stops before returning (another breakpoint, an
-    /// interrupt), the original breakpoint stays armed and its address is counted as a
-    /// hit when the handler later returns to it.
+    /// interrupt), the original breakpoint stays armed; when a later `resume` or
+    /// `resume_with_signal` lets the handler return to it in the frame it interrupted,
+    /// that return is not reported or counted: the original instruction is executed and
+    /// the continue goes on. A `step_instruction` or source step started after the
+    /// handler stopped gives this up, and so does removing or disabling that breakpoint;
+    /// the return is then reported as a hit. A handler that never returns (it leaves by
+    /// `siglongjmp`) leaves that one rendezvous pending: the thread's next arrival at the
+    /// breakpoint in the same frame, under a continue, is taken for it.
     ///
     /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
     /// because another stop cut its step-over sequence short (the signal is still held),
@@ -200,6 +206,7 @@ impl Session
             self.deferred = Some(event);
         } else {
             self.stale_step = None;
+            self.note_handler_continue(&request);
             self.start_continue(request)?;
         }
         self.state = SessionState::Running;
@@ -227,7 +234,8 @@ impl Session
                 // A step plan or a source step may already have an internal stop queued, in
                 // which case the backend does not deliver another; remember the request so
                 // that stop ends the operation instead of starting the next instruction.
-                self.interrupt_requested = self.step_plan.is_some() || self.line_plan.is_some();
+                self.interrupt_requested =
+                    self.step_plan.is_some() || self.line_plan.is_some() || self.handler_return.is_some();
                 Ok(())
             }
             SessionState::NotStarted | SessionState::Exited => Err(DebuggerError::NotAttached),

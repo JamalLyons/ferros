@@ -413,6 +413,45 @@ impl LineIndex
         }
     }
 
+    /// `(file, line)` of each row of `sequence` as a line step sees it: a row that is not
+    /// `is_stmt` takes the key of the closest `is_stmt` row before it in the same function
+    /// fragment, if any. No statement carries across a fragment boundary.
+    fn statement_keys(&self, sequence: &LineSequence) -> Vec<((u32, u32), u32)>
+    {
+        let mut current: Option<((u32, u32), u32)> = None;
+        let mut fragment = None;
+        sequence
+            .rows
+            .iter()
+            .map(|row| {
+                let bounds = self.function_bounds(row.address);
+                if fragment.as_ref() != Some(&bounds) {
+                    current = None;
+                    fragment = Some(bounds);
+                }
+                if row.is_stmt {
+                    current = Some(((row.file, row.line), row.column));
+                }
+                current.unwrap_or(((row.file, row.line), row.column))
+            })
+            .collect()
+    }
+
+    /// The statement key and column of row `at` of `sequence` (see
+    /// [`statement_keys`](Self::statement_keys)); `None` for line 0.
+    fn statement_at(&self, sequence: &LineSequence, at: usize) -> Option<((u32, u32), u32)>
+    {
+        let (key, column) = self.statement_keys(sequence)[at];
+        (key.1 != 0).then_some((key, column))
+    }
+
+    /// The ranges of row `at`'s statement within the function fragment of `address`.
+    fn statement_ranges(&self, sequence: &LineSequence, at: usize, address: u64) -> Vec<Range<u64>>
+    {
+        let keys: Vec<(u32, u32)> = self.statement_keys(sequence).into_iter().map(|(key, _)| key).collect();
+        line_ranges(sequence, &keys, keys[at], self.function_bounds(address))
+    }
+
     /// The sequence and row index whose `[row, next row)` range contains `address`.
     pub(crate) fn row_at(&self, address: u64) -> Option<(&LineSequence, usize)>
     {
@@ -625,27 +664,13 @@ impl BinaryImage
         if row.line == 0 {
             return Ok(None);
         }
-        let function = index.function_bounds(file_address);
-        let mut ranges: Vec<Range<u64>> = Vec::new();
-        for pair in sequence.rows.windows(2) {
-            let (start, next) = (pair[0], pair[1]);
-            if start.file != row.file
-                || start.line != row.line
-                || start.address >= next.address
-                || !function.contains(&start.address)
-            {
-                continue;
-            }
-            let end = next.address.min(function.end);
-            match ranges.last_mut() {
-                Some(last) if last.end == start.address => last.end = end,
-                _ => ranges.push(start.address..end),
-            }
-        }
-        let ranges = ranges
-            .into_iter()
-            .filter_map(|range| Some(self.runtime_address(range.start)?..self.runtime_address(range.end - 1)? + 1))
-            .collect();
+        let keys: Vec<(u32, u32)> = sequence.rows.iter().map(|row| (row.file, row.line)).collect();
+        let ranges = self.runtime_ranges(line_ranges(
+            sequence,
+            &keys,
+            (row.file, row.line),
+            index.function_bounds(file_address),
+        ));
         Ok(Some(AddressLine {
             file: index.files[row.file as usize].clone(),
             line: row.line,
@@ -653,6 +678,68 @@ impl BinaryImage
             ranges,
         }))
     }
+
+    /// The statement containing `address`, for choosing where a source-line step stops.
+    ///
+    /// Like [`line_at_address`](Self::line_at_address), except that only `is_stmt` rows
+    /// start a line: a row without `is_stmt` (optimised code interleaving the
+    /// instructions of several lines) belongs to the line of the closest `is_stmt` row
+    /// before it in its sequence, so a step does not stop there. A sequence that starts
+    /// with rows that are not statements keeps their own lines until its first statement.
+    /// The reported `line` and `ranges` are that statement's; `column` is the statement
+    /// row's.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceLookupError::DebugInfo`] when the DWARF sections cannot be loaded.
+    pub fn statement_at_address(&self, address: Address) -> Result<Option<AddressLine>, SourceLookupError>
+    {
+        let Some(file_address) = self.file_address(address) else {
+            return Ok(None);
+        };
+        let index = self.line_index()?;
+        let Some((sequence, at)) = index.row_at(file_address) else {
+            return Ok(None);
+        };
+        let Some((key, column)) = index.statement_at(sequence, at) else {
+            return Ok(None);
+        };
+        let ranges = self.runtime_ranges(index.statement_ranges(sequence, at, file_address));
+        Ok(Some(AddressLine {
+            file: index.files[key.0 as usize].clone(),
+            line: key.1,
+            column: (column != 0).then_some(column),
+            ranges,
+        }))
+    }
+
+    /// File virtual ranges as runtime ranges; a range outside the image is dropped.
+    fn runtime_ranges(&self, ranges: Vec<Range<u64>>) -> Vec<Range<Address>>
+    {
+        ranges
+            .into_iter()
+            .filter_map(|range| Some(self.runtime_address(range.start)?..self.runtime_address(range.end - 1)? + 1))
+            .collect()
+    }
+}
+
+/// Every `[start, end)` of `sequence` whose row has key `key` (by `keys`, one per row),
+/// within `function`, adjacent ranges merged, sorted by start.
+fn line_ranges(sequence: &LineSequence, keys: &[(u32, u32)], key: (u32, u32), function: Range<u64>) -> Vec<Range<u64>>
+{
+    let mut ranges: Vec<Range<u64>> = Vec::new();
+    for (at, pair) in sequence.rows.windows(2).enumerate() {
+        let (start, next) = (pair[0], pair[1]);
+        if keys[at] != key || start.address >= next.address || !function.contains(&start.address) {
+            continue;
+        }
+        let end = next.address.min(function.end);
+        match ranges.last_mut() {
+            Some(last) if last.end == start.address => last.end = end,
+            _ => ranges.push(start.address..end),
+        }
+    }
+    ranges
 }
 
 /// The skips of the line and function indexes together, sorted and distinct: a unit that
@@ -714,6 +801,8 @@ pub(crate) mod synthetic
         pub(crate) end: u64,
         /// More sequences `(rows, end)` in the same file, written after the first.
         pub(crate) more_sequences: Vec<(Vec<(u64, u64)>, u64)>,
+        /// Row addresses (of any sequence) written without `is_stmt`.
+        pub(crate) non_statements: Vec<u64>,
         /// Subprograms of the unit.
         pub(crate) functions: Vec<TestFunction>,
         /// Extra attributes `(function name, attribute, value)` set on a subprogram after
@@ -735,6 +824,7 @@ pub(crate) mod synthetic
                 rows: Vec::new(),
                 end: 0,
                 more_sequences: Vec::new(),
+                non_statements: Vec::new(),
                 functions: Vec::new(),
                 attributes: Vec::new(),
             }
@@ -773,7 +863,7 @@ pub(crate) mod synthetic
                     row.address_offset = address - base;
                     row.file = file;
                     row.line = line;
-                    row.is_statement = true;
+                    row.is_statement = !spec.non_statements.contains(&address);
                     line_program.generate_row();
                 }
                 line_program.end_sequence(end - base);
@@ -1133,6 +1223,54 @@ mod tests
         let mut lines = vec![BTreeMap::new()];
         index_statements(&mut lines, &sequence, &[0x0, 0x8]);
         assert_eq!(lines[0].get(&5), Some(&vec![0x4, 0x8, 0x30]));
+    }
+
+    /// Issue #120 (5): rows without `is_stmt` do not start a line for a step. Line 5 at
+    /// 0x1000 is interleaved with a non-statement row of line 7 (0x1004); line 6 at 0x1008
+    /// is followed by a non-statement row of line 5 (0x100c). A step from line 5 runs
+    /// through 0x1004 and stops at 0x1008, and 0x100c belongs to line 6's statement.
+    #[test]
+    fn a_line_step_ignores_rows_that_are_not_statements()
+    {
+        use super::super::functions::FunctionIndex;
+
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.rows = vec![(0x1000, 5), (0x1004, 7), (0x1008, 6), (0x100c, 5), (0x1010, 8)];
+        unit.end = 0x1014;
+        unit.non_statements = vec![0x1004, 0x100c];
+        unit.functions = vec![("f", vec![(0x1000, 0x1014)], None)];
+        let dwarf = write(&[unit]).load();
+        let functions = FunctionIndex::build(&dwarf);
+        let index = LineIndex::build(&dwarf, functions.fragments());
+        let (sequence, at) = index.row_at(0x1000).expect("row");
+        assert!(!sequence.rows[1].is_stmt, "the writer emits non-statement rows");
+
+        // Every row: the display line splits line 5 at 0x1004 ...
+        let keys: Vec<(u32, u32)> = sequence.rows.iter().map(|row| (row.file, row.line)).collect();
+        assert_eq!(
+            line_ranges(sequence, &keys, keys[at], index.function_bounds(0x1000)),
+            vec![0x1000..0x1004, 0x100c..0x1010]
+        );
+        // ... statements only: line 5 runs on through the line-7 row to line 6.
+        assert_eq!(index.statement_ranges(sequence, at, 0x1000), vec![0x1000..0x1008]);
+        let (_, at) = index.row_at(0x100c).expect("row");
+        assert_eq!(index.statement_at(sequence, at).map(|(key, _)| key.1), Some(6));
+        assert_eq!(index.statement_ranges(sequence, at, 0x100c), vec![0x1008..0x1010]);
+        let (_, at) = index.row_at(0x1004).expect("row");
+        assert_eq!(index.statement_at(sequence, at).map(|(key, _)| key.1), Some(5));
+
+        // A statement does not carry into the next function's leading non-statement rows,
+        // even with no row exactly at the function's start.
+        let mut unit = TestUnit::new("/w", "src/lib.rs");
+        unit.rows = vec![(0x2000, 3), (0x200c, 9), (0x2010, 10)];
+        unit.end = 0x2014;
+        unit.non_statements = vec![0x200c];
+        unit.functions = vec![("f", vec![(0x2000, 0x2008)], None), ("g", vec![(0x2008, 0x2014)], None)];
+        let dwarf = write(&[unit]).load();
+        let functions = FunctionIndex::build(&dwarf);
+        let index = LineIndex::build(&dwarf, functions.fragments());
+        let (sequence, at) = index.row_at(0x200c).expect("row");
+        assert_eq!(index.statement_at(sequence, at).map(|(key, _)| key.1), Some(9));
     }
 
     #[test]

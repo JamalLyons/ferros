@@ -23,6 +23,7 @@ use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 fn all_fixtures() -> Vec<Fixture>
 {
     vec![
+        fixture!("caught_panic"),
         fixture!("exit_code"),
         fixture!("hello"),
         fixture!("hot_loop"),
@@ -34,6 +35,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("signal_tracing"),
         fixture!("spawn_thread"),
         fixture!("step_races"),
+        fixture!("step_targets"),
         fixture!("symbols"),
         fixture!("thread_signals"),
         fixture!("threads"),
@@ -140,11 +142,17 @@ fn enclosing_function(source: &str, line: u32) -> String
 
 /// Last path segment of a demangled name, generic arguments removed:
 /// `<crate::Counter>::bump` -> `bump`, `crate::generic_identity::<u64>` -> `generic_identity`.
+/// A char literal argument (`Gate<'<'>`) is skipped whole, so its bracket is not counted.
 fn last_segment(name: &str) -> String
 {
     let mut depth = 0_usize;
     let mut plain = String::new();
-    for c in name.chars() {
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            chars.by_ref().take_while(|&next| next != '\'').for_each(drop);
+            continue;
+        }
         match c {
             '<' => depth += 1,
             '>' => depth = depth.saturating_sub(1),
@@ -160,13 +168,17 @@ fn last_segment(name: &str) -> String
         .to_owned()
 }
 
-/// Whether any frame (inlined ones included) of `address` belongs to function `function`.
+/// Whether any frame (inlined ones included) of `address` belongs to function `function`,
+/// directly or through a closure defined in it (`function::{closure#0}`).
 fn in_function(image: &BinaryImage, address: Address, function: &str) -> bool
 {
     image.symbolicate(address).is_some_and(|result| {
         result.frames.iter().any(|frame| {
             let raw = frame.symbol.raw();
-            let name = rustc_demangle::try_demangle(raw).map_or_else(|_| raw.to_owned(), |name| format!("{name:#}"));
+            let mut name = rustc_demangle::try_demangle(raw).map_or_else(|_| raw.to_owned(), |name| format!("{name:#}"));
+            while let Some(outer) = name.strip_suffix('}').and_then(|rest| rest.rsplit_once("::{closure")) {
+                name = outer.0.to_owned();
+            }
             last_segment(&name) == function
         })
     })

@@ -115,3 +115,35 @@ fn planted_trap_is_executed_once_the_target_runs()
         }
     });
 }
+
+/// A write the backend refuses changes nothing: `Backend::write_memory` is all or
+/// nothing (issue #133), which the session's trap rollback relies on. The write starts
+/// in the last bytes of the code region that holds `tick` and runs past its end, so part
+/// of it would land in the region's own (read-only, code) page.
+#[test]
+fn refused_write_across_a_code_region_end_leaves_memory_unchanged()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch(&fixture);
+        let tick = function_address(d.session_mut(), &fixture, "tick");
+        let region = backend(&mut d)
+            .memory_regions()
+            .expect("memory regions")
+            .into_iter()
+            .find(|region| region.start <= tick && tick < region.end)
+            .expect("the region of tick");
+        assert!(region.permissions.contains('x'), "{region:?}");
+        let tail = Address::from(region.end.value() - 2);
+        let before = backend(&mut d).read_memory(tail, 2).expect("read the region's last bytes");
+        backend(&mut d)
+            .write_memory(tail, &TRAP)
+            .expect_err("a write past the region end is refused");
+        assert_eq!(backend(&mut d).read_memory(tail, 2).expect("read again"), before);
+        // A write inside the region still succeeds and can be undone.
+        let original = backend(&mut d).read_memory(tick, TRAP.len()).expect("read tick");
+        backend(&mut d).write_memory(tick, &TRAP).expect("plant a trap");
+        assert_eq!(backend(&mut d).read_memory(tick, TRAP.len()).unwrap(), TRAP);
+        backend(&mut d).write_memory(tick, &original).expect("restore tick");
+    });
+}

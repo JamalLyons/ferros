@@ -101,7 +101,7 @@ use crate::error::MachError;
 use crate::exception::{
     self, ExceptionLoopCommand, ExceptionSharedState, LoopEvent, ReplyFaultInjector, SavedExceptionPorts, lock_shared,
 };
-use crate::memory::{MemoryCache, MemoryProtectionGuard, get_memory_regions, write_memory};
+use crate::memory::{MemoryCache, get_memory_regions, write_memory_all_or_nothing};
 #[cfg(target_arch = "aarch64")]
 use crate::registers::{read_registers_arm64, write_registers_arm64};
 #[cfg(target_arch = "x86_64")]
@@ -1502,24 +1502,10 @@ impl MacOSBackend
         Ok(())
     }
 
-    /// Write `data` at `address`, making a read-only page writable for the write if needed.
+    /// Write `data` at `address`, all or nothing (see [`write_memory_all_or_nothing`]).
     fn write_target_memory(&mut self, address: Address, data: &[u8]) -> Result<()>
     {
-        let result = match write_memory(self.task, address, data) {
-            Ok(_) => Ok(()),
-            Err(first) => {
-                // Code pages are not writable: make the range writable, write, and let the
-                // guard restore the original protection.
-                tracing::debug!(
-                    "Direct write at 0x{:016x} failed ({first}); retrying with the page made writable",
-                    address.value()
-                );
-                let guard = MemoryProtectionGuard::make_writable(self.task, address, data.len())?;
-                let written = write_memory(self.task, address, data);
-                drop(guard);
-                written.map(|_| ())
-            }
-        };
+        let result = write_memory_all_or_nothing(self.task, address, data);
         self.memory_cache.invalidate_range(address, data.len());
         result
     }

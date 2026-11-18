@@ -34,7 +34,7 @@ use libc::{mach_port_t, thread_act_t};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
 
-use crate::memory::{MemoryProtectionGuard, read_memory, write_memory};
+use crate::memory::{read_memory, write_memory, write_memory_all_or_nothing};
 
 /// `brk #0`, the same trap the engine plants for software breakpoints.
 const BRK: [u8; 4] = [0x00, 0x00, 0x20, 0xD4];
@@ -521,16 +521,7 @@ impl BirthPolicy
 
 fn patch(task: mach_port_t, address: u64, bytes: &[u8; 4]) -> Result<(), String>
 {
-    let at = Address::from(address);
-    match write_memory(task, at, bytes) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let guard = MemoryProtectionGuard::make_writable(task, at, bytes.len()).map_err(|err| err.to_string())?;
-            let result = write_memory(task, at, bytes).map(|_| ());
-            drop(guard);
-            result.map_err(|err| err.to_string())
-        }
-    }
+    write_memory_all_or_nothing(task, Address::from(address), bytes).map_err(|err| err.to_string())
 }
 
 /// Where a read or write of `len` bytes at `address` covers the 4-byte trap at `site`:

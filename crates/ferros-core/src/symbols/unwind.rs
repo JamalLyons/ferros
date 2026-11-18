@@ -1548,6 +1548,124 @@ mod tests
         );
     }
 
+    /// Link-time and load address of [`cfi_image`]'s `__TEXT`, and the one function its
+    /// `__eh_frame` describes: CFA `x29 + 16`, `x29` at CFA - 16, `x30` at CFA - 8.
+    const CFI_BASE: u64 = 0x1_0000_0000;
+    const CFI_FUNCTION: u64 = CFI_BASE + 0x1000;
+
+    /// An arm64 Mach-O with `__eh_frame` and no `__unwind_info` (so CFI is used), plus
+    /// placeholder DWARF sections so loading it looks for no dSYM.
+    fn cfi_image() -> Vec<u8>
+    {
+        fn u32s(bytes: &mut Vec<u8>, values: &[u32])
+        {
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        fn name(bytes: &mut Vec<u8>, name: &str)
+        {
+            let mut field = [0u8; 16];
+            field[..name.len()].copy_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&field);
+        }
+        const EH_FRAME: u64 = 0x400;
+        const DEBUG: u64 = 0x500;
+        const FILE_SIZE: u64 = 0x600;
+
+        let mut eh_frame = Vec::new();
+        // CIE `zR`, pcrel|sdata4 pointers, code alignment 4, data alignment -8, RA x30,
+        // initial rule CFA = sp.
+        u32s(&mut eh_frame, &[20, 0]);
+        eh_frame.extend_from_slice(&[1, b'z', b'R', 0, 4, 0x78, 30, 1, 0x1b, 0x0c, 31, 0, 0, 0, 0, 0]);
+        // FDE at offset 24 for [CFI_FUNCTION, +0x100).
+        let pc_begin_field = CFI_BASE + EH_FRAME + 24 + 8;
+        let pc_begin = i32::try_from(CFI_FUNCTION.cast_signed() - pc_begin_field.cast_signed()).unwrap();
+        u32s(&mut eh_frame, &[20, 28, pc_begin.cast_unsigned(), 0x100]);
+        // def_cfa x29, 16; offset x30 at cfa - 8; offset x29 at cfa - 16.
+        eh_frame.extend_from_slice(&[0, 0x0c, 29, 16, 0x9e, 1, 0x9d, 2]);
+        u32s(&mut eh_frame, &[0]);
+
+        let sections = [
+            ("__eh_frame", EH_FRAME, eh_frame.len() as u64),
+            ("__debug_info", DEBUG, 8),
+            ("__debug_abbrev", DEBUG + 8, 8),
+            ("__debug_line", DEBUG + 16, 8),
+        ];
+        let command_size = 72 + 80 * sections.len() as u32;
+        let mut bytes = Vec::new();
+        // MH_MAGIC_64, CPU_TYPE_ARM64, subtype, MH_EXECUTE, ncmds, sizeofcmds, flags, reserved.
+        u32s(&mut bytes, &[0xfeed_facf, 0x0100_000c, 0, 2, 1, command_size, 0, 0]);
+        u32s(&mut bytes, &[0x19, command_size]); // LC_SEGMENT_64
+        name(&mut bytes, "__TEXT");
+        for value in [CFI_BASE, 0x1_0000, 0, FILE_SIZE] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        u32s(&mut bytes, &[5, 5, sections.len() as u32, 0]);
+        for (section, offset, size) in sections {
+            name(&mut bytes, section);
+            name(&mut bytes, "__TEXT");
+            bytes.extend_from_slice(&(CFI_BASE + offset).to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            u32s(&mut bytes, &[offset as u32, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        bytes.resize(EH_FRAME as usize, 0);
+        bytes.extend_from_slice(&eh_frame);
+        bytes.resize(DEBUG as usize, 0);
+        bytes.extend_from_slice(&[0xaa; 24]);
+        bytes.resize(FILE_SIZE as usize, 0);
+        bytes
+    }
+
+    #[test]
+    fn after_an_alternate_stack_signal_frame_a_cfi_step_must_grow_sp()
+    {
+        // Issue #134: the interrupted frame (sp 0x2000) is in a function with CFI whose row
+        // restores sp 0x1f10 (x29 0x1f00 + 16), below the interrupted sp. The frame record
+        // and return address it reads are valid, so only `accept`'s sp check ends the trace.
+        let path = std::env::temp_dir().join(format!("ferros-unwind-cfi-sp-{}.macho", std::process::id()));
+        std::fs::write(&path, cfi_image()).expect("write synthetic image");
+        let mut symbols = SymbolCache::with_debug_info_options(crate::symbols::DebugInfoOptions {
+            dsymutil: None,
+            ..crate::symbols::DebugInfoOptions::default()
+        });
+        let loaded = symbols.load_image(crate::symbols::ImageDescriptor {
+            path: path.clone(),
+            load_address: CFI_BASE,
+        });
+        let _ = std::fs::remove_file(&path);
+        loaded.expect("load synthetic image");
+
+        let mut memory = alternate_signal_stack();
+        let mcontext = 0x9110 + sigframe::MCONTEXT;
+        let interrupted_pc = CFI_FUNCTION + 0x10;
+        memory.words.insert(mcontext + sigframe::SS_PC, interrupted_pc);
+        memory.words.insert(mcontext + sigframe::SS_FP, 0x1f00);
+        memory.words.insert(0x1f00, 0);
+        memory.words.insert(0x1f08, 0x4000_0300);
+        let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
+            .expect("unwind");
+        let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+        assert_eq!(pcs, [0x4000_0000, 0x5000_0044, interrupted_pc]);
+        assert_eq!(frames[2].sp, Address::new(0x2000));
+
+        // The rejected step is the CFI row, not the frame-pointer fallback.
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let interrupted = Cursor {
+            regs: regs(interrupted_pc, 0x2000, 0x1f00, 0x4000_0aa0),
+            known: ALL_GENERAL,
+            is_caller: false,
+        };
+        let image = symbols.image_for_address(Address::new(interrupted_pc)).expect("image");
+        let row = unwinder
+            .scan_cfi_step(&image, &interrupted, Address::new(interrupted_pc))
+            .expect("a CFI step");
+        assert_eq!(row.next.sp, Address::new(0x1f10));
+        assert_eq!(row.status, FrameStatus::Complete);
+        assert!(unwinder.accept(&interrupted, row).is_none());
+    }
+
     #[test]
     fn indirect_calls_are_recognized()
     {

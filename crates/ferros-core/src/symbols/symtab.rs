@@ -310,6 +310,12 @@ impl SymbolTable
         self
     }
 
+    /// Every symbol, `(runtime address, string table index)`, sorted by address.
+    pub(crate) fn symbols(&self) -> impl Iterator<Item = (Address, u32)> + '_
+    {
+        self.symbols.iter().map(|&(address, strx)| (Address::new(address), strx))
+    }
+
     /// The string table index of the nearest symbol at or before `address` in the same
     /// executable section, or `None` when `address` is outside the executable sections,
     /// no symbol precedes it there, or (with function starts) a function starts after

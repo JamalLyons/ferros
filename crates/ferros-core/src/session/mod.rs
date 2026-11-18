@@ -120,6 +120,7 @@ pub struct Session
     step_plan: Option<stepping::StepPlan>,
     line_plan: Option<line_stepping::LinePlan>,
     handler_return: Option<stepping::HandlerReturn>,
+    unwinder: Option<line_stepping::Unwinder>,
     interrupt_requested: bool,
     /// A backend `wait` error met while `resume` drove a step-over, returned by the
     /// next `wait`.
@@ -290,6 +291,7 @@ impl Session
             step_plan: None,
             line_plan: None,
             handler_return: None,
+            unwinder: None,
             interrupt_requested: false,
             deferred_error: None,
             stale_step: None,
@@ -422,6 +424,7 @@ impl Session
         self.step_plan = None;
         self.line_plan = None;
         self.handler_return = None;
+        self.unwinder = None;
         self.interrupt_requested = false;
         self.deferred_error = None;
         self.stale_step = None;

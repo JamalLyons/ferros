@@ -324,6 +324,64 @@ fn a_handler_stop_during_step_resume_does_not_count_the_return_as_a_hit()
     });
 }
 
+/// Issue #120 (1): `next` over a call whose panic is caught further out never sees the
+/// call return. It stops in the frame that catches it instead of running on.
+#[test]
+fn next_over_a_call_that_unwinds_past_its_caller_stops_in_the_outer_frame()
+{
+    harness::run(|t| {
+        let fixture = fixture!("caught_panic");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, "call_inner");
+        let before = d.stack_trace(64).expect("trace").len();
+        d.step_over().expect("next over a panicking call");
+        stepped(&mut d);
+        let after = d.stack_trace(64).expect("trace").len();
+        assert!(
+            after < before,
+            "stopped in a frame outer than middle ({after} >= {before} frames)"
+        );
+        assert!(
+            d.breakpoints().is_empty(),
+            "private breakpoints leaked: {:?}",
+            d.breakpoints()
+        );
+        let at = d.set_breakpoint(location(&fixture, "after_catch")).expect("after catch");
+        d.resume().expect("continue");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("hit").id, at);
+        d.delete_breakpoint(at).expect("remove");
+        d.resume().expect("finish");
+        assert_eq!(stop(&mut d), StopEvent::Exited { code: 0 });
+        assert!(d.wait_for_stdout("caught panic: true", TIMEOUT));
+    });
+}
+
+/// Issue #120 (1): `finish` from a frame that unwinds past its caller stops in the frame
+/// that catches it.
+#[test]
+fn finish_from_a_frame_that_unwinds_stops_in_the_outer_frame()
+{
+    harness::run(|t| {
+        let fixture = fixture!("caught_panic");
+        let mut d = t.launch(&fixture);
+        start(&mut d, &fixture, "in_inner");
+        let before = d.stack_trace(64).expect("trace").len();
+        d.step_out().expect("finish from a panicking frame");
+        stepped(&mut d);
+        let after = d.stack_trace(64).expect("trace").len();
+        assert!(
+            after + 1 < before,
+            "stopped in a frame outer than middle ({after} vs {before} frames)"
+        );
+        assert!(
+            d.breakpoints().is_empty(),
+            "private breakpoints leaked: {:?}",
+            d.breakpoints()
+        );
+    });
+}
+
 #[test]
 fn next_through_the_return_from_main_eventually_reports_exit()
 {

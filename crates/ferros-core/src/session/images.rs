@@ -95,6 +95,11 @@ impl SessionImage
     {
         self.descriptor.load_address
     }
+
+    pub(super) fn descriptor_path(&self) -> &std::path::Path
+    {
+        &self.descriptor.path
+    }
 }
 
 impl Session

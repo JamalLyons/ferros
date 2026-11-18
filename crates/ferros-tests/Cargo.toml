@@ -118,3 +118,8 @@ test = false
 name = "ferros-fixture-step_targets"
 path = "fixtures/step_targets.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-caught_panic"
+path = "fixtures/caught_panic.rs"
+test = false

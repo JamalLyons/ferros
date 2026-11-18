@@ -404,6 +404,16 @@ fn write_restoring(
             );
             Err(error)
         }
+        // The restore can put the bytes back and still fail, as when the cache flush is
+        // what failed the first write too: memory then holds its original bytes.
+        Err(rollback) if read_memory(task, addr, before.len()).is_ok_and(|now| now == before) => {
+            tracing::warn!(
+                "a failed write at 0x{:016x} had changed memory; the original bytes are back, but restoring them reported: \
+                 {rollback}",
+                addr.value()
+            );
+            Err(error)
+        }
         Err(rollback) => Err(DebuggerError::Io(Error::other(format!(
             "{error}; restoring the original {} bytes at 0x{:016x} also failed ({rollback}), so that memory may be partly \
              written",
@@ -1111,6 +1121,23 @@ mod tests
         assert!(message.contains("injected failure"), "{message}");
         assert!(message.contains("partly written"), "{message}");
         assert_eq!(target.bytes(), [9; 4]);
+    }
+
+    #[test]
+    fn rollback_that_restored_the_bytes_but_failed_reports_only_the_write_error()
+    {
+        // Both the write and its restore change memory and then fail, like a cache flush
+        // failing after each `vm_write`.
+        let target = Target::new();
+        let addr = target.address();
+        let result = write_restoring(task(), addr, &[9; 4], |task, addr, data| {
+            write_memory(task, addr, data)?;
+            Err(failure())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("injected failure"), "{message}");
+        assert!(!message.contains("partly written"), "{message}");
+        assert_eq!(target.bytes(), [1, 2, 3, 4]);
     }
 
     #[test]

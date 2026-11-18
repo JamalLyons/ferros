@@ -170,8 +170,11 @@ impl Session
     /// whole handler with the other threads suspended, so the breakpoint is not counted
     /// again when the handler returns. A handler that waits for another thread blocks
     /// until interrupted. If the handler stops before returning (another breakpoint, an
-    /// interrupt), the original breakpoint stays armed and its address is counted as a
-    /// hit when the handler later returns to it.
+    /// interrupt), the original breakpoint stays armed; when a later `resume` or
+    /// `resume_with_signal` lets the handler return to it in the frame it interrupted,
+    /// that return is not reported or counted: the original instruction is executed and
+    /// the continue goes on. A `step_instruction` or source step started after the
+    /// handler stopped gives this up, so the return is then reported as a hit.
     ///
     /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
     /// because another stop cut its step-over sequence short (the signal is still held),
@@ -200,6 +203,7 @@ impl Session
             self.deferred = Some(event);
         } else {
             self.stale_step = None;
+            self.note_handler_continue(&request);
             self.start_continue(request)?;
         }
         self.state = SessionState::Running;

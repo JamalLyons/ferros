@@ -119,6 +119,7 @@ pub struct Session
     deferred: Option<StopEvent>,
     step_plan: Option<stepping::StepPlan>,
     line_plan: Option<line_stepping::LinePlan>,
+    handler_return: Option<stepping::HandlerReturn>,
     interrupt_requested: bool,
     /// A backend `wait` error met while `resume` drove a step-over, returned by the
     /// next `wait`.
@@ -288,6 +289,7 @@ impl Session
             deferred: None,
             step_plan: None,
             line_plan: None,
+            handler_return: None,
             interrupt_requested: false,
             deferred_error: None,
             stale_step: None,
@@ -419,6 +421,7 @@ impl Session
         self.deferred = None;
         self.step_plan = None;
         self.line_plan = None;
+        self.handler_return = None;
         self.interrupt_requested = false;
         self.deferred_error = None;
         self.stale_step = None;

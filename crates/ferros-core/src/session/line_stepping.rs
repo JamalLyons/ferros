@@ -123,6 +123,8 @@ impl Session
             }
         }
         self.stale_step = None;
+        // A source step reports a stopped handler's return like any other stop.
+        self.handler_return = None;
         self.carried_signals.retain(|(carried, _)| *carried != thread);
         let registers = self.backend.read_registers(thread)?;
         let position = self.position_at(registers.pc, None);

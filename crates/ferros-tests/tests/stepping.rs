@@ -291,6 +291,39 @@ fn signal_handler_return_does_not_count_the_step_resume_breakpoint()
     });
 }
 
+/// Issue #120 (2): the handler of a signal passed at a breakpoint stops at another
+/// breakpoint before it returns. When the user continues, the handler's return to the
+/// original breakpoint's address is the step-resume rendezvous, not a second hit.
+#[test]
+fn a_handler_stop_during_step_resume_does_not_count_the_return_as_a_hit()
+{
+    harness::run(|t| {
+        let fixture = fixture!("signal_handler");
+        let mut d = t.launch_with_args(&fixture, &["--handler-stop"]);
+        d.resume().expect("run to signal");
+        assert!(matches!(stop(&mut d), StopEvent::Signal { signal: 30, .. }));
+        let pc = d.read_registers().expect("signal registers").pc;
+        let id = d
+            .add_breakpoint(ferros_core::BreakpointRequest::Software { address: pc })
+            .expect("break at signal pc");
+        let handler = d.set_breakpoint(location(&fixture, "in_handler")).expect("in handler");
+        let after = d.set_breakpoint(location(&fixture, "after_signal")).expect("after handler");
+        d.resume_with_signal().expect("pass SIGUSR1 through step-resume");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("handler hit").id, handler);
+        d.resume().expect("let the handler return");
+        assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
+        assert_eq!(d.breakpoint_hit().expect("after handler hit").id, after);
+        assert_eq!(d.breakpoint_info(id).expect("original breakpoint").hit_count, 0);
+        d.remove_breakpoint(id).expect("remove original breakpoint");
+        d.delete_breakpoint(handler).expect("remove handler breakpoint");
+        d.delete_breakpoint(after).expect("remove after breakpoint");
+        d.resume().expect("finish");
+        assert_eq!(stop(&mut d), StopEvent::Exited { code: 0 });
+        assert!(d.wait_for_stdout("signal handled: true", TIMEOUT));
+    });
+}
+
 #[test]
 fn next_through_the_return_from_main_eventually_reports_exit()
 {

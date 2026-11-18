@@ -3,6 +3,9 @@
 //! With `--step-resume`, raises SIGUSR1 at itself and stops after the handler
 //! (marker `after_signal`).
 //!
+//! With `--handler-stop`, the same, but the handler is `on_sigusr1` (marker
+//! `in_handler`), so a breakpoint can stop the handler before it returns.
+//!
 //! With `--interrupt`, installs `on_sigusr1` for SIGUSR1 and spins forever in `spin` on
 //! one line with no calls (marker `spin_line`, called from `main` at `call_spin`), so a
 //! SIGUSR1 sent from outside interrupts `spin` on that line. The handler is a named,
@@ -16,6 +19,12 @@
 fn main()
 {
     if std::env::args().any(|arg| arg == "--step-resume") {
+        ferros_macos::diagnostics::install_sigusr1_observer().expect("install SIGUSR1 handler");
+        signal_roundtrip();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--handler-stop") {
+        ferros_macos::diagnostics::install_sigusr1_handler(on_sigusr1).expect("install SIGUSR1 handler");
         signal_roundtrip();
         return;
     }
@@ -46,9 +55,8 @@ fn main() {}
 fn signal_roundtrip()
 {
     use ferros_macos::diagnostics;
-    diagnostics::install_sigusr1_observer().expect("install SIGUSR1 handler");
     diagnostics::raise_sigusr1().expect("raise SIGUSR1");
-    let handled = std::hint::black_box(diagnostics::sigusr1_observed()); // BREAK: after_signal
+    let handled = std::hint::black_box(diagnostics::sigusr1_observed() || HANDLED.load(Ordering::SeqCst)); // BREAK: after_signal
     println!("signal handled: {handled}");
 }
 
@@ -74,4 +82,12 @@ fn spin() -> !
 extern "C" fn on_sigusr1(signal: i32)
 {
     let _ = std::hint::black_box(signal); // BREAK: in_handler
+    HANDLED.store(true, Ordering::SeqCst);
 }
+
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by `on_sigusr1`.
+#[cfg(target_os = "macos")]
+static HANDLED: AtomicBool = AtomicBool::new(false);

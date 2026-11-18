@@ -565,3 +565,87 @@ fn failed_step_rearm_disables_every_logical_owner()
     assert!(session.breakpoints().iter().all(|bp| bp.enabled));
     assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
 }
+
+const STACK: Address = Address::new(0x7_0000_0000);
+const CALLEE: Address = Address::new(0x1_0000_0000);
+
+/// A process stopped in a frame whose return address is `BREAKPOINT`: frame pointer and
+/// stack pointer at `STACK`, which holds saved fp 0 and saved lr `BREAKPOINT`.
+fn returning_to_breakpoint() -> MockBackend
+{
+    let mut stack = vec![0u8; 32];
+    stack[8..16].copy_from_slice(&BREAKPOINT.value().to_le_bytes());
+    MockBackend::new()
+        .with_thread(THREAD, in_callee(arm64_registers()))
+        .with_region(CALLEE, "r-x", vec![0x1F; 64])
+        .with_region(STACK, "rw-", stack)
+}
+
+fn in_callee(mut registers: ferros_core::Registers) -> ferros_core::Registers
+{
+    registers.pc = CALLEE;
+    registers.fp = STACK;
+    registers.sp = STACK;
+    registers
+}
+
+/// `step_out` from the callee, with the next stop scripted as the return trap.
+fn step_out_to_breakpoint(mock: &MockBackend, session: &mut Session)
+{
+    let caller = session.stack_trace(8).unwrap()[1].clone();
+    assert_eq!(caller.pc, BREAKPOINT);
+    let mut at_return = session.read_registers_for(THREAD).unwrap();
+    at_return.pc = BREAKPOINT;
+    at_return.sp = caller.sp;
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: BREAKPOINT,
+        })
+        .set_registers(THREAD, at_return),
+    );
+    session.step_out().unwrap();
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+}
+
+#[test]
+fn enabling_a_breakpoint_at_a_line_step_site_keeps_it_enabled_and_armed()
+{
+    // Issue #133: a line step puts a temporary trap on a disabled site and disables the
+    // site again when the step ends. The session is running for the whole step, so
+    // enabling a logical breakpoint there is refused and the release cannot undo it.
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let id = session.set_breakpoint(BreakpointLocation::Address(BREAKPOINT)).unwrap();
+    session.disable_logical_breakpoint(id).unwrap();
+    step_out_to_breakpoint(&mock, &mut session);
+    assert!(matches!(
+        session.enable_logical_breakpoint(id),
+        Err(ferros_core::DebuggerError::NotStopped)
+    ));
+    assert_eq!(session.wait(None).unwrap(), Some(StopEvent::SingleStep { thread: THREAD }));
+    assert!(!session.logical_breakpoints()[0].enabled);
+    assert_eq!(session.logical_breakpoints()[0].hit_count, 0);
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(vec![0x1F; 4]));
+
+    // Enabled once the step has stopped, it is armed; the next line step through the
+    // site reports the hit and leaves it enabled and armed.
+    session.enable_logical_breakpoint(id).unwrap();
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    let back = in_callee(session.read_registers_for(THREAD).unwrap());
+    session.write_registers_for(THREAD, &back).unwrap();
+    step_out_to_breakpoint(&mock, &mut session);
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: BREAKPOINT
+        })
+    );
+    assert!(session.logical_breakpoints()[0].enabled);
+    assert_eq!(session.logical_breakpoints()[0].hit_count, 1);
+    assert!(session.breakpoints()[0].enabled);
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+}

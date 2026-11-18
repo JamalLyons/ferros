@@ -302,6 +302,13 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
     if data.is_empty() {
         return Ok(0);
     }
+    let Ok(count) = mach_msg_type_number_t::try_from(data.len()) else {
+        return Err(DebuggerError::InvalidArgument(format!(
+            "a write of {} bytes at 0x{:016x} is larger than vm_write accepts",
+            data.len(),
+            addr.value()
+        )));
+    };
 
     ensure_range(task, addr, data.len())?;
 
@@ -310,7 +317,7 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
             task as vm_map_t,
             addr.value() as vm_address_t,
             data.as_ptr() as vm_offset_t,
-            data.len() as mach_msg_type_number_t,
+            count,
         );
 
         if result != KERN_SUCCESS {
@@ -323,6 +330,97 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
 
     flush_caches(task, addr, data.len())?;
     Ok(data.len())
+}
+
+/// Write `data` at `addr`, all or nothing, making a read-only page writable if needed.
+///
+/// A direct [`write_memory`] is tried first. Code pages are not writable, so if it fails
+/// the range is made writable with a [`MemoryProtectionGuard`], written, and the guard
+/// restores the original protection.
+///
+/// ## All or nothing
+///
+/// This is what `Backend::write_memory` promises the engine, which rolls back its own
+/// multi-site trap updates assuming a failed write changed nothing (issue #133). Most
+/// failures happen before any byte is written: an unmapped range, a range that crosses
+/// a region boundary (checked first), or a refused protection change. But `vm_write`
+/// can succeed and the cache flush after it fail, which leaves memory changed. So the
+/// bytes in the range are read before the write; if the write fails and memory no
+/// longer holds them, they are written back the same way and the original error is
+/// returned.
+///
+/// The guarantee has two limits, both reported rather than hidden: a range that cannot
+/// be read beforehand gets no rollback, and if the rollback itself fails the error says
+/// that memory may be partly written.
+pub fn write_memory_all_or_nothing(task: mach_port_t, addr: Address, data: &[u8]) -> Result<()>
+{
+    write_restoring(task, addr, data, write_with_protection)
+}
+
+/// [`write_memory`], retried with the range made writable when the direct write fails.
+fn write_with_protection(task: mach_port_t, addr: Address, data: &[u8]) -> Result<()>
+{
+    match write_memory(task, addr, data) {
+        Ok(_) => Ok(()),
+        Err(first) => {
+            tracing::debug!(
+                "Direct write at 0x{:016x} failed ({first}); retrying with the page made writable",
+                addr.value()
+            );
+            let guard = MemoryProtectionGuard::make_writable(task, addr, data.len())?;
+            let written = write_memory(task, addr, data);
+            drop(guard);
+            written.map(|_| ())
+        }
+    }
+}
+
+/// Run `write`, and if it fails, put back the bytes the range held before it (see
+/// [`write_memory_all_or_nothing`]).
+fn write_restoring(
+    task: mach_port_t,
+    addr: Address,
+    data: &[u8],
+    mut write: impl FnMut(mach_port_t, Address, &[u8]) -> Result<()>,
+) -> Result<()>
+{
+    let before = read_memory(task, addr, data.len())
+        .ok()
+        .filter(|before| before.len() == data.len());
+    let Err(error) = write(task, addr, data) else {
+        return Ok(());
+    };
+    let Some(before) = before else {
+        return Err(error);
+    };
+    if read_memory(task, addr, before.len()).is_ok_and(|now| now == before) {
+        return Err(error);
+    }
+    match write(task, addr, &before) {
+        Ok(()) => {
+            tracing::warn!(
+                "a failed write at 0x{:016x} had changed memory; the original bytes were restored",
+                addr.value()
+            );
+            Err(error)
+        }
+        // The restore can put the bytes back and still fail, as when the cache flush is
+        // what failed the first write too: memory then holds its original bytes.
+        Err(rollback) if read_memory(task, addr, before.len()).is_ok_and(|now| now == before) => {
+            tracing::warn!(
+                "a failed write at 0x{:016x} had changed memory; the original bytes are back, but restoring them reported: \
+                 {rollback}",
+                addr.value()
+            );
+            Err(error)
+        }
+        Err(rollback) => Err(DebuggerError::Io(Error::other(format!(
+            "{error}; restoring the original {} bytes at 0x{:016x} also failed ({rollback}), so that memory may be partly \
+             written",
+            before.len(),
+            addr.value()
+        )))),
+    }
 }
 
 /// Write back data and invalidate instructions cached for `len` bytes at `addr`.
@@ -929,4 +1027,125 @@ fn aligned_range(addr: Address, len: usize) -> (mach_vm_address_t, mach_vm_size_
     let aligned_start = start & !(page_size - 1);
     let aligned_end = (end + page_size - 1) & !(page_size - 1);
     (aligned_start, aligned_end - aligned_start)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests
+{
+    use std::cell::{Cell, UnsafeCell};
+
+    use mach2::traps::mach_task_self;
+
+    use super::*;
+
+    fn task() -> mach_port_t
+    {
+        // SAFETY: returns this process's own task port; no resource is acquired.
+        unsafe { mach_task_self() }
+    }
+
+    /// Bytes of this process that the kernel writes through its task port.
+    struct Target(UnsafeCell<[u8; 4]>);
+
+    impl Target
+    {
+        fn new() -> Self
+        {
+            Self(UnsafeCell::new([1, 2, 3, 4]))
+        }
+
+        fn address(&self) -> Address
+        {
+            Address::from(self.0.get() as u64)
+        }
+
+        fn bytes(&self) -> [u8; 4]
+        {
+            // SAFETY: the pointer is valid and aligned; no reference to the bytes exists
+            // while `vm_write` changes them behind Rust's back.
+            unsafe { self.0.get().read_volatile() }
+        }
+    }
+
+    fn failure() -> DebuggerError
+    {
+        DebuggerError::Io(Error::other("injected failure"))
+    }
+
+    #[test]
+    fn write_that_changed_memory_before_failing_is_rolled_back()
+    {
+        // Issue #133: `vm_write` succeeded and the cache flush after it failed.
+        let target = Target::new();
+        let addr = target.address();
+        let calls = Cell::new(0);
+        let result = write_restoring(task(), addr, &[9; 4], |task, addr, data| {
+            calls.set(calls.get() + 1);
+            write_memory(task, addr, data)?;
+            if calls.get() == 1 { Err(failure()) } else { Ok(()) }
+        });
+        assert!(result.unwrap_err().to_string().contains("injected failure"));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(target.bytes(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn failed_write_that_changed_nothing_is_not_written_again()
+    {
+        let target = Target::new();
+        let addr = target.address();
+        let calls = Cell::new(0);
+        let result = write_restoring(task(), addr, &[9; 4], |_, _, _| {
+            calls.set(calls.get() + 1);
+            Err(failure())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(target.bytes(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn failed_rollback_reports_memory_may_be_partly_written()
+    {
+        let target = Target::new();
+        let addr = target.address();
+        let calls = Cell::new(0);
+        let result = write_restoring(task(), addr, &[9; 4], |task, addr, data| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                write_memory(task, addr, data)?;
+            }
+            Err(failure())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("injected failure"), "{message}");
+        assert!(message.contains("partly written"), "{message}");
+        assert_eq!(target.bytes(), [9; 4]);
+    }
+
+    #[test]
+    fn rollback_that_restored_the_bytes_but_failed_reports_only_the_write_error()
+    {
+        // Both the write and its restore change memory and then fail, like a cache flush
+        // failing after each `vm_write`.
+        let target = Target::new();
+        let addr = target.address();
+        let result = write_restoring(task(), addr, &[9; 4], |task, addr, data| {
+            write_memory(task, addr, data)?;
+            Err(failure())
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("injected failure"), "{message}");
+        assert!(!message.contains("partly written"), "{message}");
+        assert_eq!(target.bytes(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn successful_write_changes_memory_once()
+    {
+        let target = Target::new();
+        let addr = target.address();
+        write_memory_all_or_nothing(task(), addr, &[5, 6, 7, 8]).unwrap();
+        assert_eq!(target.bytes(), [5, 6, 7, 8]);
+    }
 }

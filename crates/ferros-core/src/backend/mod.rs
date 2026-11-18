@@ -354,6 +354,12 @@ pub trait Backend: Send
 
     /// Write `data` at `address`, all or nothing.
     ///
+    /// On an error, memory in the range is what it was before the call: no byte of `data`
+    /// was written, or every byte written was put back. The session relies on this to roll
+    /// back multi-site trap updates by rewriting only the sites whose writes succeeded. A
+    /// backend that cannot undo a partial write must say so in the error message: the
+    /// session cannot detect or repair such memory.
+    ///
     /// Must succeed on mapped pages that are not writable (such as code): the backend
     /// temporarily adjusts and then restores the protection, because the engine uses this
     /// call to plant trap instructions.

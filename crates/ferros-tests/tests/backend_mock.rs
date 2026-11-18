@@ -501,6 +501,35 @@ fn failed_logical_release_rollback_reports_unarmed_owners_disabled()
 }
 
 #[test]
+fn failed_resume_rearm_disables_every_logical_owner()
+{
+    // Issue #134: the re-arm after a failed `backend.resume` in `start_plan`.
+    let (_image, mock, mut session, _) = multi_site_session();
+    session.set_breakpoint(BreakpointLocation::Address(BREAKPOINT)).unwrap();
+    let unaffected = session.set_breakpoint(BreakpointLocation::Address(SECOND_SITE)).unwrap();
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: BREAKPOINT,
+        })
+        .set_pc(THREAD, BREAKPOINT),
+    );
+    session.resume().unwrap();
+    session.wait(None).unwrap();
+    mock.fail_next(MockCallKind::Resume, BackendError::PermissionDenied("resume refused".into()));
+    // First write restores the original instruction; the second is the re-arm.
+    mock.fail_on_nth(MockCallKind::WriteMemory, 2, write_error());
+    let result = session.step_instruction(THREAD);
+    assert!(matches!(result, Err(ferros_core::DebuggerError::Backend(error)) if error == write_error()));
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(vec![0x1F; 4]));
+    assert!(!session.breakpoints()[0].enabled);
+    for breakpoint in session.logical_breakpoints() {
+        assert_eq!(breakpoint.enabled, breakpoint.id == unaffected);
+    }
+}
+
+#[test]
 fn failed_step_rearm_disables_every_logical_owner()
 {
     let (_image, mock, mut session, _) = multi_site_session();

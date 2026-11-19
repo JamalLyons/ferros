@@ -84,8 +84,8 @@ impl ReplCommand for Continue
          stopped: breakpoint <id> at <address> (thread <tid>), then '<function> at <file>:<line>' and the \
          source line when known\n  stopped: signal <number> (thread <tid>)\n  \
          stopped: interrupted\n  process exited with status <code>\n  process killed by signal <number>\nA \
-         signal the program stopped for is passed on to it, except SIGINT (2). Ctrl-C while the program \
-         runs interrupts it and returns to the prompt."
+         signal the program stopped for is passed on to it, except SIGINT (2) and SIGTSTP (18). Ctrl-C while the program \
+         runs interrupts it and returns to the prompt; Ctrl-Z interrupts it, then suspends ferros."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult

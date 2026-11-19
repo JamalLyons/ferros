@@ -551,3 +551,162 @@ fn sigint_sent_directly_to_the_debuggee_remains_a_signal_stop()
         end_with_ctrl_d(&mut ferros, &tag);
     });
 }
+
+/// Ctrl-Z typed at a terminal.
+const CTRL_Z: &[u8] = b"\x1a";
+
+/// The `ps` state letters of `pid` (`T` means stopped), or `None` once it is gone.
+fn process_state(pid: u32) -> Option<String>
+{
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "state=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .expect("run ps");
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!state.is_empty()).then_some(state)
+}
+
+/// Wait until `ps` reports `pid` in a state starting with `letter`.
+fn wait_for_state(pid: u32, letter: char, text: impl Fn() -> String)
+{
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let state = process_state(pid);
+        if state.as_deref().is_some_and(|state| state.starts_with(letter)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let what = format!("process {pid} is {state:?}, not {letter}");
+            panic!("{what} after {STEP_TIMEOUT:?}; terminal output:\n{}", text());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Ctrl-Z while `continue` runs stops the program as well as ferros (issue #122).
+///
+/// The terminal sends `SIGTSTP` only to ferros's foreground group. Ferros interrupts the
+/// program, prints the stop, then stops itself. `SIGCONT` stands in for the shell's `fg`
+/// (the pty has no shell). Afterwards the program is still stopped: it prints no more
+/// ticks, and `status` shows the interrupt.
+#[test]
+fn ctrl_z_while_the_program_runs_stops_it_then_ferros()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
+        let pid = ferros.child.process_id().expect("ferros pid");
+
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_Z);
+        ferros.expect("stopped: interrupted");
+        ferros.expect("ferros suspended");
+        wait_for_state(pid, 'T', || ferros.text());
+
+        // The program does not run while ferros is suspended.
+        let before = ferros.text().matches("tick: ").count();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            ferros.text().matches("tick: ").count(),
+            before,
+            "the program kept running while ferros was suspended:\n{}",
+            ferros.text()
+        );
+
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-CONT", &pid.to_string()])
+            .status()
+            .expect("send SIGCONT");
+        assert!(status.success(), "kill -CONT failed: {status}");
+        ferros.expect(PROMPT);
+        ferros.type_line("status");
+        ferros.expect("status: stopped (pid ");
+        ferros.expect("stopped: interrupted");
+        ferros.expect(PROMPT);
+        thread::sleep(Duration::from_millis(100));
+        let text = ferros.text();
+        assert_eq!(text.matches("tick: ").count(), before, "fg resumed the program:\n{text}");
+
+        // The session goes on: `continue` runs the program again, Ctrl-C stops it.
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: interrupted");
+        ferros.expect(PROMPT);
+        end_with_ctrl_d(&mut ferros, &tag);
+    });
+}
+
+/// `launch --terminal`: the program reads a line typed at the terminal, and the prompt
+/// works at the next stop (issue #122).
+#[test]
+fn terminal_mode_gives_the_program_typed_input()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let fixture = fixture!("read_line");
+        let mut ferros = PtyFerros::launch_with(&tag, &fixture, &scratch, &["--terminal"], &[]);
+
+        ferros.type_line("continue");
+        // Wait until the program blocks in its read with the terminal in the foreground.
+        thread::sleep(Duration::from_millis(500));
+        ferros.type_line("typed at the terminal");
+        ferros.expect("read: typed at the terminal");
+        ferros.expect("process exited with status 0");
+        ferros.expect(PROMPT);
+
+        ferros.type_line("status");
+        ferros.expect("status: exited");
+        ferros.expect(PROMPT);
+        let text = ferros.text();
+        assert!(!text.contains("stopped: signal 21"), "the program got SIGTTIN:\n{text}");
+        end_with_ctrl_d(&mut ferros, &tag);
+    });
+}
+
+/// `launch --terminal`: the line editor works at a stop in the middle of the run, and
+/// Ctrl-C typed while the program runs reaches it as a signal stop.
+#[test]
+fn terminal_mode_returns_the_terminal_at_each_stop()
+{
+    run(|t| {
+        let tag = t.tag();
+        let scratch = Scratch::new();
+        let mut ferros = PtyFerros::launch_with(
+            &tag,
+            &fixture!("loop_counter"),
+            &scratch,
+            &["--terminal"],
+            &["100000", "--progress"],
+        );
+
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: signal 2 ");
+        ferros.expect(PROMPT);
+        // The line editor has the terminal again: a key typed now is edited by it.
+        ferros.type_keys(b"bogus");
+        ferros.expect("bogus");
+        ferros.type_keys(CTRL_C);
+        ferros.expect(PROMPT);
+        ferros.type_line("status");
+        ferros.expect("stopped: signal 2 ");
+        ferros.expect(PROMPT);
+
+        // `continue` does not pass the SIGINT on, so the program keeps counting.
+        ferros.type_line("continue");
+        ferros.expect("tick: ");
+        ferros.type_keys(CTRL_C);
+        ferros.expect("stopped: signal 2 ");
+        ferros.expect(PROMPT);
+        let text = ferros.text();
+        assert!(!text.contains("process killed"), "the program died:\n{text}");
+        assert!(!text.contains("unknown command 'bogus"), "the discarded line ran:\n{text}");
+        end_with_ctrl_d(&mut ferros, &tag);
+    });
+}

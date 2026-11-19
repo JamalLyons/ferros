@@ -43,15 +43,51 @@ pub fn function_address(session: &mut Session, fixture: &Fixture, name: &str) ->
 {
     static ADDRESSES: OnceLock<Mutex<HashMap<(PathBuf, String), u64>>> = OnceLock::new();
 
+    let key = (fixture.path().to_path_buf(), name.to_owned());
+    let addresses = ADDRESSES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut addresses = addresses.lock().unwrap_or_else(PoisonError::into_inner);
+    let file_address = *addresses.entry(key).or_insert_with(|| symbol_address(fixture, name));
+    drop(addresses);
+    runtime_address(session, fixture, name, file_address)
+}
+
+/// Runtime address of the text symbol whose raw (unmangled) name is `symbol`, such as
+/// `"_frameless_spill"` for a function written in assembly or C, which
+/// [`function_address`] cannot name.
+///
+/// # Panics
+///
+/// As [`function_address`].
+pub fn raw_symbol_address(session: &mut Session, fixture: &Fixture, symbol: &str) -> Address
+{
+    let path = fixture.path();
+    let data = std::fs::read(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let file = object::File::parse(&*data).unwrap_or_else(|err| panic!("parse {}: {err}", path.display()));
+    let mut addresses: Vec<u64> = file
+        .symbols()
+        .filter(|candidate| candidate.kind() == SymbolKind::Text && candidate.is_definition())
+        .filter(|candidate| candidate.name() == Ok(symbol))
+        .map(|candidate| candidate.address())
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let [file_address] = addresses.as_slice() else {
+        panic!(
+            "expected one text symbol named {symbol} in {}, found {addresses:#x?}",
+            path.display()
+        );
+    };
+    runtime_address(session, fixture, symbol, *file_address)
+}
+
+/// `file_address` in the fixture's main executable, translated to its runtime address.
+fn runtime_address(session: &mut Session, fixture: &Fixture, name: &str, file_address: u64) -> Address
+{
     let images = session.images().expect("images");
     let main = images
         .iter()
         .find(|image| image.path == fixture.path())
         .expect("the main executable image");
-    let key = (fixture.path().to_path_buf(), name.to_owned());
-    let addresses = ADDRESSES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut addresses = addresses.lock().unwrap_or_else(PoisonError::into_inner);
-    let file_address = *addresses.entry(key).or_insert_with(|| symbol_address(fixture, name));
     session
         .runtime_address(main, file_address)
         .expect("image mapping")

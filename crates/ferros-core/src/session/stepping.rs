@@ -135,7 +135,9 @@ impl Session
     ///
     /// Requires a stopped process. A pending event defers the step exactly as for
     /// [`resume`](Self::resume): the session becomes running, and the next
-    /// [`wait`](Self::wait) returns that event without executing an instruction.
+    /// [`wait`](Self::wait) returns that event without executing an instruction. A
+    /// pending breakpoint stop at an address that no longer holds a trap is dropped
+    /// as for `resume`.
     /// At an enabled software breakpoint its original instruction is executed and the
     /// trap is restored before the stop is returned. Completion is reported as
     /// [`StopEvent::SingleStep`]; other events are reported normally. A held signal
@@ -157,7 +159,7 @@ impl Session
         self.interrupt_requested = false;
         // An instruction step reports a handler's return like any other stop.
         self.handler_return = None;
-        if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+        if let Some(event) = self.pending_event()? {
             self.deferred = Some(event);
             return self.enter_running();
         }
@@ -183,6 +185,21 @@ impl Session
         self.state = SessionState::Running;
         self.last_stop = None;
         Ok(())
+    }
+
+    /// An event still queued from the last stop, taken without blocking, for `resume`
+    /// and `step_instruction`. A breakpoint stop of a private trap that is gone (see
+    /// `stale_trap`) belongs to no request of the caller and is dropped; the thread has
+    /// not executed the instruction there yet, so the resume runs it. Draining goes on
+    /// until a reportable event or nothing is left.
+    pub(super) fn pending_event(&mut self) -> Result<Option<StopEvent>>
+    {
+        while let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+            if !self.stale_trap(None, &event)? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
 
     /// `Backend::wait`, minus the `SingleStep` of an abandoned internal step (see

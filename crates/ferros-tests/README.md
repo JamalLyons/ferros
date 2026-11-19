@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines fifteen fixture binaries:
+The crate defines eighteen fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -18,6 +18,13 @@ The crate defines fifteen fixture binaries:
   Markers `call_a`, `call_b` and `call_c` sit on the call lines, for backtrace call-site checks.
   `leaf_mix` is a frameless leaf (compact unwind `MODE_FRAMELESS`, no `__eh_frame` FDE) called
   from `main` at marker `call_leaf`.
+- `ferros-fixture-frameless_stack`: Before `main`, a dyld initializer `_frameless_caller` calls
+  `_frameless_spill`, a leaf with a 32-byte stack allocation and an epilogue (compact unwind
+  `MODE_FRAMELESS`, encoding `0x02002000`, no `__eh_frame` FDE). Both are assembly from
+  `fixtures/asm/frameless_stack.s`, assembled and linked into this fixture only by `build.rs`
+  (rustc gives such Rust leaves DWARF CFI in a debug build). Used for a backtrace stopped
+  after the epilogue released the stack (issue #130). Find them with
+  `ferros_tests::symbols::raw_symbol_address`.
 - `ferros-fixture-recursion`: `descend` recurses to the depth given by the first argument (default 60);
   marker `bottom` is reached at the deepest call. Used for deep backtraces.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
@@ -158,7 +165,8 @@ fn resume_runs_hello()
   call-site lines from the `nested_calls` `call_*` markers, a stop on a function's first instruction,
   a spawned thread's trace ending at its base, a 60-level `recursion` trace under one second, and
   every frame pc in an executable region, an inlined frame in `symbols`, and a stop inside the
-  frameless `leaf_mix`.
+  frameless `leaf_mix`, and a stop on the `add sp` and the `ret` of the
+  frameless `_frameless_spill` with a stack allocation (issue #130).
 - `tests/code_writes.rs` checks that code the backend writes is what the target executes next
   (issue #80): a `brk` planted over an instruction the `hot_loop` threads have cached stops them.
 - `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit

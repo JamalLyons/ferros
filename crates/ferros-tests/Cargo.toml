@@ -123,3 +123,8 @@ test = false
 name = "ferros-fixture-caught_panic"
 path = "fixtures/caught_panic.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-frameless_stack"
+path = "fixtures/frameless_stack.rs"
+test = false

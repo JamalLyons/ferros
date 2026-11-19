@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ferros_core::{Address, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
 use ferros_tests::harness::{self, TestContext};
-use ferros_tests::symbols::{function_address, marker_address};
+use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
 use ferros_tests::{Fixture, fixture};
 
@@ -759,5 +759,55 @@ fn backtrace_after_the_epilogue_of_a_frame_function_keeps_its_caller()
         assert!(frames.len() >= 2, "the caller of `_main` is missing: {frames:#?}");
         assert_eq!(frames[1].pc, start, "the caller is dyld's `start` at the call: {frames:#?}");
         assert_eq!(frames[0].sp, frames[1].sp, "the epilogue released the frame");
+    });
+}
+
+/// `bl <label>`.
+fn is_branch_with_link(insn: u32) -> bool
+{
+    insn & 0xFC00_0000 == 0x9400_0000
+}
+
+/// `frameless_spill` of `frameless_stack` is a leaf with a 32-byte stack allocation and no
+/// frame record (compact unwind `MODE_FRAMELESS`, stack size 32, no FDE), called from the
+/// initializer `frameless_caller`. Stopped on its `add sp` the allocation is still there,
+/// so the caller's `sp` is 32 higher. Stopped on its `ret`, after `add sp` released the
+/// allocation, the caller's `sp` is the stopped `sp`: the compact encoding alone would
+/// add the stack size again (issue #130). Either way the caller is `frameless_caller` at
+/// the return address of its call. Both stops have a breakpoint on an analysed
+/// instruction, so the unwinder must read the original code under the traps.
+#[test]
+fn backtrace_after_the_epilogue_of_a_frameless_function_keeps_the_callers_sp()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let leaf = raw_symbol_address(&mut d, &fixture, "_frameless_spill");
+        let caller = raw_symbol_address(&mut d, &fixture, "_frameless_caller");
+        let release = find_instruction(&mut d, leaf, |insn| insn == 0x9100_83FF); // add sp, sp, #0x20
+        let ret = find_instruction(&mut d, leaf, |insn| insn == 0xD65F_03C0);
+        assert_eq!(ret.value(), release.value() + 4, "the `ret` follows the `add sp`");
+        let return_address = find_instruction(&mut d, caller, is_branch_with_link) + 4;
+        for stop in [release, ret] {
+            d.add_breakpoint(BreakpointRequest::Software { address: stop })
+                .unwrap_or_else(|err| panic!("add_breakpoint at {stop}: {err}"));
+        }
+
+        for (stop, allocated) in [(release, 0x20), (ret, 0)] {
+            continue_to(&mut d, stop);
+            let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+            assert_sane(&mut d, &frames);
+            assert_eq!(frames[0].pc, stop, "{frames:#?}");
+            assert!(frames.len() >= 2, "the caller is missing: {frames:#?}");
+            assert_eq!(
+                frames[1].pc, return_address,
+                "stopped at {stop}, the caller is `frameless_caller` after its call: {frames:#?}"
+            );
+            assert_eq!(
+                frames[1].sp.value(),
+                frames[0].sp.value() + allocated,
+                "stopped at {stop}: {frames:#?}"
+            );
+        }
     });
 }

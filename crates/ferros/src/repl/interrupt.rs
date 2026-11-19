@@ -6,7 +6,9 @@
 //!
 //! Launched debuggees have their own background process group; ferros keeps the
 //! terminal foreground. Terminal Ctrl-C reaches only ferros and uses the flag below.
-//! A SIGINT sent directly to the program remains a signal stop.
+//! A SIGINT sent directly to the program remains a signal stop. With `launch --terminal`
+//! the program holds the foreground while it runs, so terminal Ctrl-C is that signal.
+//! Ctrl-Z (see `jobs`) also interrupts the program, once per run.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +16,8 @@ use std::time::Duration;
 
 use ferros_core::{Result, Session, StopEvent};
 use ferros_utils::warn;
+
+use super::jobs::JobControl;
 
 /// Length of each `Session::wait` slice while the debuggee runs.
 pub const WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -32,15 +36,20 @@ pub fn install() -> Arc<AtomicBool>
     flag
 }
 
-/// Wait until the running debuggee stops, interrupting it whenever `flag` is set.
+/// Wait until the running debuggee stops, interrupting it whenever `flag` is set, and
+/// once when `jobs` reports Ctrl-Z.
 ///
 /// # Errors
 ///
 /// The error of [`Session::wait`].
-pub fn wait_for_stop(session: &mut Session, flag: &AtomicBool) -> Result<StopEvent>
+pub fn wait_for_stop(session: &mut Session, flag: &AtomicBool, jobs: &dyn JobControl) -> Result<StopEvent>
 {
+    let mut suspending = false;
     loop {
-        if flag.swap(false, Ordering::SeqCst)
+        let ctrl_c = flag.swap(false, Ordering::SeqCst);
+        let ctrl_z = !suspending && jobs.suspend_requested();
+        suspending |= ctrl_z;
+        if (ctrl_c || ctrl_z)
             && let Err(error) = session.interrupt()
         {
             // The process may be exiting; its terminal event is still awaited below.

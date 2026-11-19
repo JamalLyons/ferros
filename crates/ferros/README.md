@@ -38,6 +38,9 @@ ferros launch --batch script.ferros --command registers <program> -- arg1 arg2
 # Feed a file to the program's stdin.
 ferros launch --stdin input.txt <program>
 
+# Give the program the terminal while it runs, to type its input.
+ferros launch --terminal <program>
+
 # Print the directory that holds the log files.
 ferros find-logs
 ```
@@ -50,6 +53,9 @@ ferros find-logs
 `launch` also takes **`--stdin <FILE>`**: the program reads FILE as its stdin (see
 [The program's stdin](#the-programs-stdin)). The file must exist; `run` reopens it from the start
 for each relaunch.
+
+`launch` also takes **`--terminal`**: the program gets the terminal while it runs (see
+[Terminal mode](#terminal-mode)). ferros must be the foreground job of a terminal on stdin.
 
 The global options `--log-level <LEVEL>` and `--log-format <pretty|json>` configure the log file
 (`~/.ferros/YYYY-MM-DD-ferros.log`). Logs never go to the terminal, so the session output is plain
@@ -82,20 +88,20 @@ A launched program's stdin depends on where `ferros` reads its commands:
 
 | Mode | Program's stdin |
 |---|---|
-| Interactive (terminal) | The terminal, in a background process group (see [Ctrl-C](#ctrl-c)) |
+| Interactive (terminal) | The terminal, in a background process group (see [Ctrl-C](#ctrl-c)); with `--terminal`, in the foreground while it runs |
 | Piped | `/dev/null`: the commands on the pipe are for `ferros` only, so the program reads end of file |
 | Batch (`--batch`, `--command`) | `ferros`'s stdin, which `ferros` does not read in this mode |
 | Any mode with `--stdin <FILE>` | FILE |
 
-To give a program input in interactive or piped mode, use `--stdin`. An attached process
-keeps whatever stdin it already has.
+To give a program input in piped mode, use `--stdin`; in interactive mode, use `--stdin` or
+`--terminal`. An attached process keeps whatever stdin it already has.
 
 ## Commands
 
 | Command | Aliases | What it does |
 |---|---|---|
 | `run` | `r` | Resume from the entry stop and wait for the next stop; after the program exited, relaunch it stopped at entry (breakpoints are cleared with the old process) |
-| `continue` | `c` | Resume and wait for the next stop. A signal the program stopped for is passed on, except `SIGINT` |
+| `continue` | `c` | Resume and wait for the next stop. A signal the program stopped for is passed on, except `SIGINT` and `SIGTSTP` |
 | `interrupt` | | Stop the program (Ctrl-C does this while it runs) |
 | `kill` | | Terminate the program with `SIGKILL` |
 | `status` | | `status: stopped (pid <pid>, thread <tid>)` and the last stop, `status: exited` and how, or `status: no process` |
@@ -139,9 +145,34 @@ The trade-off is terminal input: a background program reading inherited terminal
 `SIGTTIN`, reported as `stopped: signal 21`; one that changes terminal settings (`tcsetattr`, as
 password prompts and full-screen programs do) stops with `SIGTTOU`, `stopped: signal 22`. `continue`
 passes the signal back, so the program stops again at the same point; ferros prints a hint. Use
-`ferros launch --stdin FILE <program>` to supply input. Batch-mode stdin from a pipe or file still works; batch-mode terminal reads have the same
-background-group restriction. Attaching leaves the target's process group unchanged. Ctrl-Z
-suspends only ferros: the program keeps running until `fg`, so interrupt it first.
+`ferros launch --stdin FILE <program>` to supply input, or [`--terminal`](#terminal-mode) to type
+it. Batch-mode stdin from a pipe or file still works; batch-mode terminal reads have the same
+background-group restriction. Attaching leaves the target's process group unchanged.
+
+### Ctrl-Z
+
+Ctrl-Z while the program runs (`continue`, `run`, `next`, `step`, `finish`, `stepi`) interrupts
+it, prints the stop (`stopped: interrupted`), then suspends ferros as a shell job. The program
+stays stopped while ferros is suspended. After `fg` the prompt returns and nothing is resumed
+until you continue; `status` shows the interrupt stop. Ctrl-Z at the interactive prompt
+suspends ferros through the line editor, with the program already stopped.
+
+### Terminal mode
+
+`ferros launch --terminal <program>` makes the program's process group the terminal's foreground
+group while it runs, so prompts and full-screen programs can read typed input and change terminal
+settings. At each stop ferros takes the foreground back, saves the program's terminal settings and
+restores its own for the prompt; the next run restores the program's settings again.
+
+The keys follow the terminal foreground. While the program runs, Ctrl-C reaches the program as
+`SIGINT` and is reported as `stopped: signal 2`, and Ctrl-Z reaches it as `SIGTSTP`,
+`stopped: signal 18`; ferros itself is not suspended. `continue` suppresses both held signals
+rather than delivering them, so the program does not stop outside ferros. A program that ignores
+or handles `SIGINT` still stops for it under ferros (the signal stop comes before delivery). Use
+the default mode, or `--stdin`, when Ctrl-C should be reported as `stopped: interrupted`.
+
+`--terminal` needs ferros to be the terminal's foreground job, with the terminal on stdin; it is
+an error otherwise. It has no effect on `attach`.
 
 ### Adding a command
 

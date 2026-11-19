@@ -53,12 +53,7 @@ macro_rules! source_command {
             fn help(&self) -> &'static str { $help }
             fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult {
                 no_args(self.names()[0], args)?;
-                ctx.out.flush()?;
-                ctx.interrupt.store(false, std::sync::atomic::Ordering::SeqCst);
-                ctx.session().$method()?;
-                ctx.debugger.at_entry = false;
-                let event = crate::repl::interrupt::wait_for_stop(&mut ctx.debugger.session, ctx.interrupt)?;
-                ctx.print_stop(&event)?;
+                ctx.run_program(|session| session.$method())?;
                 Ok(Flow::Continue)
             }
         }

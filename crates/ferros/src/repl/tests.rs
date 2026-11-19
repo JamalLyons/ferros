@@ -8,6 +8,7 @@ use ferros_core::backend::mock::{MockBackend, MockCallKind, MockState, MockStop,
 use ferros_core::{Address, LaunchSpec, ProcessId, StopEvent, ThreadId};
 
 use super::commands::{find, parse_address, parse_number};
+use super::jobs::NoJobControl;
 use super::{Debugger, Input, PROMPT, Target, history_path};
 
 const THREAD: ThreadId = ThreadId(7);
@@ -39,7 +40,14 @@ fn run_with(mock: &MockBackend, target: Target, input: Input<Cursor<Vec<u8>>>) -
     let (mut debugger, _) = Debugger::start(Box::new(mock.clone()), target).expect("start");
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let ok = super::run(&mut debugger, input, &mut out, &mut err, &AtomicBool::new(false));
+    let ok = super::run(
+        &mut debugger,
+        input,
+        &mut out,
+        &mut err,
+        &AtomicBool::new(false),
+        &mut NoJobControl,
+    );
     Transcript {
         ok,
         out: String::from_utf8(out).expect("utf-8"),
@@ -333,7 +341,7 @@ fn interrupt_flag_interrupts_a_running_process()
         Debugger::start(Box::new(mock.clone()), Target::Launch(LaunchSpec::new("/bin/prog"))).expect("start");
     debugger.session.resume().expect("resume");
     let flag = AtomicBool::new(true);
-    let event = super::interrupt::wait_for_stop(&mut debugger.session, &flag).expect("wait");
+    let event = super::interrupt::wait_for_stop(&mut debugger.session, &flag, &NoJobControl).expect("wait");
     assert_eq!(event, StopEvent::Interrupted { thread: None });
 }
 

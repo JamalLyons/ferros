@@ -18,6 +18,7 @@
 
 pub mod commands;
 pub mod interrupt;
+pub mod jobs;
 pub mod output;
 
 use std::collections::VecDeque;
@@ -26,16 +27,21 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ferros_core::backend::ProcessGroup;
 use ferros_core::{Backend, LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent, ThreadId};
 use ferros_utils::warn;
 
 use self::commands::{CommandError, Flow};
+use self::jobs::JobControl;
 
 /// The prompt printed before each command.
 pub const PROMPT: &str = "(ferros) ";
 
-/// `SIGINT`: a stop for this signal is not passed back to the program by `continue`.
+/// `SIGINT` and `SIGTSTP`: a stop for one of these signals is not passed back to the
+/// program by `continue`. With `launch --terminal`, Ctrl-C and Ctrl-Z reach the program
+/// as these signals; passing `SIGTSTP` on would stop it for the shell, outside ferros.
 const SIGINT: i32 = 2;
+const SIGTSTP: i32 = 18;
 /// `SIGTTIN` and `SIGTTOU`: a launched program, in a background process group, used the
 /// terminal. `continue` passes the signal back and the program stops again.
 const SIGTTIN: i32 = 21;
@@ -130,6 +136,8 @@ pub struct Ctx<'a>
     pub out: &'a mut dyn Write,
     /// Set by the Ctrl-C handler.
     pub interrupt: &'a AtomicBool,
+    /// Ctrl-Z and the terminal foreground while the program runs.
+    pub jobs: &'a mut dyn JobControl,
 }
 
 impl Ctx<'_>
@@ -142,29 +150,77 @@ impl Ctx<'_>
 
     /// Resume the stopped process (or step `step`), wait for the next stop and print it.
     ///
-    /// A pending Ctrl-C from before the resume is forgotten; one pressed while the
-    /// process runs interrupts it. A held `SIGINT` is not passed back to the program, any
-    /// other held signal is.
+    /// A held `SIGINT` or `SIGTSTP` is not passed back to the program, any other held
+    /// signal is. See [`run_program`](Self::run_program) for Ctrl-C and Ctrl-Z.
     ///
     /// # Errors
     ///
     /// The session's resume, step or wait error.
     pub fn resume_and_wait(&mut self, step: Option<ThreadId>) -> Result<StopEvent, CommandError>
     {
+        self.run_program(|session| match step {
+            Some(thread) => session.step_instruction(thread),
+            None if matches!(
+                session.last_stop(),
+                Some(StopEvent::Signal {
+                    signal: SIGINT | SIGTSTP,
+                    ..
+                })
+            ) =>
+            {
+                session.resume()
+            }
+            None => session.resume_with_signal(),
+        })
+    }
+
+    /// Let the program run with `start` (a resume or a step), wait for the next stop and
+    /// print it.
+    ///
+    /// A pending Ctrl-C from before the start is forgotten; one pressed while the process
+    /// runs interrupts it. Ctrl-Z while it runs interrupts it too, and once the stop is
+    /// printed ferros stops itself; after `fg` the program is still stopped. With
+    /// `launch --terminal` the program holds the terminal foreground until it stops.
+    ///
+    /// # Errors
+    ///
+    /// The error of `start` or of the wait, or a job control error.
+    pub fn run_program(
+        &mut self,
+        start: impl FnOnce(&mut Session) -> ferros_core::Result<()>,
+    ) -> Result<StopEvent, CommandError>
+    {
         self.out.flush()?;
         self.interrupt.store(false, Ordering::SeqCst);
-        let session = &mut self.debugger.session;
-        match step {
-            Some(thread) => session.step_instruction(thread)?,
-            None if matches!(session.last_stop(), Some(StopEvent::Signal { signal: SIGINT, .. })) => {
-                session.resume()?;
-            }
-            None => session.resume_with_signal()?,
+        let group = self.program_group();
+        self.jobs.program_runs(group).map_err(|error| job_error(&error))?;
+        if let Err(error) = start(&mut self.debugger.session) {
+            let _ = self.jobs.program_stopped();
+            return Err(error.into());
         }
         self.debugger.at_entry = false;
-        let event = interrupt::wait_for_stop(session, self.interrupt)?;
+        let waited = interrupt::wait_for_stop(&mut self.debugger.session, self.interrupt, &*self.jobs);
+        let suspend = self.jobs.program_stopped();
+        let event = waited?;
         self.print_stop(&event)?;
+        if suspend.map_err(|error| job_error(&error))? {
+            writeln!(self.out, "ferros suspended; after 'fg' the program is still stopped")?;
+            self.out.flush()?;
+            self.jobs.suspend().map_err(|error| job_error(&error))?;
+        }
         Ok(event)
+    }
+
+    /// The program's own process group: a launched program in a new group leads it.
+    fn program_group(&self) -> Option<ProcessId>
+    {
+        let session = &self.debugger.session;
+        match (&self.debugger.target, session.ownership()) {
+            (Target::Launch(spec), Some(ProcessOwnership::Launched)) if spec.process_group == Some(ProcessGroup::New) => {
+                session.pid()
+            }
+            _ => None,
+        }
     }
 
     /// Print one line describing `event`.
@@ -183,11 +239,18 @@ impl Ctx<'_>
         {
             writeln!(
                 self.out,
-                "  the program used the terminal from its background process group; relaunch with `--stdin FILE`"
+                "  the program used the terminal from its background process group; relaunch with `--stdin FILE`, or with \
+                 `--terminal` to type its input"
             )?;
         }
         Ok(())
     }
+}
+
+/// A job control failure as a command error.
+fn job_error(error: &io::Error) -> CommandError
+{
+    CommandError::new(format!("job control: {error}"))
 }
 
 /// Where commands come from. See the [module documentation](self).
@@ -314,6 +377,7 @@ pub fn run<R: BufRead>(
     out: &mut dyn Write,
     err: &mut dyn Write,
     interrupt: &AtomicBool,
+    jobs: &mut dyn JobControl,
 ) -> bool
 {
     let mut ok = true;
@@ -331,6 +395,7 @@ pub fn run<R: BufRead>(
             debugger,
             out,
             interrupt,
+            jobs: &mut *jobs,
         };
         let result = run_line(&mut ctx, &line);
         let _ = out.flush();

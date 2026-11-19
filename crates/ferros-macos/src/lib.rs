@@ -190,6 +190,7 @@ mod lifecycle;
 pub mod memory;
 pub mod registers;
 pub mod task;
+pub mod terminal;
 pub mod threads;
 pub mod types;
 

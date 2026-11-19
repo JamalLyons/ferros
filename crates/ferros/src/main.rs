@@ -11,6 +11,7 @@ use ferros_core::{LaunchSpec, ProcessId};
 use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
 
 use crate::platform::create_backend;
+use crate::repl::jobs::JobControl;
 use crate::repl::{Debugger, Input, Target};
 
 /// A Rust-native debugger with hybrid MIR and system-level introspection.
@@ -47,6 +48,11 @@ enum Commands
         /// program with SIGTTIN; piped commands give it /dev/null; batch stdin is inherited
         #[arg(long, value_name = "FILE")]
         stdin: Option<PathBuf>,
+        /// Give the program the terminal while it runs, so it can read typed input and
+        /// change terminal settings. Ctrl-C and Ctrl-Z then reach the program as signals
+        /// (stops for signal 2 and 18); ferros takes the terminal back at each stop
+        #[arg(long)]
+        terminal: bool,
         /// Path to the executable to launch
         program: PathBuf,
         /// Arguments passed to the program (after `--`)
@@ -126,7 +132,7 @@ fn main() -> ExitCode
         }
     };
 
-    let (script, mut target, stdin_file) = match cli.command {
+    let (script, mut target, stdin_file, give_terminal) = match cli.command {
         Commands::FindLogs => {
             println!("{}", log_directory().display());
             return ExitCode::SUCCESS;
@@ -134,15 +140,16 @@ fn main() -> ExitCode
         Commands::Launch {
             script,
             stdin,
+            terminal,
             program,
             args,
         } => {
             let spec = LaunchSpec::new(absolute(&program))
                 .args(args)
                 .process_group(ProcessGroup::New);
-            (script, Target::Launch(spec), stdin)
+            (script, Target::Launch(spec), stdin, terminal)
         }
-        Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid)), None),
+        Commands::Attach { script, pid } => (script, Target::Attach(ProcessId::from(pid)), None, false),
     };
 
     // Logs go to a file so the session output stays deterministic (no timestamps, no colour).
@@ -171,7 +178,15 @@ fn main() -> ExitCode
         spec.stdin = debuggee_stdin(stdin_file, &mode);
     }
 
-    if run_session(target, mode) {
+    let mut jobs = match platform::job_control(give_terminal, io::stdin().is_terminal()) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("error: --terminal needs ferros in the foreground of a terminal on stdin: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if run_session(target, mode, &mut *jobs) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -226,7 +241,7 @@ fn debuggee_stdin(file: Option<PathBuf>, mode: &Mode) -> StdioSpec
 }
 
 /// Start the session and run the command loop. Returns `true` when nothing failed.
-fn run_session(target: Target, mode: Mode) -> bool
+fn run_session(target: Target, mode: Mode, jobs: &mut dyn JobControl) -> bool
 {
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -263,7 +278,7 @@ fn run_session(target: Target, mode: Mode) -> bool
     if matches!(&input, Input::Editor(..)) {
         let _ = writeln!(out, "Type 'help' for the commands; 'quit' or Ctrl-D ends the session.");
     }
-    repl::run(&mut debugger, input, &mut out, &mut err, &interrupt)
+    repl::run(&mut debugger, input, &mut out, &mut err, &interrupt, jobs)
 }
 
 #[cfg(test)]

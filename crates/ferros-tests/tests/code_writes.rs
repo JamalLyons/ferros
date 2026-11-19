@@ -43,6 +43,32 @@ fn interrupt(d: &mut Debuggee)
     }
 }
 
+/// Interrupt the running target and drain every stop until it is stopped with nothing
+/// pending, accepting a breakpoint at `site` that raced the interrupt (issue #122).
+///
+/// A thread can execute the `brk` planted at `site` in one round without its exception
+/// reaching the backend before that round's drain. The exception is then delivered
+/// after the next resume, as `Breakpoint` at `site`, and the interrupt loses the race
+/// to it. That thread really executed the planted trap, so the stop is not an error.
+/// Any other stop still fails the test.
+fn interrupt_racing_trap(d: &mut Debuggee, site: Address, round: usize)
+{
+    backend(d).interrupt().expect("interrupt");
+    let mut stop = backend(d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt");
+    assert!(
+        stop.is_some(),
+        "round {round}: no stop within {STOP_TIMEOUT:?} of the interrupt"
+    );
+    while let Some(event) = stop {
+        assert!(
+            matches!(event, StopEvent::Interrupted { .. })
+                || matches!(event, StopEvent::Breakpoint { pc, .. } if pc == site),
+            "round {round}: expected the interrupt or a breakpoint at {site}, got {event:?}"
+        );
+        stop = backend(d).wait(Some(Duration::ZERO)).expect("drain");
+    }
+}
+
 /// The address `hot_loop` printed for its call counter.
 fn calls_address(d: &Debuggee) -> Address
 {
@@ -89,7 +115,7 @@ fn planted_trap_is_executed_once_the_target_runs()
                 .resume(&ResumeRequest::continue_all())
                 .expect("run the original");
             std::thread::sleep(Duration::from_millis(2));
-            interrupt(&mut d);
+            interrupt_racing_trap(&mut d, site, round);
             let before = read_u64(&mut d, calls);
             backend(&mut d).write_memory(site, &TRAP).expect("plant the trap");
             backend(&mut d)

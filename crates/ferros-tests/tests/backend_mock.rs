@@ -1295,3 +1295,244 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
     session.resume_with_signal().expect("pass the carried signal");
     assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all().with_signal(THREAD, 30)]);
 }
+
+/// The thread whose signal handler stops in the `handler_stopped_*` tests.
+const HANDLER: ThreadId = ThreadId(2);
+/// Where `HANDLER` is interrupted by its signal; a breakpoint is set there.
+const INTERRUPTED: Address = Address::new(0x1000);
+
+/// Two threads: `THREAD` at `INTERRUPTED + 16` and `HANDLER` at `INTERRUPTED`, where
+/// signal 30 stops it. `resume_with_signal` passes the signal at the breakpoint there and
+/// the handler stops at a breakpoint of its own, which is then removed: the handler's later
+/// return to `INTERRUPTED` in the frame it interrupted is a pending rendezvous. Returns
+/// the breakpoint at `INTERRUPTED` and `HANDLER`'s registers there, for that return.
+fn handler_stopped_in_its_handler(
+    mock: &MockBackend,
+    session: &mut Session,
+) -> (ferros_core::BreakpointId, ferros_core::Registers)
+{
+    use ferros_core::BreakpointRequest;
+    use ferros_core::backend::ThreadAction;
+
+    let in_handler = INTERRUPTED + 32;
+    let mut registers = session.read_registers_for(HANDLER).expect("registers");
+    registers.pc = INTERRUPTED;
+    registers.sp = Address::new(0x8000);
+    session
+        .write_registers_for(HANDLER, &registers)
+        .expect("place the handler thread");
+    mock.script(
+        MockStop::new(StopEvent::Signal {
+            thread: HANDLER,
+            signal: 30,
+        })
+        .expect_resume(ResumeRequest::continue_all()),
+    );
+    session.resume().expect("run to the signal");
+    assert!(matches!(session.wait(None).expect("wait"), Some(StopEvent::Signal { .. })));
+    let id = session
+        .add_breakpoint(BreakpointRequest::Software { address: INTERRUPTED })
+        .expect("breakpoint at the signal pc");
+    let handler_bp = session
+        .add_breakpoint(BreakpointRequest::Software { address: in_handler })
+        .expect("breakpoint in the handler");
+    let mut handler_registers = registers.clone();
+    handler_registers.pc = in_handler;
+    handler_registers.sp = Address::new(0x7000);
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: HANDLER,
+            pc: in_handler,
+        })
+        .set_registers(HANDLER, handler_registers)
+        .expect_resume(
+            ResumeRequest::all(ThreadAction::Suspend)
+                .with_thread(HANDLER, ThreadAction::Continue)
+                .with_signal(HANDLER, 30),
+        ),
+    );
+    session.resume_with_signal().expect("pass the signal");
+    assert!(matches!(
+        session.wait(None).expect("wait"),
+        Some(StopEvent::Breakpoint { pc, .. }) if pc == in_handler
+    ));
+    session.remove_breakpoint(handler_bp).expect("remove the handler breakpoint");
+    (id, registers)
+}
+
+fn handler_stopped_process() -> MockBackend
+{
+    let mut registers = arm64_registers();
+    registers.pc = INTERRUPTED + 16;
+    MockBackend::new()
+        .with_thread(THREAD, registers.clone())
+        .with_thread(HANDLER, registers)
+        .with_region(INTERRUPTED, "r-x", vec![0; 64])
+}
+
+/// #150 re-review: a step over a breakpoint at another address than a stopped handler's
+/// rendezvous, refused for a late stop or failing to start, leaves that rendezvous alone:
+/// the handler's return to its own breakpoint is still not reported or counted.
+#[test]
+fn unstarted_step_over_elsewhere_keeps_a_stopped_handlers_rendezvous()
+{
+    use ferros_core::BreakpointRequest;
+
+    for refused in [true, false] {
+        let mock = handler_stopped_process();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session.launch(&LaunchSpec::new("scripted-step-elsewhere")).expect("launch");
+        let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+        // The other thread arrives at a different breakpoint; the step over it runs
+        // nothing.
+        let elsewhere = INTERRUPTED + 8;
+        session
+            .add_breakpoint(BreakpointRequest::Software { address: elsewhere })
+            .expect("breakpoint elsewhere");
+        let mut at_elsewhere = session.read_registers_for(THREAD).expect("registers");
+        at_elsewhere.pc = elsewhere;
+        session.write_registers_for(THREAD, &at_elsewhere).expect("move");
+        if refused {
+            let late = StopEvent::Interrupted { thread: Some(THREAD) };
+            mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
+            session.resume().expect("a stop raced the step over");
+            assert_eq!(session.wait(None).expect("wait"), Some(late));
+        } else {
+            mock.fail_next(
+                MockCallKind::Resume,
+                BackendError::Os {
+                    code: 5,
+                    message: "step failed".into(),
+                },
+            );
+            assert!(session.resume().is_err());
+            assert_eq!(session.state(), SessionState::Stopped);
+        }
+        assert_eq!(mock.peek_memory(elsewhere, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+
+        // The other thread is moved off; the handler returns to its breakpoint in the frame
+        // it interrupted: the rendezvous, so the continue goes on to the interrupt.
+        let mut moved = session.read_registers_for(THREAD).expect("registers");
+        moved.pc = INTERRUPTED + 16;
+        session.write_registers_for(THREAD, &moved).expect("move off");
+        mock.script(
+            MockStop::new(StopEvent::Breakpoint {
+                thread: HANDLER,
+                pc: INTERRUPTED,
+            })
+            .set_registers(HANDLER, registers)
+            .expect_resume(ResumeRequest::continue_all()),
+        );
+        mock.script(
+            MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+                .set_pc(HANDLER, INTERRUPTED + 4)
+                .expect_resume(ResumeRequest::step(HANDLER)),
+        );
+        let end = StopEvent::Interrupted { thread: Some(HANDLER) };
+        mock.script(MockStop::new(end.clone()).expect_resume(ResumeRequest::continue_all()));
+        session.resume().expect("let the handler return");
+        assert_eq!(session.wait(None).expect("wait"), Some(end), "refused: {refused}");
+        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+        assert_eq!(mock.script_len(), 0);
+    }
+}
+
+/// #150 re-review: another thread's signal stop is reported before the stopped handler's
+/// return to its breakpoint, which stays queued. `resume_with_signal` for that signal is
+/// deferred for the queued return, so the signal stays carried; the session then consumes
+/// the return as the rendezvous and continues every thread in place of that resume. The
+/// continue passes the carried signal (its thread runs, so it would lose it otherwise),
+/// and it is not carried any more for a later `resume_with_signal`.
+#[test]
+fn handler_return_continue_passes_a_signal_carried_from_a_deferred_resume()
+{
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("scripted-deferred-signal")).expect("launch");
+    let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let signal = StopEvent::Signal {
+        thread: THREAD,
+        signal: 31,
+    };
+    mock.script_simultaneous(vec![
+        MockStop::new(signal.clone()).expect_resume(ResumeRequest::continue_all()),
+        MockStop::new(StopEvent::Breakpoint {
+            thread: HANDLER,
+            pc: INTERRUPTED,
+        })
+        .set_registers(HANDLER, registers),
+    ]);
+    session.resume().expect("let the handler return");
+    assert_eq!(session.wait(None).expect("wait"), Some(signal));
+    assert_eq!(mock.pending_len(), 1, "the handler's return is queued");
+
+    let _ = mock.take_calls();
+    session.resume_with_signal().expect("deferred for the queued return");
+    assert_eq!(resumes(&mock), Vec::<ResumeRequest>::new(), "nothing was resumed");
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+            .set_pc(HANDLER, INTERRUPTED + 4)
+            .expect_resume(ResumeRequest::step(HANDLER)),
+    );
+    let end = StopEvent::Interrupted { thread: Some(HANDLER) };
+    let with_signal = ResumeRequest::continue_all().with_signal(THREAD, 31);
+    mock.script(MockStop::new(end.clone()).expect_resume(with_signal.clone()));
+    assert_eq!(session.wait(None).expect("wait"), Some(end));
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(HANDLER), with_signal]);
+    assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    session.resume_with_signal().expect("nothing is carried any more");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+}
+
+/// #150 re-review: a step-over's final continue that passes another thread's signal,
+/// refused for a late stop, sent nothing: the next `resume_with_signal` passes that signal.
+#[test]
+fn refused_step_over_final_continue_keeps_another_threads_signal()
+{
+    let other = ThreadId(2);
+    let mut registers = arm64_registers();
+    registers.pc = BREAKPOINT;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers.clone())
+        .with_thread(other, registers)
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let mut elsewhere = session.read_registers_for(other).expect("registers");
+    elsewhere.pc = BREAKPOINT + 16;
+    session.write_registers_for(other, &elsewhere).expect("move");
+    let signal = StopEvent::Signal {
+        thread: other,
+        signal: 31,
+    };
+    mock.script(MockStop::new(signal.clone()).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("run to the signal");
+    assert_eq!(session.wait(None).expect("wait"), Some(signal));
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at THREAD's pc");
+
+    // Resume 1 steps THREAD over the breakpoint; the late stop races resume 2, the final
+    // continue that passes the other thread's signal.
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    let late = StopEvent::Interrupted { thread: Some(THREAD) };
+    mock.stop_before_nth_resume(2, std::iter::once(MockStop::new(late.clone())));
+    session.resume_with_signal().expect("a stop raced the final continue");
+    assert_eq!(session.wait(None).expect("wait"), Some(late));
+
+    let _ = mock.take_calls();
+    let pass = ResumeRequest::continue_all().with_signal(other, 31);
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(pass.clone()));
+    session.resume_with_signal().expect("pass the held signal");
+    assert_eq!(resumes(&mock), vec![pass]);
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+}

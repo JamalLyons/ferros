@@ -140,7 +140,7 @@ impl Session
                 .handler_return
                 .take_if(|pending| pending.address == site.entry.info.address);
             if let Err(error) = self.restore_original(&site.entry) {
-                self.handler_return = rendezvous;
+                self.put_back_rendezvous(rendezvous);
                 return Err(error);
             }
         }
@@ -148,11 +148,44 @@ impl Session
             // The backend guarantees that a failed resume ran nothing: with the trap back,
             // the handler can still return to it.
             self.rearm(&site.entry)?;
-            self.handler_return = rendezvous;
+            self.put_back_rendezvous(rendezvous);
             return Err(error.into());
         }
         self.step_plan = Some(plan);
         Ok(())
+    }
+
+    /// Put back the rendezvous `start_plan` took for a step that did not run. `None` means
+    /// it took none, and a pending handler return at another address stays as it is.
+    fn put_back_rendezvous(&mut self, rendezvous: Option<HandlerReturn>)
+    {
+        if rendezvous.is_some() {
+            self.handler_return = rendezvous;
+        }
+    }
+
+    /// Start a pending handler return's continue `request` (see `HandlerReturn`) in place
+    /// of the user's resume it completes: the session consumed the handler's stop instead
+    /// of reporting it. Signals still carried from that resume (it was deferred for the
+    /// stop, or a step-over cut short) are passed with it to the threads it lets run, as
+    /// the resume would have; otherwise they are lost when those threads run on, and a
+    /// later `resume_with_signal` would pass them to threads that no longer hold them.
+    /// Once the continue starts they are no longer carried; a refused or failed start ran
+    /// nothing, so they stay carried.
+    fn continue_handler(&mut self, mut request: ResumeRequest) -> Result<Option<StopEvent>>
+    {
+        let mut passed = Vec::new();
+        for &(thread, signal) in &self.carried_signals {
+            if request.action_for(thread) != ThreadAction::Suspend {
+                merge_signal(&mut request.signals, thread, signal);
+                passed.push(thread);
+            }
+        }
+        let started = self.start_continue(request);
+        if started.is_ok() {
+            self.carried_signals.retain(|(thread, _)| !passed.contains(thread));
+        }
+        self.or_refused_stop(started)
     }
 
     /// Drain the events still queued from the last stop, then start the continue of
@@ -557,8 +590,7 @@ impl Session
         }
         // The rendezvous is over, and its exit traps with it.
         self.release_handler_exits()?;
-        let started = self.start_continue(request);
-        self.or_refused_stop(started)
+        self.continue_handler(request)
     }
 
     /// Consume `event` if it belongs to the exit traps of a pending handler return:
@@ -603,12 +635,14 @@ impl Session
                 // runs again.
                 self.release_exit_hooks(Some(std::mem::replace(&mut exits, ExitHooks::empty(thread))))?;
             }
-            let started = match follow {
-                Follow::Step => self.step_thread(thread),
-                Follow::Continue => self.start_continue(request),
-                Follow::Report(event) => return Ok(Some(event)),
-            };
-            self.or_refused_stop(started)
+            match follow {
+                Follow::Step => {
+                    let started = self.step_thread(thread);
+                    self.or_refused_stop(started)
+                }
+                Follow::Continue => self.continue_handler(request),
+                Follow::Report(event) => Ok(Some(event)),
+            }
         });
         self.state = state;
         self.handler_exits = self.handler_return.is_some().then_some(exits);

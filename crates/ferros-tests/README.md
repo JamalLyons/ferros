@@ -245,7 +245,7 @@ control and real kernel exception messages:
   zero. A plain continue produces no stray step.
 - `single_step::signal_cancels_a_real_step_without_a_stray_step_stop` (#75) stops at
   the `svc` of a blocking read on arm64. With the socket empty and its writer gated,
-  the test observes the stepping thread waiting in the kernel with MDSCR_EL1.SS set
+  the test waits until Mach reports the stepping thread waiting, with MDSCR_EL1.SS set
   and its peers suspended. A thread-directed SIGUSR1 produces a real signal event
   before the step completes. The test checks the bit and suspend counts at event
   delivery, then releases the writer and requires a clean exit after plain continue.

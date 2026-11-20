@@ -1601,7 +1601,7 @@ fn signal_cancels_a_real_step_without_a_stray_step_stop()
         assert_eq!(original, 0xd400_1001_u32.to_le_bytes(), "expected svc #0x80");
         control.release("run-0");
         let (stepped, others) = run_to_trap(&mut d, svc);
-        assert!(others.is_empty(), "only worker 0 reads from the socket");
+        assert!(others.is_empty(), "only worker 0 was released");
         backend(&mut d).write_memory(svc, &original).expect("restore the syscall");
         let threads = backend(&mut d).threads().expect("threads");
         assert!(threads.len() >= 3, "expected main and both workers");

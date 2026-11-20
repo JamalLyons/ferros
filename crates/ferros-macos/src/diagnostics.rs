@@ -451,7 +451,8 @@ pub fn raise_sigusr1() -> std::io::Result<()>
 pub fn send_sigusr1(thread: ferros_core::ThreadId) -> std::io::Result<()>
 {
     let port = mach_port_t::try_from(thread.raw()).map_err(std::io::Error::other)?;
-    // SAFETY: the caller owns the tracee thread right; this syscall takes no pointers.
+    // SAFETY: the syscall takes no pointers; the kernel validates the port name, so a
+    // wrong ThreadId yields an error or a signal to some other thread, never UB.
     if unsafe { ffi::__pthread_kill(port, libc::SIGUSR1) } == 0 {
         Ok(())
     } else {

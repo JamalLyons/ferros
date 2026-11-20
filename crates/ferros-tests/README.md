@@ -216,6 +216,12 @@ The `*_reports_a_stop_that_arrives_after_its_drain` tests and
 `step_over_reports_a_stop_that_arrives_before_its_final_continue` cover `resume`,
 `step_instruction`, `step_out` and a step-over's final continue (#150); the native race behind
 them is the one `lifecycle::replacement_signals_do_not_hide_later_signal_stops` hit under load.
+A refused resume sent nothing, so it must lose no state: the next `ResumeRequest` still passes
+the signals it held (`signal_of_a_refused_resume_is_passed_by_the_next_resume_with_signal`,
+`refused_step_out_keeps_a_signal_carried_for_another_thread`,
+`failed_step_instruction_keeps_the_threads_carried_signal`), and a stopped handler's
+rendezvous survives a refused step over its breakpoint
+(`refused_step_over_keeps_a_stopped_handlers_rendezvous`).
 
 
 ## Debug-info regressions

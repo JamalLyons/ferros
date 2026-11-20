@@ -899,6 +899,58 @@ fn released_processes_run_to_completion()
 }
 
 /// Other signals must never let user code run while the signal stop is held (#56).
+/// A private SIGSTOP that takes effect after detach's wait gave up and sent its SIGCONT
+/// (#149) is overtaken by nothing: detach continues it again, so the released process
+/// is not left stopped and runs to completion.
+#[test]
+fn detach_continues_a_private_stop_that_lands_after_its_wait()
+{
+    harness::run_with_timeout(Duration::from_secs(60), |_| {
+        let mut target = Grandchild::spawn(&["100", "--progress"]);
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(ProcessId::from(target.pid)).expect("attach");
+        backend.reply_fault_injector().expire_next_detach_stop_wait();
+        backend.detach().expect("detach after a late private stop");
+        for _ in 0..5 {
+            let stat = process_state(target.pid);
+            assert!(
+                !stat.starts_with('T'),
+                "the released process is stopped (state {stat}); {}",
+                target.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = target
+            .ran_to_completion(Duration::from_secs(15))
+            .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
+        assert!(status.success(), "the released process exited with {status}");
+    });
+}
+
+/// If detach never sees its private SIGSTOP take effect, it reports that the released
+/// process may stay stopped instead of returning `Ok` (#149).
+#[test]
+fn detach_reports_a_private_stop_it_never_saw()
+{
+    harness::run_with_timeout(Duration::from_secs(60), |_| {
+        // Long enough to outlive the whole bounded wait.
+        let mut target = Grandchild::spawn(&["600", "--progress"]);
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(ProcessId::from(target.pid)).expect("attach");
+        backend.reply_fault_injector().hide_next_detach_stop();
+        let error = backend.detach().expect_err("an unseen private stop is reported");
+        assert!(
+            matches!(error, BackendError::DetachCleanup(ref message) if message.contains("may stay stopped")),
+            "{error:?}"
+        );
+        // The stop did land, so the late SIGCONT still released the process.
+        let status = target
+            .ran_to_completion(Duration::from_secs(30))
+            .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
+        assert!(status.success(), "the released process exited with {status}");
+    });
+}
+
 #[test]
 fn ordinary_signals_do_not_release_a_signal_stop()
 {

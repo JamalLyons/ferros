@@ -2,43 +2,12 @@
 
 use std::ops::Range;
 
+use super::exits::{ExitHooks, ExitStep, SiteOwner};
 use super::{Session, SessionState, SourcePosition};
 use crate::backend::{ResumeRequest, StopEvent, ThreadAction};
-use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
+use crate::breakpoints::{BreakpointId, BreakpointKind};
 use crate::error::{DebuggerError, Result};
-use crate::symbols::symtab::SymtabLayout;
 use crate::types::{Address, ThreadId};
-
-/// File name of the system unwinder that resumes a thread at a landing pad.
-const UNWINDER_IMAGE: &str = "libunwind.dylib";
-
-/// Functions through which the unwinder transfers control to a landing pad:
-/// `unw_resume` and, on current macOS, the variant `_Unwind_RaiseException` and
-/// `_Unwind_Resume` call. Matched with every leading underscore removed: the shared
-/// cache's symbol table names them `___unw_resume` (the internal alias), the exports
-/// `_unw_resume`.
-const RESUME_SYMBOLS: [&str; 2] = ["unw_resume", "unw_resume_with_frames_walked"];
-
-/// Instructions single-stepped from a resume entry to the landing pad before giving up
-/// (the observed path is a few dozen).
-const MAX_RESUME_STEPS: u32 = 4096;
-
-/// The unwinder's code and its resume entries in one process.
-#[derive(Clone)]
-pub(super) struct Unwinder
-{
-    load_address: u64,
-    code: SymtabLayout,
-    resume: Vec<Address>,
-}
-
-/// An unwinder resume in progress: the thread hit a resume entry with `sp` and is being
-/// single-stepped until it leaves the unwinder for a landing pad.
-struct Resuming
-{
-    sp: Address,
-    steps: u32,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode
@@ -48,26 +17,10 @@ enum Mode
     Out,
 }
 
-/// How to undo the temporary use of a breakpoint site.
-enum SiteOwner
-{
-    Private,
-    Disabled,
-    User,
-}
-
 struct RunTo
 {
     address: Address,
     sp: Address,
-    id: BreakpointId,
-    owner: SiteOwner,
-}
-
-/// A private trap on an unwinder resume entry, armed while a call runs to its return.
-struct Hook
-{
-    address: Address,
     id: BreakpointId,
     owner: SiteOwner,
 }
@@ -81,9 +34,8 @@ pub(super) struct LinePlan
     call: Option<(Address, Address)>,
     prologue_end: Option<Address>,
     run_to: Option<RunTo>,
-    hooks: Vec<Hook>,
-    unwinder: Option<Unwinder>,
-    resuming: Option<Resuming>,
+    /// Traps on non-local exits, armed while a call runs to its return.
+    exits: Option<ExitHooks>,
 }
 
 impl Session
@@ -103,12 +55,11 @@ impl Session
     /// - Only `is_stmt` line-table rows start a line: the statement being stepped runs
     ///   on through rows without it that follow it. Leaving that statement's code for
     ///   another line still stops wherever it lands, statement row or not.
-    /// - The return trap is matched by stack pointer. A callee that unwinds past its
-    ///   caller through the system unwinder (a panic caught by an outer `catch_unwind`)
-    ///   is caught where the unwinder resumes at a landing pad: a landing pad in the
-    ///   stepping frame or an outer one ends the step there (reported as `SingleStep`,
-    ///   possibly at code without a source line). A `longjmp` past the caller is not
-    ///   seen, so the step becomes a continue with other threads suspended; interrupt it.
+    /// - The return trap is matched by stack pointer. A callee that leaves its caller
+    ///   without returning, by unwinding through the system unwinder (a panic caught by an
+    ///   outer `catch_unwind`) or by `longjmp`/`_longjmp`/`siglongjmp`, is caught where
+    ///   that exit lands: a landing in the stepping frame or an outer one ends the step
+    ///   there (reported as `SingleStep`, possibly at code without a source line).
     /// - Inlined callees are stepped over, never entered.
     ///
     /// # Errors
@@ -184,9 +135,7 @@ impl Session
             call: None,
             prologue_end: None,
             run_to: None,
-            hooks: Vec::new(),
-            unwinder: None,
-            resuming: None,
+            exits: None,
         };
         let result = if mode == Mode::Out {
             let frames = self.stack_trace(32)?;
@@ -246,19 +195,8 @@ impl Session
         }
         let (id, owner) = self.take_site(address)?;
         plan.run_to = Some(RunTo { address, sp, id, owner });
-        if plan.hooks.is_empty() {
-            if plan.unwinder.is_none() {
-                plan.unwinder = self.unwinder();
-            }
-            for address in plan
-                .unwinder
-                .as_ref()
-                .map(|unwinder| unwinder.resume.clone())
-                .unwrap_or_default()
-            {
-                let (id, owner) = self.take_site(address)?;
-                plan.hooks.push(Hook { address, id, owner });
-            }
+        if plan.exits.is_none() {
+            self.arm_exit_hooks(&mut plan.exits, plan.thread)?;
         }
         // start_continue also executes a restored instruction if the call itself is
         // at a user breakpoint. Its final request still holds every peer thread.
@@ -268,149 +206,56 @@ impl Session
         Ok(())
     }
 
-    /// Arm a software breakpoint at `address` for the plan, recording how to undo it.
-    fn take_site(&mut self, address: Address) -> Result<(BreakpointId, SiteOwner)>
-    {
-        let existing = self.breakpoints.id_for_kind(address, BreakpointKind::Software);
-        let owner = match existing.and_then(|id| self.breakpoints.get(id)) {
-            Some(entry) if entry.info.enabled => SiteOwner::User,
-            Some(_) => SiteOwner::Disabled,
-            None => SiteOwner::Private,
-        };
-        let id = self.add_breakpoint(BreakpointRequest::Software { address })?;
-        self.enable_breakpoint(id)?;
-        Ok((id, owner))
-    }
-
-    fn release_site(&mut self, id: BreakpointId, owner: &SiteOwner) -> Result<()>
-    {
-        match owner {
-            SiteOwner::Private => self.remove_breakpoint(id)?,
-            SiteOwner::Disabled => self.disable_breakpoint(id)?,
-            SiteOwner::User => {}
-        }
-        Ok(())
-    }
-
-    /// Release the return trap and the unwinder hooks. Every site is released even when
-    /// one fails; the first failure is returned.
+    /// Release the return trap and the exit hooks. Every site is released even when one
+    /// fails; the first failure is returned.
     fn release_line_site(&mut self, plan: &mut LinePlan) -> Result<()>
     {
-        plan.resuming = None;
         let mut result = Ok(());
         if let Some(site) = plan.run_to.take() {
             result = self.release_site(site.id, &site.owner);
         }
-        for hook in std::mem::take(&mut plan.hooks) {
-            let released = self.release_site(hook.id, &hook.owner);
-            if result.is_ok() {
-                result = released;
-            }
+        let released = self.release_exit_hooks(plan.exits.take());
+        if result.is_ok() {
+            result = released;
         }
         result
     }
 
-    /// The process's system unwinder and its resume entries, read from its symbol table
-    /// in the target's memory. Cached once found; `None` (and retried by the next step)
-    /// when the image is not loaded or its symbols cannot be read.
-    fn unwinder(&mut self) -> Option<Unwinder>
-    {
-        if let Err(error) = self.load_images() {
-            tracing::debug!("no unwinder hooks: listing images: {error}");
-            return None;
-        }
-        let load_address = self
-            .loaded_images
-            .iter()
-            .find(|image| image.descriptor_path().file_name().is_some_and(|name| name == UNWINDER_IMAGE))?
-            .descriptor_load_address();
-        if let Some(cached) = self.unwinder.as_ref().filter(|cached| cached.load_address == load_address) {
-            return Some(cached.clone());
-        }
-        let found = self.read_unwinder(load_address);
-        match &found {
-            Ok(unwinder) => self.unwinder = Some(unwinder.clone()),
-            Err(detail) => tracing::debug!("no unwinder hooks: {detail}"),
-        }
-        found.ok()
-    }
-
-    fn read_unwinder(&mut self, load_address: u64) -> std::result::Result<Unwinder, String>
-    {
-        let header = self.read_mapped_header(load_address)?;
-        let code = SymtabLayout::from_header(&header, load_address).map_err(|error| error.to_string())?;
-        let table = super::stack::read_symbol_table(self.backend.as_mut(), &code)?;
-        let mut resume = Vec::new();
-        for (address, strx) in table.symbols().filter(|&(address, _)| code.contains(address)) {
-            let name = super::stack::read_symbol_string(self.backend.as_mut(), &code, strx)?;
-            if name.is_some_and(|name| RESUME_SYMBOLS.contains(&name.trim_start_matches('_'))) {
-                resume.push(address);
-            }
-        }
-        if resume.is_empty() {
-            return Err(format!("{UNWINDER_IMAGE} has no resume symbol"));
-        }
-        Ok(Unwinder {
-            load_address,
-            code,
-            resume,
-        })
-    }
-
-    /// The unwinder hook `event` hit, if it is a breakpoint stop of the plan's thread at
-    /// one of the plan's private hooks.
-    fn hook_hit(&self, plan: &LinePlan, event: &StopEvent) -> Result<bool>
-    {
-        let StopEvent::Breakpoint { thread, pc } = *event else {
-            return Ok(false);
-        };
-        let address = self.arch()?.pc_after_trap(pc);
-        Ok(thread == plan.thread
-            && plan
-                .hooks
-                .iter()
-                .any(|hook| hook.address == address && !matches!(hook.owner, SiteOwner::User)))
-    }
-
-    /// One instruction step of an unwinder resume completed. Once the thread leaves the
-    /// unwinder above the stack it resumed from, it is at a landing pad: in the guarded
-    /// frame or an outer one the step ends there, otherwise the call runs on.
-    fn resume_stepped(&mut self, plan: &mut LinePlan) -> Result<Option<StopEvent>>
+    /// One instruction step of a non-local exit completed. Once the thread leaves the
+    /// exit's image above the stack it entered with, it has landed (at a landing pad, or
+    /// where a `longjmp` goes): in the guarded frame or an outer one the step ends there,
+    /// otherwise the call runs on.
+    fn exit_stepped_in_line(&mut self, plan: &mut LinePlan) -> Result<Option<StopEvent>>
     {
         let thread = plan.thread;
         if self.interrupt_requested {
             return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
         }
-        let registers = self.backend.read_registers(thread)?;
-        let (Some(resuming), Some(unwinder), Some(site)) = (&mut plan.resuming, &plan.unwinder, &plan.run_to) else {
+        let (Some(exits), Some(site)) = (&mut plan.exits, &plan.run_to) else {
             return Ok(Some(StopEvent::SingleStep { thread }));
         };
-        let landed = !unwinder.code.contains(registers.pc) && registers.sp > resuming.sp;
-        if !landed && resuming.steps < MAX_RESUME_STEPS {
-            resuming.steps += 1;
-            self.step_instruction(thread)?;
-            return Ok(None);
+        let guarded = site.sp;
+        match self.exit_stepped(exits)? {
+            ExitStep::Stepping => {
+                self.step_instruction(thread)?;
+                return Ok(None);
+            }
+            ExitStep::Landed { pc, sp } => {
+                // A user breakpoint on the landing's first instruction is that breakpoint's
+                // hit, as on any line-step stop; it must not be stepped over by the continue.
+                if let Some(id) = self.breakpoints.id_for_kind(pc, BreakpointKind::Software)
+                    && self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled)
+                {
+                    self.release_line_site(plan)?;
+                    return Ok(Some(StopEvent::Breakpoint { thread, pc }));
+                }
+                if sp >= guarded {
+                    self.release_line_site(plan)?;
+                    return Ok(Some(StopEvent::SingleStep { thread }));
+                }
+            }
+            ExitStep::Lost => {}
         }
-        // A user breakpoint on the landing pad's first instruction is that breakpoint's
-        // hit, as on any line-step stop; it must not be stepped over by the continue.
-        if landed
-            && let Some(id) = self.breakpoints.id_for_kind(registers.pc, BreakpointKind::Software)
-            && self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled)
-        {
-            self.release_line_site(plan)?;
-            return Ok(Some(StopEvent::Breakpoint {
-                thread,
-                pc: registers.pc,
-            }));
-        }
-        if landed && registers.sp >= site.sp {
-            self.release_line_site(plan)?;
-            return Ok(Some(StopEvent::SingleStep { thread }));
-        }
-        if !landed {
-            tracing::debug!("no landing pad within {MAX_RESUME_STEPS} instructions of an unwinder resume");
-        }
-        plan.resuming = None;
         self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue))?;
         Ok(None)
     }
@@ -490,19 +335,22 @@ impl Session
 
     fn line_stopped(&mut self, plan: &mut LinePlan, event: StopEvent) -> Result<Option<StopEvent>>
     {
-        if plan.run_to.is_some() && self.hook_hit(plan, &event)? {
+        let hook = match (&plan.run_to, &plan.exits) {
+            (Some(_), Some(exits)) => self.exit_hook_hit(exits, &event)?,
+            _ => None,
+        };
+        if let Some((thread, image)) = hook.filter(|&(thread, _)| thread == plan.thread) {
             if self.interrupt_requested {
-                return Ok(Some(StopEvent::Interrupted {
-                    thread: Some(plan.thread),
-                }));
+                return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
             }
-            let sp = self.backend.read_registers(plan.thread)?.sp;
-            plan.resuming = Some(Resuming { sp, steps: 0 });
-            self.step_instruction(plan.thread)?;
+            if let Some(exits) = &mut plan.exits {
+                self.begin_exit(exits, image)?;
+            }
+            self.step_instruction(thread)?;
             return Ok(None);
         }
-        if plan.resuming.is_some() && event == (StopEvent::SingleStep { thread: plan.thread }) {
-            return self.resume_stepped(plan);
+        if plan.exits.as_ref().is_some_and(ExitHooks::leaving) && event == (StopEvent::SingleStep { thread: plan.thread }) {
+            return self.exit_stepped_in_line(plan);
         }
         if let Some(site) = &plan.run_to {
             if let StopEvent::Breakpoint { thread, pc } = event

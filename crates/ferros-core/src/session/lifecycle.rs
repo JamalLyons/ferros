@@ -125,7 +125,11 @@ impl Session
     /// As the backend contract requires, events still queued from the last stop (for
     /// example two threads that stopped at once) are drained first with a zero-timeout
     /// wait. If one is pending, the process is not resumed: the session still becomes
-    /// running and the next [`wait`](Self::wait) returns that event.
+    /// running and the next [`wait`](Self::wait) returns that event. A pending
+    /// breakpoint stop at an address with no trap any more (none in the breakpoint table
+    /// and none in memory) is dropped instead: it is left over from a source step's
+    /// private trap that an interrupt raced, and the thread has not executed the
+    /// instruction there yet.
     ///
     /// A signal held by the backend after a [`StopEvent::Signal`] stop is discarded: the
     /// program never sees it. Use [`resume_with_signal`](Self::resume_with_signal) to pass
@@ -202,7 +206,7 @@ impl Session
     {
         self.require_stopped()?;
         self.interrupt_requested = false;
-        if let Some(event) = self.backend_wait(Some(Duration::ZERO))? {
+        if let Some(event) = self.pending_event()? {
             self.deferred = Some(event);
         } else {
             self.stale_step = None;

@@ -782,3 +782,161 @@ fn removing_the_breakpoint_drops_a_stopped_handlers_rendezvous()
     );
     assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
 }
+
+/// `step_out` from the callee, raced by an interrupt: the interrupt is reported first and
+/// the return trap's exception stays queued behind it, as on a real kernel when the
+/// thread reaches the trap just as it is stopped. The step ends and removes its trap,
+/// so the queued stop is left over from a trap that is gone (issue #142). `more` are
+/// further stops queued after it.
+fn step_out_interrupted_at_return_trap(mock: &MockBackend, session: &mut Session, more: Vec<MockStop>)
+{
+    let caller = session.stack_trace(8).unwrap()[1].clone();
+    assert_eq!(caller.pc, BREAKPOINT);
+    let mut at_return = session.read_registers_for(THREAD).unwrap();
+    at_return.pc = BREAKPOINT;
+    at_return.sp = caller.sp;
+    let mut stops = vec![
+        MockStop::new(StopEvent::Interrupted { thread: Some(THREAD) }),
+        MockStop::new(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: BREAKPOINT,
+        })
+        .set_registers(THREAD, at_return),
+    ];
+    stops.extend(more);
+    mock.script_simultaneous(stops);
+    session.step_out().unwrap();
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Interrupted { thread: Some(THREAD) })
+    );
+    // The step is over: its private trap is gone, but its exception is still queued.
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(vec![0x1F; 4]));
+    assert!(session.breakpoints().iter().all(|bp| bp.address != BREAKPOINT));
+    assert!(mock.pending_len() > 0);
+}
+
+#[test]
+fn resume_drops_a_stale_return_trap_stop_and_continues()
+{
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    step_out_interrupted_at_return_trap(&mock, &mut session, Vec::new());
+
+    // Resume drains the stale stop, then really continues the process.
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("resume");
+    assert_eq!(mock.pending_len(), 0);
+    assert_eq!(session.wait(None).unwrap(), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(mock.script_len(), 0);
+}
+
+#[test]
+fn step_instruction_drops_a_stale_return_trap_stop_and_steps()
+{
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    step_out_interrupted_at_return_trap(&mock, &mut session, Vec::new());
+
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    session.step_instruction(THREAD).expect("step");
+    assert_eq!(mock.pending_len(), 0);
+    assert_eq!(session.wait(None).unwrap(), Some(StopEvent::SingleStep { thread: THREAD }));
+    assert_eq!(mock.script_len(), 0);
+    assert_eq!(session.read_registers_for(THREAD).unwrap().pc, BREAKPOINT + 4);
+}
+
+#[test]
+fn resume_still_reports_a_queued_stop_at_an_armed_breakpoint()
+{
+    use ferros_core::BreakpointRequest;
+
+    // A second thread is stopped at a real breakpoint in the same group, queued behind
+    // the stale return-trap stop. Only the stale one is dropped.
+    let other = ThreadId(2);
+    let user = CALLEE + 16;
+    let mut registers = arm64_registers();
+    registers.pc = CALLEE + 32;
+    let mock = returning_to_breakpoint().with_thread(other, registers);
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    session.select_thread(THREAD).expect("select the stepping thread");
+    let id = session
+        .add_breakpoint(BreakpointRequest::Software { address: user })
+        .expect("user breakpoint");
+    step_out_interrupted_at_return_trap(
+        &mock,
+        &mut session,
+        vec![MockStop::new(StopEvent::Breakpoint { thread: other, pc: user }).set_pc(other, user)],
+    );
+    assert_eq!(session.breakpoints().len(), 1);
+
+    session.resume().expect("resume");
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Breakpoint { thread: other, pc: user })
+    );
+    assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
+    assert_eq!(mock.pending_len(), 0);
+}
+
+#[test]
+fn resume_reports_a_drained_breakpoint_stop_at_an_armed_breakpoint()
+{
+    use ferros_core::BreakpointRequest;
+
+    // Two threads stop at real breakpoints at once: `wait` reports the first, and the
+    // second, drained by the next `resume`, still holds a trap, so it is reported too.
+    let other = ThreadId(2);
+    let first = CALLEE + 16;
+    let second = CALLEE + 32;
+    let mut registers = arm64_registers();
+    registers.pc = CALLEE + 40;
+    let mock = returning_to_breakpoint().with_thread(other, registers);
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let a = session
+        .add_breakpoint(BreakpointRequest::Software { address: first })
+        .expect("first breakpoint");
+    let b = session
+        .add_breakpoint(BreakpointRequest::Software { address: second })
+        .expect("second breakpoint");
+    mock.script_simultaneous(vec![
+        MockStop::new(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: first,
+        })
+        .set_pc(THREAD, first)
+        .expect_resume(ResumeRequest::continue_all()),
+        MockStop::new(StopEvent::Breakpoint {
+            thread: other,
+            pc: second,
+        })
+        .set_pc(other, second),
+    ]);
+    session.resume().expect("resume");
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Breakpoint {
+            thread: THREAD,
+            pc: first
+        })
+    );
+    session.resume().expect("resume with a stop queued");
+    assert_eq!(
+        session.wait(None).unwrap(),
+        Some(StopEvent::Breakpoint {
+            thread: other,
+            pc: second
+        })
+    );
+    assert_eq!(session.breakpoint_info(a).expect("first").hit_count, 1);
+    assert_eq!(session.breakpoint_info(b).expect("second").hit_count, 1);
+}

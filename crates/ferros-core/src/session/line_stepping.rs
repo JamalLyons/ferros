@@ -162,7 +162,7 @@ impl Session
             // that is already gone belongs to no request; drop it and start the step.
             // Anything else is reported first.
             let stale_step = event == (StopEvent::SingleStep { thread });
-            if !stale_step && !self.stale_trap(thread, &event)? {
+            if !stale_step && !self.stale_trap(Some(thread), &event)? {
                 self.deferred = Some(event);
                 self.state = SessionState::Running;
                 self.last_stop = None;
@@ -465,16 +465,17 @@ impl Session
         }
     }
 
-    /// Whether `event` is a breakpoint stop of `thread` left over from a private return
-    /// trap this session already removed: an interrupt can stop the thread just as it
-    /// reaches the trap, so the trap's exception is delivered later, when no trap is at
-    /// that address any more (none in the table and no trap instruction in memory).
-    fn stale_trap(&mut self, thread: ThreadId, event: &StopEvent) -> Result<bool>
+    /// Whether `event` is a breakpoint stop left over from a private trap this session
+    /// already removed (a return trap or a libunwind resume hook): an interrupt can stop
+    /// the thread just as it reaches the trap, so the trap's exception is delivered
+    /// later, when no trap is at that address any more (none in the table and no trap
+    /// instruction in memory). With `thread`, only a stop of that thread qualifies.
+    pub(super) fn stale_trap(&mut self, thread: Option<ThreadId>, event: &StopEvent) -> Result<bool>
     {
         let StopEvent::Breakpoint { thread: stopped, pc } = *event else {
             return Ok(false);
         };
-        if stopped != thread {
+        if thread.is_some_and(|thread| stopped != thread) {
             return Ok(false);
         }
         let arch = self.arch()?;
@@ -527,13 +528,13 @@ impl Session
                 if plan.mode == Mode::Out {
                     return Ok(Some(StopEvent::SingleStep { thread }));
                 }
-            } else if self.stale_trap(plan.thread, &event)? {
+            } else if self.stale_trap(Some(plan.thread), &event)? {
                 self.advance_line(plan)?;
                 return Ok(None);
             } else {
                 return Ok(Some(event));
             }
-        } else if self.stale_trap(plan.thread, &event)? {
+        } else if self.stale_trap(Some(plan.thread), &event)? {
             // The thread has not executed the instruction at the old trap's address yet.
             self.advance_line(plan)?;
             return Ok(None);

@@ -115,8 +115,28 @@ const EXCEPTION_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// released process.
 const DETACH_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long detach keeps watching for a private SIGSTOP that took effect after its
+/// first wait gave up and its SIGCONT was sent (#149). A stop landing in that time is
+/// continued again; one never seen is reported.
+const DETACH_STOP_RECHECK: Duration = Duration::from_secs(3);
+
 /// How long `kill` waits for a launched process to be reaped.
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll `done` every millisecond until it holds or `timeout` passes; whether it held.
+fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
 
 /// The three states of the [`Backend`] contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,8 +1373,20 @@ impl MacOSBackend
         };
         self.exit_watcher = None;
         self.child_cleanup.detach(self.traced);
+        let stop_fault = self
+            .reply_faults
+            .detach_stop_wait
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        let hide_stop = stop_fault == 2;
+        // Test hook: send the SIGCONT of a timed-out wait before the private SIGSTOP is
+        // even answered, so the stop is certain to land after it.
+        let expire_wait = stop_fault == 1 && private_stop_sent && !self.traced;
+        if expire_wait {
+            self.send_detach_sigcont();
+        }
         let restored = self.stop_exception_handler(true);
         self.release_suspends();
+        let mut stop_unconfirmed = Ok(());
         if private_stop_sent && !self.traced {
             // The handler answered the private SIGSTOP exception after PT_DETACH, so the
             // kernel takes the SIGSTOP as an ordinary job-control stop (state `T`) once the
@@ -1362,22 +1394,38 @@ impl MacOSBackend
             // cannot overtake the stop. SSTOP alone precedes the kernel task hold;
             // wait for that hold too, then undo our own stop: the released process must
             // keep running. A program with a SIGCONT handler sees one extra SIGCONT.
+            //
+            // If the wait runs out first (the target not scheduled for over a second),
+            // the SIGCONT can overtake the stop, which then leaves the process stopped
+            // (#149). Keep watching for a bounded time and continue it again once the
+            // stop lands; if it is never seen, report that it may stay stopped.
             let pid = self.pid.0 as libc::pid_t;
-            let deadline = Instant::now() + DETACH_STOP_TIMEOUT;
-            while !crate::lifecycle::job_control_stop_has_taken_effect(pid, self.task) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(1));
+            let landed = |task| !hide_stop && crate::lifecycle::job_control_stop_has_taken_effect(pid, task);
+            let mut observed = false;
+            if !expire_wait {
+                observed = wait_until(DETACH_STOP_TIMEOUT, || landed(self.task));
+                self.send_detach_sigcont();
             }
-            // SAFETY: plain kill(2) on the pid this backend still holds (not yet released).
-            if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGCONT) } != 0 {
-                tracing::warn!(
-                    "SIGCONT after detach failed: {}; process {} may stay stopped",
-                    std::io::Error::last_os_error(),
-                    self.pid.0
-                );
+            if !observed {
+                observed = wait_until(DETACH_STOP_RECHECK, || landed(self.task));
+                if observed {
+                    self.send_detach_sigcont();
+                }
+            }
+            // SAFETY: signal 0 only checks that the pid this backend holds still exists.
+            if !observed && unsafe { libc::kill(pid, 0) } == 0 {
+                stop_unconfirmed = Err(BackendError::Os {
+                    code: -1,
+                    message: format!(
+                        "detach did not see its private SIGSTOP take effect within {:?}; process {} may stay stopped",
+                        DETACH_STOP_TIMEOUT + DETACH_STOP_RECHECK,
+                        self.pid.0
+                    ),
+                });
             }
         }
         self.release_ports();
-        let failures: Vec<_> = [birth, traced, replayed, fallback, restored]
+        let failures: Vec<_> = [birth, traced, replayed, fallback, restored, stop_unconfirmed]
             .into_iter()
             .filter_map(|result| result.err())
             .map(|err| err.to_string())
@@ -1386,6 +1434,19 @@ impl MacOSBackend
             Ok(())
         } else {
             Err(BackendError::DetachCleanup(failures.join("; ")))
+        }
+    }
+
+    /// Continue the released process after detach's private SIGSTOP.
+    fn send_detach_sigcont(&self)
+    {
+        // SAFETY: plain kill(2) on the pid this backend still holds (not yet released).
+        if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGCONT) } != 0 {
+            tracing::warn!(
+                "SIGCONT after detach failed: {}; process {} may stay stopped",
+                std::io::Error::last_os_error(),
+                self.pid.0
+            );
         }
     }
 

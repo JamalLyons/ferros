@@ -179,9 +179,9 @@ impl Session
     /// that return is not reported or counted: the original instruction is executed and
     /// the continue goes on. A `step_instruction` or source step started after the
     /// handler stopped gives this up, and so does removing or disabling that breakpoint;
-    /// the return is then reported as a hit. A handler that never returns (it leaves by
-    /// `siglongjmp`) leaves that one rendezvous pending: the thread's next arrival at the
-    /// breakpoint in the same frame, under a continue, is taken for it.
+    /// the return is then reported as a hit. So does a handler that never returns: when it
+    /// leaves by `longjmp` or `siglongjmp` for the frame it interrupted or an outer one,
+    /// the thread's next arrival at the breakpoint is a hit.
     ///
     /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
     /// because another stop cut its step-over sequence short (the signal is still held),
@@ -210,8 +210,11 @@ impl Session
             self.deferred = Some(event);
         } else {
             self.stale_step = None;
-            self.note_handler_continue(&request);
-            self.start_continue(request)?;
+            self.note_handler_continue(&request)?;
+            if let Err(error) = self.start_continue(request) {
+                self.release_handler_exits_after_error();
+                return Err(error);
+            }
         }
         self.state = SessionState::Running;
         self.last_stop = None;

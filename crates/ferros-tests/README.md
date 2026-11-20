@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines eighteen fixture binaries:
+The crate defines nineteen fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -25,6 +25,13 @@ The crate defines eighteen fixture binaries:
   (rustc gives such Rust leaves DWARF CFI in a debug build). Used for a backtrace stopped
   after the epilogue released the stack (issue #130). Find them with
   `ferros_tests::symbols::raw_symbol_address`.
+- `ferros-fixture-long_jump`: A C program (`fixtures/c/long_jump.c`, compiled and linked by
+  `build.rs`; `fixtures/long_jump.rs` is a `#![no_main]` stub) whose markers live in the C
+  source. Without arguments, `main` (marker `call_middle`) calls `middle` (marker
+  `call_jumper`), whose callee `jumper` (marker `in_jumper`) `longjmp`s back to `main`
+  (marker `after_jump`). With `--handler`, a SIGUSR1 handler (marker `in_handler`) leaves
+  by `siglongjmp`, and its caller then calls `raise(0)` from the same frame (marker
+  `raise_again`). Used for stepping across non-local exits (issue #141).
 - `ferros-fixture-recursion`: `descend` recurses to the depth given by the first argument (default 60);
   marker `bottom` is reached at the deepest call. Used for deep backtraces.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).

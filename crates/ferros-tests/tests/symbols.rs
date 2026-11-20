@@ -28,6 +28,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("frameless_stack"),
         fixture!("hello"),
         fixture!("hot_loop"),
+        fixture!("long_jump"),
         fixture!("loop_counter"),
         fixture!("nested_calls"),
         fixture!("read_line"),

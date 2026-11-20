@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use super::exits::{ExitHooks, ExitStep};
 use super::{Session, SessionState};
 use crate::backend::{ResumeRequest, StopEvent, ThreadAction};
 use crate::breakpoints::{BreakpointEntry, BreakpointKind};
@@ -34,6 +35,17 @@ impl HandlerReturn
     {
         self.address
     }
+}
+
+/// The next move after a stop of a pending handler return's exit traps.
+enum Follow
+{
+    /// Single-step the handler's thread through the exit.
+    Step,
+    /// Reissue the user's continue.
+    Continue,
+    /// Report this stop.
+    Report(StopEvent),
 }
 
 pub(super) struct StepPlan
@@ -167,17 +179,24 @@ impl Session
         // The stepping thread's held signal is discarded by this step; other threads stay
         // suspended, so a signal carried for them is still held.
         self.carried_signals.retain(|(carried, _)| *carried != thread);
+        self.step_thread(thread)?;
+        self.enter_running()
+    }
+
+    /// Start one instruction step of `thread` with the others suspended, stepping over an
+    /// enabled software breakpoint at its pc; its completion is a `SingleStep` of `thread`.
+    fn step_thread(&mut self, thread: ThreadId) -> Result<()>
+    {
         if let Some(current) = self.breakpoint_at_pc(thread)? {
             self.start_plan(StepPlan {
                 current,
                 remaining: VecDeque::new(),
                 final_request: None,
                 signal_return_sp: None,
-            })?;
+            })
         } else {
-            self.backend.resume(&ResumeRequest::step(thread))?;
+            Ok(self.backend.resume(&ResumeRequest::step(thread))?)
         }
-        self.enter_running()
     }
 
     fn enter_running(&mut self) -> Result<()>
@@ -274,6 +293,7 @@ impl Session
                 if let Err(cleanup) = self.cancel_line_step() {
                     tracing::warn!("could not cancel a source step: {cleanup}");
                 }
+                self.release_handler_exits_after_error();
                 return Err(error);
             }
         };
@@ -284,24 +304,80 @@ impl Session
         }
     }
 
-    /// Note the continue `request` for a pending handler return (see `HandlerReturn`).
-    pub(super) fn note_handler_continue(&mut self, request: &ResumeRequest)
+    /// Note the continue `request` for a pending handler return (see `HandlerReturn`), and
+    /// trap the non-local exits of its thread for the continue, so a handler that leaves
+    /// by `siglongjmp` gives the rendezvous up. Requires a stopped session.
+    pub(super) fn note_handler_continue(&mut self, request: &ResumeRequest) -> Result<()>
     {
-        if let Some(pending) = &mut self.handler_return {
-            let mut request = request.clone();
-            request.signals.clear();
-            pending.request = Some(request);
+        let Some(pending) = &mut self.handler_return else {
+            return Ok(());
+        };
+        let mut request = request.clone();
+        request.signals.clear();
+        pending.request = Some(request);
+        let thread = pending.thread;
+        if self.handler_exits.is_none() {
+            let mut exits = None;
+            let armed = self.arm_exit_hooks(&mut exits, thread);
+            if let Err(error) = armed {
+                if let Err(cleanup) = self.release_exit_hooks(exits) {
+                    tracing::warn!("could not remove a temporary exit breakpoint: {cleanup}");
+                }
+                return Err(error);
+            }
+            self.handler_exits = exits;
+        }
+        Ok(())
+    }
+
+    /// Remove the exit traps of a pending handler return. They exist only while a continue
+    /// runs; the backend is stopped whenever this is called.
+    fn release_handler_exits(&mut self) -> Result<()>
+    {
+        let Some(exits) = self.handler_exits.take() else {
+            return Ok(());
+        };
+        let state = std::mem::replace(&mut self.state, SessionState::Stopped);
+        let result = self.release_exit_hooks(Some(exits));
+        self.state = state;
+        result
+    }
+
+    /// Remove the exit traps of a pending handler return, logging a failure.
+    pub(super) fn release_handler_exits_after_error(&mut self)
+    {
+        if let Err(cleanup) = self.release_handler_exits() {
+            tracing::warn!("could not remove a temporary exit breakpoint: {cleanup}");
         }
     }
 
     /// A breakpoint stop that is a stopped handler's return to its step-resume trap, in the
     /// frame it interrupted, is consumed: the original instruction is stepped over and the
-    /// user's continue reissued. Any other event is returned.
+    /// user's continue reissued. So are the stops of the exit traps armed for the continue.
+    /// Any other event is returned, and the exit traps are removed with it.
     fn finish_handler_return(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
     {
         if event.is_terminal() {
             self.handler_return = None;
+            self.handler_exits = None;
             return Ok(Some(event));
+        }
+        let result = self.handler_return_stop(event);
+        if !matches!(result, Ok(None))
+            && let Err(cleanup) = self.release_handler_exits()
+        {
+            if result.is_ok() {
+                return Err(cleanup);
+            }
+            tracing::warn!("could not remove a temporary exit breakpoint: {cleanup}");
+        }
+        result
+    }
+
+    fn handler_return_stop(&mut self, event: StopEvent) -> Result<Option<StopEvent>>
+    {
+        if let Some(consumed) = self.handler_exit_stop(&event)? {
+            return Ok(consumed);
         }
         let Some(pending) = &self.handler_return else {
             return Ok(Some(event));
@@ -326,8 +402,101 @@ impl Session
         if let Some(other) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             return Ok(Some(other));
         }
+        // The rendezvous is over, and its exit traps with it.
+        self.release_handler_exits()?;
         self.start_continue(request)?;
         Ok(None)
+    }
+
+    /// Consume `event` if it belongs to the exit traps of a pending handler return:
+    /// `Some(None)` when it was consumed and execution goes on, `Some(Some(event))` for an
+    /// event to report instead, `None` when it is not theirs.
+    ///
+    /// The handler's thread at an exit entry is single-stepped alone until it lands. A
+    /// landing in the frame the handler interrupted or an outer one means the handler is
+    /// gone without returning (`siglongjmp`), so the rendezvous is given up. Another thread
+    /// at an exit trap steps over it.
+    fn handler_exit_stop(&mut self, event: &StopEvent) -> Result<Option<Option<StopEvent>>>
+    {
+        let (Some(exits), Some(pending)) = (&self.handler_exits, &self.handler_return) else {
+            return Ok(None);
+        };
+        let Some(request) = pending.request.clone() else {
+            return Ok(None);
+        };
+        let (thread, interrupted_sp) = (exits.thread(), pending.sp);
+        let hit = self.exit_hook_hit(exits, event)?;
+        let stepped = exits.leaving() && *event == (StopEvent::SingleStep { thread });
+        if hit.is_none() && !stepped {
+            return Ok(None);
+        }
+        if self.interrupt_requested {
+            return Ok(Some(Some(StopEvent::Interrupted {
+                thread: event.thread().or(Some(thread)),
+            })));
+        }
+        // Other threads' events reported with this stop are the caller's.
+        if let Some(other) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+            return Ok(Some(Some(other)));
+        }
+        let Some(mut exits) = self.handler_exits.take() else {
+            return Ok(None);
+        };
+        // Adding and removing traps needs a stopped session; the backend is stopped.
+        let state = std::mem::replace(&mut self.state, SessionState::Stopped);
+        let result = self.follow_handler_exit(&mut exits, hit, interrupted_sp).and_then(|follow| {
+            if self.handler_return.is_none() {
+                // A given-up rendezvous takes its exit traps with it, before the process
+                // runs again.
+                self.release_exit_hooks(Some(std::mem::replace(&mut exits, ExitHooks::empty(thread))))?;
+            }
+            match follow {
+                Follow::Step => self.step_thread(thread).map(|()| None),
+                Follow::Continue => self.start_continue(request).map(|()| None),
+                Follow::Report(event) => Ok(Some(event)),
+            }
+        });
+        self.state = state;
+        self.handler_exits = self.handler_return.is_some().then_some(exits);
+        result.map(Some)
+    }
+
+    /// What to do after a stop of a pending handler return's exit traps.
+    fn follow_handler_exit(
+        &mut self,
+        exits: &mut ExitHooks,
+        hit: Option<(ThreadId, usize)>,
+        interrupted_sp: Address,
+    ) -> Result<Follow>
+    {
+        let thread = exits.thread();
+        match hit {
+            Some((hit_thread, image)) if hit_thread == thread => {
+                self.begin_exit(exits, image)?;
+                return Ok(Follow::Step);
+            }
+            // Another thread at an exit trap: the continue steps it over the trap.
+            Some(_) => return Ok(Follow::Continue),
+            None => {}
+        }
+        match self.exit_stepped(exits)? {
+            ExitStep::Stepping => Ok(Follow::Step),
+            ExitStep::Landed { pc, sp } => {
+                if sp >= interrupted_sp {
+                    // The handler left the frame it interrupted without returning.
+                    self.handler_return = None;
+                }
+                // A user breakpoint at the landing is that breakpoint's hit; the continue
+                // must not step over it.
+                if let Some(id) = self.breakpoints.id_for_kind(pc, BreakpointKind::Software)
+                    && self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled)
+                {
+                    return Ok(Follow::Report(StopEvent::Breakpoint { thread, pc }));
+                }
+                Ok(Follow::Continue)
+            }
+            ExitStep::Lost => Ok(Follow::Continue),
+        }
     }
 
     fn finish_breakpoint_step(&mut self, event: StopEvent) -> Result<Option<StopEvent>>

@@ -68,6 +68,7 @@
 #![forbid(unsafe_code)]
 
 mod breakpoints;
+mod exits;
 mod images;
 mod lifecycle;
 mod line_stepping;
@@ -120,7 +121,11 @@ pub struct Session
     step_plan: Option<stepping::StepPlan>,
     line_plan: Option<line_stepping::LinePlan>,
     handler_return: Option<stepping::HandlerReturn>,
-    unwinder: Option<line_stepping::Unwinder>,
+    /// Non-local exit traps armed while a continue runs a stopped handler on (see
+    /// `HandlerReturn`), so a handler that leaves by `siglongjmp` gives up its rendezvous.
+    handler_exits: Option<exits::ExitHooks>,
+    /// Exit images found in this process (see `exits`), each read once.
+    exit_images: Vec<exits::ExitImage>,
     interrupt_requested: bool,
     /// A backend `wait` error met while `resume` drove a step-over, returned by the
     /// next `wait`.
@@ -291,7 +296,8 @@ impl Session
             step_plan: None,
             line_plan: None,
             handler_return: None,
-            unwinder: None,
+            handler_exits: None,
+            exit_images: Vec::new(),
             interrupt_requested: false,
             deferred_error: None,
             stale_step: None,
@@ -424,7 +430,8 @@ impl Session
         self.step_plan = None;
         self.line_plan = None;
         self.handler_return = None;
-        self.unwinder = None;
+        self.handler_exits = None;
+        self.exit_images.clear();
         self.interrupt_requested = false;
         self.deferred_error = None;
         self.stale_step = None;

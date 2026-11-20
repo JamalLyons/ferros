@@ -22,6 +22,13 @@ pub enum BackendError
     #[error("invalid state: {0}")]
     InvalidState(String),
 
+    /// `resume` was refused because a stop event is pending: one may arrive after the
+    /// caller's last zero-timeout [`wait`](super::Backend::wait) and before `resume`
+    /// checks the queue. Nothing was resumed and the target is still *Stopped*; the
+    /// next `wait` returns that event.
+    #[error("resume is not allowed while stop events are pending; drain them with wait")]
+    StopPending,
+
     /// The backend or architecture does not support the requested operation.
     #[error("unsupported: {0}")]
     Unsupported(String),

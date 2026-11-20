@@ -1822,9 +1822,7 @@ impl Backend for MacOSBackend
             let mut shared = lock_shared(&shared_state);
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
-                return Err(BackendError::InvalidState(
-                    "resume is not allowed while stop events are pending; drain them with wait".to_string(),
-                ));
+                return Err(BackendError::StopPending);
             }
             shared.preparing_resume = true;
             (
@@ -1867,9 +1865,7 @@ impl Backend for MacOSBackend
                 self.peeked = Some(event);
                 drop(shared);
                 restore(self, count);
-                return Err(BackendError::InvalidState(
-                    "resume is not allowed while stop events are pending; drain them with wait".into(),
-                ));
+                return Err(BackendError::StopPending);
             }
             if pending || held {
                 // A selectively suspended thread retains its logical signal decision

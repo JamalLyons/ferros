@@ -354,6 +354,10 @@ struct Inner
     script: VecDeque<Vec<MockStop>>,
     /// Events of the last stop not yet returned by `wait`.
     pending: VecDeque<StopEvent>,
+    /// Stops that arrive while the target is stopped, just before the `resume` this many
+    /// resumes from now (one-based) checks for pending events; one group per refused
+    /// resume, counted down in queue order.
+    racing: VecDeque<(usize, Vec<MockStop>)>,
     interrupt_requested: bool,
     calls: Vec<MockCall>,
     failures: VecDeque<(MockCallKind, usize, BackendError)>,
@@ -478,6 +482,7 @@ impl Inner
     {
         self.state = MockState::NoProcess;
         self.pending.clear();
+        self.racing.clear();
         self.interrupt_requested = false;
     }
 
@@ -553,6 +558,7 @@ impl MockBackend
                 images: Vec::new(),
                 script: VecDeque::new(),
                 pending: VecDeque::new(),
+                racing: VecDeque::new(),
                 interrupt_requested: false,
                 calls: Vec::new(),
                 failures: VecDeque::new(),
@@ -676,6 +682,34 @@ impl MockBackend
         assert!(event.is_terminal(), "die: {event:?} is not a terminal event");
         assert_eq!(inner.state, MockState::Stopped, "die: the mock is not stopped");
         inner.pending.push_back(event);
+    }
+
+    /// Simulate stops that arrive while the target is *Stopped*, after the engine's last
+    /// drain and just before the next `resume` checks for pending events: that `resume`
+    /// applies their effects, queues their events as pending, and is refused with
+    /// [`BackendError::StopPending`] (the macOS backend's refusal for the same race). The
+    /// following `wait` calls return the events. Each call races one future resume; an
+    /// empty group is ignored. A resume that fails earlier (an injected failure, no
+    /// process, running) does not count.
+    pub fn stop_before_next_resume(&self, stops: impl IntoIterator<Item = MockStop>)
+    {
+        self.stop_before_nth_resume(1, stops);
+    }
+
+    /// As [`stop_before_next_resume`](Self::stop_before_next_resume), for the `nth`
+    /// counted resume (one-based) after earlier races have fired, so an internal resume
+    /// in the middle of an engine operation can be raced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nth` is zero.
+    pub fn stop_before_nth_resume(&self, nth: usize, stops: impl IntoIterator<Item = MockStop>)
+    {
+        assert!(nth > 0, "resume index must be one-based");
+        let stops: Vec<MockStop> = stops.into_iter().collect();
+        if !stops.is_empty() {
+            self.lock().racing.push_back((nth, stops));
+        }
     }
 
     /// Make the next call of `kind` fail with `error`, after it is recorded and before
@@ -858,11 +892,17 @@ impl Backend for MockBackend
         let mut inner = self.lock();
         inner.begin(MockCall::Resume(request.clone()))?;
         inner.require_stopped("resume")?;
+        if let Some((nth, stops)) = inner.racing.front().cloned() {
+            if nth == 1 {
+                inner.apply_effects(&stops)?;
+                inner.racing.pop_front();
+                inner.pending.extend(stops.into_iter().map(|stop| stop.event));
+            } else if let Some(race) = inner.racing.front_mut() {
+                race.0 -= 1;
+            }
+        }
         if !inner.pending.is_empty() {
-            return Err(invalid_state(format!(
-                "resume: {} stop event(s) still pending; drain them with wait first",
-                inner.pending.len()
-            )));
+            return Err(BackendError::StopPending);
         }
         if let Some((thread, _)) = request
             .thread_actions
@@ -1336,7 +1376,7 @@ mod tests
         assert_eq!(mock.pending_len(), 1);
         // Effects of the whole group are visible as soon as the process stops.
         assert_eq!(mock.threads(), Ok(vec![T1, t2]));
-        assert!(is_invalid_state(&mock.resume(&ResumeRequest::continue_all())));
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
         assert_eq!(mock.state(), MockState::Stopped);
 
         let second = mock.wait(Some(Duration::ZERO)).expect("wait");
@@ -1609,13 +1649,37 @@ mod tests
     }
 
     #[test]
+    fn stop_before_next_resume_refuses_that_resume_once()
+    {
+        let mut mock = process();
+        mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+        mock.launch(&spec()).expect("launch");
+        mock.stop_before_next_resume([
+            MockStop::new(StopEvent::Signal { thread: T1, signal: 30 }).set_pc(T1, Address::new(CODE + 4))
+        ]);
+        assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(None), "nothing pending before the resume");
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
+        assert_eq!(mock.state(), MockState::Stopped);
+        assert_eq!(
+            mock.peek_registers(T1).map(|registers| registers.pc),
+            Some(Address::new(CODE + 4))
+        );
+        assert_eq!(
+            mock.wait(Some(Duration::ZERO)),
+            Ok(Some(StopEvent::Signal { thread: T1, signal: 30 }))
+        );
+        mock.resume(&ResumeRequest::continue_all()).expect("the race is used once");
+        assert_eq!(mock.wait(None), Ok(Some(StopEvent::Exited { code: 0 })));
+    }
+
+    #[test]
     fn death_while_stopped_is_a_pending_terminal_event()
     {
         let mut mock = process();
         mock.launch(&spec()).expect("launch");
         mock.die(StopEvent::Killed { signal: 9 });
         assert_eq!(mock.state(), MockState::Stopped);
-        assert!(is_invalid_state(&mock.resume(&ResumeRequest::continue_all())));
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
         assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(Some(StopEvent::Killed { signal: 9 })));
         assert_eq!(mock.state(), MockState::NoProcess);
 

@@ -940,3 +940,113 @@ fn resume_reports_a_drained_breakpoint_stop_at_an_armed_breakpoint()
     assert_eq!(session.breakpoint_info(a).expect("first").hit_count, 1);
     assert_eq!(session.breakpoint_info(b).expect("second").hit_count, 1);
 }
+
+/// #150: a stop can arrive after `Session::resume` drained the backend's queue and before
+/// the backend checks it, so the backend refuses the resume with `StopPending`. The
+/// session defers that stop as it does a drained one: it becomes running, the next
+/// `wait` reports the stop, and the step over the breakpoint at the pc is undone.
+#[test]
+fn resume_reports_a_stop_that_arrives_after_its_drain()
+{
+    let mock = scripted_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint");
+    session.resume().expect("run to the breakpoint");
+    assert!(matches!(
+        session.wait(None).expect("wait"),
+        Some(StopEvent::Breakpoint { .. })
+    ));
+
+    let late = StopEvent::Signal {
+        thread: THREAD,
+        signal: 30,
+    };
+    mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
+    let _ = mock.take_calls();
+    session.resume().expect("a stop raced the resume");
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(mock.state(), MockState::Stopped, "nothing ran");
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(session.wait(None).expect("wait"), Some(late.clone()));
+    assert_eq!(session.last_stop(), Some(&late));
+    assert_eq!(session.breakpoints()[0].hit_count, 1);
+
+    // The process runs on from there: the breakpoint is stepped over and the exit reported.
+    session.resume().expect("resume after the late stop");
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+}
+
+/// #150: the same race for `step_instruction`: the late stop is reported, not an error.
+#[test]
+fn step_instruction_reports_a_stop_that_arrives_after_its_drain()
+{
+    let mock = scripted_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let late = StopEvent::Signal {
+        thread: THREAD,
+        signal: 30,
+    };
+    mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
+    session.step_instruction(THREAD).expect("a stop raced the step");
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(session.wait(None).expect("wait"), Some(late));
+    assert_eq!(mock.script_len(), 3, "no scripted stop was consumed");
+}
+
+/// #150: the same race for a source step that runs to a private return trap: the late
+/// stop is reported and the private trap is gone with the step.
+#[test]
+fn step_out_reports_a_stop_that_arrives_after_its_drain()
+{
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let late = StopEvent::Signal {
+        thread: THREAD,
+        signal: 30,
+    };
+    mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
+    session.step_out().expect("a stop raced the step");
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(vec![0x1F; 4]), "private trap released");
+    assert!(session.breakpoints().is_empty());
+    assert_eq!(session.wait(None).expect("wait"), Some(late));
+}
+
+/// #150: the race can also hit the final continue of `resume`'s step over the breakpoint
+/// at the pc: the late stop is reported from `wait`, the trap is armed again, and the
+/// signal meant for the continue stays held for the next `resume_with_signal`.
+#[test]
+fn step_over_reports_a_stop_that_arrives_before_its_final_continue()
+{
+    let mock = scripted_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint");
+    session.resume().expect("run to the breakpoint");
+    assert!(matches!(
+        session.wait(None).expect("wait"),
+        Some(StopEvent::Breakpoint { .. })
+    ));
+
+    // Resume 1 is the step off the breakpoint (scripted SingleStep); resume 2 is the
+    // final continue, which the late stop races.
+    let late = StopEvent::Signal {
+        thread: THREAD,
+        signal: 30,
+    };
+    mock.stop_before_nth_resume(2, std::iter::once(MockStop::new(late.clone())));
+    session.resume().expect("a stop raced the final continue");
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(mock.state(), MockState::Stopped, "the final continue ran nothing");
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(session.wait(None).expect("wait"), Some(late));
+    assert_eq!(session.breakpoints()[0].hit_count, 1);
+    assert_eq!(mock.script_len(), 1, "only the exit is left");
+}

@@ -46,7 +46,8 @@ The crate defines nineteen fixture binaries:
 - `ferros-fixture-step_races`: Two workers wait behind independent file gates before
   entering `step_site` (marker `step_site`). Each can raise its own SIGUSR1 afterwards.
   A fixture-side observer publishes the handler bitset on request; an exit gate releases
-  both workers. Used to retain one exception while admitting the other worker, to observe
+  both workers. With `--block-in-read`, worker 0 reads from an empty socket until the
+  exit gate opens. Used to retain one exception while admitting the other worker, to observe
   carried-signal delivery, and to keep attached workers alive throughout teardown checks.
 - `ferros-fixture-symbols`: Source-lookup targets read from its dSYM without a process: a generic
   function instantiated twice, an inherent method, a function in a module, an `#[inline(always)]`
@@ -241,10 +242,13 @@ control and real kernel exception messages:
 - `single_step::breakpoint_cancels_a_real_step_without_a_stray_step_stop` steps a planted
   `brk`: the synchronous breakpoint precedes instruction completion. Immediately after
   `wait`, before any resume, MDSCR_EL1.SS is clear and every per-thread suspend count is
-  zero. A plain continue produces no stray step. This replaces the former SIGUSR1 trial
-  loop: sending a signal while stopped cannot force it to reach the stepping thread
-  before that thread completes an instruction. Signal cancellation with that exact
-  ordering is not claimed; signal retention/delivery is covered natively below.
+  zero. A plain continue produces no stray step.
+- `single_step::signal_cancels_a_real_step_without_a_stray_step_stop` (#75) stops at
+  the `svc` of a blocking read on arm64. With the socket empty and its writer gated,
+  the test observes the stepping thread waiting in the kernel with MDSCR_EL1.SS set
+  and its peers suspended. A thread-directed SIGUSR1 produces a real signal event
+  before the step completes. The test checks the bit and suspend counts at event
+  delivery, then releases the writer and requires a clean exit after plain continue.
 - `single_step::interrupt_precedes_a_real_instruction_step` pauses publication of a real
   step exception, queues an interrupt first, and requires `Interrupted`. It checks the
   same immediate cleanup, then releases and observes the late real completion below
@@ -270,10 +274,10 @@ control and real kernel exception messages:
 - `single_step::detach_cleanup_after_starting_step_releases_suspended_threads` directly
   observes peer suspend counts of one while a real completion is publication-paused,
   then covers both attached Session drop and explicit interrupt/wait/detach, requiring
-  a successful child exit. `backend_drop_releases_directly_observed_step_suspends`
-  drops an attached backend without calling `wait`, independently testing teardown's
-  cleanup rather than relying on Session's stop delivery. Public `detach` still
-  requires a stopped session.
+  a successful child exit. `single_step::backend_drop_releases_directly_observed_step_suspends`
+  (#75) drops an attached backend without calling `wait`. A one-shot hook samples a
+  known peer's Mach suspend count immediately before detach sends its real private
+  SIGSTOP. The count must already be zero there, and the child must exit normally.
 
 The four Session mock tests for late abandoned steps, pending events alongside step
 completion, and delivery/drop of carried signals remain as fast, isolated complements;

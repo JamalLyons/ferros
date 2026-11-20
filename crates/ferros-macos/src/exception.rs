@@ -197,10 +197,18 @@ pub struct ReplyFaultInjector
     /// Detach's private stop: 0 normal, 1 SIGCONT before the reply, 2 never observe
     /// the stop. Tests only (#149).
     pub(crate) detach_stop_wait: Arc<AtomicU8>,
+    detach_suspend_probe: Arc<Mutex<Option<DetachSuspendProbe>>>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
     birth_suspend: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct DetachSuspendProbe
+{
+    thread: ThreadId,
+    sample: mpsc::Sender<ferros_core::error::Result<i32>>,
 }
 
 impl ReplyFaultInjector
@@ -245,6 +253,28 @@ impl ReplyFaultInjector
     pub fn hide_next_detach_stop(&self)
     {
         self.detach_stop_wait.store(2, Ordering::SeqCst);
+    }
+
+    /// Sample the given tracee thread's Mach suspend count before the next detach
+    /// sends its private SIGSTOP. The backend must still own the thread port. Tests only.
+    pub fn observe_next_detach_suspend_count(&self, thread: ThreadId) -> mpsc::Receiver<ferros_core::error::Result<i32>>
+    {
+        let (sample, result) = mpsc::channel();
+        *self.detach_suspend_probe.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(DetachSuspendProbe { thread, sample });
+        result
+    }
+
+    pub(crate) fn sample_detach_suspend_count(&self)
+    {
+        let probe = self
+            .detach_suspend_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(probe) = probe {
+            let _ = probe.sample.send(crate::diagnostics::thread_suspend_count(probe.thread));
+        }
     }
 
     /// Deliver a real SIGUSR1 to another thread when the next private SIGSTOP arrives.

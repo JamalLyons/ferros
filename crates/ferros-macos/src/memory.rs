@@ -352,6 +352,15 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
 /// The guarantee has two limits, both reported rather than hidden: a range that cannot
 /// be read beforehand gets no rollback, and if the rollback itself fails the error says
 /// that memory may be partly written.
+///
+/// ## Protection restore
+///
+/// A write that had to make the range writable fails if the original protection cannot
+/// be put back afterwards (issue #139), even though the bytes were written: a code page
+/// left `rw-` faults the moment the target executes it. The written bytes are then
+/// rolled back as for any other failed write, and the error names the address and the
+/// protection that could not be restored, because the range stays writable and not
+/// executable.
 pub fn write_memory_all_or_nothing(task: mach_port_t, addr: Address, data: &[u8]) -> Result<()>
 {
     write_restoring(task, addr, data, write_with_protection)
@@ -359,6 +368,18 @@ pub fn write_memory_all_or_nothing(task: mach_port_t, addr: Address, data: &[u8]
 
 /// [`write_memory`], retried with the range made writable when the direct write fails.
 fn write_with_protection(task: mach_port_t, addr: Address, data: &[u8]) -> Result<()>
+{
+    write_with_protection_using(task, addr, data, change_protection)
+}
+
+/// [`write_with_protection`], with `restore` putting back the original protection (a
+/// seam so tests can make the restore fail).
+fn write_with_protection_using(
+    task: mach_port_t,
+    addr: Address,
+    data: &[u8],
+    restore: impl FnMut(mach_port_t, mach_vm_address_t, mach_vm_size_t, c_int) -> Result<()>,
+) -> Result<()>
 {
     match write_memory(task, addr, data) {
         Ok(_) => Ok(()),
@@ -369,8 +390,11 @@ fn write_with_protection(task: mach_port_t, addr: Address, data: &[u8]) -> Resul
             );
             let guard = MemoryProtectionGuard::make_writable(task, addr, data.len())?;
             let written = write_memory(task, addr, data);
-            drop(guard);
-            written.map(|_| ())
+            match (written, guard.restore_with(restore)) {
+                (Ok(_), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                (Err(error), Err(restore)) => Err(DebuggerError::Io(Error::other(format!("{error}; {restore}")))),
+            }
         }
     }
 }
@@ -818,16 +842,71 @@ impl MemoryProtectionGuard
             active: true,
         })
     }
+
+    /// Put back the original protection, reporting a failure.
+    ///
+    /// A refused change is retried once. Dropping the guard also restores the
+    /// protection, but can only log a failure; call this wherever the outcome matters,
+    /// as after writing code (issue #139).
+    pub fn restore(self) -> Result<()>
+    {
+        self.restore_with(change_protection)
+    }
+
+    fn restore_with(
+        mut self,
+        mut protect: impl FnMut(mach_port_t, mach_vm_address_t, mach_vm_size_t, c_int) -> Result<()>,
+    ) -> Result<()>
+    {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let Err(first) = protect(self.task, self.addr, self.len, self.original) else {
+            return Ok(());
+        };
+        tracing::debug!(
+            "restoring the protection of 0x{:016x}+{} failed ({first}); retrying once",
+            self.addr,
+            self.len
+        );
+        protect(self.task, self.addr, self.len, self.original).map_err(|error| self.restore_error(&error))
+    }
+
+    fn restore_error(&self, error: &DebuggerError) -> DebuggerError
+    {
+        DebuggerError::Io(Error::other(format!(
+            "the protection of 0x{:016x}+{} could not be restored to {} ({error}), so the range is left writable",
+            self.addr,
+            self.len,
+            protection_label(self.original)
+        )))
+    }
 }
 
 impl Drop for MemoryProtectionGuard
 {
     fn drop(&mut self)
     {
-        if self.active {
-            let _ = change_protection(self.task, self.addr, self.len, self.original);
+        if self.active
+            && let Err(error) = change_protection(self.task, self.addr, self.len, self.original)
+        {
+            tracing::warn!("{}", self.restore_error(&error));
         }
     }
+}
+
+/// `protection` as `rwx` flags, with `-` for a missing one.
+fn protection_label(protection: c_int) -> String
+{
+    [
+        (libc::VM_PROT_READ, 'r'),
+        (libc::VM_PROT_WRITE, 'w'),
+        (libc::VM_PROT_EXECUTE, 'x'),
+    ]
+    .iter()
+    .map(|&(flag, letter)| if protection & flag != 0 { letter } else { '-' })
+    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1217,132 @@ mod tests
         assert!(message.contains("injected failure"), "{message}");
         assert!(!message.contains("partly written"), "{message}");
         assert_eq!(target.bytes(), [1, 2, 3, 4]);
+    }
+
+    /// A read-only page of this process, so a direct `vm_write` is refused and the write
+    /// goes through [`MemoryProtectionGuard`] like a write to code does.
+    struct ReadOnlyPage
+    {
+        base: *mut libc::c_void,
+        len: usize,
+    }
+
+    impl ReadOnlyPage
+    {
+        fn new() -> Self
+        {
+            let len = *SYSTEM_PAGE_SIZE;
+            // SAFETY: a fresh anonymous private mapping; nothing else refers to it.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            // SAFETY: the mapping is `len` writable bytes and owned by this value.
+            unsafe {
+                base.cast::<[u8; 4]>().write_volatile([1, 2, 3, 4]);
+                assert_eq!(libc::mprotect(base, len, libc::PROT_READ), 0);
+            }
+            Self { base, len }
+        }
+
+        fn address(&self) -> Address
+        {
+            Address::from(self.base as u64)
+        }
+
+        fn bytes(&self) -> [u8; 4]
+        {
+            // SAFETY: the mapping stays readable for the lifetime of `self`.
+            unsafe { self.base.cast::<[u8; 4]>().read_volatile() }
+        }
+
+        fn protection(&self) -> u32
+        {
+            region_for_address(task(), self.address()).unwrap().unwrap().protection
+        }
+    }
+
+    impl Drop for ReadOnlyPage
+    {
+        fn drop(&mut self)
+        {
+            // SAFETY: unmaps the mapping this value created and nothing else uses.
+            unsafe { libc::munmap(self.base, self.len) };
+        }
+    }
+
+    // Issue #139: a failed protection restore must fail the write, not leave a code page
+    // writable and non-executable behind an `Ok`.
+    //
+    // These tests inject the restore failure because the real backend cannot be made to
+    // produce one, and the same goes for a write that changes memory and then fails
+    // (issue #133's second criterion), so the rollback tests above inject that failure
+    // too. Concretely:
+    // - The restore asks `mach_vm_protect` for the protection the region had a moment
+    //   earlier, which never exceeds its maximum, so the kernel refuses it only if the
+    //   mapping changed in between (unmapped or remapped). The target is suspended while
+    //   the debugger writes, so nothing can change it, and racing an unmap from another
+    //   thread in this process would make a nondeterministic test.
+    // - `vm_write` is checked against one region before it runs (`ensure_range`), and
+    //   the `MATTR_CACHE` flush after it fails only on a range that is no longer mapped,
+    //   which again needs the mapping to change between two calls.
+    // A real-process test in `ferros-tests` would need the same injection reachable from
+    // outside this crate, which is instrumentation the production path should not carry.
+    #[test]
+    fn failed_protection_restore_fails_the_write_and_rolls_it_back()
+    {
+        let page = ReadOnlyPage::new();
+        let addr = page.address();
+        let restores = Cell::new(0);
+        let result = write_restoring(task(), addr, &[9; 4], |task, addr, data| {
+            write_with_protection_using(task, addr, data, |_, _, _, _| {
+                restores.set(restores.get() + 1);
+                Err(failure())
+            })
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("could not be restored to r--"), "{message}");
+        assert!(message.contains(&format!("0x{:016x}", addr.value())), "{message}");
+        assert!(message.contains("injected failure"), "{message}");
+        // Tried once and retried once; the rollback's own write then needed no guard,
+        // because the range was left writable.
+        assert_eq!(restores.get(), 2);
+        assert_eq!(page.bytes(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn protection_restore_that_succeeds_on_retry_completes_the_write()
+    {
+        let page = ReadOnlyPage::new();
+        let restores = Cell::new(0);
+        write_with_protection_using(task(), page.address(), &[9; 4], |task, addr, len, protection| {
+            restores.set(restores.get() + 1);
+            if restores.get() == 1 {
+                Err(failure())
+            } else {
+                change_protection(task, addr, len, protection)
+            }
+        })
+        .unwrap();
+        assert_eq!(restores.get(), 2);
+        assert_eq!(page.bytes(), [9; 4]);
+        assert_eq!(page.protection(), libc::VM_PROT_READ as u32);
+    }
+
+    #[test]
+    fn write_through_a_guard_restores_the_protection()
+    {
+        let page = ReadOnlyPage::new();
+        write_memory_all_or_nothing(task(), page.address(), &[5, 6, 7, 8]).unwrap();
+        assert_eq!(page.bytes(), [5, 6, 7, 8]);
+        assert_eq!(page.protection(), libc::VM_PROT_READ as u32);
     }
 
     #[test]

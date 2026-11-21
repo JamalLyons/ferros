@@ -694,8 +694,10 @@ impl MacOSBackend
         // the exceptions still queued on the port and exit before the port is destroyed.
         // Otherwise it is blocked receiving, and destroying the port is what wakes it.
         let holds_exception = lock_shared(&self.exception_state).pending_exception;
-        if let Some(tx) = self.exception_commands.take() {
-            let _ = tx.send(ExceptionLoopCommand::Shutdown);
+        if let Some(tx) = self.exception_commands.take()
+            && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
+        {
+            exception::wake_loop(self.exception_port);
         }
         if holds_exception && let Some(handle) = self.exception_thread.take() {
             let _ = handle.join();

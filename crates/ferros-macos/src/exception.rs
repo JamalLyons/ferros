@@ -947,8 +947,7 @@ pub(crate) fn run_exception_loop(
                 // so no user instruction is needed to raise it.
                 assert_eq!(unsafe { crate::ffi::__pthread_kill(peer, libc::SIGUSR1) }, 0);
                 assert_eq!(unsafe { crate::ffi::thread_resume(peer) }, KERN_SUCCESS);
-                let buffer =
-                    receive_exception_with_timeout(exception_port, Some(1000)).expect("signal batched with real step");
+                let buffer = receive_request_for_hook(exception_port).expect("signal batched with real step");
                 let request = decode_request(&buffer).expect("real signal request");
                 let racing = hold_exception(&request, architecture);
                 assert!(
@@ -979,7 +978,7 @@ pub(crate) fn run_exception_loop(
                 deallocate_right(first.0.thread);
                 // SAFETY: refresh_thread_list retained this tracee thread right.
                 assert_eq!(unsafe { crate::ffi::__pthread_kill(other, libc::SIGUSR1) }, 0);
-                let buffer = receive_exception_with_timeout(exception_port, Some(1000)).expect("racing signal exception");
+                let buffer = receive_request_for_hook(exception_port).expect("racing signal exception");
                 let request = decode_request(&buffer).expect("racing exception request");
                 let mut racing = hold_exception(&request, architecture);
                 for port in ports {
@@ -993,7 +992,7 @@ pub(crate) fn run_exception_loop(
                 if race == 1 {
                     first = racing;
                 } else {
-                    let buffer = receive_exception_with_timeout(exception_port, Some(1000)).expect("fresh private stop");
+                    let buffer = receive_request_for_hook(exception_port).expect("fresh private stop");
                     let request = decode_request(&buffer).expect("private exception request");
                     first = hold_exception(&request, architecture);
                     injected_batch.push(racing);
@@ -1220,6 +1219,22 @@ pub(crate) fn run_exception_loop(
 fn receive_exception(exception_port: mach_port_t, poll: bool) -> std::result::Result<ReceiveBuffer, mach_msg_return_t>
 {
     receive_exception_with_timeout(exception_port, poll.then_some(0))
+}
+
+/// Receive the next message other than a [`wake_loop`] wake, for the fault-injection
+/// hooks that expect a real exception request next: a wake left queued by a `Continue`
+/// the loop took before the wake arrived is skipped.
+#[cfg(target_os = "macos")]
+fn receive_request_for_hook(exception_port: mach_port_t) -> std::result::Result<ReceiveBuffer, mach_msg_return_t>
+{
+    loop {
+        let buffer = receive_exception_with_timeout(exception_port, Some(1000))?;
+        // SAFETY: the buffer holds a complete message that starts with its header.
+        let header = unsafe { std::ptr::read_unaligned(buffer.0.as_ptr().cast::<mach_msg_header_t>()) };
+        if header.msgh_id != WAKE_LOOP_ID {
+            return Ok(buffer);
+        }
+    }
 }
 
 /// A bounded receive also lets the loop check commands while a stop is pending.

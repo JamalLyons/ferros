@@ -2233,3 +2233,47 @@ fn zero_timeout_wait_does_not_block_on_a_dying_targets_refused_continue()
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(session.last_stop(), Some(&exited));
 }
+
+/// #155 review: a stopped handler's return to its breakpoint is consumed inside `wait`, and
+/// the session reissues the user's continue, which steps the handler off the breakpoint
+/// first. The backend refuses that step: the target died, so putting the trap back fails,
+/// and its terminal event comes later. That internal resume goes through `refused_stop`,
+/// which now behaves like the other refused resumes: `wait(Some(ZERO))` neither returns
+/// the write error nor blocks, the session runs on, and a later `wait` reports the death.
+#[test]
+fn zero_timeout_wait_reports_a_dying_targets_refused_handler_continue_later()
+{
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("scripted-dying-handler")).expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    session.resume().expect("let the handler return");
+    let exited = StopEvent::Exited { code: 5 };
+    mock.die_refusing_nth_resume(1, exited.clone(), Duration::from_millis(1500));
+    mock.script(
+        MockStop::new(StopEvent::Breakpoint {
+            thread: HANDLER,
+            pc: INTERRUPTED,
+        })
+        .set_registers(HANDLER, registers),
+    );
+    let _ = mock.take_calls();
+    let started = Instant::now();
+    let waited = session.wait(Some(Duration::ZERO));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "wait(Some(ZERO)) blocked for {elapsed:?}, returning {waited:?}"
+    );
+    assert_eq!(waited.expect("the refused step off the rendezvous"), None);
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::step(HANDLER)],
+        "the step off the rendezvous trap was the refused resume"
+    );
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(session.wait(None).expect("wait"), Some(exited.clone()));
+    assert_eq!(session.state(), SessionState::Exited);
+    assert_eq!(session.last_stop(), Some(&exited));
+}

@@ -272,19 +272,55 @@ impl Session
     }
 
     /// The stop the backend refused a resume for ([`BackendError::StopPending`]): it
-    /// arrived after the last drain, and the next `wait` returns it.
+    /// arrived after the last drain, and the next `wait` returns it. For the internal
+    /// resumes of a stopped handler's return, which report that stop as it is.
     ///
-    /// If nothing comes (see `refused_wait`) the refusal is returned as an error; nothing
-    /// ran and the session is unchanged. A failure to put the resume's traps back (see
-    /// `note_refusal_cleanup`) is returned instead, without waiting.
-    pub(super) fn refused_stop(&mut self) -> Result<StopEvent>
+    /// The wait is bounded as in `refusal`. When nothing comes in time (the target died,
+    /// its terminal event still on its way) `None`, as for a started resume: a later
+    /// `wait` takes the terminal event (#155). When the stop was an abandoned step's late
+    /// completion, the refusal is returned as an error; nothing ran and the session is
+    /// unchanged. A failure to put the resume's traps back (see `note_refusal_cleanup`)
+    /// does not hide the stop: it is logged, and returned in place of that error.
+    pub(super) fn refused_stop(&mut self) -> Result<Option<StopEvent>>
     {
-        if let Some(error) = self.refusal_cleanup.take() {
-            return Err(error);
+        let cleanup = self.refusal_cleanup.take();
+        let refusal = self.refused_wait(self.refusal_limit());
+        match Self::settle_refusal_cleanup(cleanup, refusal)? {
+            Refusal::Stop(event) => Ok(Some(event)),
+            Refusal::Pending => Ok(None),
+            Refusal::Retry => Err(DebuggerError::Backend(BackendError::StopPending)),
         }
-        match self.refused_wait(REFUSED_STOP_TIMEOUT)? {
-            Refusal::Stop(event) => Ok(event),
-            Refusal::Retry | Refusal::Pending => Err(DebuggerError::Backend(BackendError::StopPending)),
+    }
+
+    /// How long a refused resume waits for its stop: `REFUSED_STOP_TIMEOUT`, and inside
+    /// [`Session::wait`] no longer than the caller's remaining timeout.
+    fn refusal_limit(&self) -> std::time::Duration
+    {
+        self.wait_deadline.map_or(REFUSED_STOP_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(REFUSED_STOP_TIMEOUT)
+        })
+    }
+
+    /// Combine a refused resume's outcome with the failure, if any, to put its traps
+    /// back: the failure is returned when the resume would be tried again (or no outcome
+    /// could be read), and only logged when a stop is reported or the target died.
+    fn settle_refusal_cleanup(cleanup: Option<DebuggerError>, refusal: Result<Refusal>) -> Result<Refusal>
+    {
+        let Some(error) = cleanup else {
+            return refusal;
+        };
+        match refusal {
+            Ok(Refusal::Retry) => Err(error),
+            Ok(refusal) => {
+                tracing::warn!("could not put back the traps of a refused resume: {error}");
+                Ok(refusal)
+            }
+            Err(other) => {
+                tracing::warn!("could not put back the traps of a refused resume: {error}");
+                Err(other)
+            }
         }
     }
 
@@ -326,22 +362,11 @@ impl Session
     pub(super) fn refusal(&mut self) -> Result<Refusal>
     {
         let cleanup = self.refusal_cleanup.take();
-        let limit = self.wait_deadline.map_or(REFUSED_STOP_TIMEOUT, |deadline| {
-            deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .min(REFUSED_STOP_TIMEOUT)
+        let refusal = self.refused_wait(self.refusal_limit()).and_then(|refusal| match refusal {
+            Refusal::Stop(event) if self.stale_trap(None, &event)? => Ok(Refusal::Retry),
+            refusal => Ok(refusal),
         });
-        let refusal = match self.refused_wait(limit)? {
-            Refusal::Stop(event) if self.stale_trap(None, &event)? => Refusal::Retry,
-            refusal => refusal,
-        };
-        if let Some(error) = cleanup {
-            if matches!(refusal, Refusal::Retry) {
-                return Err(error);
-            }
-            tracing::warn!("could not put back the traps of a refused resume: {error}");
-        }
-        Ok(refusal)
+        Self::settle_refusal_cleanup(cleanup, refusal)
     }
 
     /// Keep a failure to put back what a resume the backend refused had changed (a trap
@@ -358,13 +383,14 @@ impl Session
         }
     }
 
-    /// `None` when an internal resume `started`; the stop it was refused for (see
-    /// `refused_stop`), to report instead, or its error otherwise.
+    /// `None` when an internal resume `started` (or was refused and the target died, see
+    /// `refused_stop`); the stop it was refused for, to report instead, or its error
+    /// otherwise.
     pub(super) fn or_refused_stop(&mut self, started: Result<()>) -> Result<Option<StopEvent>>
     {
         match started {
             Ok(()) => Ok(None),
-            Err(error) if is_stop_pending(&error) => self.refused_stop().map(Some),
+            Err(error) if is_stop_pending(&error) => self.refused_stop(),
             Err(error) => Err(error),
         }
     }

@@ -634,3 +634,22 @@ fn final_continue_failure_inside_resume_leaves_session_stopped()
     assert!(session.step_plan.is_none());
     assert_eq!(peek(&mock, BP), TRAP);
 }
+
+/// #155: `step_instruction` at a breakpoint removes its trap to step off it, the backend
+/// refuses the step for a stop, and the target dies before the trap goes back. The failed
+/// write does not hide the refusal: the step "starts", and `wait` reports the death.
+#[test]
+fn refused_step_off_a_breakpoint_on_a_dying_target_reports_its_death()
+{
+    let (mock, mut session, id) = at_breakpoint();
+    mock.die_refusing_nth_resume(1, StopEvent::Exited { code: 4 }, Duration::ZERO);
+    session.step_instruction(T1).expect("the refused step reports no write error");
+    assert_eq!(session.state(), SessionState::Running);
+    assert!(session.step_plan.is_none(), "the refused step left no plan");
+    assert!(
+        !session.breakpoint_info(id).unwrap().enabled,
+        "the trap that could not go back is disabled"
+    );
+    assert_eq!(session.wait(None).unwrap(), Some(StopEvent::Exited { code: 4 }));
+    assert_eq!(session.state(), SessionState::Exited);
+}

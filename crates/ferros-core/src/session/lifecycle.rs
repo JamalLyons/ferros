@@ -331,6 +331,17 @@ impl Session
     {
         self.require_process()?;
         let started = Instant::now();
+        // An internal resume refused for a stop that does not come at once (the target
+        // died, its terminal event still on its way) waits no longer than the caller does;
+        // the session then stays running for the next `wait` (#155).
+        self.wait_deadline = timeout.and_then(|limit| started.checked_add(limit));
+        let result = self.wait_until(started, timeout);
+        self.wait_deadline = None;
+        result
+    }
+
+    fn wait_until(&mut self, started: Instant, timeout: Option<Duration>) -> Result<Option<StopEvent>>
+    {
         let mut first = true;
         loop {
             let remaining = if first {

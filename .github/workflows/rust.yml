@@ -2,7 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "trunk" ]
     paths:
       - '**.rs'
       - '**/Cargo.toml'
@@ -15,7 +15,7 @@ on:
       - 'scripts/**'
       - '**/*.entitlements'
   pull_request:
-    branches: [ "master" ]
+    branches: [ "trunk" ]
     paths:
       - '**.rs'
       - '**/Cargo.toml'

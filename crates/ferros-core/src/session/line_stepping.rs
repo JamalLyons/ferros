@@ -109,18 +109,21 @@ impl Session
         self.interrupt_requested = false;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             // The session is stopped, so a queued single-step completion of this thread
-            // (an interrupted step's late completion) or a trap from a return breakpoint
-            // that is already gone belongs to no request; drop it and start the step.
-            // Anything else is reported first.
+            // (an interrupted step's late completion) or a breakpoint stop of a private
+            // trap that is already gone, of any thread (see `stale_trap`), belongs to no
+            // request; drop it and start the step, whose resume drains the rest
+            // (`run_line_to`, `step_instruction`). Anything else is reported first.
             let stale_step = event == (StopEvent::SingleStep { thread });
-            if !stale_step && !self.stale_trap(Some(thread), &event)? {
+            if !stale_step && !self.stale_trap(None, &event)? {
                 self.deferred = Some(event);
                 self.state = SessionState::Running;
                 self.last_stop = None;
                 return Ok(());
             }
         }
-        self.stale_step = None;
+        // `stale_step` is kept until a resume of this step starts: an abandoned step's
+        // completion can still arrive after the drains (the backend then refuses the
+        // resume), and it belongs to no request of this step either.
         // A source step reports a stopped handler's return like any other stop.
         self.handler_return = None;
         self.carried_signals.retain(|(carried, _)| *carried != thread);
@@ -187,39 +190,83 @@ impl Session
 
     fn run_line_to(&mut self, plan: &mut LinePlan, address: Address, sp: Address) -> Result<()>
     {
-        if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
-            self.deferred = Some(event);
-            self.state = SessionState::Running;
-            self.last_stop = None;
-            return Ok(());
-        }
-        let (id, owner) = self.take_site(address)?;
-        plan.run_to = Some(RunTo { address, sp, id, owner });
         let arm_exits = plan.exits.is_none();
-        if arm_exits {
-            self.arm_exit_hooks(&mut plan.exits, plan.thread)?;
-        }
-        // start_continue also executes a restored instruction if the call itself is
-        // at a user breakpoint. Its final request still holds every peer thread.
-        let started =
-            self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(plan.thread, ThreadAction::Continue));
-        match started {
-            Err(error) if super::stepping::is_stop_pending(&error) => {
-                // A stop arrived after the drain above and nothing ran: put the plan back
-                // as that drain leaves it, and defer the stop the same way.
-                if let Some(site) = plan.run_to.take() {
-                    self.release_site(site.id, &site.owner)?;
-                }
-                if arm_exits {
-                    self.release_exit_hooks(plan.exits.take())?;
-                }
-                self.deferred = Some(self.refused_stop()?);
+        loop {
+            // Stops can still be queued here (#148): `start_line_step` drains only one event
+            // and drops it if it is stale, and `line_stopped` gets here after an
+            // instruction step whose completion may have come with others. A breakpoint
+            // stop of a private trap that is gone is among them when an interrupt ended
+            // the operation that owned the trap before the trap's exception was taken
+            // (#142). `pending_event` drops it, as for `resume`, and anything else is
+            // deferred.
+            if let Some(event) = self.pending_event()? {
+                self.deferred = Some(event);
+                break;
             }
-            started => started?,
+            let (id, owner) = self.take_site(address)?;
+            plan.run_to = Some(RunTo { address, sp, id, owner });
+            if arm_exits {
+                self.arm_exit_hooks(&mut plan.exits, plan.thread)?;
+            }
+            // start_continue also executes a restored instruction if the call itself is
+            // at a user breakpoint. Its final request still holds every peer thread.
+            let started = self
+                .start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(plan.thread, ThreadAction::Continue));
+            match started {
+                Err(error) if super::stepping::is_stop_pending(&error) => {
+                    // A stop arrived after the drain above and nothing ran: put the plan
+                    // back as that drain leaves it, and defer the stop the same way, or
+                    // try again if it belongs to no request (see `refused_event`).
+                    if let Some(site) = plan.run_to.take() {
+                        self.release_site(site.id, &site.owner)?;
+                    }
+                    if arm_exits {
+                        self.release_exit_hooks(plan.exits.take())?;
+                    }
+                    if let Some(event) = self.refused_event()? {
+                        self.deferred = Some(event);
+                        break;
+                    }
+                }
+                started => {
+                    started?;
+                    self.stale_step = None;
+                    break;
+                }
+            }
         }
         self.state = SessionState::Running;
         self.last_stop = None;
         Ok(())
+    }
+
+    /// Continue `thread` alone, the other threads suspended, while a line step waits for
+    /// its return trap: `None` once the continue starts, or the stop to report instead.
+    /// A stop that comes first (still queued, or one the backend refuses the continue
+    /// for) is reported, unless it belongs to no request: a breakpoint stop of a private
+    /// trap that is gone or an abandoned step's late completion (see `pending_event` and
+    /// `refused_event`). The continue is then tried again.
+    fn continue_line_thread(&mut self, thread: ThreadId) -> Result<Option<StopEvent>>
+    {
+        loop {
+            if let Some(event) = self.pending_event()? {
+                return Ok(Some(event));
+            }
+            let started =
+                self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue));
+            match started {
+                Err(error) if super::stepping::is_stop_pending(&error) => {
+                    if let Some(event) = self.refused_event()? {
+                        return Ok(Some(event));
+                    }
+                }
+                started => {
+                    started?;
+                    self.stale_step = None;
+                    return Ok(None);
+                }
+            }
+        }
     }
 
     /// Release the return trap and the exit hooks. Every site is released even when one
@@ -272,9 +319,7 @@ impl Session
             }
             ExitStep::Lost => {}
         }
-        let started =
-            self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue));
-        self.or_refused_stop(started)
+        self.continue_line_thread(thread)
     }
 
     /// Release the plan's temporary site after another error, keeping that error: a
@@ -331,7 +376,9 @@ impl Session
     /// already removed (a return trap or a libunwind resume hook): an interrupt can stop
     /// the thread just as it reaches the trap, so the trap's exception is delivered
     /// later, when no trap is at that address any more (none in the table and no trap
-    /// instruction in memory). With `thread`, only a stop of that thread qualifies.
+    /// instruction of any form in memory, see
+    /// [`Arch::is_trap_instruction`](crate::arch::Arch::is_trap_instruction)). With
+    /// `thread`, only a stop of that thread qualifies.
     pub(super) fn stale_trap(&mut self, thread: Option<ThreadId>, event: &StopEvent) -> Result<bool>
     {
         let StopEvent::Breakpoint { thread: stopped, pc } = *event else {
@@ -345,9 +392,10 @@ impl Session
         if self.breakpoints.id_for_kind(address, BreakpointKind::Software).is_some() {
             return Ok(false);
         }
-        let trap = arch.trap_instruction();
-        let memory = self.backend.read_memory(address, trap.len())?;
-        Ok(memory != trap)
+        // Any trap instruction in memory makes the stop a real one: the program's own
+        // (an arm64 `brk #1` Rust emits for a trap) as well as a trap of this session.
+        let memory = self.backend.read_memory(address, arch.trap_instruction().len())?;
+        Ok(!arch.is_trap_instruction(&memory))
     }
 
     fn line_stopped(&mut self, plan: &mut LinePlan, event: StopEvent) -> Result<Option<StopEvent>>
@@ -384,10 +432,7 @@ impl Session
                     }
                     // The same instruction in a deeper recursive frame. Step off
                     // the private trap and continue waiting for the guarded frame.
-                    let started = self.start_continue(
-                        ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue),
-                    );
-                    return self.or_refused_stop(started);
+                    return self.continue_line_thread(thread);
                 }
                 self.release_line_site(plan)?;
                 if plan.mode == Mode::Out {

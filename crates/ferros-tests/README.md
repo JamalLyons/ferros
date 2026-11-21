@@ -229,6 +229,24 @@ consumes a handler's return in place of a deferred `resume_with_signal`, its con
 the signals that resume still held and drops them from those carried
 (`handler_return_continue_passes_a_signal_carried_from_a_deferred_resume`).
 
+Source steps drop stops that belong to no request where they drain or are refused (#148):
+a breakpoint stop of a private trap that is gone, of any thread, queued for `start_line_step`
+(`step_out_drops_another_threads_stale_trap_stop_queued_before_it`) or for the continue to
+the return trap (`step_out_drops_a_stale_trap_stop_queued_for_its_return_continue`) or
+refusing the continue from a deeper recursive frame
+(`step_out_drops_a_stale_trap_stop_that_refuses_its_recursive_continue`), and an abandoned
+step's late `SingleStep` refusing the step's first continue
+(`step_out_drops_an_abandoned_steps_completion_that_refuses_its_continue`). A step that starts
+at a user breakpoint drops one refusing the continue after the step off it
+(`step_out_from_a_breakpoint_drops_a_stale_trap_stop_that_refuses_its_continue`). A queued
+stop at an armed breakpoint is still reported
+(`step_out_reports_a_real_breakpoint_stop_queued_for_its_return_continue`), and so is one at a
+trap the program itself contains (an arm64 `brk #1`, not in the breakpoint table), queued
+for `start_line_step` (`step_out_reports_another_threads_program_trap_queued_before_it`) or
+for the continue to the return trap
+(`step_out_reports_a_program_trap_stop_queued_for_its_return_continue`): only a stop with no
+trap instruction of any form left at its address is stale.
+
 
 ## Debug-info regressions
 

@@ -12,14 +12,13 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use ferros_tests::harness::{self, Tag, TestContext};
 use ferros_tests::transcript::{self, PROMPT};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::{Fixture, fixture, scratch};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
 /// How long one command may take to print what the test waits for.
@@ -46,13 +45,7 @@ impl Scratch
 {
     fn new() -> Self
     {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ferros-repl-pty-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create scratch HOME");
+        let path = scratch::create_dir("ferros-repl-pty");
         Self(fs::canonicalize(&path).expect("canonical scratch HOME"))
     }
 

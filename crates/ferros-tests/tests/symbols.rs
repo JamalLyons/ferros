@@ -10,12 +10,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ferros_core::symbols::{BinaryImage, DebugInfoOptions, FunctionAddress, ImageDescriptor, SourceLookupError};
 use ferros_core::{Address, SymbolCache};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::{Fixture, fixture, scratch};
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 
 /// Every fixture binary. `fixture!` needs a literal name, so the table is written out;
@@ -53,14 +52,7 @@ impl Scratch
 {
     fn new() -> Self
     {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ferros-symbols-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).expect("create scratch directory");
-        Self(path)
+        Self(scratch::create_dir("ferros-symbols"))
     }
 
     fn options(&self) -> DebugInfoOptions

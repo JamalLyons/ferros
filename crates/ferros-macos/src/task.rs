@@ -1273,6 +1273,7 @@ impl MacOSBackend
             if shared.dead {
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
+            self.reply_faults.sample_detach_suspend_count();
             // SAFETY: the shared lock excludes the watcher's reaping of this pid.
             if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
                 return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));

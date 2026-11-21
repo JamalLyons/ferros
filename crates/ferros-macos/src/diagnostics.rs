@@ -446,6 +446,53 @@ pub fn raise_sigusr1() -> std::io::Result<()>
     }
 }
 
+/// Send SIGUSR1 to the thread named by a live thread port held by the debugger. Tests only.
+#[doc(hidden)]
+pub fn send_sigusr1(thread: ferros_core::ThreadId) -> std::io::Result<()>
+{
+    let port = mach_port_t::try_from(thread.raw()).map_err(std::io::Error::other)?;
+    // SAFETY: the syscall takes no pointers; the kernel validates the port name, so a
+    // wrong ThreadId yields an error or a signal to some other thread, never UB.
+    if unsafe { ffi::__pthread_kill(port, libc::SIGUSR1) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Read a byte on the stepping fixture's blocking socket. Tests break on the
+/// SVC in the exported function so the syscall is the first instruction of the step.
+#[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
+pub fn read_step_fixture_byte(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u8>
+{
+    use std::os::fd::AsRawFd;
+
+    #[unsafe(naked)]
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn ferros_step_fixture_read(_fd: libc::c_int, _byte: *mut u8) -> i64
+    {
+        core::arch::naked_asm!(
+            "mov x2, #1",
+            "mov x16, #3", // Darwin SYS_read
+            "svc #0x80",
+            "cneg x0, x0, cs", // Negate errno if the kernel set carry.
+            "ret",
+        );
+    }
+
+    let mut byte = 0;
+    loop {
+        // SAFETY: the socket stays open and the one-byte destination is writable.
+        match unsafe { ferros_step_fixture_read(stream.as_raw_fd(), &raw mut byte) } {
+            1 => return Ok(byte),
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            code if code == -i64::from(libc::EINTR) => {}
+            code => return Err(std::io::Error::from_raw_os_error((-code) as i32)),
+        }
+    }
+}
+
 /// Read MDSCR_EL1.SS using a thread port held by the debugger. Tests only.
 ///
 /// # Errors
@@ -473,6 +520,14 @@ pub fn single_step_enabled(thread: ferros_core::ThreadId) -> Result<bool>
 pub fn thread_suspend_count(thread: ferros_core::ThreadId) -> Result<i32>
 {
     thread_basic_state(thread).map(|info| info.suspend_count)
+}
+
+/// Whether Mach reports the tracee thread waiting in the kernel. Tests only.
+#[doc(hidden)]
+pub fn thread_is_waiting(thread: ferros_core::ThreadId) -> Result<bool>
+{
+    const TH_STATE_WAITING: i32 = 3;
+    thread_basic_state(thread).map(|info| info.run_state == TH_STATE_WAITING)
 }
 
 /// A thread's basic Mach scheduling state, sampled without suspending it. Tests only.

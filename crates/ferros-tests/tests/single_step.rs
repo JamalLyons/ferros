@@ -1584,6 +1584,66 @@ fn breakpoint_cancels_a_real_step_without_a_stray_step_stop()
     });
 }
 
+/// An empty socket keeps the stepping thread in its first instruction's syscall
+/// until the kernel can report SIGUSR1 on that same thread.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn signal_cancels_a_real_step_without_a_stray_step_stop()
+{
+    harness::run(|t| {
+        let control = ControlDir::new();
+        let fixture = fixture!("step_races");
+        let mut d = t.launch_with_args(&fixture, &[control.path().to_str().expect("path"), "--block-in-read"]);
+        let read = ferros_tests::symbols::raw_symbol_address(&mut d, &fixture, "_ferros_step_fixture_read");
+        // The two setup instructions load the one-byte length and Darwin syscall number.
+        let svc = Address::from(read.value() + 2 * 4);
+        let original = plant_trap(&mut d, svc);
+        assert_eq!(original, 0xd400_1001_u32.to_le_bytes(), "expected svc #0x80");
+        control.release("run-0");
+        let (stepped, others) = run_to_trap(&mut d, svc);
+        assert!(others.is_empty(), "only worker 0 was released");
+        backend(&mut d).write_memory(svc, &original).expect("restore the syscall");
+        let threads = backend(&mut d).threads().expect("threads");
+        assert!(threads.len() >= 3, "expected main and both workers");
+
+        backend(&mut d).resume(&ResumeRequest::step(stepped)).expect("start step");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !diagnostics::thread_is_waiting(stepped).expect("thread run state") {
+            assert!(Instant::now() < deadline, "stepping thread never waited in the kernel");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(diagnostics::single_step_enabled(stepped).expect("armed MDSCR_EL1.SS"));
+        for &peer in threads.iter().filter(|&&thread| thread != stepped) {
+            assert_eq!(diagnostics::thread_suspend_count(peer).expect("peer suspend count"), 1);
+        }
+        diagnostics::send_sigusr1(stepped).expect("send SIGUSR1 to the stepping thread");
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("signal stop"),
+            Some(StopEvent::Signal {
+                thread: stepped,
+                signal: SIGUSR1,
+            })
+        );
+        assert_step_cleaned(stepped, &threads);
+        // The signal interrupted the blocking `svc`: the thread is still at the syscall
+        // (restarted) or just after it, never beyond, so the step did not complete.
+        let pc = backend(&mut d).read_registers(stepped).expect("registers").pc;
+        assert!(
+            pc == svc || pc == Address::from(svc.value() + 4),
+            "signal stop at {pc:?}, expected the svc at {svc:?} or the instruction after it"
+        );
+
+        control.release("run-1");
+        control.release("exit");
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("exit after continue"),
+            Some(StopEvent::Exited { code: 0 }),
+            "continuing after the signal must finish without a stray step"
+        );
+    });
+}
+
 /// A real internal step completion arriving after abandonment belongs to no user
 /// request. Waiting after Interrupted must consume it silently, without a resume.
 #[test]
@@ -1804,6 +1864,7 @@ fn backend_drop_releases_directly_observed_step_suspends()
         control.wait("ready-0");
         control.wait("ready-1");
         let mut debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
         debugger.attach(target.pid()).expect("attach");
         let threads = debugger.threads().expect("threads");
         assert!(threads.len() >= 3);
@@ -1815,7 +1876,17 @@ fn backend_drop_releases_directly_observed_step_suspends()
         // Do not call wait: even if a real completion is already queued, only the
         // backend's teardown (detach_target and release_ports) can balance the
         // suspensions on this path.
+        let peer = threads[0];
+        let sample = faults.observe_next_detach_suspend_count(peer);
         drop(debugger);
+        assert_eq!(
+            sample
+                .try_recv()
+                .expect("sample before detach SIGSTOP")
+                .expect("peer suspend count"),
+            0,
+            "detach sent its private SIGSTOP while peer {peer:?} was still suspended"
+        );
         control.release("run-0");
         control.release("run-1");
         control.release("exit");

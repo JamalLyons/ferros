@@ -265,8 +265,10 @@ pub trait Backend: Send
     ///
     /// # Errors
     ///
-    /// - [`BackendError::InvalidState`] with no process, while running, or while stop
-    ///   events are still pending.
+    /// - [`BackendError::InvalidState`] with no process or while running.
+    /// - [`BackendError::StopPending`] while a stop event is pending, including one that
+    ///   arrived after the caller last drained with `wait`. Nothing is resumed; the next
+    ///   `wait` returns that event.
     /// - [`BackendError::NotFound`] if a thread named in `request` does not exist.
     /// - [`BackendError::Unsupported`] if the combination of thread actions cannot be
     ///   expressed on this OS, a signal is named for a thread whose action is `Suspend`,

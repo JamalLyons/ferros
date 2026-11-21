@@ -195,12 +195,28 @@ impl Session
         }
         let (id, owner) = self.take_site(address)?;
         plan.run_to = Some(RunTo { address, sp, id, owner });
-        if plan.exits.is_none() {
+        let arm_exits = plan.exits.is_none();
+        if arm_exits {
             self.arm_exit_hooks(&mut plan.exits, plan.thread)?;
         }
         // start_continue also executes a restored instruction if the call itself is
         // at a user breakpoint. Its final request still holds every peer thread.
-        self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(plan.thread, ThreadAction::Continue))?;
+        let started =
+            self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(plan.thread, ThreadAction::Continue));
+        match started {
+            Err(error) if super::stepping::is_stop_pending(&error) => {
+                // A stop arrived after the drain above and nothing ran: put the plan back
+                // as that drain leaves it, and defer the stop the same way.
+                if let Some(site) = plan.run_to.take() {
+                    self.release_site(site.id, &site.owner)?;
+                }
+                if arm_exits {
+                    self.release_exit_hooks(plan.exits.take())?;
+                }
+                self.deferred = Some(self.refused_stop()?);
+            }
+            started => started?,
+        }
         self.state = SessionState::Running;
         self.last_stop = None;
         Ok(())
@@ -256,8 +272,9 @@ impl Session
             }
             ExitStep::Lost => {}
         }
-        self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue))?;
-        Ok(None)
+        let started =
+            self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue));
+        self.or_refused_stop(started)
     }
 
     /// Release the plan's temporary site after another error, keeping that error: a
@@ -367,10 +384,10 @@ impl Session
                     }
                     // The same instruction in a deeper recursive frame. Step off
                     // the private trap and continue waiting for the guarded frame.
-                    self.start_continue(
+                    let started = self.start_continue(
                         ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue),
-                    )?;
-                    return Ok(None);
+                    );
+                    return self.or_refused_stop(started);
                 }
                 self.release_line_site(plan)?;
                 if plan.mode == Mode::Out {

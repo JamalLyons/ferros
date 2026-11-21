@@ -125,7 +125,9 @@ impl Session
     /// As the backend contract requires, events still queued from the last stop (for
     /// example two threads that stopped at once) are drained first with a zero-timeout
     /// wait. If one is pending, the process is not resumed: the session still becomes
-    /// running and the next [`wait`](Self::wait) returns that event. A pending
+    /// running and the next [`wait`](Self::wait) returns that event. So does a stop that
+    /// arrives after the drain, when the backend refuses the resume for it
+    /// ([`BackendError::StopPending`]). A pending
     /// breakpoint stop at an address with no trap any more (none in the breakpoint table
     /// and none in memory) is dropped instead: it is left over from a source step's
     /// private trap that an interrupt raced, and the thread has not executed the
@@ -184,8 +186,10 @@ impl Session
     /// the thread's next arrival at the breakpoint is a hit.
     ///
     /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
-    /// because another stop cut its step-over sequence short (the signal is still held),
-    /// that signal is passed again now, together with the last stop's.
+    /// because another stop cut its step-over sequence short, or was reported first
+    /// without resuming (a pending event, or one that arrived after the drain), the signal
+    /// is still held and is passed again now, together with the last stop's. A thread is
+    /// passed one signal, the latest.
     ///
     /// # Errors
     ///
@@ -193,11 +197,9 @@ impl Session
     pub fn resume_with_signal(&mut self) -> Result<()>
     {
         let mut request = ResumeRequest::continue_all();
-        for (thread, signal) in std::mem::take(&mut self.carried_signals) {
-            request = request.with_signal(thread, signal);
-        }
+        request.signals = std::mem::take(&mut self.carried_signals);
         if let Some(StopEvent::Signal { thread, signal }) = self.last_stop.as_ref() {
-            request = request.with_signal(*thread, *signal);
+            super::stepping::merge_signal(&mut request.signals, *thread, *signal);
         }
         self.resume_request(request)
     }
@@ -206,15 +208,11 @@ impl Session
     {
         self.require_stopped()?;
         self.interrupt_requested = false;
-        if let Some(event) = self.pending_event()? {
+        if let Some(event) = self.continue_after_drain(&request)? {
+            // The request was not sent: its signals are still held, for the next
+            // `resume_with_signal` (a plain `resume` drops them, as always).
+            self.carry_signals(request.signals);
             self.deferred = Some(event);
-        } else {
-            self.stale_step = None;
-            self.note_handler_continue(&request)?;
-            if let Err(error) = self.start_continue(request) {
-                self.release_handler_exits_after_error();
-                return Err(error);
-            }
         }
         self.state = SessionState::Running;
         self.last_stop = None;

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use super::exits::{ExitHooks, ExitStep};
 use super::{Session, SessionState};
-use crate::backend::{ResumeRequest, StopEvent, ThreadAction};
+use crate::backend::{BackendError, ResumeRequest, StopEvent, ThreadAction};
 use crate::breakpoints::{BreakpointEntry, BreakpointKind};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, ThreadId};
@@ -57,6 +57,18 @@ pub(super) struct StepPlan
     signal_return_sp: Option<Address>,
 }
 
+/// How long `refused_stop` waits for the stop a resume was refused for. The backend has
+/// it queued already, so this bounds only the case where the target died meanwhile and
+/// its terminal event is still being collected.
+const REFUSED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `error` is the backend's refusal to resume because a stop arrived after the
+/// session's last drain (see [`BackendError::StopPending`]).
+pub(super) fn is_stop_pending(error: &DebuggerError) -> bool
+{
+    matches!(error, DebuggerError::Backend(BackendError::StopPending))
+}
+
 impl Session
 {
     fn breakpoint_at_pc(&mut self, thread: ThreadId) -> Result<Option<StepSite>>
@@ -107,6 +119,7 @@ impl Session
     {
         let site = &plan.current;
         let mut request = ResumeRequest::step(site.thread);
+        let mut rendezvous = None;
         if let Some(final_request) = &mut plan.final_request
             && let Some(signal) = final_request.signal_for(site.thread)
         {
@@ -121,15 +134,172 @@ impl Session
             final_request.signals.retain(|(thread, _)| *thread != site.thread);
         } else {
             plan.signal_return_sp = None;
-            self.restore_original(&site.entry)?;
+            // Removing the trap gives up a stopped handler's rendezvous there (see
+            // `restore_original`), but only once the step really runs.
+            rendezvous = self
+                .handler_return
+                .take_if(|pending| pending.address == site.entry.info.address);
+            if let Err(error) = self.restore_original(&site.entry) {
+                self.put_back_rendezvous(rendezvous);
+                return Err(error);
+            }
         }
         if let Err(error) = self.backend.resume(&request) {
-            // The backend guarantees that a failed resume ran nothing.
+            // The backend guarantees that a failed resume ran nothing: with the trap back,
+            // the handler can still return to it.
             self.rearm(&site.entry)?;
+            self.put_back_rendezvous(rendezvous);
             return Err(error.into());
         }
         self.step_plan = Some(plan);
         Ok(())
+    }
+
+    /// Put back the rendezvous `start_plan` took for a step that did not run. `None` means
+    /// it took none, and a pending handler return at another address stays as it is.
+    fn put_back_rendezvous(&mut self, rendezvous: Option<HandlerReturn>)
+    {
+        if rendezvous.is_some() {
+            self.handler_return = rendezvous;
+        }
+    }
+
+    /// Start a pending handler return's continue `request` (see `HandlerReturn`) in place
+    /// of the user's resume it completes: the session consumed the handler's stop instead
+    /// of reporting it. Signals still carried from that resume (it was deferred for the
+    /// stop, or a step-over cut short) are passed with it to the threads it lets run, as
+    /// the resume would have; otherwise they are lost when those threads run on, and a
+    /// later `resume_with_signal` would pass them to threads that no longer hold them.
+    /// Once the continue starts they are no longer carried; a refused or failed start ran
+    /// nothing, so they stay carried.
+    fn continue_handler(&mut self, mut request: ResumeRequest) -> Result<Option<StopEvent>>
+    {
+        let mut passed = Vec::new();
+        for &(thread, signal) in &self.carried_signals {
+            if request.action_for(thread) != ThreadAction::Suspend {
+                merge_signal(&mut request.signals, thread, signal);
+                passed.push(thread);
+            }
+        }
+        let started = self.start_continue(request);
+        if started.is_ok() {
+            self.carried_signals.retain(|(thread, _)| !passed.contains(thread));
+        }
+        self.or_refused_stop(started)
+    }
+
+    /// Drain the events still queued from the last stop, then start the continue of
+    /// `request` (see `start_continue`); `Some(event)` instead when one is pending, for
+    /// the caller to defer. A stop that arrives after the drain makes the backend refuse
+    /// the resume ([`BackendError::StopPending`]); nothing ran, so the pending handler
+    /// return is put back as before and that stop is taken (see `refused_stop`), or the
+    /// resume tried again if it was one `pending_event` drops.
+    pub(super) fn continue_after_drain(&mut self, request: &ResumeRequest) -> Result<Option<StopEvent>>
+    {
+        loop {
+            if let Some(event) = self.pending_event()? {
+                return Ok(Some(event));
+            }
+            let noted = self.handler_return.as_ref().map(|pending| pending.request.clone());
+            let armed = self.handler_exits.is_none();
+            self.note_handler_continue(request)?;
+            match self.start_continue(request.clone()) {
+                Err(error) if is_stop_pending(&error) => {
+                    if let (Some(pending), Some(noted)) = (&mut self.handler_return, noted) {
+                        pending.request = noted;
+                    }
+                    if armed {
+                        self.release_handler_exits()?;
+                    }
+                    if let Some(event) = self.refused_event()? {
+                        return Ok(Some(event));
+                    }
+                }
+                started => {
+                    self.stale_step = None;
+                    if started.is_err() {
+                        self.release_handler_exits_after_error();
+                    }
+                    return started.map(|()| None);
+                }
+            }
+        }
+    }
+
+    /// Keep the `signals` of a request that was not sent for the next
+    /// `resume_with_signal`, merged into those already carried: a thread has at most one
+    /// carried signal, the latest.
+    pub(super) fn carry_signals(&mut self, signals: Vec<(ThreadId, i32)>)
+    {
+        for (thread, signal) in signals {
+            merge_signal(&mut self.carried_signals, thread, signal);
+        }
+    }
+
+    /// The stop the backend refused a resume for ([`BackendError::StopPending`]): it
+    /// arrived after the last drain, and the next `wait` returns it.
+    ///
+    /// If nothing comes (see `refused_wait`) the refusal is returned as an error; nothing
+    /// ran and the session is unchanged.
+    pub(super) fn refused_stop(&mut self) -> Result<StopEvent>
+    {
+        self.refused_wait()?.ok_or(DebuggerError::Backend(BackendError::StopPending))
+    }
+
+    /// Take the stop a resume was refused for. The backend has it queued, so a
+    /// zero-timeout wait returns it, except in two cases. It may be an abandoned step's
+    /// late completion, which `backend_wait` drops: `None`. Or the target died after the
+    /// refusal: the macOS backend then drops the dead task's nonterminal events and its
+    /// terminal event may still be on its way, so the wait goes on for at most
+    /// `REFUSED_STOP_TIMEOUT`.
+    fn refused_wait(&mut self) -> Result<Option<StopEvent>>
+    {
+        let stale = self.stale_step;
+        if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+            return Ok(Some(event));
+        }
+        if stale.is_some() && self.stale_step.is_none() {
+            return Ok(None);
+        }
+        self.backend_wait(Some(REFUSED_STOP_TIMEOUT))
+    }
+
+    /// As `refused_stop`, for `resume` and `step_instruction`, which retry the resume
+    /// instead of failing: `None` when the stop is one `pending_event` drops (or none
+    /// came), the rest of the queue being drained before the retry.
+    fn refused_event(&mut self) -> Result<Option<StopEvent>>
+    {
+        match self.refused_wait()? {
+            Some(event) if !self.stale_trap(None, &event)? => Ok(Some(event)),
+            _ => Ok(None),
+        }
+    }
+
+    /// `None` when an internal resume `started`; the stop it was refused for (see
+    /// `refused_stop`), to report instead, or its error otherwise.
+    pub(super) fn or_refused_stop(&mut self, started: Result<()>) -> Result<Option<StopEvent>>
+    {
+        match started {
+            Ok(()) => Ok(None),
+            Err(error) if is_stop_pending(&error) => self.refused_stop().map(Some),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Start the next step of an internal step-over `plan`. If a stop arrived first, the
+    /// backend runs nothing: the plan is given up as in `abandon` (no step was started, so
+    /// no completion can follow) and that stop is returned.
+    fn continue_plan(&mut self, plan: StepPlan) -> Result<Option<StopEvent>>
+    {
+        // Cloned before `start_plan` moves the current thread's signal out of the request.
+        let carried = plan.final_request.as_ref().map(|request| request.signals.clone());
+        let started = self.start_plan(plan);
+        if let (Err(error), Some(signals)) = (&started, carried)
+            && is_stop_pending(error)
+        {
+            self.carry_signals(signals);
+        }
+        self.or_refused_stop(started)
     }
 
     fn rearm(&mut self, entry: &BreakpointEntry) -> Result<()>
@@ -147,9 +317,10 @@ impl Session
     ///
     /// Requires a stopped process. A pending event defers the step exactly as for
     /// [`resume`](Self::resume): the session becomes running, and the next
-    /// [`wait`](Self::wait) returns that event without executing an instruction. A
-    /// pending breakpoint stop at an address that no longer holds a trap is dropped
-    /// as for `resume`.
+    /// [`wait`](Self::wait) returns that event without executing an instruction. That
+    /// includes a stop the backend refuses the step for because it arrived after the
+    /// drain. A pending breakpoint stop at an address that no longer holds a trap is
+    /// dropped as for `resume`.
     /// At an enabled software breakpoint its original instruction is executed and the
     /// trap is restored before the stop is returned. Completion is reported as
     /// [`StopEvent::SingleStep`]; other events are reported normally. A held signal
@@ -171,16 +342,31 @@ impl Session
         self.interrupt_requested = false;
         // An instruction step reports a handler's return like any other stop.
         self.handler_return = None;
-        if let Some(event) = self.pending_event()? {
-            self.deferred = Some(event);
-            return self.enter_running();
+        loop {
+            if let Some(event) = self.pending_event()? {
+                self.deferred = Some(event);
+                return self.enter_running();
+            }
+            match self.step_thread(thread) {
+                // A stop arrived after the drain and nothing ran: report it, or step again
+                // if it was one `pending_event` drops.
+                Err(error) if is_stop_pending(&error) => {
+                    if let Some(event) = self.refused_event()? {
+                        self.deferred = Some(event);
+                        return self.enter_running();
+                    }
+                }
+                started => {
+                    self.stale_step = None;
+                    // A failed start ran nothing, so the thread's held signal is still held.
+                    started?;
+                    // The stepping thread's held signal is discarded by this step; other
+                    // threads stay suspended, so a signal carried for them is still held.
+                    self.carried_signals.retain(|(carried, _)| *carried != thread);
+                    return self.enter_running();
+                }
+            }
         }
-        self.stale_step = None;
-        // The stepping thread's held signal is discarded by this step; other threads stay
-        // suspended, so a signal carried for them is still held.
-        self.carried_signals.retain(|(carried, _)| *carried != thread);
-        self.step_thread(thread)?;
-        self.enter_running()
     }
 
     /// Start one instruction step of `thread` with the others suspended, stepping over an
@@ -245,7 +431,7 @@ impl Session
             self.stale_step = Some(plan.current.thread);
         }
         if let Some(final_request) = plan.final_request {
-            self.carried_signals = final_request.signals;
+            self.carry_signals(final_request.signals);
         }
     }
 
@@ -404,8 +590,7 @@ impl Session
         }
         // The rendezvous is over, and its exit traps with it.
         self.release_handler_exits()?;
-        self.start_continue(request)?;
-        Ok(None)
+        self.continue_handler(request)
     }
 
     /// Consume `event` if it belongs to the exit traps of a pending handler return:
@@ -451,8 +636,11 @@ impl Session
                 self.release_exit_hooks(Some(std::mem::replace(&mut exits, ExitHooks::empty(thread))))?;
             }
             match follow {
-                Follow::Step => self.step_thread(thread).map(|()| None),
-                Follow::Continue => self.start_continue(request).map(|()| None),
+                Follow::Step => {
+                    let started = self.step_thread(thread);
+                    self.or_refused_stop(started)
+                }
+                Follow::Continue => self.continue_handler(request),
                 Follow::Report(event) => Ok(Some(event)),
             }
         });
@@ -515,8 +703,7 @@ impl Session
             {
                 // This trap is the step-resume rendezvous, not another user hit.
                 plan.signal_return_sp = None;
-                self.start_plan(plan)?;
-                return Ok(None);
+                return self.continue_plan(plan);
             }
             // The handler stopped before returning. Remember the rendezvous so its later
             // return to this trap, in this frame, is not reported as a second hit.
@@ -556,10 +743,25 @@ impl Session
         }
         if let Some(next) = plan.remaining.pop_front() {
             plan.current = next;
-            self.start_plan(plan)?;
-        } else if let Some(request) = plan.final_request {
-            self.backend.resume(&request)?;
+            return self.continue_plan(plan);
+        }
+        if let Some(request) = plan.final_request
+            && let Err(error) = self.backend.resume(&request)
+        {
+            if error != BackendError::StopPending {
+                return Err(error.into());
+            }
+            // A stop arrived after the drain; the final continue's signals stay held.
+            self.carry_signals(request.signals);
+            return self.refused_stop().map(Some);
         }
         Ok(None)
     }
+}
+
+/// Set `thread`'s entry in `signals` to `signal`, replacing an earlier one.
+pub(super) fn merge_signal(signals: &mut Vec<(ThreadId, i32)>, thread: ThreadId, signal: i32)
+{
+    signals.retain(|(carried, _)| *carried != thread);
+    signals.push((thread, signal));
 }

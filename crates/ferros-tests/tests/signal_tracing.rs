@@ -357,10 +357,7 @@ fn a_late_stop_during_resume_retains_its_signal_decision()
         ));
         probe.publish_paused_stop_during_next_resume();
         assert!(
-            matches!(
-                backend.resume(&ResumeRequest::continue_all()),
-                Err(BackendError::InvalidState(_))
-            ),
+            matches!(backend.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending)),
             "resume must not answer a newly published stop without its decision"
         );
         let second = match backend.wait(Some(Duration::from_secs(2))).expect("late signal") {

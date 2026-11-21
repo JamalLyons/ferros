@@ -1918,3 +1918,190 @@ fn step_out_drops_a_stale_trap_stop_that_refuses_its_recursive_continue()
     assert_eq!(mock.script_len(), 0);
     assert_eq!(mock.pending_len(), 0);
 }
+
+/// Where a peer thread's breakpoint stop is taken in the step-over tests of #158: a
+/// stale private trap (no trap at the address), a session breakpoint, or the program's
+/// own `brk #1`.
+#[derive(Clone, Copy, Debug)]
+enum PeerTrap
+{
+    Stale,
+    Armed,
+    Program,
+}
+
+/// The third thread of `step_over_process`, which takes the peer stop at `PEER_SITE`.
+const PEER: ThreadId = ThreadId(3);
+const PEER_SITE: Address = Address::new(0x1_0000_0020);
+
+/// `THREAD` at a user breakpoint at `BREAKPOINT`; with `two_sites`, a second thread at
+/// another one at `SECOND_SITE`, so `resume` steps over both before its final continue.
+/// `PEER` runs elsewhere; `trap` says what is at `PEER_SITE`.
+fn step_over_process(two_sites: bool, trap: PeerTrap) -> (MockBackend, Session)
+{
+    use ferros_core::BreakpointRequest;
+
+    let mut code = vec![0x1F; 64];
+    if matches!(trap, PeerTrap::Program) {
+        code[0x20..0x24].copy_from_slice(&BRK_1);
+    }
+    let at = |pc: Address| {
+        let mut registers = arm64_registers();
+        registers.pc = pc;
+        registers
+    };
+    let second = if two_sites { SECOND_SITE } else { CALLEE + 0x30 };
+    let mock = MockBackend::new()
+        .with_thread(THREAD, at(BREAKPOINT))
+        .with_thread(ThreadId(2), at(second))
+        .with_thread(PEER, at(CALLEE + 0x38))
+        .with_region(CALLEE, "r-x", code);
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let mut sites = vec![BREAKPOINT];
+    if two_sites {
+        sites.push(SECOND_SITE);
+    }
+    if matches!(trap, PeerTrap::Armed) {
+        sites.push(PEER_SITE);
+    }
+    for address in sites {
+        session
+            .add_breakpoint(BreakpointRequest::Software { address })
+            .expect("breakpoint");
+    }
+    let _ = mock.take_calls();
+    (mock, session)
+}
+
+/// `PEER`'s breakpoint stop at `PEER_SITE`.
+fn peer_stop() -> StopEvent
+{
+    StopEvent::Breakpoint {
+        thread: PEER,
+        pc: PEER_SITE,
+    }
+}
+
+/// #158: the stop that completes the internal step off the breakpoint at the pc also
+/// reports another thread's breakpoint stop at a private trap that is gone. It belongs
+/// to no request: the drain before the final continue drops it, and the program runs on.
+#[test]
+fn step_over_drops_a_stale_trap_stop_reported_with_its_internal_step()
+{
+    let (mock, mut session) = step_over_process(false, PeerTrap::Stale);
+    mock.script_simultaneous(vec![
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+        stale_trap_stop(PEER, PEER_SITE),
+    ]);
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("resume");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::step(THREAD), ResumeRequest::continue_all()],
+        "the final continue was issued"
+    );
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(session.breakpoints()[0].hit_count, 0);
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #158: the same stop at a real trap (a session breakpoint, or the program's own
+/// `brk #1`) is the caller's: it is reported, and the final continue is not issued.
+#[test]
+fn step_over_reports_a_real_trap_stop_reported_with_its_internal_step()
+{
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let (mock, mut session) = step_over_process(false, trap);
+        mock.script_simultaneous(vec![
+            MockStop::new(StopEvent::SingleStep { thread: THREAD })
+                .set_pc(THREAD, BREAKPOINT + 4)
+                .expect_resume(ResumeRequest::step(THREAD)),
+            MockStop::new(peer_stop()).set_pc(PEER, PEER_SITE),
+        ]);
+        session.resume().expect("resume");
+        assert_eq!(
+            resumes(&mock),
+            vec![ResumeRequest::step(THREAD)],
+            "{trap:?}: no final continue"
+        );
+        assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+        assert_eq!(session.wait(None).expect("wait"), Some(peer_stop()), "{trap:?}");
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(mock.pending_len(), 0);
+    }
+}
+
+/// #158: `resume` steps two threads over the breakpoints at their pcs, one after the
+/// other. Another thread's breakpoint stop at a private trap that is gone arrives just
+/// before the second step, so the backend refuses it; the stop belongs to no request, so
+/// it is dropped and the step is issued again, and the step-over goes on.
+#[test]
+fn step_over_drops_a_stale_trap_stop_that_refuses_its_next_step()
+{
+    let other = ThreadId(2);
+    let (mock, mut session) = step_over_process(true, PeerTrap::Stale);
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: other })
+            .set_pc(other, SECOND_SITE + 4)
+            .expect_resume(ResumeRequest::step(other)),
+    );
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    mock.stop_before_nth_resume(2, std::iter::once(stale_trap_stop(PEER, PEER_SITE)));
+    session.resume().expect("resume");
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::step(THREAD),
+            ResumeRequest::step(other),
+            ResumeRequest::step(other),
+            ResumeRequest::continue_all(),
+        ],
+        "the refused step was issued again, then the final continue"
+    );
+    for address in [BREAKPOINT, SECOND_SITE] {
+        assert_eq!(mock.peek_memory(address, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    }
+    assert!(session.breakpoints().iter().all(|info| info.hit_count == 0));
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #158: the same refusal for a stop at a real trap (a session breakpoint, or the
+/// program's own `brk #1`) ends the step-over: the stop is reported and the second step
+/// is not issued again.
+#[test]
+fn step_over_reports_a_real_trap_stop_that_refuses_its_next_step()
+{
+    let other = ThreadId(2);
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let (mock, mut session) = step_over_process(true, trap);
+        mock.script(
+            MockStop::new(StopEvent::SingleStep { thread: THREAD })
+                .set_pc(THREAD, BREAKPOINT + 4)
+                .expect_resume(ResumeRequest::step(THREAD)),
+        );
+        mock.stop_before_nth_resume(2, std::iter::once(MockStop::new(peer_stop()).set_pc(PEER, PEER_SITE)));
+        session.resume().expect("resume");
+        assert_eq!(
+            resumes(&mock),
+            vec![ResumeRequest::step(THREAD), ResumeRequest::step(other)],
+            "{trap:?}: the refused step was not issued again"
+        );
+        for address in [BREAKPOINT, SECOND_SITE] {
+            assert_eq!(mock.peek_memory(address, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+        }
+        assert_eq!(session.wait(None).expect("wait"), Some(peer_stop()), "{trap:?}");
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(mock.script_len(), 0);
+        assert_eq!(mock.pending_len(), 0);
+    }
+}

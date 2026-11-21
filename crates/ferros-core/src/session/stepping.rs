@@ -9,6 +9,7 @@ use crate::breakpoints::{BreakpointEntry, BreakpointKind};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, ThreadId};
 
+#[derive(Clone)]
 pub(super) struct StepSite
 {
     thread: ThreadId,
@@ -48,6 +49,7 @@ enum Follow
     Report(StopEvent),
 }
 
+#[derive(Clone)]
 pub(super) struct StepPlan
 {
     current: StepSite,
@@ -264,10 +266,10 @@ impl Session
         self.backend_wait(Some(REFUSED_STOP_TIMEOUT))
     }
 
-    /// As `refused_stop`, for `resume`, `step_instruction`, source steps and the final
-    /// continue of a step-over, which retry the resume instead of failing: `None` when the
-    /// stop is one `pending_event` drops (or none came), the rest of the queue being
-    /// drained before the retry.
+    /// As `refused_stop`, for `resume`, `step_instruction`, source steps and the next step
+    /// and final continue of a step-over, which retry the resume instead of failing: `None`
+    /// when the stop is one `pending_event` drops (or none came), the rest of the queue
+    /// being drained before the retry.
     pub(super) fn refused_event(&mut self) -> Result<Option<StopEvent>>
     {
         match self.refused_wait()? {
@@ -289,18 +291,31 @@ impl Session
 
     /// Start the next step of an internal step-over `plan`. If a stop arrived first, the
     /// backend runs nothing: the plan is given up as in `abandon` (no step was started, so
-    /// no completion can follow) and that stop is returned.
+    /// no completion can follow) and that stop is returned, unless it is one
+    /// `pending_event` drops (see `refused_event`): the step is then started again, after
+    /// draining the rest (#158).
     fn continue_plan(&mut self, plan: StepPlan) -> Result<Option<StopEvent>>
     {
-        // Cloned before `start_plan` moves the current thread's signal out of the request.
-        let carried = plan.final_request.as_ref().map(|request| request.signals.clone());
-        let started = self.start_plan(plan);
-        if let (Err(error), Some(signals)) = (&started, carried)
-            && is_stop_pending(error)
-        {
-            self.carry_signals(signals);
+        loop {
+            // `start_plan` takes the current thread's signal out of the final request and
+            // drops the plan when the backend refuses the step; a retry starts from the
+            // plan as it was.
+            match self.start_plan(plan.clone()) {
+                Err(error) if is_stop_pending(&error) => {
+                    let refused = match self.refused_event()? {
+                        Some(event) => Some(event),
+                        None => self.pending_event()?,
+                    };
+                    if let Some(event) = refused {
+                        if let Some(request) = plan.final_request {
+                            self.carry_signals(request.signals);
+                        }
+                        return Ok(Some(event));
+                    }
+                }
+                started => return started.map(|()| None),
+            }
         }
-        self.or_refused_stop(started)
     }
 
     fn rearm(&mut self, entry: &BreakpointEntry) -> Result<()>
@@ -737,8 +752,10 @@ impl Session
             return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
         }
         // The stop that completed the step may have reported other threads' events too;
-        // the backend refuses to resume until they are drained, and they are the caller's.
-        if let Some(pending) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+        // the backend refuses to resume until they are drained, and they are the caller's,
+        // except a breakpoint stop of a private trap that is gone (see `pending_event`),
+        // which belongs to no request and is dropped (#158).
+        if let Some(pending) = self.pending_event()? {
             self.abandon(plan, true);
             return Ok(Some(pending));
         }

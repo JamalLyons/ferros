@@ -94,10 +94,10 @@ use mach2::exception_types::{
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 #[cfg(target_os = "macos")]
 use mach2::message::{
-    MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_MSGH_BITS_COMPLEX,
-    MACH_RCV_INVALID_NAME, MACH_RCV_MSG, MACH_RCV_PORT_DIED, MACH_RCV_TIMEOUT, MACH_SEND_INVALID_DEST, MACH_SEND_MSG,
-    mach_msg, mach_msg_body_t, mach_msg_destroy, mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_return_t,
-    mach_msg_size_t, mach_msg_type_number_t,
+    MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS,
+    MACH_MSGH_BITS_COMPLEX, MACH_RCV_INVALID_NAME, MACH_RCV_MSG, MACH_RCV_PORT_DIED, MACH_RCV_TIMEOUT,
+    MACH_SEND_INVALID_DEST, MACH_SEND_MSG, MACH_SEND_TIMEOUT, mach_msg, mach_msg_body_t, mach_msg_destroy,
+    mach_msg_header_t, mach_msg_port_descriptor_t, mach_msg_return_t, mach_msg_size_t, mach_msg_type_number_t,
 };
 #[cfg(target_os = "macos")]
 use mach2::ndr::NDR_record;
@@ -414,6 +414,52 @@ impl ReplyFaultInjector
 /// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`.
 #[cfg(target_os = "macos")]
 const MACH_EXCEPTION_RAISE_ID: i32 = 2405;
+
+/// Id of the empty message [`wake_loop`] sends to the exception port. It is outside the
+/// MIG `mach_exc` subsystem (2405 to 2407), so it is never taken for a request.
+#[cfg(target_os = "macos")]
+const WAKE_LOOP_ID: i32 = 0x6665_7272;
+
+/// Wake the exception loop out of its receive on `exception_port`, so it takes a command
+/// just sent to it at once.
+///
+/// While a stop is pending the loop alternates between a bounded receive and a check of
+/// its commands. Without a wake, every `Continue` (and so every resume and instruction
+/// step) waited for that receive to time out (issue #160). The send never blocks: a full
+/// queue already wakes the loop. A failure only loses the wake, and the loop then takes
+/// the command when its receive times out.
+#[cfg(target_os = "macos")]
+pub(crate) fn wake_loop(exception_port: mach_port_t)
+{
+    if exception_port == MACH_PORT_NULL {
+        return;
+    }
+    let mut wake = mach_msg_header_t {
+        msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
+        msgh_size: std::mem::size_of::<mach_msg_header_t>() as mach_msg_size_t,
+        msgh_remote_port: exception_port,
+        msgh_local_port: MACH_PORT_NULL,
+        msgh_voucher_port: MACH_PORT_NULL,
+        msgh_id: WAKE_LOOP_ID,
+    };
+    // SAFETY: `wake` is a complete header-only message that outlives the call; the
+    // backend holds a send right to `exception_port` until it destroys the port, and
+    // `MACH_MSG_TYPE_COPY_SEND` leaves that right with it.
+    let kr = unsafe {
+        mach_msg(
+            &mut wake,
+            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+            wake.msgh_size,
+            0,
+            MACH_PORT_NULL,
+            0,
+            MACH_PORT_NULL,
+        )
+    };
+    if kr != MACH_MSG_SUCCESS {
+        debug!("could not wake the exception loop: mach_msg returned {kr:#x}");
+    }
+}
 
 /// Request message of `mach_exception_raise` (MIG id 2405), which the kernel sends for
 /// `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`: like `exception_raise`, but with 64-bit
@@ -1231,6 +1277,10 @@ fn decode_request(buffer: &ReceiveBuffer) -> Option<MachExceptionRaiseRequest>
         && body.msgh_descriptor_count == 2;
     if is_exception {
         return Some(request);
+    }
+    if header.msgh_id == WAKE_LOOP_ID {
+        // A header-only wake carries no rights; the loop goes back to its commands.
+        return None;
     }
     warn!("Ignoring unexpected Mach message id {} on the exception port", header.msgh_id);
     let mut copy = ReceiveBuffer(buffer.0);

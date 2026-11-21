@@ -1143,6 +1143,7 @@ impl MacOSBackend
                 code: -1,
                 message: "attach reply channel closed".into(),
             })?;
+        exception::wake_loop(self.exception_port);
         replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "attach reply timed out".into(),
@@ -1254,6 +1255,7 @@ impl MacOSBackend
                     code: -1,
                     message: "detach reply channel closed".into(),
                 })?;
+            exception::wake_loop(self.exception_port);
             replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
                 code: -1,
                 message: "detach reply timed out".into(),
@@ -1900,6 +1902,9 @@ impl Backend for MacOSBackend
                 })
                 .is_ok()
             });
+            if sent {
+                exception::wake_loop(self.exception_port);
+            }
             let replied = if sent {
                 ack_rx
                     .recv_timeout(EXCEPTION_REPLY_TIMEOUT)

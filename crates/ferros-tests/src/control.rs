@@ -1,7 +1,6 @@
 //! File gates shared by controlled native stepping tests and fixtures.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A unique directory containing fixture gates and acknowledgements.
@@ -24,14 +23,7 @@ impl ControlDir
     #[must_use]
     pub fn new() -> Self
     {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ferros-step-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).expect("create control directory");
-        Self(path)
+        Self(crate::scratch::create_dir("ferros-step"))
     }
 
     /// Path passed to the fixture.

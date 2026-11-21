@@ -24,6 +24,7 @@ use ferros_core::error::DebuggerError;
 use ferros_core::symbols::unwind::{MemoryAccess, StackUnwinder};
 use ferros_core::symbols::{DebugInfoOptions, ImageDescriptor, SymbolCache};
 use ferros_core::types::{Address, Architecture, Registers, StackFrame, ThreadId};
+use ferros_tests::scratch;
 
 /// Link-time address of the `__TEXT` segment.
 const FILE_BASE: u64 = 0x1_0000_0000;
@@ -243,8 +244,8 @@ impl TempImage
 {
     fn create(name: &str, layout: Layout) -> Self
     {
-        let path = std::env::temp_dir().join(format!("ferros-{name}-{}.macho", std::process::id()));
-        std::fs::write(&path, mach_o(layout)).expect("write synthetic image");
+        let (mut file, path) = scratch::create_file(&format!("ferros-{name}"), ".macho");
+        std::io::Write::write_all(&mut file, &mach_o(layout)).expect("write synthetic image");
         Self(path)
     }
 }

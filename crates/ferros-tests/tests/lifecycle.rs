@@ -5,12 +5,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ferros_core::backend::{Backend, BackendError, ResumeRequest};
 use ferros_core::{LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent};
 use ferros_macos::{MacOSBackend, diagnostics};
-use ferros_tests::{fixture, harness};
+use ferros_tests::{fixture, harness, scratch};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 // Darwin signal numbers; the test harness deliberately uses no raw FFI.
@@ -129,9 +129,8 @@ impl Drop for NonExecutable
 fn failed_launches_are_typed_and_leave_no_process()
 {
     harness::run(|_| {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let tag = format!("ferros-fixture-nonexec-{}-{nonce}", std::process::id());
-        let path = NonExecutable(std::env::temp_dir().join(&tag));
+        let path = NonExecutable(scratch::unique_path("ferros-fixture-nonexec", ""));
+        let tag = path.0.file_name().expect("file name").to_string_lossy().into_owned();
         let mut backend = MacOSBackend::new().expect("backend");
         assert!(matches!(
             backend.launch(&LaunchSpec::new(&path.0)),
@@ -693,12 +692,7 @@ impl Grandchild
     fn spawn(args: &[&str]) -> Self
     {
         // Files cannot fill a pipe and delay the very completion being measured.
-        let output_path = std::env::temp_dir().join(format!(
-            "ferros-release-{}-{}.log",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos()
-        ));
-        let output = fs::File::create_new(&output_path).expect("create release output");
+        let (output, output_path) = scratch::create_file("ferros-release", ".log");
         let output_path = ReleaseOutput(output_path);
         let shell = Command::new("/bin/sh")
             .arg("-c")

@@ -245,14 +245,7 @@ impl MultiSiteImage
 {
     fn new() -> (Self, MockBackend)
     {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ferros-mock-multi-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let (mut image, path) = ferros_tests::scratch::create_file("ferros-mock-multi", "");
         // DWARF 4: a compile unit with children, then subprograms with inline name,
         // low_pc (address), high_pc (data4 offset). No statement table is referenced.
         let abbrev = vec![1, 0x11, 1, 0, 0, 2, 0x2e, 0, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 0];
@@ -301,7 +294,8 @@ impl MultiSiteImage
             bytes.extend(data);
         }
         bytes.resize(0x2000, 0x1F);
-        std::fs::write(&path, &bytes).expect("write synthetic image");
+        std::io::Write::write_all(&mut image, &bytes).expect("write synthetic image");
+        drop(image);
         let mut registers = arm64_registers();
         registers.pc = IMAGE_BASE;
         let mock = MockBackend::new()

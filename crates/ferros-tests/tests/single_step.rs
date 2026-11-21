@@ -198,6 +198,37 @@ fn step_executes_one_instruction_at_a_time()
     });
 }
 
+/// Steps run back to back do not wait on the exception loop's poll (issue #160).
+///
+/// Each resume hands the loop a `Continue` while it holds the stop. Before the fix the
+/// loop noticed that only when its 10 ms receive timed out, so every step took at least
+/// 10 ms: a few hundred steps through the unwinder took seconds, and the stepping tests
+/// over a caught panic timed out on a slower CI runner. Two hundred steps in less than a
+/// second leaves a wide margin either way (they take about 2 s at 10 ms each).
+#[test]
+fn back_to_back_steps_do_not_wait_for_the_exception_loop_poll()
+{
+    const RUNS: u32 = 200;
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+
+        let started = Instant::now();
+        for n in 1..=RUNS {
+            let event = step(&mut d, thread);
+            assert_eq!(event, StopEvent::SingleStep { thread }, "step {n} ended with another stop");
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "{RUNS} instruction steps took {elapsed:?}");
+    });
+}
+
 /// Stepping one worker of `threads` keeps every other thread where it is, even one that
 /// holds an unanswered breakpoint stop of its own; continuing afterwards runs the fixture
 /// to completion.

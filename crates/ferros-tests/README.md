@@ -247,6 +247,15 @@ for the continue to the return trap
 (`step_out_reports_a_program_trap_stop_queued_for_its_return_continue`): only a stop with no
 trap instruction of any form left at its address is stale.
 
+Step-overs of breakpoints at the pc drop such a stop too (#158): one reported with the
+internal step off a breakpoint, which the drain before the final continue drops
+(`step_over_drops_a_stale_trap_stop_reported_with_its_internal_step`), and one refusing the
+next step of a step-over with several sites, which is issued again
+(`step_over_drops_a_stale_trap_stop_that_refuses_its_next_step`). The same stop at an armed
+breakpoint or at a program `brk #1` is still reported at either point
+(`step_over_reports_a_real_trap_stop_reported_with_its_internal_step`,
+`step_over_reports_a_real_trap_stop_that_refuses_its_next_step`).
+
 
 ## Debug-info regressions
 

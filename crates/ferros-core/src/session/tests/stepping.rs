@@ -475,6 +475,9 @@ fn terminal_event_during_resume_is_reported_and_kill_still_works()
 fn event_reported_with_the_internal_step_is_not_skipped()
 {
     let (mock, mut session, _) = at_breakpoint();
+    // A real trap at T2's stop: a breakpoint stop with no trap in memory is a stale one
+    // (see `stale_trap`), which the drain after the internal step drops (#158).
+    session.add_breakpoint(software(BP2)).unwrap();
     mock.script_simultaneous([
         MockStop::new(StopEvent::SingleStep { thread: T1 })
             .set_pc(T1, Address::new(BP + 4))

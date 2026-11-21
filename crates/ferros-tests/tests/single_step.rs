@@ -1625,6 +1625,13 @@ fn signal_cancels_a_real_step_without_a_stray_step_stop()
             })
         );
         assert_step_cleaned(stepped, &threads);
+        // The signal interrupted the blocking `svc`: the thread is still at the syscall
+        // (restarted) or just after it, never beyond, so the step did not complete.
+        let pc = backend(&mut d).read_registers(stepped).expect("registers").pc;
+        assert!(
+            pc == svc || pc == Address::from(svc.value() + 4),
+            "signal stop at {pc:?}, expected the svc at {svc:?} or the instruction after it"
+        );
 
         control.release("run-1");
         control.release("exit");

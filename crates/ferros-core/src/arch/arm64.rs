@@ -86,6 +86,14 @@ impl Arch for Arm64
         &Self::TRAP_INSTRUCTION
     }
 
+    fn is_trap_instruction(&self, bytes: &[u8]) -> bool
+    {
+        // BRK #imm16: 1101 0100 001 imm16 000 00.
+        bytes
+            .try_into()
+            .is_ok_and(|word| u32::from_le_bytes(word) & 0xffe0_001f == 0xd420_0000)
+    }
+
     fn call_return_address(&self, pc: Address, instruction: &[u8]) -> Option<Address>
     {
         let word = u32::from_le_bytes(instruction.try_into().ok()?);
@@ -230,6 +238,33 @@ mod tests
         assert_eq!(arch.architecture(), Architecture::Arm64);
         assert_eq!(Arm64::default(), arch);
         assert_eq!(arch.addressable_bits(), 47);
+    }
+
+    #[test]
+    fn any_brk_is_a_trap_instruction()
+    {
+        let arch = Arm64::new();
+        let traps = [
+            ("BRK #0", 0xd420_0000_u32),
+            ("BRK #1", 0xd420_0020),
+            ("BRK #0xf000", 0xd43e_0000),
+            ("BRK #0xffff", 0xd43f_ffe0),
+        ];
+        for (name, word) in traps {
+            assert!(arch.is_trap_instruction(&word.to_le_bytes()), "{name}");
+        }
+        let others = [
+            ("NOP", 0xd503_201f_u32),
+            ("HLT #0", 0xd440_0000),
+            ("SVC #0x80", 0xd400_1001),
+            ("BRK with a nonzero low field", 0xd420_0001),
+            ("BRK with a nonzero op2 field", 0xd420_0004),
+        ];
+        for (name, word) in others {
+            assert!(!arch.is_trap_instruction(&word.to_le_bytes()), "{name}");
+        }
+        assert!(!arch.is_trap_instruction(&[0x00, 0x00, 0x20]), "short read");
+        assert!(!arch.is_trap_instruction(&[0x00, 0x00, 0x20, 0xd4, 0x00]), "long read");
     }
 
     #[test]

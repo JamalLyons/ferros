@@ -264,10 +264,11 @@ impl Session
         self.backend_wait(Some(REFUSED_STOP_TIMEOUT))
     }
 
-    /// As `refused_stop`, for `resume` and `step_instruction`, which retry the resume
-    /// instead of failing: `None` when the stop is one `pending_event` drops (or none
-    /// came), the rest of the queue being drained before the retry.
-    fn refused_event(&mut self) -> Result<Option<StopEvent>>
+    /// As `refused_stop`, for `resume`, `step_instruction`, source steps and the final
+    /// continue of a step-over, which retry the resume instead of failing: `None` when the
+    /// stop is one `pending_event` drops (or none came), the rest of the queue being
+    /// drained before the retry.
+    pub(super) fn refused_event(&mut self) -> Result<Option<StopEvent>>
     {
         match self.refused_wait()? {
             Some(event) if !self.stale_trap(None, &event)? => Ok(Some(event)),
@@ -745,17 +746,28 @@ impl Session
             plan.current = next;
             return self.continue_plan(plan);
         }
-        if let Some(request) = plan.final_request
-            && let Err(error) = self.backend.resume(&request)
-        {
-            if error != BackendError::StopPending {
-                return Err(error.into());
+        let Some(request) = plan.final_request else {
+            return Ok(None);
+        };
+        loop {
+            match self.backend.resume(&request) {
+                Ok(()) => return Ok(None),
+                // A stop arrived after the drain and nothing ran: report it, the final
+                // continue's signals staying held, or continue again if it is one
+                // `pending_event` drops (see `refused_event`), after draining the rest.
+                Err(BackendError::StopPending) => {
+                    let refused = match self.refused_event()? {
+                        Some(event) => Some(event),
+                        None => self.pending_event()?,
+                    };
+                    if let Some(event) = refused {
+                        self.carry_signals(request.signals);
+                        return Ok(Some(event));
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
-            // A stop arrived after the drain; the final continue's signals stay held.
-            self.carry_signals(request.signals);
-            return self.refused_stop().map(Some);
         }
-        Ok(None)
     }
 }
 

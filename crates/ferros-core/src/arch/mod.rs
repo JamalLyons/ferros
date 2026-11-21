@@ -48,6 +48,17 @@ pub trait Arch: Send + Sync + std::fmt::Debug
     /// None; infallible.
     fn trap_instruction(&self) -> &'static [u8];
 
+    /// Whether `bytes` (in memory order) encode a trap instruction of any form: the
+    /// session's own [`trap_instruction`](Self::trap_instruction) or one the program
+    /// itself contains (on arm64, `BRK` with any immediate).
+    ///
+    /// The default recognizes only [`trap_instruction`](Self::trap_instruction). This
+    /// is instruction decoding only: it does not read target memory.
+    fn is_trap_instruction(&self, bytes: &[u8]) -> bool
+    {
+        bytes == self.trap_instruction()
+    }
+
     /// Return pc of a call encoded by `instruction` at `pc`, if recognized.
     ///
     /// The default recognizes no calls. This is instruction decoding only: it does

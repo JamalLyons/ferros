@@ -694,8 +694,10 @@ impl MacOSBackend
         // the exceptions still queued on the port and exit before the port is destroyed.
         // Otherwise it is blocked receiving, and destroying the port is what wakes it.
         let holds_exception = lock_shared(&self.exception_state).pending_exception;
-        if let Some(tx) = self.exception_commands.take() {
-            let _ = tx.send(ExceptionLoopCommand::Shutdown);
+        if let Some(tx) = self.exception_commands.take()
+            && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
+        {
+            exception::wake_loop(self.exception_port);
         }
         if holds_exception && let Some(handle) = self.exception_thread.take() {
             let _ = handle.join();
@@ -1143,6 +1145,7 @@ impl MacOSBackend
                 code: -1,
                 message: "attach reply channel closed".into(),
             })?;
+        exception::wake_loop(self.exception_port);
         replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "attach reply timed out".into(),
@@ -1254,6 +1257,7 @@ impl MacOSBackend
                     code: -1,
                     message: "detach reply channel closed".into(),
                 })?;
+            exception::wake_loop(self.exception_port);
             replied.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
                 code: -1,
                 message: "detach reply timed out".into(),
@@ -1900,6 +1904,9 @@ impl Backend for MacOSBackend
                 })
                 .is_ok()
             });
+            if sent {
+                exception::wake_loop(self.exception_port);
+            }
             let replied = if sent {
                 ack_rx
                     .recv_timeout(EXCEPTION_REPLY_TIMEOUT)

@@ -12,7 +12,7 @@ use ferros_core::Address;
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address};
 use ferros_tests::transcript::{self, Interactive, normalize};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::{Fixture, fixture, scratch};
 
 /// Iterations passed to `loop_counter` so it outlives the test (10 ms each).
 const LONG_LOOP: &str = "100000";
@@ -252,8 +252,7 @@ fn sigint_interrupts_the_running_debuggee()
 fn batch_file_runs_before_commands()
 {
     run(|t| {
-        let dir = std::env::temp_dir().join(format!("ferros-cli-batch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch::create_dir("ferros-cli-batch");
         let script = dir.join("script.ferros");
         std::fs::write(&script, "# set up\n\nstatus\ncontinue\n").expect("write script");
 
@@ -286,9 +285,7 @@ impl TempDir
 {
     fn new(name: &str) -> Self
     {
-        let path = std::env::temp_dir().join(format!("ferros-cli-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("temp dir");
-        Self(path)
+        Self(scratch::create_dir(&format!("ferros-cli-{name}")))
     }
 
     /// Write `contents` to `name` in the directory and return its path.

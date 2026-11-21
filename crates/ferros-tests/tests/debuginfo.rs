@@ -5,7 +5,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ferros_core::backend::LoadedImage;
@@ -16,7 +15,7 @@ use ferros_core::{
 };
 use ferros_macos::MacOSBackend;
 use ferros_tests::symbols::function_address;
-use ferros_tests::{Fixture, fixture, harness};
+use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 
 struct Scratch(PathBuf);
@@ -25,19 +24,7 @@ impl Scratch
 {
     fn new() -> Self
     {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "ferros-debuginfo-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("create scratch directory: {error}"),
-            }
-        }
+        Self(scratch::create_dir("ferros-debuginfo"))
     }
 
     fn options(&self) -> DebugInfoOptions

@@ -6,6 +6,7 @@ pub mod control;
 pub mod fixture;
 #[cfg(target_os = "macos")]
 pub mod harness;
+pub mod scratch;
 #[cfg(target_os = "macos")]
 mod staging;
 #[cfg(target_os = "macos")]

@@ -2,27 +2,18 @@
 #![cfg(target_os = "macos")]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ferros_core::backend::Backend;
 use ferros_macos::MacOSBackend;
-use ferros_tests::{fixture, harness};
+use ferros_tests::{fixture, harness, scratch};
 
 struct Observer(PathBuf);
 impl Observer
 {
     fn new() -> Self
     {
-        static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ferros-signals-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-            NEXT_OBSERVER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).expect("observer directory");
-        Self(path)
+        Self(scratch::create_dir("ferros-signals"))
     }
     fn wait_released(&self, pid: ferros_core::ProcessId)
     {

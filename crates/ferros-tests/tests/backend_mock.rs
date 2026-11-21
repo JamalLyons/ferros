@@ -5,6 +5,8 @@
 //! scripted, in-memory backend. They therefore need no `harness::run`, no fixtures and no
 //! debugger entitlement, and they are not limited to macOS.
 
+use std::time::{Duration, Instant};
+
 use ferros_core::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use ferros_core::backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent};
 use ferros_core::types::{Address, ProcessId, ThreadId};
@@ -2104,4 +2106,130 @@ fn step_over_reports_a_real_trap_stop_that_refuses_its_next_step()
         assert_eq!(mock.script_len(), 0);
         assert_eq!(mock.pending_len(), 0);
     }
+}
+
+/// Whether `calls` write memory at `address` after their last `Resume`: the cleanup after
+/// a refused resume reached the target.
+fn writes_after_last_resume(calls: &[MockCall], address: Address) -> bool
+{
+    let refused = calls
+        .iter()
+        .rposition(|call| matches!(call, MockCall::Resume(_)))
+        .expect("a resume");
+    calls[refused + 1..]
+        .iter()
+        .any(|call| matches!(call, MockCall::WriteMemory { address: written, .. } if *written == address))
+}
+
+/// #155: `resume` steps over the breakpoint at the pc, and the backend refuses that step
+/// (the first, or the next of two sites) for a stop, after which the target dies before
+/// the trap is put back. The failed write does not hide the refusal: `resume` succeeds,
+/// and `wait` reports how the target ended.
+#[test]
+fn refused_step_over_on_a_dying_target_reports_its_death()
+{
+    let other = ThreadId(2);
+    for (two_sites, nth) in [(false, 1), (true, 2)] {
+        let (mock, mut session) = step_over_process(two_sites, PeerTrap::Stale);
+        if two_sites {
+            mock.script(
+                MockStop::new(StopEvent::SingleStep { thread: THREAD })
+                    .set_pc(THREAD, BREAKPOINT + 4)
+                    .expect_resume(ResumeRequest::step(THREAD)),
+            );
+        }
+        let exited = StopEvent::Exited { code: 7 };
+        mock.die_refusing_nth_resume(nth, exited.clone(), Duration::from_millis(50));
+        session
+            .resume()
+            .unwrap_or_else(|error| panic!("site {nth}: the refused step reported {error:?}"));
+        let site = if two_sites { SECOND_SITE } else { BREAKPOINT };
+        let stepped = if two_sites { other } else { THREAD };
+        let calls = mock.take_calls();
+        assert_eq!(
+            calls.iter().rev().find_map(|call| match call {
+                MockCall::Resume(request) => Some(request.clone()),
+                _ => None,
+            }),
+            Some(ResumeRequest::step(stepped)),
+            "site {nth}: the step was the refused resume"
+        );
+        assert!(
+            writes_after_last_resume(&calls, site),
+            "site {nth}: the trap was put back after the refusal"
+        );
+        assert_eq!(session.state(), SessionState::Running);
+        assert_eq!(session.wait(None).expect("wait"), Some(exited.clone()), "site {nth}");
+        assert_eq!(session.state(), SessionState::Exited);
+        assert_eq!(session.last_stop(), Some(&exited));
+    }
+}
+
+/// #155: the same death after the backend refuses the continue of a source step to its
+/// return trap: releasing the private trap fails, and `wait` still reports the death.
+#[test]
+fn refused_step_out_continue_on_a_dying_target_reports_its_death()
+{
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let killed = StopEvent::Killed { signal: 9 };
+    mock.die_refusing_nth_resume(1, killed.clone(), Duration::from_millis(50));
+    let _ = mock.take_calls();
+    session
+        .step_out()
+        .unwrap_or_else(|error| panic!("the refused continue reported {error:?}"));
+    let calls = mock.take_calls();
+    assert!(
+        calls.contains(&MockCall::Resume(step_out_continue())),
+        "the continue was the refused resume"
+    );
+    assert!(
+        writes_after_last_resume(&calls, BREAKPOINT),
+        "the return trap was released after the refusal"
+    );
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(session.wait(None).expect("wait"), Some(killed.clone()));
+    assert_eq!(session.state(), SessionState::Exited);
+    assert_eq!(session.last_stop(), Some(&killed));
+}
+
+/// #155: `wait(Some(Duration::ZERO))` takes the completion of `resume`'s step off the
+/// breakpoint at the pc, and the backend refuses the final continue; the target died, and
+/// its terminal event comes later. The wait keeps to its budget: it returns `None` at
+/// once, the session running, and a later `wait` reports the death.
+#[test]
+fn zero_timeout_wait_does_not_block_on_a_dying_targets_refused_continue()
+{
+    let (mock, mut session) = step_over_process(false, PeerTrap::Stale);
+    let exited = StopEvent::Exited { code: 0 };
+    mock.die_refusing_nth_resume(2, exited.clone(), Duration::from_millis(1500));
+    // No completion is scripted yet, so `resume` leaves the step to `wait`.
+    session.resume().expect("resume");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
+    assert_eq!(session.state(), SessionState::Running);
+
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    let started = Instant::now();
+    let waited = session.wait(Some(Duration::ZERO));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "wait(Some(ZERO)) blocked for {elapsed:?}, returning {waited:?}"
+    );
+    assert_eq!(waited.expect("wait"), None);
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all()],
+        "the final continue was refused once"
+    );
+    assert_eq!(mock.peek_memory(BREAKPOINT, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(session.state(), SessionState::Running);
+    assert_eq!(session.wait(None).expect("wait"), Some(exited.clone()));
+    assert_eq!(session.state(), SessionState::Exited);
+    assert_eq!(session.last_stop(), Some(&exited));
 }

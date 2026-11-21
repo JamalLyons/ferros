@@ -3,6 +3,7 @@
 use std::ops::Range;
 
 use super::exits::{ExitHooks, ExitStep, SiteOwner};
+use super::stepping::Refusal;
 use super::{Session, SessionState, SourcePosition};
 use crate::backend::{ResumeRequest, StopEvent, ThreadAction};
 use crate::breakpoints::{BreakpointId, BreakpointKind};
@@ -216,16 +217,25 @@ impl Session
                 Err(error) if super::stepping::is_stop_pending(&error) => {
                     // A stop arrived after the drain above and nothing ran: put the plan
                     // back as that drain leaves it, and defer the stop the same way, or
-                    // try again if it belongs to no request (see `refused_event`).
+                    // try again if it belongs to no request (see `refusal`). A target that
+                    // died after the refusal fails these writes; its terminal event is
+                    // still the one to report (#155). If it has not come yet the session
+                    // runs, and a later `wait` takes it.
                     if let Some(site) = plan.run_to.take() {
-                        self.release_site(site.id, &site.owner)?;
+                        let released = self.release_site(site.id, &site.owner);
+                        self.note_refusal_cleanup(released);
                     }
                     if arm_exits {
-                        self.release_exit_hooks(plan.exits.take())?;
+                        let released = self.release_exit_hooks(plan.exits.take());
+                        self.note_refusal_cleanup(released);
                     }
-                    if let Some(event) = self.refused_event()? {
-                        self.deferred = Some(event);
-                        break;
+                    match self.refusal()? {
+                        Refusal::Stop(event) => {
+                            self.deferred = Some(event);
+                            break;
+                        }
+                        Refusal::Retry => {}
+                        Refusal::Pending => break,
                     }
                 }
                 started => {
@@ -245,7 +255,7 @@ impl Session
     /// A stop that comes first (still queued, or one the backend refuses the continue
     /// for) is reported, unless it belongs to no request: a breakpoint stop of a private
     /// trap that is gone or an abandoned step's late completion (see `pending_event` and
-    /// `refused_event`). The continue is then tried again.
+    /// `refusal`). The continue is then tried again.
     fn continue_line_thread(&mut self, thread: ThreadId) -> Result<Option<StopEvent>>
     {
         loop {
@@ -255,11 +265,13 @@ impl Session
             let started =
                 self.start_continue(ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue));
             match started {
-                Err(error) if super::stepping::is_stop_pending(&error) => {
-                    if let Some(event) = self.refused_event()? {
-                        return Ok(Some(event));
-                    }
-                }
+                Err(error) if super::stepping::is_stop_pending(&error) => match self.refusal()? {
+                    Refusal::Stop(event) => return Ok(Some(event)),
+                    Refusal::Retry => {}
+                    // The target died after the refusal: a later `wait` takes its terminal
+                    // event (#155).
+                    Refusal::Pending => return Ok(None),
+                },
                 started => {
                     started?;
                     self.stale_step = None;

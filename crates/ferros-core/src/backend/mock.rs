@@ -27,7 +27,9 @@
 //! When the target is running and the script is empty, `wait(Some(_))` returns
 //! `Ok(None)` immediately (it never sleeps, so tests stay fast) and `wait(None)` returns
 //! [`BackendError::InvalidState`] (a real backend would block forever; the mock refuses
-//! rather than hang the test).
+//! rather than hang the test). The one exception is a target that dies after a refused
+//! resume ([`MockBackend::die_refusing_nth_resume`]): its terminal event comes after a
+//! real delay, and `wait` sleeps for it.
 //!
 //! ## Inspecting the mock afterwards
 //!
@@ -61,7 +63,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{Backend, BackendError, BackendResult, LaunchSpec, LoadedImage, ResumeRequest, StopEvent, ThreadAction};
 use crate::types::{Address, Architecture, MemoryRegion, MemoryRegionId, ProcessId, Registers, ThreadId};
@@ -341,6 +343,16 @@ struct Region
     bytes: Vec<u8>,
 }
 
+/// What happens just before a counted `resume` checks for pending events.
+#[derive(Debug, Clone)]
+enum Race
+{
+    /// These stops arrive (see [`MockBackend::stop_before_nth_resume`]).
+    Stops(Vec<MockStop>),
+    /// A stop arrives and the target dies (see [`MockBackend::die_refusing_nth_resume`]).
+    Death(StopEvent, Duration),
+}
+
 #[derive(Debug)]
 struct Inner
 {
@@ -355,9 +367,12 @@ struct Inner
     /// Events of the last stop not yet returned by `wait`.
     pending: VecDeque<StopEvent>,
     /// Stops that arrive while the target is stopped, just before the `resume` this many
-    /// resumes from now (one-based) checks for pending events; one group per refused
+    /// resumes from now (one-based) checks for pending events; one race per refused
     /// resume, counted down in queue order.
-    racing: VecDeque<(usize, Vec<MockStop>)>,
+    racing: VecDeque<(usize, Race)>,
+    /// The terminal event of a target that died after a refused resume, and when it is
+    /// published (see [`MockBackend::die_refusing_nth_resume`]).
+    dying: Option<(StopEvent, Instant)>,
     interrupt_requested: bool,
     calls: Vec<MockCall>,
     failures: VecDeque<(MockCallKind, usize, BackendError)>,
@@ -483,7 +498,28 @@ impl Inner
         self.state = MockState::NoProcess;
         self.pending.clear();
         self.racing.clear();
+        self.dying = None;
         self.interrupt_requested = false;
+    }
+
+    /// `wait` on a target that died after a refused resume: its terminal event once it is
+    /// published, sleeping for it when `timeout` reaches that far; otherwise the timeout
+    /// is slept out and nothing is returned. The lock is held while sleeping, which only
+    /// delays other handles' inspection.
+    fn wait_for_death(&mut self, event: StopEvent, due: Instant, timeout: Option<Duration>) -> Option<StopEvent>
+    {
+        let now = Instant::now();
+        let remaining = due.saturating_duration_since(now);
+        match timeout {
+            Some(timeout) if timeout < remaining => {
+                std::thread::sleep(timeout);
+                None
+            }
+            _ => {
+                std::thread::sleep(remaining);
+                Some(self.deliver(event))
+            }
+        }
     }
 
     /// Deliver an event: terminal events end the process, others leave it stopped.
@@ -559,6 +595,7 @@ impl MockBackend
                 script: VecDeque::new(),
                 pending: VecDeque::new(),
                 racing: VecDeque::new(),
+                dying: None,
                 interrupt_requested: false,
                 calls: Vec::new(),
                 failures: VecDeque::new(),
@@ -708,8 +745,36 @@ impl MockBackend
         assert!(nth > 0, "resume index must be one-based");
         let stops: Vec<MockStop> = stops.into_iter().collect();
         if !stops.is_empty() {
-            self.lock().racing.push_back((nth, stops));
+            self.lock().racing.push_back((nth, Race::Stops(stops)));
         }
+    }
+
+    /// Simulate a target that dies right after a stop refused one of its resumes: the
+    /// `nth` counted resume (one-based, counted with the races of
+    /// [`stop_before_nth_resume`](Self::stop_before_nth_resume)) is refused with
+    /// [`BackendError::StopPending`], and the target dies before the engine takes that
+    /// stop. As the macOS backend does for a dead task, the stop itself is dropped, and the
+    /// terminal `event` is published `delay` after the refusal (`Duration::ZERO` makes it
+    /// available to the next `wait`).
+    ///
+    /// From the refusal on the mock stays *Stopped* until `wait` returns `event`: every
+    /// `write_memory` fails with [`BackendError::NotFound`] (the task is gone) and every
+    /// `resume` with [`BackendError::InvalidState`] (death pending, as on macOS). A `wait`
+    /// before `event` is due sleeps its timeout out and returns `Ok(None)`, or sleeps until
+    /// the event is due when the timeout reaches that far (`wait(None)` always does). This
+    /// is the only case in which the mock sleeps. `kill` ends the process as usual.
+    ///
+    /// # Panics
+    ///
+    /// If `nth` is zero or `event` is not terminal.
+    pub fn die_refusing_nth_resume(&self, nth: usize, event: StopEvent, delay: Duration)
+    {
+        assert!(nth > 0, "resume index must be one-based");
+        assert!(
+            event.is_terminal(),
+            "die_refusing_nth_resume: {event:?} is not a terminal event"
+        );
+        self.lock().racing.push_back((nth, Race::Death(event, delay)));
     }
 
     /// Make the next call of `kind` fail with `error`, after it is recorded and before
@@ -855,6 +920,13 @@ impl Backend for MockBackend
     {
         let mut inner = self.lock();
         inner.begin(MockCall::Wait(timeout))?;
+        if let Some((event, due)) = inner.dying.take() {
+            let delivered = inner.wait_for_death(event.clone(), due, timeout);
+            if delivered.is_none() {
+                inner.dying = Some((event, due));
+            }
+            return Ok(delivered);
+        }
         match inner.state {
             MockState::NoProcess => Err(invalid_state("wait: no process")),
             MockState::Stopped => match inner.pending.pop_front() {
@@ -892,11 +964,22 @@ impl Backend for MockBackend
         let mut inner = self.lock();
         inner.begin(MockCall::Resume(request.clone()))?;
         inner.require_stopped("resume")?;
-        if let Some((nth, stops)) = inner.racing.front().cloned() {
+        if inner.dying.is_some() {
+            return Err(invalid_state("resume: process death is pending; drain it with wait"));
+        }
+        if let Some((nth, race)) = inner.racing.front().cloned() {
             if nth == 1 {
-                inner.apply_effects(&stops)?;
                 inner.racing.pop_front();
-                inner.pending.extend(stops.into_iter().map(|stop| stop.event));
+                match race {
+                    Race::Stops(stops) => {
+                        inner.apply_effects(&stops)?;
+                        inner.pending.extend(stops.into_iter().map(|stop| stop.event));
+                    }
+                    Race::Death(event, delay) => {
+                        inner.dying = Some((event, Instant::now() + delay));
+                        return Err(BackendError::StopPending);
+                    }
+                }
             } else if let Some(race) = inner.racing.front_mut() {
                 race.0 -= 1;
             }
@@ -1007,6 +1090,9 @@ impl Backend for MockBackend
             data: data.to_vec(),
         })?;
         inner.require_stopped("write_memory")?;
+        if inner.dying.is_some() {
+            return Err(BackendError::NotFound(format!("process {} has exited", inner.pid.0)));
+        }
         write_bytes(&mut inner.memory, address, data)
     }
 
@@ -1689,6 +1775,45 @@ mod tests
         mock.kill().expect("kill a dead process");
         assert_eq!(mock.state(), MockState::NoProcess);
         assert_eq!(mock.pending_len(), 0);
+    }
+
+    #[test]
+    fn die_refusing_nth_resume_refuses_it_then_publishes_the_death_late()
+    {
+        let mut mock = process();
+        mock.script(MockStop::new(StopEvent::SingleStep { thread: T1 }));
+        mock.launch(&spec()).expect("launch");
+        mock.die_refusing_nth_resume(2, StopEvent::Exited { code: 3 }, Duration::from_millis(200));
+        mock.resume(&ResumeRequest::step(T1))
+            .expect("the first resume is not counted down to");
+        assert_eq!(mock.wait(None), Ok(Some(StopEvent::SingleStep { thread: T1 })));
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
+        assert_eq!(mock.state(), MockState::Stopped);
+        assert!(matches!(
+            mock.write_memory(Address::new(CODE), &[0]),
+            Err(BackendError::NotFound(_))
+        ));
+        assert!(is_invalid_state(&mock.resume(&ResumeRequest::continue_all())));
+        let started = Instant::now();
+        assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(None), "not published yet");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a zero timeout does not sleep"
+        );
+        assert_eq!(mock.wait(None), Ok(Some(StopEvent::Exited { code: 3 })));
+        assert!(started.elapsed() >= Duration::from_millis(150), "published after the delay");
+        assert_eq!(mock.state(), MockState::NoProcess);
+
+        // With no delay the next wait takes it, and `kill` is the other way out.
+        mock.launch(&spec()).expect("relaunch");
+        mock.die_refusing_nth_resume(1, StopEvent::Killed { signal: 9 }, Duration::ZERO);
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
+        assert_eq!(mock.wait(Some(Duration::ZERO)), Ok(Some(StopEvent::Killed { signal: 9 })));
+        mock.launch(&spec()).expect("relaunch");
+        mock.die_refusing_nth_resume(1, StopEvent::Killed { signal: 9 }, Duration::from_secs(60));
+        assert_eq!(mock.resume(&ResumeRequest::continue_all()), Err(BackendError::StopPending));
+        mock.kill().expect("kill a dying process");
+        assert!(is_invalid_state(&mock.wait(Some(Duration::ZERO))));
     }
 
     #[test]

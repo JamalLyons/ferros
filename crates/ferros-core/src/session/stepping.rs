@@ -59,10 +59,25 @@ pub(super) struct StepPlan
     signal_return_sp: Option<Address>,
 }
 
-/// How long `refused_stop` waits for the stop a resume was refused for. The backend has
+/// How long `refused_wait` waits for the stop a resume was refused for. The backend has
 /// it queued already, so this bounds only the case where the target died meanwhile and
-/// its terminal event is still being collected.
+/// its terminal event is still being collected. Inside [`Session::wait`] the caller's
+/// remaining timeout bounds it too (see `refusal`).
 const REFUSED_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a resume the backend refused ([`BackendError::StopPending`]) comes to; nothing
+/// ran. See `refusal`.
+pub(super) enum Refusal
+{
+    /// The stop the resume was refused for, to report.
+    Stop(StopEvent),
+    /// It was one `pending_event` drops: drain the rest and resume again.
+    Retry,
+    /// Nothing came in time: the target died after the refusal and its terminal event is
+    /// still on its way. The session runs on, as if the resume had started, and a later
+    /// `wait` takes that event.
+    Pending,
+}
 
 /// Whether `error` is the backend's refusal to resume because a stop arrived after the
 /// session's last drain (see [`BackendError::StopPending`]).
@@ -149,8 +164,18 @@ impl Session
         if let Err(error) = self.backend.resume(&request) {
             // The backend guarantees that a failed resume ran nothing: with the trap back,
             // the handler can still return to it.
-            self.rearm(&site.entry)?;
-            self.put_back_rendezvous(rendezvous);
+            let rearmed = self.rearm(&site.entry);
+            if rearmed.is_ok() {
+                self.put_back_rendezvous(rendezvous);
+            }
+            // A refusal is still a refusal when the trap cannot be put back: the target
+            // may have died after it, and the stop it was refused for (its terminal event)
+            // is the caller's to report (#155; see `refusal`).
+            if error == BackendError::StopPending {
+                self.note_refusal_cleanup(rearmed);
+            } else {
+                rearmed?;
+            }
             return Err(error.into());
         }
         self.step_plan = Some(plan);
@@ -194,8 +219,10 @@ impl Session
     /// `request` (see `start_continue`); `Some(event)` instead when one is pending, for
     /// the caller to defer. A stop that arrives after the drain makes the backend refuse
     /// the resume ([`BackendError::StopPending`]); nothing ran, so the pending handler
-    /// return is put back as before and that stop is taken (see `refused_stop`), or the
-    /// resume tried again if it was one `pending_event` drops.
+    /// return is put back as before and that stop is taken (see `refusal`), or the resume
+    /// tried again if it was one `pending_event` drops. When that stop does not come in
+    /// time (the target died), `None` as for a started continue, the request's signals
+    /// being carried: a later `wait` takes the terminal event.
     pub(super) fn continue_after_drain(&mut self, request: &ResumeRequest) -> Result<Option<StopEvent>>
     {
         loop {
@@ -211,10 +238,16 @@ impl Session
                         pending.request = noted;
                     }
                     if armed {
-                        self.release_handler_exits()?;
+                        let released = self.release_handler_exits();
+                        self.note_refusal_cleanup(released);
                     }
-                    if let Some(event) = self.refused_event()? {
-                        return Ok(Some(event));
+                    match self.refusal()? {
+                        Refusal::Stop(event) => return Ok(Some(event)),
+                        Refusal::Retry => {}
+                        Refusal::Pending => {
+                            self.carry_signals(request.signals.clone());
+                            return Ok(None);
+                        }
                     }
                 }
                 started => {
@@ -242,39 +275,86 @@ impl Session
     /// arrived after the last drain, and the next `wait` returns it.
     ///
     /// If nothing comes (see `refused_wait`) the refusal is returned as an error; nothing
-    /// ran and the session is unchanged.
+    /// ran and the session is unchanged. A failure to put the resume's traps back (see
+    /// `note_refusal_cleanup`) is returned instead, without waiting.
     pub(super) fn refused_stop(&mut self) -> Result<StopEvent>
     {
-        self.refused_wait()?.ok_or(DebuggerError::Backend(BackendError::StopPending))
+        if let Some(error) = self.refusal_cleanup.take() {
+            return Err(error);
+        }
+        match self.refused_wait(REFUSED_STOP_TIMEOUT)? {
+            Refusal::Stop(event) => Ok(event),
+            Refusal::Retry | Refusal::Pending => Err(DebuggerError::Backend(BackendError::StopPending)),
+        }
     }
 
     /// Take the stop a resume was refused for. The backend has it queued, so a
     /// zero-timeout wait returns it, except in two cases. It may be an abandoned step's
-    /// late completion, which `backend_wait` drops: `None`. Or the target died after the
+    /// late completion, which `backend_wait` drops: `Retry`. Or the target died after the
     /// refusal: the macOS backend then drops the dead task's nonterminal events and its
-    /// terminal event may still be on its way, so the wait goes on for at most
-    /// `REFUSED_STOP_TIMEOUT`.
-    fn refused_wait(&mut self) -> Result<Option<StopEvent>>
+    /// terminal event may still be on its way, so the wait goes on for at most `limit`,
+    /// and `Pending` when nothing came.
+    fn refused_wait(&mut self, limit: std::time::Duration) -> Result<Refusal>
     {
         let stale = self.stale_step;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
-            return Ok(Some(event));
+            return Ok(Refusal::Stop(event));
         }
         if stale.is_some() && self.stale_step.is_none() {
-            return Ok(None);
+            return Ok(Refusal::Retry);
         }
-        self.backend_wait(Some(REFUSED_STOP_TIMEOUT))
+        if limit.is_zero() {
+            return Ok(Refusal::Pending);
+        }
+        Ok(self.backend_wait(Some(limit))?.map_or(Refusal::Pending, Refusal::Stop))
     }
 
     /// As `refused_stop`, for `resume`, `step_instruction`, source steps and the next step
-    /// and final continue of a step-over, which retry the resume instead of failing: `None`
-    /// when the stop is one `pending_event` drops (or none came), the rest of the queue
-    /// being drained before the retry.
-    pub(super) fn refused_event(&mut self) -> Result<Option<StopEvent>>
+    /// and final continue of a step-over, which retry the resume instead of failing:
+    /// `Retry` when the stop is one `pending_event` drops, the rest of the queue being
+    /// drained before the retry, and `Pending` when none came in time (#155).
+    ///
+    /// The wait is bounded by `REFUSED_STOP_TIMEOUT` and, inside [`Session::wait`], by the
+    /// caller's remaining timeout, so a refused internal resume never blocks `wait` past
+    /// it: a dead target's terminal event that is still on its way is left to the next
+    /// `wait`.
+    ///
+    /// A failure to put the resume's traps back after the refusal (see
+    /// `note_refusal_cleanup`) does not hide the stop: on a target that died after the
+    /// refusal the writes fail, and its terminal event is what the caller must see. The
+    /// failure is logged, and returned only when the resume would be tried again.
+    pub(super) fn refusal(&mut self) -> Result<Refusal>
     {
-        match self.refused_wait()? {
-            Some(event) if !self.stale_trap(None, &event)? => Ok(Some(event)),
-            _ => Ok(None),
+        let cleanup = self.refusal_cleanup.take();
+        let limit = self.wait_deadline.map_or(REFUSED_STOP_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(REFUSED_STOP_TIMEOUT)
+        });
+        let refusal = match self.refused_wait(limit)? {
+            Refusal::Stop(event) if self.stale_trap(None, &event)? => Refusal::Retry,
+            refusal => refusal,
+        };
+        if let Some(error) = cleanup {
+            if matches!(refusal, Refusal::Retry) {
+                return Err(error);
+            }
+            tracing::warn!("could not put back the traps of a refused resume: {error}");
+        }
+        Ok(refusal)
+    }
+
+    /// Keep a failure to put back what a resume the backend refused had changed (a trap
+    /// removed for a step-over, a temporary trap armed for it) for `refusal` or
+    /// `refused_stop`, which take the refused stop next. The first failure is kept.
+    pub(super) fn note_refusal_cleanup(&mut self, cleanup: Result<()>)
+    {
+        if let Err(error) = cleanup {
+            if self.refusal_cleanup.is_none() {
+                self.refusal_cleanup = Some(error);
+            } else {
+                tracing::warn!("could not put back the traps of a refused resume: {error}");
+            }
         }
     }
 
@@ -292,8 +372,10 @@ impl Session
     /// Start the next step of an internal step-over `plan`. If a stop arrived first, the
     /// backend runs nothing: the plan is given up as in `abandon` (no step was started, so
     /// no completion can follow) and that stop is returned, unless it is one
-    /// `pending_event` drops (see `refused_event`): the step is then started again, after
-    /// draining the rest (#158).
+    /// `pending_event` drops (see `refusal`): the step is then started again, after
+    /// draining the rest (#158). When no stop comes in time (the target died), `None` as
+    /// for a started step, with the plan given up the same way: a later `wait` takes the
+    /// terminal event (#155).
     fn continue_plan(&mut self, plan: StepPlan) -> Result<Option<StopEvent>>
     {
         loop {
@@ -302,16 +384,18 @@ impl Session
             // plan as it was.
             match self.start_plan(plan.clone()) {
                 Err(error) if is_stop_pending(&error) => {
-                    let refused = match self.refused_event()? {
-                        Some(event) => Some(event),
-                        None => self.pending_event()?,
+                    let refused = match self.refusal()? {
+                        Refusal::Stop(event) => Some(event),
+                        Refusal::Retry => match self.pending_event()? {
+                            Some(event) => Some(event),
+                            None => continue,
+                        },
+                        Refusal::Pending => None,
                     };
-                    if let Some(event) = refused {
-                        if let Some(request) = plan.final_request {
-                            self.carry_signals(request.signals);
-                        }
-                        return Ok(Some(event));
+                    if let Some(request) = plan.final_request {
+                        self.carry_signals(request.signals);
                     }
+                    return Ok(refused);
                 }
                 started => return started.map(|()| None),
             }
@@ -365,13 +449,16 @@ impl Session
             }
             match self.step_thread(thread) {
                 // A stop arrived after the drain and nothing ran: report it, or step again
-                // if it was one `pending_event` drops.
-                Err(error) if is_stop_pending(&error) => {
-                    if let Some(event) = self.refused_event()? {
+                // if it was one `pending_event` drops. If none comes in time the target
+                // died: the session runs, and a later `wait` takes its terminal event.
+                Err(error) if is_stop_pending(&error) => match self.refusal()? {
+                    Refusal::Stop(event) => {
                         self.deferred = Some(event);
                         return self.enter_running();
                     }
-                }
+                    Refusal::Retry => {}
+                    Refusal::Pending => return self.enter_running(),
+                },
                 started => {
                     self.stale_step = None;
                     // A failed start ran nothing, so the thread's held signal is still held.
@@ -771,16 +858,20 @@ impl Session
                 Ok(()) => return Ok(None),
                 // A stop arrived after the drain and nothing ran: report it, the final
                 // continue's signals staying held, or continue again if it is one
-                // `pending_event` drops (see `refused_event`), after draining the rest.
+                // `pending_event` drops (see `refusal`), after draining the rest. If none
+                // comes in time the target died: `None`, and a later `wait` takes its
+                // terminal event (#155).
                 Err(BackendError::StopPending) => {
-                    let refused = match self.refused_event()? {
-                        Some(event) => Some(event),
-                        None => self.pending_event()?,
+                    let refused = match self.refusal()? {
+                        Refusal::Stop(event) => Some(event),
+                        Refusal::Retry => match self.pending_event()? {
+                            Some(event) => Some(event),
+                            None => continue,
+                        },
+                        Refusal::Pending => None,
                     };
-                    if let Some(event) = refused {
-                        self.carry_signals(request.signals);
-                        return Ok(Some(event));
-                    }
+                    self.carry_signals(request.signals);
+                    return Ok(refused);
                 }
                 Err(error) => return Err(error.into()),
             }

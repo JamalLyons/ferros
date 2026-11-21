@@ -136,6 +136,12 @@ pub struct Session
     /// Signals a `resume_with_signal` meant to pass on the final continue of a step-over
     /// sequence that another event cut short; the next `resume_with_signal` passes them.
     carried_signals: Vec<(ThreadId, i32)>,
+    /// A failure to put back what a resume the backend refused had changed, kept until the
+    /// refused stop is taken (see `Session::refusal`).
+    refusal_cleanup: Option<DebuggerError>,
+    /// When the [`Session::wait`] in progress must return, if it has a timeout: a refused
+    /// internal resume waits no longer for its stop (see `Session::refusal`).
+    wait_deadline: Option<Instant>,
     breakpoints: BreakpointStore,
     /// Logical breakpoints, ordered by id; their sites live in `breakpoints`.
     logical: Vec<LogicalBreakpoint>,
@@ -302,6 +308,8 @@ impl Session
             deferred_error: None,
             stale_step: None,
             carried_signals: Vec::new(),
+            refusal_cleanup: None,
+            wait_deadline: None,
             breakpoints: BreakpointStore::new(),
             logical: Vec::new(),
             next_logical: 0,
@@ -436,6 +444,7 @@ impl Session
         self.deferred_error = None;
         self.stale_step = None;
         self.carried_signals.clear();
+        self.refusal_cleanup = None;
         self.detach_intent = None;
         self.breakpoints.drain();
         self.forget_logical_sites();

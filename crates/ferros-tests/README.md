@@ -256,6 +256,16 @@ breakpoint or at a program `brk #1` is still reported at either point
 (`step_over_reports_a_real_trap_stop_reported_with_its_internal_step`,
 `step_over_reports_a_real_trap_stop_that_refuses_its_next_step`).
 
+`MockBackend::die_refusing_nth_resume` models a target that dies right after a stop refuses
+one of its resumes: memory writes then fail, and the terminal event comes after a delay (#155).
+The cleanup after the refusal cannot put the traps back, and the death is still what `wait`
+reports, for a step over the breakpoint at the pc
+(`refused_step_over_on_a_dying_target_reports_its_death`) and for a source step's continue to
+its return trap (`refused_step_out_continue_on_a_dying_target_reports_its_death`). A refused
+internal resume inside `wait(Some(Duration::ZERO))` keeps to that budget: the session stays
+running and the next `wait` reports the death
+(`zero_timeout_wait_does_not_block_on_a_dying_targets_refused_continue`).
+
 
 ## Debug-info regressions
 

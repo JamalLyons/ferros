@@ -83,6 +83,13 @@ Agents work in parallel git worktrees. [Worktrunk](https://worktrunk.dev) (`brew
 - `wt merge` runs the five checks from the Test section as its `pre-merge` hook, after rebasing. Run them alone with `wt hook pre-merge`.
 - `wt remove` kills the worktree's leaked fixtures (`pre-remove`) before deleting it.
 
+T3 Code creates its worktrees without `wt`, so these hooks do not run there. Each person adds two project scripts once in their own T3 app (top-right panel, **Add project script**). They are stored per machine, not in the repo, and scripts set through T3's API are ignored:
+
+| Name | Command | Toggles |
+|---|---|---|
+| Warm build cache | `wt step copy-ignored --require-include` | Run automatically on worktree creation; Wait for it to finish before the agent starts |
+| Kill fixtures | `just kill-fixtures` | Run in the thread's worktree when the thread settles |
+
 ## Troubleshooting
 If a test fails with "task_for_pid was denied":
 - If not signed: run through `just test-integration` so the cargo runner signs the executable automatically.

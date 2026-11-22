@@ -198,8 +198,14 @@ impl Session
     /// the resume would have; otherwise they are lost when those threads run on, and a
     /// later `resume_with_signal` would pass them to threads that no longer hold them.
     /// Once the continue starts they are no longer carried; a refused or failed start ran
-    /// nothing, so they stay carried.
-    fn continue_handler(&mut self, mut request: ResumeRequest) -> Result<Option<StopEvent>>
+    /// nothing, so they stay carried. A refusal is handled as in `retry_refused`.
+    fn continue_handler(&mut self, request: &ResumeRequest) -> Result<Option<StopEvent>>
+    {
+        self.retry_refused(|session| session.start_handler_continue(request.clone()))
+    }
+
+    /// Start `continue_handler`'s continue once, passing the carried signals with it.
+    fn start_handler_continue(&mut self, mut request: ResumeRequest) -> Result<()>
     {
         let mut passed = Vec::new();
         for &(thread, signal) in &self.carried_signals {
@@ -212,7 +218,7 @@ impl Session
         if started.is_ok() {
             self.carried_signals.retain(|(thread, _)| !passed.contains(thread));
         }
-        self.or_refused_stop(started)
+        started
     }
 
     /// Drain the events still queued from the last stop, then start the continue of
@@ -271,27 +277,6 @@ impl Session
         }
     }
 
-    /// The stop the backend refused a resume for ([`BackendError::StopPending`]): it
-    /// arrived after the last drain, and the next `wait` returns it. For the internal
-    /// resumes of a stopped handler's return, which report that stop as it is.
-    ///
-    /// The wait is bounded as in `refusal`. When nothing comes in time (the target died,
-    /// its terminal event still on its way) `None`, as for a started resume: a later
-    /// `wait` takes the terminal event (#155). When the stop was an abandoned step's late
-    /// completion, the refusal is returned as an error; nothing ran and the session is
-    /// unchanged. A failure to put the resume's traps back (see `note_refusal_cleanup`)
-    /// does not hide the stop: it is logged, and returned in place of that error.
-    pub(super) fn refused_stop(&mut self) -> Result<Option<StopEvent>>
-    {
-        let cleanup = self.refusal_cleanup.take();
-        let refusal = self.refused_wait(self.refusal_limit());
-        match Self::settle_refusal_cleanup(cleanup, refusal)? {
-            Refusal::Stop(event) => Ok(Some(event)),
-            Refusal::Pending => Ok(None),
-            Refusal::Retry => Err(DebuggerError::Backend(BackendError::StopPending)),
-        }
-    }
-
     /// How long a refused resume waits for its stop: `REFUSED_STOP_TIMEOUT`, and inside
     /// [`Session::wait`] no longer than the caller's remaining timeout.
     fn refusal_limit(&self) -> std::time::Duration
@@ -345,10 +330,13 @@ impl Session
         Ok(self.backend_wait(Some(limit))?.map_or(Refusal::Pending, Refusal::Stop))
     }
 
-    /// As `refused_stop`, for `resume`, `step_instruction`, source steps and the next step
-    /// and final continue of a step-over, which retry the resume instead of failing:
-    /// `Retry` when the stop is one `pending_event` drops, the rest of the queue being
-    /// drained before the retry, and `Pending` when none came in time (#155).
+    /// The stop the backend refused a resume for ([`BackendError::StopPending`]): it
+    /// arrived after the last drain, and the next `wait` returns it. For `resume`,
+    /// `step_instruction`, source steps, the next step and final continue of a step-over,
+    /// and the internal resumes of a stopped handler's return, which retry the resume
+    /// instead of failing: `Retry` when the stop is one `pending_event` drops, the rest of
+    /// the queue being drained before the retry, and `Pending` when none came in time
+    /// (#155).
     ///
     /// The wait is bounded by `REFUSED_STOP_TIMEOUT` and, inside [`Session::wait`], by the
     /// caller's remaining timeout, so a refused internal resume never blocks `wait` past
@@ -370,8 +358,8 @@ impl Session
     }
 
     /// Keep a failure to put back what a resume the backend refused had changed (a trap
-    /// removed for a step-over, a temporary trap armed for it) for `refusal` or
-    /// `refused_stop`, which take the refused stop next. The first failure is kept.
+    /// removed for a step-over, a temporary trap armed for it) for `refusal`, which takes
+    /// the refused stop next. The first failure is kept.
     pub(super) fn note_refusal_cleanup(&mut self, cleanup: Result<()>)
     {
         if let Err(error) = cleanup {
@@ -383,15 +371,27 @@ impl Session
         }
     }
 
-    /// `None` when an internal resume `started` (or was refused and the target died, see
-    /// `refused_stop`); the stop it was refused for, to report instead, or its error
-    /// otherwise.
-    pub(super) fn or_refused_stop(&mut self, started: Result<()>) -> Result<Option<StopEvent>>
+    /// Start an internal resume of a stopped handler's return with `start`: `None` when it
+    /// started, or was refused and no stop came in time (the target died: a later `wait`
+    /// takes its terminal event, #155). Otherwise the stop it was refused for, to report
+    /// instead, unless it is one `pending_event` drops (see `refusal`): the rest of the
+    /// queue is drained and the resume started again (#165). A refused start ran nothing
+    /// and left the rendezvous, carried signals and exit traps as they were.
+    fn retry_refused(&mut self, mut start: impl FnMut(&mut Self) -> Result<()>) -> Result<Option<StopEvent>>
     {
-        match started {
-            Ok(()) => Ok(None),
-            Err(error) if is_stop_pending(&error) => self.refused_stop(),
-            Err(error) => Err(error),
+        loop {
+            match start(self) {
+                Err(error) if is_stop_pending(&error) => match self.refusal()? {
+                    Refusal::Stop(event) => return Ok(Some(event)),
+                    Refusal::Retry => {
+                        if let Some(event) = self.pending_event()? {
+                            return Ok(Some(event));
+                        }
+                    }
+                    Refusal::Pending => return Ok(None),
+                },
+                started => return started.map(|()| None),
+            }
         }
     }
 
@@ -713,13 +713,15 @@ impl Session
         if self.interrupt_requested {
             return Ok(Some(StopEvent::Interrupted { thread: Some(thread) }));
         }
-        // Other threads' events reported with this stop are the caller's.
-        if let Some(other) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+        // Other threads' events reported with this stop are the caller's, except a
+        // breakpoint stop of a private trap that is gone (see `pending_event`), which
+        // belongs to no request and is dropped (#165).
+        if let Some(other) = self.pending_event()? {
             return Ok(Some(other));
         }
         // The rendezvous is over, and its exit traps with it.
         self.release_handler_exits()?;
-        self.continue_handler(request)
+        self.continue_handler(&request)
     }
 
     /// Consume `event` if it belongs to the exit traps of a pending handler return:
@@ -749,8 +751,10 @@ impl Session
                 thread: event.thread().or(Some(thread)),
             })));
         }
-        // Other threads' events reported with this stop are the caller's.
-        if let Some(other) = self.backend_wait(Some(std::time::Duration::ZERO))? {
+        // Other threads' events reported with this stop are the caller's, except a
+        // breakpoint stop of a private trap that is gone (see `pending_event`), which is
+        // dropped (#165).
+        if let Some(other) = self.pending_event()? {
             return Ok(Some(Some(other)));
         }
         let Some(mut exits) = self.handler_exits.take() else {
@@ -765,11 +769,8 @@ impl Session
                 self.release_exit_hooks(Some(std::mem::replace(&mut exits, ExitHooks::empty(thread))))?;
             }
             match follow {
-                Follow::Step => {
-                    let started = self.step_thread(thread);
-                    self.or_refused_stop(started)
-                }
-                Follow::Continue => self.continue_handler(request),
+                Follow::Step => self.retry_refused(|session| session.step_thread(thread)),
+                Follow::Continue => self.continue_handler(&request),
                 Follow::Report(event) => Ok(Some(event)),
             }
         });

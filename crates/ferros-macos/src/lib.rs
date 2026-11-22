@@ -7,6 +7,11 @@
 //! traces, symbolication):
 //!
 //! ```rust,no_run
+//! # // The crate is `#![cfg(target_os = "macos")]`, so this doctest is extracted on every
+//! # // host while `MacOSBackend` only exists on macOS. The other `main` keeps the test
+//! # // building where the crate is empty; on macOS this body is the one that compiles.
+//! # #[cfg(target_os = "macos")]
+//! # fn main() -> Result<(), ferros_core::error::DebuggerError> {
 //! use ferros_core::{LaunchSpec, Session};
 //! use ferros_macos::MacOSBackend;
 //!
@@ -15,8 +20,10 @@
 //! let regs = session.read_registers()?;
 //! println!("stopped at entry, pc = {}", regs.pc);
 //! session.detach()?; // the process keeps running
-//!
-//! # Ok::<(), ferros_core::error::DebuggerError>(())
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "macos"))]
+//! # fn main() {}
 //! ```
 //!
 //! ## Backend behaviour

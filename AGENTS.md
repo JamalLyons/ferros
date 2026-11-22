@@ -1,7 +1,48 @@
 # Agent and Contributor Guide
 
 ## What this is
-Ferros is a Rust debugger designed for macOS arm64. The repository is organized as a Cargo workspace with the following crate layout: `crates/ferros` provides the command-line interface; `crates/ferros-core` implements the portable debugging engine and holds no OS-specific code; `crates/ferros-macos` implements it for macOS with Mach process control primitives; `crates/ferros-tests` contains fixture binaries and integration test harnesses; `crates/ferros-utils` provides shared utilities; `crates/ferros-mir` and `crates/ferros-protocol` are workspace members reserved for future compiler IR and protocol support (currently empty); and `crates/ferros-ui` is parked and excluded from the workspace.
+Ferros is a Rust debugger designed for macOS arm64. The long-form narrative is [`docs/architecture.md`](docs/architecture.md). Architecture decisions that are still open are recorded under [`docs/adr/`](docs/adr/README.md).
+
+`docs/architecture.md` states that ownership, lifetimes, and MIR are goals, not current behavior. Its crate map, `Session` / `Backend` split, image list, stop channel, and `BreakpointStore` description match the code.
+
+## Module map
+Cargo workspace members, one purpose each:
+
+| Crate | Path | Role |
+|---|---|---|
+| `ferros` | `crates/ferros` | CLI. Names a platform crate only in `crates/ferros/src/platform.rs`. |
+| `ferros-core` | `crates/ferros-core` | Portable engine. No OS API, no `cfg(target_os)`, no `unsafe`. |
+| `ferros-macos` | `crates/ferros-macos` | macOS `Backend` (Mach). The only crate allowed to use `unsafe`. |
+| `ferros-tests` | `crates/ferros-tests` | Fixture binaries, the integration harness, and tests that debug real processes. |
+| `ferros-utils` | `crates/ferros-utils` | Shared logging (`tracing`). |
+| `ferros-mir` | `crates/ferros-mir` | Empty workspace member, reserved for a future compiler-IR crate. |
+| `ferros-protocol` | `crates/ferros-protocol` | Empty workspace member, reserved for a future protocol crate. |
+| `ferros-ui` | `crates/ferros-ui` | Parked TUI. Excluded from the workspace (`exclude` in the root `Cargo.toml`). It does not build against the current engine. |
+
+There is no `ferros-linux` or `ferros-windows` crate.
+
+## Key interfaces
+Read these before changing engine behavior. One line each; the module docs carry the contracts.
+
+| Interface | Path | What it is |
+|---|---|---|
+| `Backend` and its types | `crates/ferros-core/src/backend/` | Mechanism trait (`mod.rs`) plus `StopEvent`, `LaunchSpec`, `LoadedImage`, and `ResumeRequest` (`types.rs`). `mock.rs` is the in-memory backend. |
+| `Session` | `crates/ferros-core/src/session/mod.rs` | Policy engine. Owns a `Box<dyn Backend>` and the process state machine. |
+| `session::lifecycle` | `crates/ferros-core/src/session/lifecycle.rs` | `launch`, `attach`, `detach`, `resume`, `kill`, and `wait`. |
+| `session::breakpoints` | `crates/ferros-core/src/session/breakpoints.rs` | Software-breakpoint table and logical breakpoints (file, function, or address). |
+| `session::stepping` | `crates/ferros-core/src/session/stepping.rs` | Resumable, serial step-over of software breakpoints. |
+| `session::line_stepping` | `crates/ferros-core/src/session/line_stepping.rs` | Source-line step over, into, and out. |
+| `session::location` | `crates/ferros-core/src/session/location.rs` | Resolves a `BreakpointLocation` to sites in the main executable. |
+| `session::stack` | `crates/ferros-core/src/session/stack.rs` | Stack traces and symbolication, including a scan for unlisted Mach-O headers. |
+| `session::images` | `crates/ferros-core/src/session/images.rs` | Loads `Backend::images` into the symbol cache. `same_build` treats two missing UUIDs as the same image and two different UUIDs as a new one. |
+| `session::exits` | `crates/ferros-core/src/session/exits.rs` | Non-local exits (panic landing pads and `longjmp`) so step-out sees a frame leave. |
+| Stop channel | `Session::wait` → `StopEvent` in `crates/ferros-core/src/backend/types.rs` | The event a backend actually returns. |
+| `DebuggerEvent` | `crates/ferros-core/src/events.rs` | Not published by any backend. Only the parked `ferros-ui` refers to it. |
+| `MacOSBackend` | `crates/ferros-macos` (`src/task.rs`) | Mach task ports, exception messages, and `posix_spawn`. `Backend::images` is `src/images.rs` (the dyld image list, not only the main executable). |
+| Test harness | `crates/ferros-tests` | `harness::run`, the `fixture!` macro, and `tests/`. See that crate's README. |
+
+## Architecture decisions
+[`docs/adr/README.md`](docs/adr/README.md) indexes the records. They are proposals until a later change adopts one. Do not treat a proposed decision as a rule that overrides this file.
 
 ## Toolchain
 The project builds and tests with Rust/Cargo 1.100.0, pinned by `rust-toolchain.toml`, with the `clippy` component. Formatting uses `cargo +nightly fmt` for the unstable options in `rustfmt.toml`. The task runner for development and CI tasks is `just`.

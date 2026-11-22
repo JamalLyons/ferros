@@ -84,7 +84,7 @@ ferros/
  │   ├─ ferros-tests/     # Integration test suite, harness, and fixture programs
  │   ├─ ferros-ui/        # Terminal User Interface (parked while being rebuilt)
  │   └─ ferros-utils/     # Shared logging (tracing) and utility helpers
- ├─ docs/                 # Architecture and design documentation
+ ├─ docs/                 # architecture.md and docs/adr/ (decision records)
  ├─ scripts/              # CI test runner and platform boundary checker
  ├─ website/              # Ferros landing page and simulation
  ├─ Cargo.toml            # Workspace manifest

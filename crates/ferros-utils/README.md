@@ -1,16 +1,10 @@
 # ferros-utils
 
-Shared utilities, logging, config, and helpers for Ferros.
+Logging for the Ferros workspace (`tracing`).
 
 ## Overview
 
-`ferros-utils` provides common utilities and helper functions used across the Ferros workspace, including:
-
-- **Production-ready logging** using `tracing` with structured logging support
-- Shared macros and traits
-- Configuration management
-- Common helper functions
-- Cross-crate utilities
+`ferros-utils` is the workspace logging crate. It initializes `tracing` and re-exports the `tracing` macros. It does not define shared macros of its own, a config type, or other helpers.
 
 ## Usage
 
@@ -69,9 +63,7 @@ init_logging_with_level(LogLevel::Info, LogFormat::Json)
 - Structured logging with spans and fields
 - Environment variable configuration
 - Multiple output formats (pretty/JSON)
-- File logging support (with daily rotation)
-- Thread-safe and async-compatible
-- Zero-cost when disabled
+- File logging to a path chosen at initialization (`FERROS_LOG_FILE`, or a dated file under `~/.ferros` from `init_logging_to_file`)
 
 ## License
 

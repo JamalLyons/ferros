@@ -1,6 +1,6 @@
 # ferros-core
 
-Low-level debugging primitives and process control for Ferros.
+Portable debugging engine for Ferros. No OS-specific code and no `unsafe`. `Session` applies policy; a platform crate supplies a `Backend`.
 
 ## Platform Support
 

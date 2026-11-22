@@ -20,7 +20,7 @@ threads stay suspended and retain any unanswered Unix signal replies. Hardware
 exception replies are sent while the task remains suspended, allowing external SIGKILL
 at breakpoint stops. SIGKILL during a held Unix signal stop remains deferred (issue #56).
 
-Known gap, fixed by a later task: `images` reports only the main executable (issue #34).
+`images` reads the stopped target's dyld image list (every image dyld has published, plus dyld itself). At the initial suspended launch, before that list exists, it reports the main executable so breakpoints can be planted before dyld runs.
 
 All Mach FFI and all `unsafe` code in the workspace lives in this crate; `ferros-core`
 holds no OS-specific code. The crate is macOS-only: on any other OS it compiles as an

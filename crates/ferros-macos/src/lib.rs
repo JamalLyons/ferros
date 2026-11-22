@@ -107,13 +107,11 @@
 //! - **ARM64 (Apple Silicon)**: Fully supported (M1, M2, M3, M4, etc.)
 //!   - Primary target architecture
 //!   - Uses `ARM_THREAD_STATE64` flavor for register access
-//! - **x86_64 (Intel Mac)**: Supported for compatibility
+//! - **x86_64 (Intel Mac)**: Register code is carried and untested
 //!   - Uses `X86_THREAD_STATE64` flavor for register access
-//!   - Note: Intel Macs are no longer sold, but support is maintained
+//!   - `registers/x86_64.rs` is compiled only for `target_arch = "x86_64"`
 //!
-//! Only arm64 is verified: the tests run on Apple Silicon. The x86_64 register code
-//! (`registers/x86_64.rs`, compiled only for `target_arch = "x86_64"`) is carried
-//! along from ferros-core untested.
+//! Only arm64 is verified: the tests run on Apple Silicon.
 //!
 //! ## Permissions and Entitlements
 //!

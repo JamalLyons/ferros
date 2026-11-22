@@ -3,7 +3,9 @@
 //! This module provides functionality to parse binary images (executables and
 //! shared libraries) and load their DWARF debugging sections. It handles:
 //!
-//! - Binary format parsing (ELF, Mach-O, PE)
+//! - Mach-O container parsing (mapped `MachHeader64`, universal slices, `LC_UUID`).
+//!   DWARF section bytes are loaded through the `object` crate, which can also parse
+//!   ELF and PE, but no session path loads those containers today.
 //! - DWARF section extraction (`.debug_info`, `.debug_line`, etc.)
 //! - Address relocation (mapping runtime addresses to file addresses)
 //! - Symbolication (mapping addresses to function names and source locations)

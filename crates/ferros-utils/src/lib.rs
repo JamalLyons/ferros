@@ -1,9 +1,9 @@
 //! # Ferros Utilities
 //!
-//! Shared utilities, logging, config, and helpers for Ferros.
+//! Logging for the Ferros workspace, built on `tracing`.
 //!
-//! This crate provides common functionality used across the Ferros workspace,
-//! including production-ready logging infrastructure built on `tracing`.
+//! This crate initializes logging and re-exports the `tracing` macros. It does
+//! not define its own macros, a config type, or other helpers.
 
 pub mod logging;
 

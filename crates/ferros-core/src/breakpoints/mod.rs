@@ -1,10 +1,13 @@
 //! Breakpoint and watchpoint bookkeeping.
 //!
-//! This module centralizes breakpoint lifecycle tracking so debugger backends can
-//! focus on the platform-specific mechanics (patching memory, configuring debug
-//! registers, etc.). The backend is responsible for actually installing /
-//! restoring traps but can use this structure to track ids, states, and hit
-//! counts in a thread-safe manner.
+//! [`Session`](crate::session::Session) owns this store. It records ids, original
+//! bytes, and hit counts for software traps the session writes with
+//! [`Backend::write_memory`](crate::backend::Backend::write_memory). A backend keeps
+//! no breakpoint table. Hardware breakpoints and watchpoints can be described by
+//! the types here; `Session` does not install them.
+//!
+//! The store is not thread-safe. Its methods take `&mut self`, and the session
+//! uses it on the one thread that owns the backend.
 
 pub mod builder;
 use std::collections::HashMap;
@@ -190,7 +193,10 @@ pub struct BreakpointEntry
 /// Serializable snapshot used when draining the store.
 pub type BreakpointRecord = BreakpointEntry;
 
-/// Thread-safe breakpoint store (wrap in Mutex/Arc in backends).
+/// Address-keyed breakpoint table owned by one session.
+///
+/// Not thread-safe: every method takes `&mut self`, and the map is not wrapped
+/// in a lock. Callers that share it across threads must add their own lock.
 #[derive(Debug, Default)]
 pub struct BreakpointStore
 {

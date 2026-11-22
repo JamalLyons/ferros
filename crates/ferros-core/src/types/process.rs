@@ -112,15 +112,16 @@ impl From<u64> for ThreadId
     }
 }
 
-/// Reason why the debugger is currently stopped (if at all)
+/// Reason why the debugger is currently stopped (if at all).
 ///
 /// [`Session`](crate::session::Session) reports stops as
-/// [`StopEvent`](crate::backend::StopEvent) instead; this enum is kept for the event
-/// helpers in [`events`](crate::events).
+/// [`StopEvent`](crate::backend::StopEvent) from [`Session::wait`](crate::session::Session::wait).
+/// This enum is kept for [`DebuggerEvent`](crate::events::DebuggerEvent), which no
+/// backend publishes. Only the parked `ferros-ui` crate refers to it. Only macOS
+/// is implemented; there is no Linux or Windows backend.
 ///
-/// This enum describes why a debugged process is currently stopped. The process
-/// can be stopped for various reasons: explicit suspension, signals, breakpoints,
-/// or because it has exited.
+/// The variants name why a process might be stopped: explicit suspension, a signal,
+/// a breakpoint, or exit.
 ///
 /// ## State Transitions
 ///
@@ -129,12 +130,6 @@ impl From<u64> for ThreadId
 /// - `Running` → `Breakpoint(addr)`: Process hit a breakpoint at `addr`
 /// - `Running` → `Exited(code)`: Process exited with exit code `code`
 /// - `Suspended` → `Running`: Process was resumed via `resume()`
-///
-/// ## Platform-Specific Behavior
-///
-/// - **macOS**: Uses `task_suspend()`/`task_resume()` for suspension
-/// - **Linux**: Uses `ptrace(PTRACE_CONT)`/`ptrace(PTRACE_STOP)` for control
-/// - **Windows**: Uses `SuspendThread()`/`ResumeThread()` for thread control
 ///
 /// ## Example
 ///

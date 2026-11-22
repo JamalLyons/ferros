@@ -255,7 +255,6 @@ pub fn init_logging_to_file(level: Option<LogLevel>, format: LogFormat) -> Resul
     Ok(log_file)
 }
 
-/// Internal initialization function
 #[allow(clippy::unnecessary_wraps)]
 fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), LoggingError>
 {

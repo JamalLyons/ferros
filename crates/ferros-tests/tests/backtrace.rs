@@ -298,7 +298,18 @@ fn dyld_is_listed_at_the_launch_stop()
         assert_sane(&mut d, &frames);
         let entry = &frames[0];
         assert!(dylds[0].load_address < entry.pc, "{entry:#?} in {images:#?}");
+        assert!(
+            images
+                .iter()
+                .all(|image| image.load_address <= dylds[0].load_address || image.load_address > entry.pc),
+            "the image containing the entry is dyld: {entry:#?} in {images:#?}"
+        );
         assert_symbol_table_frame(entry);
+        assert_eq!(
+            entry.symbol.as_ref().map(ferros_core::SymbolName::display_name),
+            Some("_dyld_start"),
+            "{entry:#?}"
+        );
     });
 }
 

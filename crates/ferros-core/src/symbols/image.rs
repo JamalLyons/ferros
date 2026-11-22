@@ -44,7 +44,7 @@ use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
-use crate::types::{Address, Architecture, FunctionParameter, SourceLocation};
+use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
 
 /// Describes a binary image mapped in the debuggee's address space.
 ///
@@ -842,7 +842,7 @@ impl BinaryImage
                 .function
                 .as_ref()
                 .and_then(|func| func.raw_name().ok())
-                .map(|raw| make_symbol_name(raw.to_string()));
+                .map(|raw| make_symbol_name(raw.to_string(), SymbolSource::DebugInfo));
             let location = frame.location.as_ref().and_then(|loc| {
                 loc.file.as_ref().map(|file| SourceLocation {
                     file: file.to_string(),

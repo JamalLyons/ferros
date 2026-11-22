@@ -683,6 +683,17 @@ impl MockBackend
         self.lock().images = images;
     }
 
+    /// Overwrite bytes already mapped at `address`.
+    ///
+    /// # Panics
+    ///
+    /// If any byte is unmapped: a mistake in the test setup.
+    pub fn overwrite_memory(&self, address: Address, data: &[u8])
+    {
+        write_bytes(&mut self.lock().memory, address, data)
+            .unwrap_or_else(|error| panic!("overwrite at {address}: {error}"));
+    }
+
     /// Enqueue one stop, delivered by the `wait` after a future `resume`.
     pub fn script(&self, stop: MockStop)
     {
@@ -1159,6 +1170,7 @@ mod tests
             .with_image(LoadedImage {
                 path: "/bin/prog".into(),
                 load_address: Address::new(CODE),
+                uuid: None,
             })
     }
 
@@ -1374,7 +1386,8 @@ mod tests
             mock.images(),
             Ok(vec![LoadedImage {
                 path: "/bin/prog".into(),
-                load_address: Address::new(CODE)
+                load_address: Address::new(CODE),
+                uuid: None,
             }])
         );
     }

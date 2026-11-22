@@ -79,6 +79,7 @@ fn image_at(path: &str, address: u64) -> LoadedImage
     LoadedImage {
         path: format!("/nonexistent/{path}").into(),
         load_address: Address::new(address),
+        uuid: None,
     }
 }
 
@@ -203,4 +204,117 @@ fn header_search_runs_once_per_region_in_a_trace()
         })
         .count();
     assert_eq!(probes, 4, "one probe per page, for the first frame only");
+}
+
+#[test]
+fn a_listed_image_is_named_without_a_header_search()
+{
+    // Issue #121: dyld is now a listed image, so its code (the base of a main-thread
+    // trace) is named from its own symbol table. The pc's region is executable, where a
+    // search would probe each 4 KiB page below the pc for `MH_MAGIC_64`; for a listed
+    // image no such probe is read.
+    const IMAGE: u64 = 0x40_0000;
+    let (header, nlists, strings) = image();
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(IMAGE + 0x1010))
+        .with_region(Address::new(IMAGE), "r-x", header)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_image(image_at("dyld", IMAGE));
+    let mut session = launched(&mock);
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
+    let probes: Vec<_> = mock
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, MockCall::ReadMemory { len: 4, .. }))
+        .collect();
+    assert_eq!(probes, [], "no header probe for a listed image");
+}
+
+#[test]
+fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_changes()
+{
+    // Issue #121: path and load address do not identify a build. An image unloaded and
+    // replaced by a different one at the same place has a new UUID, and the names cached
+    // from the old symbol table must not survive. An unknown UUID is no evidence of a
+    // change: the macOS backend learns the main executable's UUID only after the launch
+    // stop. So the same UUID, or an unknown one on either side, is the same image, and a
+    // name already read is kept even when the mapped bytes change (they do not while
+    // that image stays loaded). Only two known, different UUIDs re-read it.
+    const IMAGE: u64 = 0x10_0000;
+    let (header, nlists, strings) = image();
+    let path = "/nonexistent/ferros-symtab-replaced";
+    let listed = |uuid| LoadedImage {
+        path: path.into(),
+        load_address: Address::new(IMAGE),
+        uuid,
+    };
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(IMAGE + 0x1010))
+        .with_region(Address::new(IMAGE), "r--", header)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_image(listed(None));
+    let mut session = launched(&mock);
+    let name = |session: &mut Session| {
+        let frames = session.stack_trace(4).expect("stack trace");
+        symbol(&frames[0]).map(|(name, source)| (name.to_owned(), source))
+    };
+    let named = |name: &str| Some((name.to_owned(), SymbolSource::SymbolTable));
+
+    assert_eq!(name(&mut session), named("foo"));
+
+    // Both UUIDs unknown, and the string table now says `_bar`: the cached name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_bar\0");
+    assert_eq!(name(&mut session), named("foo"));
+
+    // The UUID becomes known (as the main executable's does once dyld runs): still the
+    // same image, so the name is kept and the UUID is recorded.
+    mock.set_images(vec![listed(Some([1; 16]))]);
+    assert_eq!(name(&mut session), named("foo"));
+
+    // An unknown UUID again (a failed read of dyld's UUID array) changes nothing either.
+    mock.set_images(vec![listed(None)]);
+    assert_eq!(name(&mut session), named("foo"));
+
+    // A different known UUID at the same path and address is a replacement: its name is
+    // read. Without the recorded UUID this would look like an unknown one and keep `foo`.
+    mock.set_images(vec![listed(Some([2; 16]))]);
+    assert_eq!(name(&mut session), named("bar"));
+
+    // The same UUID again, with the string table now saying `_baz`: the name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_baz\0");
+    assert_eq!(name(&mut session), named("bar"));
+
+    // And another build replaces it: `_baz`.
+    mock.set_images(vec![listed(Some([3; 16]))]);
+    assert_eq!(name(&mut session), named("baz"));
+}
+
+#[test]
+fn runtime_address_refuses_an_image_whose_known_uuid_differs()
+{
+    // Issue #121: an image at the same path and address with a different known UUID is
+    // a different build, so its file addresses do not apply. An unknown UUID on either
+    // side is no evidence of a change.
+    let (header, _, _) = image();
+    let listed = |uuid| LoadedImage {
+        path: "/nonexistent/ferros-uuid-image".into(),
+        load_address: Address::new(0x10_0000),
+        uuid,
+    };
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(0x10_1010))
+        .with_region(Address::new(0x10_0000), "r-x", header)
+        .with_image(listed(Some([1; 16])));
+    let mut session = launched(&mock);
+    let at = |session: &mut Session, uuid| {
+        session
+            .runtime_address(&listed(uuid), 0x1_0000_1000)
+            .expect("runtime address")
+    };
+    assert_eq!(at(&mut session, Some([1; 16])), Some(Address::new(0x10_1000)));
+    assert_eq!(at(&mut session, None), Some(Address::new(0x10_1000)));
+    assert_eq!(at(&mut session, Some([2; 16])), None);
 }

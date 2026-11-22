@@ -307,6 +307,7 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
             .with_image(LoadedImage {
                 path: executable,
                 load_address: Address::new(0x2_0000_0000),
+                uuid: None,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -349,6 +350,7 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
+                uuid: None,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -405,6 +407,7 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
+                uuid: None,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -456,6 +459,7 @@ fn session_refreshes_unloaded_and_relocated_images()
         let first = LoadedImage {
             path: fixture.path().to_path_buf(),
             load_address: Address::new(0x2_0000_0000),
+            uuid: None,
         };
         let second = LoadedImage {
             load_address: Address::new(0x3_0000_0000),
@@ -496,6 +500,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
         let image = LoadedImage {
             path: relative.clone(),
             load_address: Address::new(0x2_0000_0000),
+            uuid: None,
         };
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
         let address = ImageMapping::parse(&descriptor(&relative, image.load_address.value()))
@@ -538,6 +543,7 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
             .with_image(LoadedImage {
                 path: relative.clone(),
                 load_address: Address::new(load_address),
+                uuid: None,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -584,7 +590,13 @@ fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
                 Some(StopEvent::Breakpoint { pc, .. }) if pc == address
             ));
             let images = debuggee.images().expect("dyld images");
-            assert!(images.len() > 1, "dyld must enumerate libraries as well as the executable");
+            // dyld lists itself as well (issue #121); a library is anything else.
+            assert!(
+                images
+                    .iter()
+                    .any(|image| image.path != fixture.path() && image.path.file_name().is_none_or(|name| name != "dyld")),
+                "dyld must enumerate libraries as well as the executable"
+            );
             for library in images.iter().filter(|image| image.path != fixture.path()) {
                 assert_eq!(
                     debuggee.read_memory(library.load_address, 4).expect("loaded library header"),

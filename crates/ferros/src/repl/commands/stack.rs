@@ -91,7 +91,7 @@ mod tests
             sp: Address::new(0x2000),
             fp: Address::ZERO,
             return_address: None,
-            symbol: name.map(|name| SymbolName::new(name.to_owned(), None, SymbolLanguage::Rust)),
+            symbol: name.map(|name| SymbolName::from_debug_info(name.to_owned(), None, SymbolLanguage::Rust)),
             location: line.map(|line| SourceLocation {
                 file: "src/main.rs".to_owned(),
                 line: Some(line),

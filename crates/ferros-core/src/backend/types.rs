@@ -398,4 +398,10 @@ pub struct LoadedImage
     pub path: PathBuf,
     /// Runtime address where the image is loaded.
     pub load_address: Address,
+    /// The image's Mach-O `LC_UUID`, when the backend knows it.
+    ///
+    /// `None` when the backend has no UUID for this image: it does not report one, the
+    /// read failed, or this image is outside the source the backend uses. Two `None`
+    /// values compare equal.
+    pub uuid: Option<[u8; 16]>,
 }

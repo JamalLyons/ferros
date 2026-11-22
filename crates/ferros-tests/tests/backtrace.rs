@@ -7,11 +7,11 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
+use ferros_core::{Address, BreakpointLocation, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::{Fixture, find_marker, fixture};
 
 /// How long a test waits for one stop after resuming.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -214,6 +214,101 @@ fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
             names.last().map(String::as_str),
             Some("start"),
             "dyld's start is the base: {names:#?}"
+        );
+    });
+}
+
+/// dyld leaves itself out of the image array it publishes; the backend lists it from
+/// `dyldImageLoadAddress`, after the main executable. The main-thread base frame, dyld's
+/// `start`, then lies in a listed image and is named from its symbol table without the
+/// header search for unlisted code (issue #121).
+#[test]
+fn dyld_is_a_listed_image_and_names_the_main_thread_base()
+{
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const MH_DYLINKER: u32 = 7;
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let in_c = marker_address(&mut d, &fixture, "in_c");
+        run_to(&mut d, in_c);
+
+        let images = d.images().expect("images");
+        assert_eq!(
+            images.first().map(|image| image.path.as_path()),
+            Some(fixture.path()),
+            "the main executable is first: {images:#?}"
+        );
+        let dylds: Vec<_> = images
+            .iter()
+            .filter(|image| image.path.file_name().is_some_and(|name| name == "dyld"))
+            .collect();
+        assert_eq!(dylds.len(), 1, "dyld is listed once: {images:#?}");
+        let dyld = dylds[0];
+        assert!(dyld.path.is_absolute(), "{dyld:?}");
+        let header = d.read_memory(dyld.load_address, 16).expect("read dyld's header");
+        assert_eq!(header[..4], MH_MAGIC_64.to_le_bytes(), "{dyld:?}");
+        assert_eq!(header[12..16], MH_DYLINKER.to_le_bytes(), "dyld's filetype: {dyld:?}");
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let base = frames.last().expect("a base frame");
+        assert_symbol_table_frame(base);
+        assert_eq!(
+            base.symbol.as_ref().map(ferros_core::SymbolName::display_name),
+            Some("start"),
+            "{frames:#?}"
+        );
+        // `start` lies in dyld: the listed image that contains the base pc is dyld, so
+        // the name comes from a listed image rather than an image found by search.
+        let owner = images
+            .iter()
+            .filter(|image| image.load_address <= base.pc)
+            .max_by_key(|image| image.load_address)
+            .expect("an image below the base pc");
+        assert_eq!(owner.load_address, dyld.load_address, "base {base:#?} in {images:#?}");
+    });
+}
+
+/// At the launch stop dyld has run no instruction and records nothing, yet it is listed:
+/// the `MH_DYLINKER` header the kernel mapped, after the main executable. The stopped pc
+/// (dyld's entry) lies in its code and is named from its symbol table (issue #121).
+#[test]
+fn dyld_is_listed_at_the_launch_stop()
+{
+    const MH_DYLINKER: u32 = 7;
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let images = d.images().expect("images at the launch stop");
+        assert_eq!(
+            images.first().map(|image| image.path.as_path()),
+            Some(fixture.path()),
+            "{images:#?}"
+        );
+        let dylds: Vec<_> = images
+            .iter()
+            .filter(|image| image.path.file_name().is_some_and(|name| name == "dyld"))
+            .collect();
+        assert_eq!(dylds.len(), 1, "dyld is listed once: {images:#?}");
+        let header = d.read_memory(dylds[0].load_address, 16).expect("read dyld's header");
+        assert_eq!(header[12..16], MH_DYLINKER.to_le_bytes(), "{images:#?}");
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let entry = &frames[0];
+        assert!(dylds[0].load_address < entry.pc, "{entry:#?} in {images:#?}");
+        assert!(
+            images
+                .iter()
+                .all(|image| image.load_address <= dylds[0].load_address || image.load_address > entry.pc),
+            "the image containing the entry is dyld: {entry:#?} in {images:#?}"
+        );
+        assert_symbol_table_frame(entry);
+        assert_eq!(
+            entry.symbol.as_ref().map(ferros_core::SymbolName::display_name),
+            Some("_dyld_start"),
+            "{entry:#?}"
         );
     });
 }
@@ -810,4 +905,127 @@ fn backtrace_after_the_epilogue_of_a_frameless_function_keeps_the_callers_sp()
             );
         }
     });
+}
+
+/// Stopped in `init_routine`, the frame directly above it is `__pthread_once_handler`.
+///
+/// That function is static (non-external) in `libsystem_pthread`, a library in the dyld
+/// shared cache. Current macOS keeps each cache library's local symbols in the mapped
+/// symbol table: there is no separate `.symbols` file, and the cache header's
+/// local-symbols range is empty, so the name comes from the image's own `LC_SYMTAB`
+/// (issue #121). The Mach-O symbol is `___pthread_once_handler`; one leading underscore
+/// is stripped.
+///
+/// Older caches move local symbols out of the mapped table into a separate `.symbols`
+/// file beside the cache, which is not read. There the function cannot be named, and the
+/// test only reports why (issue #121 accepts a trace that documents it).
+#[test]
+fn backtrace_through_a_static_shared_cache_function_names_it()
+{
+    harness::run(|t| {
+        let fixture = fixture!("pthread_once");
+        let mut d = t.launch(&fixture);
+        let source_path = fixture.source_path().with_file_name("c").join("pthread_once.c");
+        let source =
+            std::fs::read_to_string(&source_path).unwrap_or_else(|err| panic!("read {}: {err}", source_path.display()));
+        let marker_line = |marker: &str| {
+            find_marker(&source, marker).unwrap_or_else(|err| panic!("marker {marker} in pthread_once.c: {err:?}"))
+        };
+        let in_init = marker_line("in_init");
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "pthread_once.c".into(),
+            line: in_init,
+        })
+        .expect("break in init_routine");
+        d.resume().expect("resume");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait") {
+            Some(StopEvent::Breakpoint { thread, .. }) => {
+                d.select_thread(thread).expect("select the stopped thread");
+            }
+            other => panic!("expected a breakpoint stop in init_routine, got {other:?}"),
+        }
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        assert!(
+            frames.len() > 1,
+            "static __pthread_once_handler is absent from the mapped symbol table of libsystem_pthread: no caller of \
+             init_routine: {frames:#?}"
+        );
+
+        let init = &frames[0];
+        let init_symbol = init.symbol.as_ref().expect("init_routine has a DWARF name");
+        assert_eq!(init_symbol.display_name(), "init_routine", "{frames:#?}");
+        assert_eq!(init_symbol.source(), SymbolSource::DebugInfo, "{frames:#?}");
+        let init_at = init.location.as_ref().expect("init_routine has a source location");
+        assert!(init_at.file.ends_with("pthread_once.c"), "{init_at:?}");
+        assert_eq!(init_at.line, Some(in_init), "{init_at:?}");
+
+        let handler = &frames[1];
+        let handler_name = handler.symbol.as_ref().map(ferros_core::SymbolName::display_name);
+        let separate = separate_local_symbols();
+        if let Some(file) = &separate {
+            eprintln!(
+                "the dyld shared cache keeps local symbols in {}, which is not read, so __pthread_once_handler cannot be \
+                 named (the frame above init_routine is {handler_name:?})",
+                file.display()
+            );
+        } else {
+            assert_eq!(
+                handler_name,
+                Some("__pthread_once_handler"),
+                "the frame above init_routine is {handler_name:?}: {frames:#?}"
+            );
+            assert_symbol_table_frame(handler);
+        }
+
+        let images = d.images().expect("images");
+        let image = images
+            .iter()
+            .filter(|image| image.load_address <= handler.pc)
+            .max_by_key(|image| image.load_address)
+            .unwrap_or_else(|| panic!("no image contains {}: {images:?}", handler.pc));
+        assert!(
+            image.path.ends_with("libsystem_pthread.dylib"),
+            "pc {} of __pthread_once_handler is in {}, not libsystem_pthread.dylib",
+            handler.pc,
+            image.path.display()
+        );
+
+        let call_once = marker_line("call_once");
+        let main = frames
+            .iter()
+            .find(|frame| frame.symbol.as_ref().is_some_and(|symbol| symbol.display_name() == "main"))
+            .unwrap_or_else(|| panic!("no main frame: {frames:#?}"));
+        assert!(main.index > handler.index, "main is below the handler: {frames:#?}");
+        let main_symbol = main.symbol.as_ref().expect("main has a name");
+        assert_eq!(main_symbol.source(), SymbolSource::DebugInfo, "{main:#?}");
+        let main_at = main.location.as_ref().expect("main has a DWARF location");
+        assert!(main_at.file.ends_with("pthread_once.c"), "{main_at:?}");
+        assert_eq!(main_at.line, Some(call_once), "{main_at:?}");
+
+        assert!(
+            separate.is_some() || frames.iter().all(|frame| frame.symbol.is_some()),
+            "an unnamed frame: {frames:#?}"
+        );
+    });
+}
+
+/// Directories that hold the dyld shared cache, newest layout first.
+const SHARED_CACHE_DIRS: [&str; 2] = [
+    "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+    "/System/Library/dyld",
+];
+
+/// The separate local-symbols file of this system's dyld shared cache, if it has one: a
+/// `*.symbols` file beside the cache files.
+fn separate_local_symbols() -> Option<std::path::PathBuf>
+{
+    SHARED_CACHE_DIRS
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "symbols"))
 }

@@ -30,6 +30,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("long_jump"),
         fixture!("loop_counter"),
         fixture!("nested_calls"),
+        fixture!("pthread_once"),
         fixture!("read_line"),
         fixture!("recursion"),
         fixture!("signal_handler"),

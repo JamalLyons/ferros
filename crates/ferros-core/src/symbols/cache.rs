@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use super::debuginfo::{DebugInfoOptions, LoadInputs};
 use super::extractor::TypeSummary;
-use super::image::{BinaryImage, ImageDescriptor, ImageId};
+use super::image::{BinaryImage, ImageDescriptor, ImageId, SliceIdentity};
 use crate::error::{DebuggerError, Result};
 use crate::types::{Address, FunctionParameter, SourceLocation, SymbolName};
 
@@ -164,7 +164,22 @@ impl SymbolCache
     /// - The image path cannot be canonicalized
     /// - The binary cannot be parsed
     /// - DWARF sections cannot be loaded
+    ///
+    /// The descriptor does not say which architecture the target runs, so a universal
+    /// (fat) file reports [`DebuggerError::NoDebugInfo`]; a session loads the slice the
+    /// target mapped (#169).
     pub fn load_image(&mut self, descriptor: ImageDescriptor) -> Result<Arc<BinaryImage>>
+    {
+        self.load_mapped_image(descriptor, None)
+    }
+
+    /// [`load_image`](Self::load_image), reading the slice `target` identifies when the
+    /// file is universal (#169).
+    pub(crate) fn load_mapped_image(
+        &mut self,
+        descriptor: ImageDescriptor,
+        target: Option<&SliceIdentity>,
+    ) -> Result<Arc<BinaryImage>>
     {
         let canonical = if descriptor.path.is_absolute() {
             descriptor.path.clone()
@@ -185,6 +200,7 @@ impl SymbolCache
                 path: canonical,
                 load_address: descriptor.load_address,
             },
+            target,
             &self.debug_info_options,
         )?);
         self.images.insert(id, image.clone());

@@ -73,23 +73,53 @@ fn valid_slice(bytes: &[u8], uuid: [u8; 16], architecture: object::Architecture)
     (file.architecture() == architecture && file.mach_uuid().ok()? == Some(uuid) && has_dwarf(&file)).then_some(bytes)
 }
 
+/// One architecture's Mach-O in a universal (fat) file.
+pub(crate) struct UniversalSlice<'data>
+{
+    /// `cputype` from the slice's fat header entry.
+    pub(crate) cpu_type: u32,
+    /// `cpusubtype` from the slice's fat header entry, capability bits included.
+    pub(crate) cpu_subtype: u32,
+    pub(crate) architecture: object::Architecture,
+    pub(crate) data: &'data [u8],
+}
+
+/// The slices of a universal Mach-O file, in file order. `None` when `bytes` is not a
+/// universal file (a single image, or not a Mach-O at all); an error when its fat header
+/// or a slice's range is malformed.
+pub(crate) fn universal_slices(bytes: &[u8]) -> Option<object::Result<Vec<UniversalSlice<'_>>>>
+{
+    fn collect<'data, Arch: FatArch>(bytes: &'data [u8], arches: &[Arch]) -> object::Result<Vec<UniversalSlice<'data>>>
+    {
+        arches
+            .iter()
+            .map(|arch| {
+                Ok(UniversalSlice {
+                    cpu_type: arch.cputype(),
+                    cpu_subtype: arch.cpusubtype(),
+                    architecture: arch.architecture(),
+                    data: arch.data(bytes)?,
+                })
+            })
+            .collect()
+    }
+    match object::FileKind::parse(bytes).ok()? {
+        object::FileKind::MachOFat32 => Some(MachOFatFile32::parse(bytes).and_then(|fat| collect(bytes, fat.arches()))),
+        object::FileKind::MachOFat64 => Some(MachOFatFile64::parse(bytes).and_then(|fat| collect(bytes, fat.arches()))),
+        _ => None,
+    }
+}
+
 /// Architecture variants can share object::Architecture, so test UUID on every slice.
 fn matching_slice(bytes: &[u8], uuid: [u8; 16], architecture: object::Architecture) -> Option<&[u8]>
 {
-    match object::FileKind::parse(bytes).ok()? {
-        object::FileKind::MachOFat32 => MachOFatFile32::parse(bytes)
+    match universal_slices(bytes) {
+        Some(slices) => slices
             .ok()?
-            .arches()
-            .iter()
-            .filter(|arch| arch.architecture() == architecture)
-            .find_map(|arch| valid_slice(arch.data(bytes).ok()?, uuid, architecture)),
-        object::FileKind::MachOFat64 => MachOFatFile64::parse(bytes)
-            .ok()?
-            .arches()
-            .iter()
-            .filter(|arch| arch.architecture() == architecture)
-            .find_map(|arch| valid_slice(arch.data(bytes).ok()?, uuid, architecture)),
-        _ => valid_slice(bytes, uuid, architecture),
+            .into_iter()
+            .filter(|slice| slice.architecture == architecture)
+            .find_map(|slice| valid_slice(slice.data, uuid, architecture)),
+        None => valid_slice(bytes, uuid, architecture),
     }
 }
 

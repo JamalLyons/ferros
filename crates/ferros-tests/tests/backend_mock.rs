@@ -2802,3 +2802,59 @@ fn handler_continue_consumes_a_fresh_step_of_the_previously_stepped_thread()
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(mock.script_len(), 0);
 }
+
+/// #177: a stopped handler's thread sits on a breakpoint of its own, so the user's
+/// continue steps it over that breakpoint with the `__longjmp` exit trap armed. The exit
+/// trap is reported instead of that step's completion, which abandons the step: its
+/// thread is named by `stale_step`. Following the exit single-steps that same thread, and
+/// the session must take that fresh `SingleStep` as the exit step's completion instead of
+/// dropping it as the abandoned step's.
+#[test]
+fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
+{
+    use ferros_core::BreakpointRequest;
+
+    let mock = handler_stopped_with_long_jump();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("scripted-exit-fresh-step")).expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    // The handler is stopped at a breakpoint that stays: the continue steps it off first.
+    session
+        .add_breakpoint(BreakpointRequest::Software {
+            address: INTERRUPTED + 32,
+        })
+        .expect("breakpoint at the handler's stop");
+
+    // The handler's step is cut short by its hit of the exit trap, so that step is
+    // abandoned; the followed exit steps the handler out of `__longjmp` to a landing
+    // inside its own frame, and the continue is reissued.
+    mock.script(handler_at_long_jump(&registers).expect_resume(ResumeRequest::step(HANDLER)));
+    let mut landed = registers.clone();
+    landed.pc = INTERRUPTED + 40;
+    landed.sp = Address::new(0x7F00);
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+            .set_registers(HANDLER, landed)
+            .expect_resume(ResumeRequest::step(HANDLER)),
+    );
+    let exited = StopEvent::Exited { code: 0 };
+    mock.script(MockStop::new(exited.clone()).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler run on");
+    assert_eq!(
+        session.wait(None).expect("wait through the exit step"),
+        Some(exited),
+        "the exit step's completion was not dropped"
+    );
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all(),
+        ],
+    );
+    assert_eq!(session.state(), SessionState::Exited);
+    assert_eq!(mock.script_len(), 0);
+}

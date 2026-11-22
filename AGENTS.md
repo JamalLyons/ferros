@@ -11,8 +11,8 @@ Cargo workspace members, one purpose each:
 | Crate | Path | Role |
 |---|---|---|
 | `ferros` | `crates/ferros` | CLI. Names a platform crate only in `crates/ferros/src/platform.rs`. |
-| `ferros-core` | `crates/ferros-core` | Portable engine. No OS API, no `cfg(target_os)`, no `unsafe`. |
-| `ferros-macos` | `crates/ferros-macos` | macOS `Backend` (Mach). The only crate allowed to use `unsafe`. |
+| `ferros-core` | `crates/ferros-core` | Portable engine. No OS API, no object-file format, no `cfg(target_os)`, no `unsafe`. |
+| `ferros-macos` | `crates/ferros-macos` | macOS `Backend` and all Mach-O knowledge. The only crate allowed to use `unsafe`. |
 | `ferros-tests` | `crates/ferros-tests` | Fixture binaries, the integration harness, and tests that debug real processes. |
 | `ferros-utils` | `crates/ferros-utils` | Shared logging (`tracing`). |
 | `ferros-mir` | `crates/ferros-mir` | Empty workspace member, reserved for a future compiler-IR crate. |
@@ -33,7 +33,7 @@ Read these before changing engine behavior. One line each; the module docs carry
 | `session::stepping` | `crates/ferros-core/src/session/stepping.rs` | Resumable, serial step-over of software breakpoints. |
 | `session::line_stepping` | `crates/ferros-core/src/session/line_stepping.rs` | Source-line step over, into, and out. |
 | `session::location` | `crates/ferros-core/src/session/location.rs` | Resolves a `BreakpointLocation` to sites in the main executable. |
-| `session::stack` | `crates/ferros-core/src/session/stack.rs` | Stack traces and symbolication, including a scan for unlisted Mach-O headers. |
+| `session::stack` | `crates/ferros-core/src/session/stack.rs` | Stack traces and symbolication. The `MH_MAGIC_64` scan still here is a leak; ADR 0001 moves it to `ferros-macos` ([#193](https://github.com/JamalLyons/ferros/issues/193)). |
 | `session::images` | `crates/ferros-core/src/session/images.rs` | Loads `Backend::images` into the symbol cache. `same_build` treats two missing UUIDs as the same image and two different UUIDs as a new one. |
 | `session::exits` | `crates/ferros-core/src/session/exits.rs` | Non-local exits (panic landing pads and `longjmp`) so step-out sees a frame leave. |
 | Stop channel | `Session::wait` → `StopEvent` in `crates/ferros-core/src/backend/types.rs` | The event a backend actually returns. |
@@ -42,7 +42,7 @@ Read these before changing engine behavior. One line each; the module docs carry
 | Test harness | `crates/ferros-tests` | `harness::run`, the `fixture!` macro, and `tests/`. See that crate's README. |
 
 ## Architecture decisions
-[`docs/adr/README.md`](docs/adr/README.md) indexes the records. They are proposals until a later change adopts one. Do not treat a proposed decision as a rule that overrides this file.
+[`docs/adr/README.md`](docs/adr/README.md) indexes the records. An accepted record is an owner decision and is restated in Conventions when it binds day-to-day work. A proposed record is not a rule. [ADR 0001](docs/adr/0001-object-file-boundary.md) is accepted.
 
 ## Toolchain
 The project builds and tests with Rust/Cargo 1.100.0, pinned by `rust-toolchain.toml`, with the `clippy` component. Formatting uses `cargo +nightly fmt` for the unstable options in `rustfmt.toml`. The task runner for development and CI tasks is `just`.
@@ -145,7 +145,7 @@ Two environment switches are available for diagnostic and harness verification:
 - `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
 
 ## Conventions
-- Platform boundary: `crates/ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`), no `cfg(target_os)` and no `unsafe`; `just check-boundary` and `crates/ferros-tests/tests/platform_boundary.rs` both enforce this. OS code goes in a platform crate (`crates/ferros-macos`). The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
+- Platform and format boundary: `crates/ferros-core` is fully platform-neutral and format-neutral. It has no OS dependency (`mach2`, `libproc`, `libc`), no `cfg(target_os)`, no `unsafe`, and no object-file format knowledge. All macOS code, including Mach-O (`MH_MAGIC` scanning, `LC_SYMTAB`, compact unwind, `LC_UUID`), lives only in `crates/ferros-macos`. A future `ferros-linux` (ELF) or `ferros-windows` (PE/COFF) crate keeps its own OS and format code; that code never enters `ferros-core` or the other platform crate. DWARF consumption stays in `ferros-core` behind a format-neutral image/object-file trait. `just check-boundary` and `crates/ferros-tests/tests/platform_boundary.rs` enforce the OS half (no OS crate, no `cfg(target_os)`, no `unsafe`). They do not yet reject Mach-O in core. The Mach-O still in `ferros-core` is a leak tracked by [#193](https://github.com/JamalLyons/ferros/issues/193) under accepted [ADR 0001](docs/adr/0001-object-file-boundary.md). Do not add more. The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
 - `unsafe`: Forbidden workspace-wide via `unsafe_code = "forbid"` in the root `Cargo.toml`. Only `crates/ferros-macos` permits `unsafe` for raw Mach FFI bindings; `crates/ferros-core` forbids it too.
 - Formatting: Governed by `rustfmt.toml`. Format all code using:
 ```sh

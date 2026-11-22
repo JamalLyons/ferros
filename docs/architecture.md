@@ -485,7 +485,7 @@ pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
 
 3. Add integration tests for the platform in `crates/ferros-tests` that debug the fixture programs through `Session`.
 
-`Session`'s process-control policy (state machine, software breakpoints, stepping) already works with any `Backend`. Image format does not. Mach-O headers, `LC_UUID`, compact unwind, and the symbol-table reader live in `ferros-core` today, and `LoadedImage.uuid` is a 16-byte Mach-O UUID. A Linux backend needs the image-format boundary proposed in [ADR 0001](adr/0001-object-file-boundary.md) before those paths can describe an ELF image. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
+`Session`'s process-control policy (state machine, software breakpoints, stepping) already works with any `Backend`. Image format does not. Mach-O headers, `LC_UUID`, compact unwind, and the symbol-table reader still live in `ferros-core`, and `LoadedImage.uuid` is a 16-byte Mach-O UUID. [ADR 0001](adr/0001-object-file-boundary.md) (accepted 2026-11-22, tracked by [#193](https://github.com/JamalLyons/ferros/issues/193)) moves that Mach-O knowledge into `ferros-macos` behind a format-neutral trait in `ferros-core`. DWARF stays in core. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
 
 ---
 

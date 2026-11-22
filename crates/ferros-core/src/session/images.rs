@@ -35,9 +35,8 @@ struct FailedLoad
 /// ([`same_build`]). Only two known, different UUIDs mean a different build loaded where
 /// the previous one was; then the mapping, the symbol table, the DWARF id and the failure
 /// records are dropped and read again. An unknown UUID (`None`) on either side is no
-/// evidence of a change: the macOS backend learns the main executable's UUID only once
-/// dyld publishes it, after the launch stop, and a read of dyld's UUID array can fail at
-/// one stop and succeed at the next. A UUID learned later is recorded on the kept image.
+/// evidence of a change: a UUID read can fail at one stop and succeed at the next. The
+/// session also records the UUID from the mapped header when the backend omits it (#170).
 ///
 /// Symbol loading keeps one of three outcomes: the loaded symbols; missing debug info
 /// (kept until the image is unloaded); or another failure, kept only while the files it
@@ -47,8 +46,8 @@ struct FailedLoad
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
-    /// Mach-O `LC_UUID` reported with this image, or `None` while the backend has reported
-    /// none. Set once a later report knows it.
+    /// Mach-O `LC_UUID` reported by the backend or read from the mapped header.
+    /// Set once a later report knows it.
     uuid: Option<[u8; 16]>,
     /// The layout read from the image's mapped header, or why it could not be read.
     /// Mapped memory does not change while this image stays loaded, so the result is kept
@@ -59,11 +58,9 @@ pub(super) struct SessionImage
     /// could not be read.
     slice: Option<SliceIdentity>,
     /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
-    /// images by the canonical path resolved at load time and the load address
-    /// ([`ImageId`]), not by UUID. A relative loader path may stop resolving later
-    /// (issue #99), so retention follows this id, not the path. A conflicting UUID builds
-    /// a new [`SessionImage`] with this unset, so [`SymbolCache::retain_ids`] drops the
-    /// previous parse and the next load reads the file again.
+    /// images by canonical path, load address and the UUID known at parse time
+    /// ([`ImageId`]). Retention uses this id because a relative loader path may stop
+    /// resolving later (#99).
     symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
     /// without repeatedly running dsymutil.
@@ -110,7 +107,7 @@ impl SessionSymtab
 
 /// Whether two UUID reports for an image at the same path and load address can be the
 /// same build: only two known, different UUIDs say it was replaced.
-fn same_build(known: Option<[u8; 16]>, reported: Option<[u8; 16]>) -> bool
+pub(super) fn same_build(known: Option<[u8; 16]>, reported: Option<[u8; 16]>) -> bool
 {
     match (known, reported) {
         (Some(known), Some(reported)) => known == reported,
@@ -128,6 +125,11 @@ impl SessionImage
     pub(super) fn descriptor_path(&self) -> &std::path::Path
     {
         &self.descriptor.path
+    }
+
+    pub(super) fn uuid(&self) -> Option<[u8; 16]>
+    {
+        self.uuid
     }
 }
 
@@ -251,12 +253,15 @@ impl Session
             }) {
                 let mut kept = previous.swap_remove(index);
                 kept.uuid = kept.uuid.or(image.uuid);
+                if let Some(slice) = &mut kept.slice {
+                    slice.uuid = slice.uuid.or(kept.uuid);
+                }
                 self.loaded_images.push(kept);
             } else {
                 let (mapping, slice) = self.map_loaded_image(descriptor.load_address, image.uuid);
                 self.loaded_images.push(SessionImage {
                     descriptor,
-                    uuid: image.uuid,
+                    uuid: image.uuid.or_else(|| slice.as_ref().and_then(|slice| slice.uuid)),
                     mapping,
                     slice,
                     symbols: None,

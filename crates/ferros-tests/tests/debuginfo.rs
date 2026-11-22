@@ -452,6 +452,148 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
 }
 
 #[test]
+fn session_symbolicates_the_replacement_build_at_the_same_address()
+{
+    harness::run(|_| {
+        let first = fixture!("hello");
+        let second = fixture!("nested_calls");
+        let scratch = Scratch::new();
+        let executable = scratch.0.join("program");
+        let dsym = scratch.0.join("program.dSYM");
+        let load_address = Address::new(0x2_0000_0000);
+        let loaded = |uuid| LoadedImage {
+            path: executable.clone(),
+            load_address,
+            uuid,
+        };
+        let header_and_uuid = |fixture: &Fixture| {
+            let mut bytes = fs::read(fixture.path()).expect("read executable");
+            let uuid = object::File::parse(&*bytes)
+                .expect("parse executable")
+                .mach_uuid()
+                .expect("read UUID")
+                .expect("Mach-O has a UUID");
+            bytes.truncate(ImageMapping::header_size(&bytes).expect("header size"));
+            (bytes, uuid)
+        };
+        let (mut header, first_uuid) = header_and_uuid(&first);
+        let (replacement, second_uuid) = header_and_uuid(&second);
+        assert_ne!(first_uuid, second_uuid);
+        header.resize(header.len().max(replacement.len()), 0);
+
+        // The first loader report omits the UUID, even though the mapped header has it.
+        let mock = MockBackend::new()
+            .with_region(load_address, "r-x", header)
+            .with_thread(ThreadId(1), Registers::default())
+            .with_image(loaded(None));
+        let mut session = Session::new(Box::new(mock.clone())).with_debug_info_options(scratch.options());
+        let install = |fixture: &Fixture| {
+            fs::copy(fixture.path(), &executable).expect("copy executable");
+            std::os::unix::fs::symlink(fixture.dsym_path(), &dsym).expect("link matching dSYM");
+        };
+        let check = |session: &mut Session, fixture: &Fixture, function: &str, marker: &str| {
+            let file = format!("{}.rs", fixture.name());
+            let line = fixture.marker_line(marker);
+            let image = SymbolCache::with_debug_info_options(scratch.options())
+                .load_image(descriptor(fixture.path(), load_address.value()))
+                .expect("read fixture DWARF");
+            let addresses = image.line_addresses(&file, line).expect("fixture marker addresses");
+            assert_eq!(addresses.line, line);
+            let address = addresses.addresses[0];
+            let result = session.symbolicate(address).expect("symbolicate image");
+            let result = result.unwrap_or_else(|| panic!("no DWARF result for {function} at {file}:{line}"));
+            assert!(
+                result.frames.iter().any(|frame| {
+                    frame.symbol.display_name() == function
+                        && frame
+                            .location
+                            .as_ref()
+                            .is_some_and(|location| location.file.ends_with(&file) && location.line == Some(line))
+                }),
+                "expected {function} at line {line}, got {result:?}"
+            );
+            result.image_id
+        };
+
+        install(&first);
+        session.launch(&LaunchSpec::new(&executable)).expect("mock launch");
+        let first_id = check(&mut session, &first, "ferros_fixture_hello::main", "hello_print");
+
+        fs::remove_file(&dsym).expect("unlink the old companion");
+        install(&second);
+        mock.overwrite_memory(load_address, &replacement);
+        mock.set_images(vec![loaded(Some(second_uuid))]);
+        let second_id = check(&mut session, &second, "ferros_fixture_nested_calls::level_c", "in_c");
+        assert_ne!(first_id, second_id, "each build has its own DWARF cache identity");
+    });
+}
+
+/// The target still maps build A of an executable while the file on disk is rebuilt to
+/// build B. The session reads A's UUID from the mapped header and refuses to label B's
+/// DWARF as A's: `symbolicate` reports a load failure naming another build, and once A's
+/// file is back the next request reads it (#170).
+#[test]
+fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
+{
+    harness::run(|_| {
+        let mapped = fixture!("hello");
+        let rebuilt = fixture!("nested_calls");
+        let scratch = Scratch::new();
+        let executable = scratch.0.join("program");
+        let dsym = scratch.0.join("program.dSYM");
+        let load_address = Address::new(0x2_0000_0000);
+        let mut header = fs::read(mapped.path()).expect("read executable");
+        header.truncate(ImageMapping::header_size(&header).expect("header size"));
+        // The loader reports no UUID; the session reads it from the mapped header.
+        let mock = MockBackend::new()
+            .with_region(load_address, "r-x", header)
+            .with_thread(ThreadId(1), Registers::default())
+            .with_image(LoadedImage {
+                path: executable.clone(),
+                load_address,
+                uuid: None,
+            });
+        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let install = |fixture: &Fixture| {
+            let _ = fs::remove_file(&executable);
+            let _ = fs::remove_file(&dsym);
+            fs::copy(fixture.path(), &executable).expect("copy executable");
+            std::os::unix::fs::symlink(fixture.dsym_path(), &dsym).expect("link matching dSYM");
+        };
+        let line = mapped.marker_line("hello_print");
+        let address = SymbolCache::with_debug_info_options(scratch.options())
+            .load_image(descriptor(mapped.path(), load_address.value()))
+            .expect("read fixture DWARF")
+            .line_addresses("hello.rs", line)
+            .expect("marker addresses")
+            .addresses[0];
+
+        install(&rebuilt);
+        session.launch(&LaunchSpec::new(&executable)).expect("mock launch");
+        match session.symbolicate(address) {
+            Err(DebuggerError::SymbolLoad { path, source }) => {
+                assert_eq!(path, executable);
+                assert!(source.to_string().contains("another build"), "{source}");
+            }
+            other => panic!("the rebuilt file was read as the mapped build: {other:?}"),
+        }
+
+        install(&mapped);
+        let result = session
+            .symbolicate(address)
+            .expect("the mapped build's file is back")
+            .expect("a DWARF result");
+        assert!(
+            result
+                .frames
+                .iter()
+                .any(|frame| frame.symbol.display_name() == "ferros_fixture_hello::main"),
+            "{result:?}"
+        );
+    });
+}
+
+#[test]
 fn session_refreshes_unloaded_and_relocated_images()
 {
     harness::run(|_| {

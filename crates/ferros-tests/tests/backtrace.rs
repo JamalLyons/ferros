@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use ferros_core::symbols::ImageMapping;
 use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, Session, StackFrame, StopEvent, SymbolSource,
 };
@@ -14,6 +15,9 @@ use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
 use ferros_tests::{Fixture, find_marker, fixture};
+use object::Endianness;
+use object::macho::MachHeader64;
+use object::read::macho::MachHeader;
 
 /// How long a test waits for one stop after resuming.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -21,6 +25,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames requested per trace: more than any fixture stack, so a trace that does not end
 /// at the thread base shows up as garbage frames rather than a cut-off.
 const MAX_FRAMES: usize = 256;
+
+fn mapped_uuid(session: &mut Session, address: Address) -> [u8; 16]
+{
+    let header = session
+        .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
+        .expect("mapped Mach-O header");
+    let size = ImageMapping::header_size(&header).expect("load command size");
+    let bytes = session.read_memory(address, size).expect("mapped load commands");
+    let mach = MachHeader64::<Endianness>::parse(&*bytes, 0).expect("64-bit Mach-O");
+    mach.uuid(mach.endian().expect("Mach-O byte order"), &*bytes, 0)
+        .expect("read LC_UUID")
+        .expect("mapped Mach-O has LC_UUID")
+}
 
 /// Resume until a breakpoint at `address` stops the process.
 fn run_to(session: &mut Session, address: Address)
@@ -269,6 +286,7 @@ fn dyld_is_a_listed_image_and_names_the_main_thread_base()
             .max_by_key(|image| image.load_address)
             .expect("an image below the base pc");
         assert_eq!(owner.load_address, dyld.load_address, "base {base:#?} in {images:#?}");
+        assert_eq!(dyld.uuid, Some(mapped_uuid(&mut d, dyld.load_address)), "{dyld:?}");
     });
 }
 
@@ -311,6 +329,16 @@ fn dyld_is_listed_at_the_launch_stop()
             entry.symbol.as_ref().map(ferros_core::SymbolName::display_name),
             Some("_dyld_start"),
             "{entry:#?}"
+        );
+        let main = &images[0];
+        let dyld = dylds[0];
+        assert_eq!(
+            (main.uuid, dyld.uuid),
+            (
+                Some(mapped_uuid(&mut d, main.load_address)),
+                Some(mapped_uuid(&mut d, dyld.load_address))
+            ),
+            "the launch executable and dyld report their mapped UUIDs"
         );
     });
 }
@@ -1048,6 +1076,7 @@ fn backtrace_through_a_static_shared_cache_function_names_it()
             frames.iter().all(|frame| frame.symbol.is_some()),
             "an unnamed frame: {frames:#?}"
         );
+        assert_eq!(image.uuid, Some(mapped_uuid(&mut d, image.load_address)), "{image:?}");
     });
 }
 

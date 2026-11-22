@@ -238,10 +238,9 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     // Issue #121: path and load address do not identify a build. An image unloaded and
     // replaced by a different one at the same place has a new UUID, and the names cached
     // from the old symbol table must not survive. An unknown UUID is no evidence of a
-    // change: the macOS backend learns the main executable's UUID only after the launch
-    // stop. So the same UUID, or an unknown one on either side, is the same image, and a
-    // name already read is kept even when the mapped bytes change (they do not while
-    // that image stays loaded). Only two known, different UUIDs re-read it.
+    // change: a backend may fail to read it at a stop. The same UUID, or an unknown one
+    // on either side, preserves the cached name even when the mocked bytes change.
+    // Only two known, different UUIDs trigger a re-read.
     const IMAGE: u64 = 0x10_0000;
     let (header, nlists, strings) = image();
     let path = "/nonexistent/ferros-symtab-replaced";
@@ -269,8 +268,8 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_bar\0");
     assert_eq!(name(&mut session), named("foo"));
 
-    // The UUID becomes known (as the main executable's does once dyld runs): still the
-    // same image, so the name is kept and the UUID is recorded.
+    // The UUID becomes known: still the same image, so the name is kept and the UUID
+    // is recorded.
     mock.set_images(vec![listed(Some([1; 16]))]);
     assert_eq!(name(&mut session), named("foo"));
 

@@ -58,8 +58,8 @@ pub(super) struct SessionImage
     /// could not be read.
     slice: Option<SliceIdentity>,
     /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
-    /// images by canonical path, load address and the UUID known at parse time
-    /// ([`ImageId`]). Retention uses this id because a relative loader path may stop
+    /// images by canonical path, load address and the slice known at parse time (CPU
+    /// type, masked subtype and UUID; [`ImageId`]). Retention uses this id because a relative loader path may stop
     /// resolving later (#99).
     symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests

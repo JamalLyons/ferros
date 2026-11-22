@@ -400,8 +400,8 @@ pub struct LoadedImage
     pub load_address: Address,
     /// The image's Mach-O `LC_UUID`, when the backend knows it.
     ///
-    /// `None` when the backend has no UUID for this image: it does not report one, the
-    /// read failed, or this image is outside the source the backend uses. Two `None`
-    /// values compare equal.
+    /// On macOS, UUIDs come from dyld's UUID array or the mapped header (#170). `None`
+    /// means the backend had no UUID source, the header lacked `LC_UUID`, or the lookup
+    /// failed. Two `None` values compare equal.
     pub uuid: Option<[u8; 16]>,
 }

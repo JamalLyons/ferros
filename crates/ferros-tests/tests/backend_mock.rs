@@ -2802,3 +2802,76 @@ fn handler_continue_consumes_a_fresh_step_of_the_previously_stepped_thread()
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(mock.script_len(), 0);
 }
+
+#[test]
+fn step_out_arms_the_replacement_exit_images_entry()
+{
+    use ferros_core::backend::LoadedImage;
+
+    const BASE: u64 = 0x2_0000_0000;
+    const FIRST_ENTRY: u64 = BASE + 0x400;
+    const SECOND_ENTRY: u64 = BASE + 0x408;
+    const NLIST: u64 = BASE + 0x1000;
+    let u32s = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let u64s = |words: &[u64]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let mut image = u32s(&[0xfeed_facf, 0x0100_000c, 0, 6, 3, 248, 0, 0]); // mach_header_64
+    image.extend(u32s(&[0x19, 152])); // LC_SEGMENT_64, with one section
+    image.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+    image.extend(u64s(&[BASE, 0x1000, 0, 0x1000]));
+    image.extend(u32s(&[5, 5, 1, 0]));
+    image.extend(b"__text\0\0\0\0\0\0\0\0\0\0__TEXT\0\0\0\0\0\0\0\0\0\0");
+    image.extend(u64s(&[FIRST_ENTRY, 16]));
+    image.extend(u32s(&[0x400, 2, 0, 0, 0x8000_0400, 0, 0, 0]));
+    image.extend(u32s(&[0x19, 72])); // LC_SEGMENT_64, with no sections
+    image.extend(b"__LINKEDIT\0\0\0\0\0\0");
+    image.extend(u64s(&[NLIST, 0x1000, 0x1000, 0x1000]));
+    image.extend(u32s(&[1, 1, 0, 0]));
+    image.extend(u32s(&[2, 24, 0x1000, 1, 0x1010, 11])); // LC_SYMTAB
+    image.resize(0x1000, 0);
+    image.extend(u32s(&[1, 0x010f])); // n_strx 1, N_SECT | N_EXT, section 1
+    image.extend(FIRST_ENTRY.to_le_bytes());
+    image.extend(b"\0__longjmp\0");
+
+    let loaded = |uuid| LoadedImage {
+        path: "/usr/lib/system/libsystem_platform.dylib".into(),
+        load_address: Address::new(BASE),
+        uuid,
+    };
+    let mock = returning_to_breakpoint()
+        .with_region(Address::new(BASE), "r-x", image)
+        .with_image(loaded(Some([1; 16])));
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
+    step_out_to_breakpoint(&mock, &mut session);
+    assert_eq!(mock.peek_memory(Address::new(FIRST_ENTRY), 4), Ok(trap.clone()));
+    assert_eq!(
+        session.wait(None).expect("first return"),
+        Some(StopEvent::SingleStep { thread: THREAD })
+    );
+
+    mock.overwrite_memory(Address::new(NLIST + 8), &SECOND_ENTRY.to_le_bytes());
+    mock.set_images(vec![loaded(None)]);
+    let callee = in_callee(session.read_registers_for(THREAD).expect("read registers"));
+    session.write_registers_for(THREAD, &callee).expect("return to callee");
+    step_out_to_breakpoint(&mock, &mut session);
+    assert_eq!(mock.peek_memory(Address::new(FIRST_ENTRY), 4), Ok(trap.clone()));
+    assert_eq!(
+        session.wait(None).expect("second return"),
+        Some(StopEvent::SingleStep { thread: THREAD })
+    );
+
+    mock.set_images(vec![loaded(Some([2; 16]))]);
+    session.write_registers_for(THREAD, &callee).expect("return to callee");
+    step_out_to_breakpoint(&mock, &mut session);
+    assert_eq!(
+        mock.peek_memory(Address::new(SECOND_ENTRY), 4),
+        Ok(trap),
+        "a different UUID must move the trap to the replacement entry"
+    );
+    assert_eq!(mock.peek_memory(Address::new(FIRST_ENTRY), 4), Ok(vec![0; 4]));
+    assert_eq!(
+        session.wait(None).expect("third return"),
+        Some(StopEvent::SingleStep { thread: THREAD })
+    );
+}

@@ -15,12 +15,9 @@
 //! list then follows the address dyld records.
 //!
 //! Each image's Mach-O UUID comes from `uuidArray` in that same structure (version 8 and
-//! later): one `dyld_uuid_info` per image that is not in the dyld shared cache, matched
-//! by load address. A missing, oversized or unreadable array leaves every UUID unset and
-//! still returns the list. Images the array does not cover stay `None`: shared-cache
-//! libraries, dyld when it lives in the cache, and the executable at the bootstrap stop
-//! before dyld publishes the array. Their `LC_UUID` is in the mapped header, but reading
-//! it for every shared-cache image is a remote read each, so it is not done.
+//! later), matched by load address. For images absent from the array, including shared-cache
+//! libraries, dyld and the executable at the bootstrap stop, read `LC_UUID` from the mapped
+//! load commands. Both reads are bounded, and a failed UUID lookup still returns the image (#170).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -29,12 +26,16 @@ use std::path::PathBuf;
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::error::{DebuggerError, Result};
+use ferros_core::symbols::ImageMapping;
 use ferros_core::types::{Address, ProcessId};
 use libc::mach_port_t;
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::task::task_info;
 use mach2::task_info::{TASK_DYLD_INFO, TASK_DYLD_INFO_COUNT, task_dyld_info};
 use mach2::vm::mach_vm_read_overwrite;
+use object::Endianness;
+use object::macho::MachHeader64;
+use object::read::macho::MachHeader;
 
 use crate::memory::get_memory_regions;
 
@@ -223,9 +224,8 @@ fn dyld_fields(bytes: &[u8]) -> Option<(u64, u64)>
 /// `uuidArrayCount` and `uuidArray` in a prefix of the 64-bit `dyld_all_image_infos`.
 ///
 /// `None` when `bytes` is older than version 8, shorter than the pointer, or the count is
-/// zero, the pointer is null, or the count is above [`MAX_IMAGES`]. A bad count leaves
-/// UUIDs unset rather than failing the image list. The count is small enough that that
-/// many [`UUID_INFO_SIZE`]-byte records fit at the returned address.
+/// zero, the pointer is null, or the count is above [`MAX_IMAGES`]. The returned address
+/// range fits that many [`UUID_INFO_SIZE`]-byte records without overflowing.
 fn uuid_array_fields(bytes: &[u8]) -> Option<(usize, u64)>
 {
     let version = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
@@ -259,7 +259,7 @@ fn decode_uuid_infos(records: &[u8]) -> Vec<(u64, [u8; 16])>
 }
 
 /// UUIDs from `uuidArray`, keyed by load address. A failed or inconsistent read yields an
-/// empty map: the image list is still returned, with UUIDs unset.
+/// empty map, so UUID lookup can fall back to mapped headers.
 fn image_uuids(task: mach_port_t, infos: &[u8]) -> HashMap<u64, [u8; 16]>
 {
     let Some((count, array)) = uuid_array_fields(infos) else {
@@ -271,23 +271,36 @@ fn image_uuids(task: mach_port_t, infos: &[u8]) -> HashMap<u64, [u8; 16]>
     let records = match read_target(task, Address::new(array), size) {
         Ok(records) if records.len() == size => records,
         Ok(_) => {
-            tracing::debug!("dyld uuid array at {array:#x} was truncated; leaving UUIDs unset");
+            tracing::debug!("dyld uuid array at {array:#x} was truncated");
             return HashMap::new();
         }
         Err(error) => {
-            tracing::debug!("dyld uuid array at {array:#x}: {error}; leaving UUIDs unset");
+            tracing::debug!("dyld uuid array at {array:#x}: {error}");
             return HashMap::new();
         }
     };
     decode_uuid_infos(&records).into_iter().collect()
 }
 
-fn with_uuid(path: PathBuf, load_address: Address, uuids: &HashMap<u64, [u8; 16]>) -> LoadedImage
+/// Read only the mapped header and load commands, with the read cap in `read_target`.
+fn mapped_uuid(task: mach_port_t, address: Address) -> Option<[u8; 16]>
+{
+    let header = read_target(task, address, ImageMapping::MACH_HEADER_SIZE).ok()?;
+    let size = ImageMapping::header_size(&header).ok()?;
+    let bytes = read_target(task, address, size).ok()?;
+    let mach = MachHeader64::<Endianness>::parse(&*bytes, 0).ok()?;
+    mach.uuid(mach.endian().ok()?, &*bytes, 0).ok()?
+}
+
+fn with_uuid(task: mach_port_t, path: PathBuf, load_address: Address, uuids: &HashMap<u64, [u8; 16]>) -> LoadedImage
 {
     LoadedImage {
         path,
         load_address,
-        uuid: uuids.get(&load_address.value()).copied(),
+        uuid: uuids
+            .get(&load_address.value())
+            .copied()
+            .or_else(|| mapped_uuid(task, load_address)),
     }
 }
 
@@ -314,7 +327,7 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &H
             PathBuf::from(DEFAULT_DYLD_PATH)
         })
     };
-    Some(with_uuid(path, load_address, uuids))
+    Some(with_uuid(task, path, load_address, uuids))
 }
 
 /// Compatibility for `POSIX_SPAWN_START_SUSPENDED`: dyld has not populated its array.
@@ -337,11 +350,11 @@ fn bootstrap_images(task: mach_port_t, pid: ProcessId, infos: Option<&[u8]>) -> 
         .clone()
         .find(|region| is_executable_header(task, region.start))
         .ok_or_else(|| invalid("loader is uninitialized and the executable header is unavailable"))?;
-    let mut images = vec![with_uuid(path, executable.start, &uuids)];
+    let mut images = vec![with_uuid(task, path, executable.start, &uuids)];
     let dyld = infos.and_then(|infos| dyld_image(task, infos, &images, &uuids)).or_else(|| {
         readable
             .find(|region| is_header_of_type(task, region.start, MH_DYLINKER))
-            .map(|region| with_uuid(PathBuf::from(DEFAULT_DYLD_PATH), region.start, &uuids))
+            .map(|region| with_uuid(task, PathBuf::from(DEFAULT_DYLD_PATH), region.start, &uuids))
     });
     images.extend(dyld);
     Ok(images)
@@ -392,26 +405,15 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
     if records.len() != size {
         return Err(invalid("truncated image array"));
     }
+    let uuids = image_uuids(task, &infos);
     let mut images = Vec::with_capacity(length);
     for record in records.as_chunks::<24>().0 {
         let load_address = word(record, 0);
         if load_address == 0 {
             return Err(invalid("null image load address"));
         }
-        images.push(LoadedImage {
-            path: remote_path(task, word(record, 8))?,
-            load_address: Address::new(load_address),
-            uuid: None,
-        });
-    }
-    // Read before the stability check below, so a list that changed under it is refused
-    // too. A failed UUID read must not fail the list. Shared-cache images are absent here.
-    let uuids = image_uuids(task, &infos);
-    if read_target(task, address, 16)? != before {
-        return Err(invalid("image list changed while reading"));
-    }
-    for image in &mut images {
-        image.uuid = uuids.get(&image.load_address.value()).copied();
+        let path = remote_path(task, word(record, 8))?;
+        images.push(with_uuid(task, path, Address::new(load_address), &uuids));
     }
     // Preserve the existing main-first contract for callers; dyld's order is not an API.
     // The main image is found by its header, so this holds after its file is unlinked.
@@ -419,6 +421,9 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
         images.swap(0, index);
     }
     images.extend(dyld_image(task, &infos, &images, &uuids));
+    if read_target(task, address, 16)? != before {
+        return Err(invalid("image list changed while reading"));
+    }
     Ok(images)
 }
 

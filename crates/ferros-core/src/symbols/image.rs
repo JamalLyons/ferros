@@ -407,10 +407,9 @@ fn hex(bytes: &[u8]) -> String
 
 /// Unique identifier for a binary image.
 ///
-/// This ID is computed from the image's path and load address, ensuring that
-/// the same binary loaded at different addresses gets different IDs. It's used
-/// as a key in the symbol cache to distinguish between multiple instances of
-/// the same binary.
+/// The symbol cache keys on path, load address, and the mapped UUID when known.
+/// Each Mach-O slice has its own UUID, so it also identifies the slice of a
+/// universal file (#170).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageId(u64);
 
@@ -439,17 +438,25 @@ impl ImageId
     /// ```
     pub fn from_parts(path: &Path, load_address: u64) -> Self
     {
+        Self::with_uuid(path, load_address, None)
+    }
+
+    pub(crate) fn with_uuid(path: &Path, load_address: u64, uuid: Option<[u8; 16]>) -> Self
+    {
         use std::collections::hash_map::DefaultHasher;
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         load_address.hash(&mut hasher);
+        if let Some(uuid) = uuid {
+            uuid.hash(&mut hasher);
+        }
         ImageId(hasher.finish())
     }
 
     /// Get the raw `u64` value of this image ID.
     ///
-    /// This is useful for serialization or debugging. The value is a hash
-    /// of the path and load address.
+    /// This is useful for serialization or debugging. The value hashes the path,
+    /// load address, and mapped UUID when known.
     ///
     /// ## Example
     ///
@@ -619,7 +626,7 @@ impl BinaryImage
         let unwind_info = load_section_blob(&file, &["__unwind_info"])?;
 
         Ok(Self {
-            id: ImageId::from_parts(&desc.path, desc.load_address),
+            id: ImageId::with_uuid(&desc.path, desc.load_address, target.and_then(|slice| slice.uuid)),
             path: desc.path,
             architecture,
             endian,

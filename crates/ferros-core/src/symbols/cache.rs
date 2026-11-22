@@ -189,7 +189,7 @@ impl SymbolCache
             })?
         };
 
-        let id = ImageId::from_parts(&canonical, descriptor.load_address);
+        let id = ImageId::with_uuid(&canonical, descriptor.load_address, target.and_then(|slice| slice.uuid));
         if let Some(existing) = self.images.get(&id) {
             return Ok(existing.clone());
         }
@@ -203,6 +203,7 @@ impl SymbolCache
             target,
             &self.debug_info_options,
         )?);
+        debug_assert_eq!(image.id(), id);
         self.images.insert(id, image.clone());
         Ok(image)
     }

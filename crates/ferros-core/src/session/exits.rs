@@ -8,6 +8,7 @@
 //! above the stack it entered with: it has then landed where the exit goes.
 
 use super::Session;
+use super::images::same_build;
 use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
@@ -65,6 +66,7 @@ pub(super) struct ExitImage
     /// Index into `SOURCES`.
     source: usize,
     load_address: u64,
+    uuid: Option<[u8; 16]>,
     code: SymtabLayout,
     entries: Vec<Address>,
 }
@@ -276,45 +278,49 @@ impl Session
     }
 
     /// The process's exit images, read from their symbol tables in the target's memory.
-    /// Each is cached once found.
+    /// Cached while the source and load address match and the UUID does not conflict (#170).
     fn exit_images(&mut self) -> Vec<ExitImage>
     {
         if let Err(error) = self.load_images() {
             tracing::debug!("no exit hooks: listing images: {error}");
             return Vec::new();
         }
+        let mut previous = std::mem::take(&mut self.exit_images);
         let mut found = Vec::new();
         for (source, exit) in SOURCES.iter().enumerate() {
-            let Some(load_address) = self
+            let Some(image) = self
                 .loaded_images
                 .iter()
                 .find(|image| image.descriptor_path().file_name().is_some_and(|name| name == exit.image))
-                .map(|image| image.descriptor_load_address())
             else {
                 tracing::debug!("no exit hooks: {} is not loaded", exit.image);
                 continue;
             };
-            if let Some(cached) = self
-                .exit_images
-                .iter()
-                .find(|cached| cached.source == source && cached.load_address == load_address)
-            {
-                found.push(cached.clone());
+            let load_address = image.descriptor_load_address();
+            let uuid = image.uuid();
+            if let Some(index) = previous.iter().position(|cached| {
+                cached.source == source && cached.load_address == load_address && same_build(cached.uuid, uuid)
+            }) {
+                let mut cached = previous.swap_remove(index);
+                cached.uuid = cached.uuid.or(uuid);
+                found.push(cached);
                 continue;
             }
-            match self.read_exit_image(source, load_address) {
-                Ok(image) => {
-                    self.exit_images.retain(|cached| cached.source != source);
-                    self.exit_images.push(image.clone());
-                    found.push(image);
-                }
+            match self.read_exit_image(source, load_address, uuid) {
+                Ok(image) => found.push(image),
                 Err(detail) => tracing::debug!("no exit hooks in {}: {detail}", exit.image),
             }
         }
+        self.exit_images.clone_from(&found);
         found
     }
 
-    fn read_exit_image(&mut self, source: usize, load_address: u64) -> std::result::Result<ExitImage, String>
+    fn read_exit_image(
+        &mut self,
+        source: usize,
+        load_address: u64,
+        uuid: Option<[u8; 16]>,
+    ) -> std::result::Result<ExitImage, String>
     {
         let exit = &SOURCES[source];
         let header = self.read_mapped_header(load_address)?;
@@ -333,6 +339,7 @@ impl Session
         Ok(ExitImage {
             source,
             load_address,
+            uuid,
             code,
             entries,
         })

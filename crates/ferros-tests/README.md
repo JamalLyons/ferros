@@ -256,6 +256,16 @@ breakpoint or at a program `brk #1` is still reported at either point
 (`step_over_reports_a_real_trap_stop_reported_with_its_internal_step`,
 `step_over_reports_a_real_trap_stop_that_refuses_its_next_step`).
 
+So do the internal resumes of a stopped signal handler's return (#165): a stale stop reported
+with the handler's return to its rendezvous, or with a hit of its `__longjmp` exit trap, is
+dropped and the continue or exit followed on
+(`handler_return_drops_a_stale_trap_stop_reported_with_it`,
+`handler_exit_drops_a_stale_trap_stop_reported_with_it`); one refusing the reissued continue
+or the exit's step is dropped and that resume issued again
+(`handler_continue_drops_a_stale_trap_stop_that_refuses_it`,
+`handler_exit_step_drops_a_stale_trap_stop_that_refuses_it`). A real trap's stop is still
+reported at each point (the matching `*_reports_a_real_trap_stop_*` tests).
+
 `MockBackend::die_refusing_nth_resume` models a target that dies right after a stop refuses
 one of its resumes: memory writes then fail, and the terminal event comes after a delay (#155).
 The cleanup after the refusal cannot put the traps back, and the death is still what `wait`

@@ -2231,7 +2231,7 @@ fn zero_timeout_wait_does_not_block_on_a_dying_targets_refused_continue()
 /// #155 review: a stopped handler's return to its breakpoint is consumed inside `wait`, and
 /// the session reissues the user's continue, which steps the handler off the breakpoint
 /// first. The backend refuses that step: the target died, so putting the trap back fails,
-/// and its terminal event comes later. That internal resume goes through `refused_stop`,
+/// and its terminal event comes later. That internal resume goes through `refusal`,
 /// which now behaves like the other refused resumes: `wait(Some(ZERO))` neither returns
 /// the write error nor blocks, the session runs on, and a later `wait` reports the death.
 #[test]
@@ -2270,4 +2270,425 @@ fn zero_timeout_wait_reports_a_dying_targets_refused_handler_continue_later()
     assert_eq!(session.wait(None).expect("wait"), Some(exited.clone()));
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(session.last_stop(), Some(&exited));
+}
+
+/// Where `libsystem_platform.dylib` is mapped in `handler_stopped_with_long_jump`: its
+/// file addresses are its runtime ones (no slide).
+const LONG_JUMP_IMAGE: Address = Address::new(0x2_0000_0000);
+/// `__longjmp` in that image, where the session traps a stopped handler's exit.
+const LONG_JUMP: Address = Address::new(0x2_0000_1000);
+
+/// A mapped `libsystem_platform.dylib` with one symbol, `__longjmp` at `LONG_JUMP`:
+/// `__TEXT` (one `__text` section at 0x1000..0x1100), `__LINKEDIT` from file offset
+/// 0x4000, its `nlist` at 0x4000 and string table at 0x5000.
+fn long_jump_image() -> Vec<u8>
+{
+    fn u32s(out: &mut Vec<u8>, values: &[u32])
+    {
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn u64s(out: &mut Vec<u8>, values: &[u64])
+    {
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn name(out: &mut Vec<u8>, name: &str)
+    {
+        let mut bytes = [0; 16];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    let base = LONG_JUMP_IMAGE.value();
+    let mut commands = Vec::new();
+    u32s(&mut commands, &[0x19, 72 + 80]);
+    name(&mut commands, "__TEXT");
+    u64s(&mut commands, &[base, 0x4000, 0, 0x4000]);
+    u32s(&mut commands, &[5, 5, 1, 0]);
+    name(&mut commands, "__text");
+    name(&mut commands, "__TEXT");
+    u64s(&mut commands, &[LONG_JUMP.value(), 0x100]);
+    u32s(&mut commands, &[0x1000, 2, 0, 0, 0x8000_0400, 0, 0, 0]);
+    u32s(&mut commands, &[0x19, 72]);
+    name(&mut commands, "__LINKEDIT");
+    u64s(&mut commands, &[base + 0x4000, 0x2000, 0x4000, 0x2000]);
+    u32s(&mut commands, &[1, 1, 0, 0]);
+    u32s(&mut commands, &[0x2, 24, 0x4000, 1, 0x5000, 0x10]);
+    let mut bytes = Vec::new();
+    u32s(
+        &mut bytes,
+        &[
+            0xfeed_facf,
+            0x0100_000c,
+            0,
+            6,
+            3,
+            u32::try_from(commands.len()).unwrap(),
+            0,
+            0,
+        ],
+    );
+    bytes.extend(commands);
+    bytes.resize(0x1000, 0);
+    bytes.extend(std::iter::repeat_n(0x1F, 0x3000));
+    u32s(&mut bytes, &[1]);
+    bytes.extend_from_slice(&[0x0f, 1, 0, 0]);
+    u64s(&mut bytes, &[LONG_JUMP.value()]);
+    bytes.resize(0x5000, 0);
+    bytes.extend_from_slice(b"\0__longjmp\0");
+    bytes.resize(0x6000, 0);
+    bytes
+}
+
+/// `handler_stopped_process` with `libsystem_platform.dylib` loaded, so the continue
+/// that lets a stopped handler run on traps `__longjmp` for its thread.
+fn handler_stopped_with_long_jump() -> MockBackend
+{
+    handler_stopped_process()
+        .with_region(LONG_JUMP_IMAGE, "r-x", long_jump_image())
+        .with_image(ferros_core::backend::LoadedImage {
+            path: "/usr/lib/system/libsystem_platform.dylib".into(),
+            load_address: LONG_JUMP_IMAGE,
+        })
+}
+
+/// Where `THREAD`'s breakpoint stop is taken in the handler-return tests of #165, inside
+/// `handler_stopped_process`'s code region and away from every breakpoint it sets.
+const HANDLER_PEER_SITE: Address = Address::new(0x1008);
+
+/// `THREAD`'s breakpoint stop at `HANDLER_PEER_SITE`, with `trap` there: none (a private
+/// trap that is gone), a session breakpoint (added here), or the program's `brk #1`.
+fn handler_peer_stop(session: &mut Session, trap: PeerTrap) -> MockStop
+{
+    let stop = MockStop::new(StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: HANDLER_PEER_SITE,
+    })
+    .set_pc(THREAD, HANDLER_PEER_SITE);
+    match trap {
+        PeerTrap::Stale => stop,
+        PeerTrap::Armed => {
+            session
+                .add_breakpoint(ferros_core::BreakpointRequest::Software {
+                    address: HANDLER_PEER_SITE,
+                })
+                .expect("breakpoint at the peer's stop");
+            stop
+        }
+        PeerTrap::Program => stop.write_memory(HANDLER_PEER_SITE, BRK_1),
+    }
+}
+
+/// `HANDLER`'s return to its breakpoint at `INTERRUPTED`, in the frame it interrupted.
+fn handler_return(registers: &ferros_core::Registers) -> MockStop
+{
+    MockStop::new(StopEvent::Breakpoint {
+        thread: HANDLER,
+        pc: INTERRUPTED,
+    })
+    .set_registers(HANDLER, registers.clone())
+}
+
+/// The session's step of `HANDLER` off its breakpoint at `INTERRUPTED`.
+fn handler_step_off() -> MockStop
+{
+    MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+        .set_pc(HANDLER, INTERRUPTED + 4)
+        .expect_resume(ResumeRequest::step(HANDLER))
+}
+
+/// #165: a stopped handler's return to its rendezvous is reported together with
+/// another thread's breakpoint stop at a private trap that is gone. That stop belongs to
+/// no request: it is dropped, and the user's continue is reissued.
+#[test]
+fn handler_return_drops_a_stale_trap_stop_reported_with_it()
+{
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session
+        .launch(&LaunchSpec::new("scripted-stale-handler-return"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let peer = handler_peer_stop(&mut session, PeerTrap::Stale);
+    mock.script_simultaneous(vec![
+        handler_return(&registers).expect_resume(ResumeRequest::continue_all()),
+        peer,
+    ]);
+    mock.script(handler_step_off());
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler return");
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all(),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all()
+        ],
+        "the user's continue was reissued"
+    );
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #165: the same stop at a real trap (a session breakpoint, or the program's own
+/// `brk #1`) is the caller's: it is reported, and the continue is not reissued.
+#[test]
+fn handler_return_reports_a_real_trap_stop_reported_with_it()
+{
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let mock = handler_stopped_process();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session
+            .launch(&LaunchSpec::new("scripted-real-handler-return"))
+            .expect("launch");
+        let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+        let peer = handler_peer_stop(&mut session, trap);
+        let reported = peer.event().clone();
+        mock.script_simultaneous(vec![
+            handler_return(&registers).expect_resume(ResumeRequest::continue_all()),
+            peer,
+        ]);
+        let _ = mock.take_calls();
+        session.resume().expect("let the handler return");
+        assert_eq!(session.wait(None).expect("wait"), Some(reported), "{trap:?}");
+        assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()], "{trap:?}");
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+        assert_eq!(mock.pending_len(), 0);
+    }
+}
+
+/// #165: the reissued continue after a stopped handler's return steps the handler off its
+/// breakpoint first; another thread's breakpoint stop at a private trap that is gone
+/// arrives just before that step, so the backend refuses it. The stop belongs to no
+/// request: it is dropped and the continue started again.
+#[test]
+fn handler_continue_drops_a_stale_trap_stop_that_refuses_it()
+{
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session
+        .launch(&LaunchSpec::new("scripted-stale-handler-refusal"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let peer = handler_peer_stop(&mut session, PeerTrap::Stale);
+    mock.script(handler_return(&registers).expect_resume(ResumeRequest::continue_all()));
+    mock.stop_before_nth_resume(2, std::iter::once(peer));
+    mock.script(handler_step_off());
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler return");
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all(),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all()
+        ],
+        "the refused step was issued again, then the continue"
+    );
+    assert_eq!(mock.peek_memory(INTERRUPTED, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #165: the same refusal for a stop at a real trap (a session breakpoint, or the
+/// program's own `brk #1`) is reported, and the step is not issued again.
+#[test]
+fn handler_continue_reports_a_real_trap_stop_that_refuses_it()
+{
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let mock = handler_stopped_process();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session
+            .launch(&LaunchSpec::new("scripted-real-handler-refusal"))
+            .expect("launch");
+        let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+        let peer = handler_peer_stop(&mut session, trap);
+        let reported = peer.event().clone();
+        mock.script(handler_return(&registers).expect_resume(ResumeRequest::continue_all()));
+        mock.stop_before_nth_resume(2, std::iter::once(peer));
+        let _ = mock.take_calls();
+        session.resume().expect("let the handler return");
+        assert_eq!(session.wait(None).expect("wait"), Some(reported), "{trap:?}");
+        assert_eq!(
+            resumes(&mock),
+            vec![ResumeRequest::continue_all(), ResumeRequest::step(HANDLER)],
+            "{trap:?}: the refused step was not issued again"
+        );
+        assert_eq!(mock.peek_memory(INTERRUPTED, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+        assert_eq!(mock.script_len(), 0);
+        assert_eq!(mock.pending_len(), 0);
+    }
+}
+
+/// `HANDLER` at `__longjmp`'s exit trap, inside its handler's frame.
+fn handler_at_long_jump(registers: &ferros_core::Registers) -> MockStop
+{
+    let mut at_entry = registers.clone();
+    at_entry.pc = LONG_JUMP;
+    at_entry.sp = Address::new(0x6F00);
+    MockStop::new(StopEvent::Breakpoint {
+        thread: HANDLER,
+        pc: LONG_JUMP,
+    })
+    .set_registers(HANDLER, at_entry)
+}
+
+/// #165: a stopped handler, let run on, hits the `__longjmp` exit trap armed for its
+/// continue, together with another thread's breakpoint stop at a private trap that is
+/// gone. That stop is dropped and the exit followed: the handler is stepped out of
+/// `__longjmp` to a landing still inside its own frame, so the rendezvous is kept and the
+/// user's continue reissued.
+#[test]
+fn handler_exit_drops_a_stale_trap_stop_reported_with_it()
+{
+    let mock = handler_stopped_with_long_jump();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session
+        .launch(&LaunchSpec::new("scripted-stale-handler-exit"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let peer = handler_peer_stop(&mut session, PeerTrap::Stale);
+    mock.script_simultaneous(vec![
+        handler_at_long_jump(&registers).expect_resume(ResumeRequest::continue_all()),
+        peer,
+    ]);
+    let mut landed = registers.clone();
+    landed.pc = INTERRUPTED + 40;
+    landed.sp = Address::new(0x7F00);
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+            .set_registers(HANDLER, landed)
+            .expect_resume(ResumeRequest::step(HANDLER)),
+    );
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler run on");
+    assert_eq!(
+        mock.peek_memory(LONG_JUMP, 4),
+        Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()),
+        "the exit is trapped"
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all(),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all()
+        ],
+        "the exit was followed, then the continue reissued"
+    );
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #165: the same stop at a real trap (a session breakpoint, or the program's own
+/// `brk #1`) is reported with the exit trap's stop, and the exit is not followed.
+#[test]
+fn handler_exit_reports_a_real_trap_stop_reported_with_it()
+{
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let mock = handler_stopped_with_long_jump();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session
+            .launch(&LaunchSpec::new("scripted-real-handler-exit"))
+            .expect("launch");
+        let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+        let peer = handler_peer_stop(&mut session, trap);
+        let reported = peer.event().clone();
+        mock.script_simultaneous(vec![
+            handler_at_long_jump(&registers).expect_resume(ResumeRequest::continue_all()),
+            peer,
+        ]);
+        let _ = mock.take_calls();
+        session.resume().expect("let the handler run on");
+        assert_eq!(session.wait(None).expect("wait"), Some(reported), "{trap:?}");
+        assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()], "{trap:?}");
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+        assert_eq!(mock.pending_len(), 0);
+    }
+}
+
+/// #165: following a stopped handler's exit steps it out of `__longjmp`; another
+/// thread's breakpoint stop at a private trap that is gone arrives just before that
+/// step, so the backend refuses it. The stop is dropped and the step issued again; the
+/// exit lands inside the handler's frame and the user's continue is reissued.
+#[test]
+fn handler_exit_step_drops_a_stale_trap_stop_that_refuses_it()
+{
+    let mock = handler_stopped_with_long_jump();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("scripted-stale-exit-step")).expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let peer = handler_peer_stop(&mut session, PeerTrap::Stale);
+    mock.script(handler_at_long_jump(&registers).expect_resume(ResumeRequest::continue_all()));
+    mock.stop_before_nth_resume(2, std::iter::once(peer));
+    let mut landed = registers.clone();
+    landed.pc = INTERRUPTED + 40;
+    landed.sp = Address::new(0x7F00);
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+            .set_registers(HANDLER, landed)
+            .expect_resume(ResumeRequest::step(HANDLER)),
+    );
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler run on");
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all(),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all()
+        ],
+        "the refused exit step was issued again, then the continue"
+    );
+    assert_eq!(mock.script_len(), 0);
+}
+
+/// #165: the same refusal for a stop at a real trap (a session breakpoint, or the
+/// program's own `brk #1`) is reported, and the exit step is not issued again.
+#[test]
+fn handler_exit_step_reports_a_real_trap_stop_that_refuses_it()
+{
+    for trap in [PeerTrap::Armed, PeerTrap::Program] {
+        let mock = handler_stopped_with_long_jump();
+        let mut session = Session::new(Box::new(mock.clone()));
+        session.launch(&LaunchSpec::new("scripted-real-exit-step")).expect("launch");
+        let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+        let peer = handler_peer_stop(&mut session, trap);
+        let reported = peer.event().clone();
+        mock.script(handler_at_long_jump(&registers).expect_resume(ResumeRequest::continue_all()));
+        mock.stop_before_nth_resume(2, std::iter::once(peer));
+        let _ = mock.take_calls();
+        session.resume().expect("let the handler run on");
+        assert_eq!(session.wait(None).expect("wait"), Some(reported), "{trap:?}");
+        assert_eq!(
+            resumes(&mock),
+            vec![ResumeRequest::continue_all(), ResumeRequest::step(HANDLER)],
+            "{trap:?}: the refused exit step was not issued again"
+        );
+        assert_eq!(session.state(), SessionState::Stopped);
+        assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 0);
+        assert_eq!(mock.script_len(), 0);
+        assert_eq!(mock.pending_len(), 0);
+    }
 }

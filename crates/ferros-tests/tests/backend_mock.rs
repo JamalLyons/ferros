@@ -304,6 +304,7 @@ impl MultiSiteImage
             .with_image(ferros_core::backend::LoadedImage {
                 path: path.clone(),
                 load_address: IMAGE_BASE,
+                uuid: None,
             });
         (Self(path), mock)
     }
@@ -2351,6 +2352,7 @@ fn handler_stopped_with_long_jump() -> MockBackend
         .with_image(ferros_core::backend::LoadedImage {
             path: "/usr/lib/system/libsystem_platform.dylib".into(),
             load_address: LONG_JUMP_IMAGE,
+            uuid: None,
         })
 }
 

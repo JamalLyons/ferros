@@ -25,6 +25,7 @@ fn mock() -> MockBackend
         .with_image(LoadedImage {
             path: "/bin/prog".into(),
             load_address: Address::new(CODE),
+            uuid: None,
         })
 }
 

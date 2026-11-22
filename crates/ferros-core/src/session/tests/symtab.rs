@@ -79,6 +79,7 @@ fn image_at(path: &str, address: u64) -> LoadedImage
     LoadedImage {
         path: format!("/nonexistent/{path}").into(),
         load_address: Address::new(address),
+        uuid: None,
     }
 }
 
@@ -229,4 +230,52 @@ fn a_listed_image_is_named_without_a_header_search()
         .filter(|call| matches!(call, MockCall::ReadMemory { len: 4, .. }))
         .collect();
     assert_eq!(probes, [], "no header probe for a listed image");
+}
+
+#[test]
+fn a_replaced_image_at_the_same_address_is_reread_only_when_its_uuid_changes()
+{
+    // Issue #121: path and load address do not identify a build. An image unloaded and
+    // replaced by a different one at the same place has a new UUID, and the names cached
+    // from the old symbol table must not survive. The same UUID, or both unknown, is the
+    // same image: a name already read is kept even when the mapped bytes change, because
+    // those bytes do not change while that image stays loaded. The UUID is the identity.
+    const IMAGE: u64 = 0x10_0000;
+    let (header, nlists, strings) = image();
+    let path = "/nonexistent/ferros-symtab-replaced";
+    let listed = |uuid| LoadedImage {
+        path: path.into(),
+        load_address: Address::new(IMAGE),
+        uuid,
+    };
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(IMAGE + 0x1010))
+        .with_region(Address::new(IMAGE), "r--", header)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_image(listed(None));
+    let mut session = launched(&mock);
+
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
+
+    // Both UUIDs unknown, and the string table now says `_bar`: the cached name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_bar\0");
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
+
+    // A UUID where there was none is a different image, so the new string is read.
+    mock.set_images(vec![listed(Some([1; 16]))]);
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("bar", SymbolSource::SymbolTable)));
+
+    // The same UUID again, with the string table now saying `_baz`: the name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_baz\0");
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("bar", SymbolSource::SymbolTable)));
+
+    // A different UUID at the same path and address reads the replacement's name.
+    mock.set_images(vec![listed(Some([2; 16]))]);
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("baz", SymbolSource::SymbolTable)));
 }

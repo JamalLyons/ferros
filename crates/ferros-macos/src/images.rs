@@ -13,7 +13,16 @@
 //! At the bootstrap stop, before dyld has set those fields, it is the `MH_DYLINKER`
 //! header the kernel mapped; dyld may later move itself (into the shared cache), and the
 //! list then follows the address dyld records.
+//!
+//! Each image's Mach-O UUID comes from `uuidArray` in that same structure (version 8 and
+//! later): one `dyld_uuid_info` per image that is not in the dyld shared cache, matched
+//! by load address. A missing, oversized or unreadable array leaves every UUID unset and
+//! still returns the list. Images the array does not cover stay `None`: shared-cache
+//! libraries, dyld when it lives in the cache, and the executable at the bootstrap stop
+//! before dyld publishes the array. Their `LC_UUID` is in the mapped header, but reading
+//! it for every shared-cache image is a remote read each, so it is not done.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -172,6 +181,18 @@ const DYLD_LOAD_ADDRESS_OFFSET: usize = 32;
 /// Offset of `dyldPath` in the 64-bit `dyld_all_image_infos` (version 15+).
 const DYLD_PATH_OFFSET: usize = 192;
 
+/// Offset of `uuidArrayCount` in the 64-bit `dyld_all_image_infos` (version 8+).
+const UUID_ARRAY_COUNT_OFFSET: usize = 88;
+
+/// Offset of `uuidArray` in the 64-bit `dyld_all_image_infos` (version 8+).
+const UUID_ARRAY_OFFSET: usize = 96;
+
+/// `struct dyld_uuid_info`: an 8-byte load address, then `uuid_t` (16 bytes).
+const UUID_INFO_SIZE: usize = 24;
+
+/// First `dyld_all_image_infos` version that records `uuidArray`.
+const UUID_ARRAY_VERSION: u32 = 8;
+
 /// Bytes of `dyld_all_image_infos` read: everything up to and including `dyldPath`.
 const ALL_IMAGE_INFOS_PREFIX: usize = DYLD_PATH_OFFSET + 8;
 
@@ -199,10 +220,82 @@ fn dyld_fields(bytes: &[u8]) -> Option<(u64, u64)>
     Some((load_address, path))
 }
 
+/// `uuidArrayCount` and `uuidArray` in a prefix of the 64-bit `dyld_all_image_infos`.
+///
+/// `None` when `bytes` is older than version 8, shorter than the pointer, or the count is
+/// zero, the pointer is null, or the count is above [`MAX_IMAGES`]. A bad count leaves
+/// UUIDs unset rather than failing the image list. The count is small enough that that
+/// many [`UUID_INFO_SIZE`]-byte records fit at the returned address.
+fn uuid_array_fields(bytes: &[u8]) -> Option<(usize, u64)>
+{
+    let version = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if version < UUID_ARRAY_VERSION || bytes.len() < UUID_ARRAY_OFFSET + 8 {
+        return None;
+    }
+    let count = usize::try_from(word(bytes, UUID_ARRAY_COUNT_OFFSET)).ok()?;
+    let array = word(bytes, UUID_ARRAY_OFFSET);
+    if count == 0 || array == 0 || count > MAX_IMAGES {
+        return None;
+    }
+    let size = count.checked_mul(UUID_INFO_SIZE)?;
+    array.checked_add(u64::try_from(size).ok()?)?;
+    Some((count, array))
+}
+
+/// `dyld_uuid_info` records. A trailing partial record is ignored. A null load address
+/// is not an image and is skipped.
+fn decode_uuid_infos(records: &[u8]) -> Vec<(u64, [u8; 16])>
+{
+    let mut found = Vec::new();
+    for record in records.as_chunks::<UUID_INFO_SIZE>().0 {
+        let load_address = word(record, 0);
+        if load_address == 0 {
+            continue;
+        }
+        let uuid = record[8..24].try_into().expect("dyld_uuid_info uuid is 16 bytes");
+        found.push((load_address, uuid));
+    }
+    found
+}
+
+/// UUIDs from `uuidArray`, keyed by load address. A failed or inconsistent read yields an
+/// empty map: the image list is still returned, with UUIDs unset.
+fn image_uuids(task: mach_port_t, infos: &[u8]) -> HashMap<u64, [u8; 16]>
+{
+    let Some((count, array)) = uuid_array_fields(infos) else {
+        return HashMap::new();
+    };
+    let Some(size) = count.checked_mul(UUID_INFO_SIZE) else {
+        return HashMap::new();
+    };
+    let records = match read_target(task, Address::new(array), size) {
+        Ok(records) if records.len() == size => records,
+        Ok(_) => {
+            tracing::debug!("dyld uuid array at {array:#x} was truncated; leaving UUIDs unset");
+            return HashMap::new();
+        }
+        Err(error) => {
+            tracing::debug!("dyld uuid array at {array:#x}: {error}; leaving UUIDs unset");
+            return HashMap::new();
+        }
+    };
+    decode_uuid_infos(&records).into_iter().collect()
+}
+
+fn with_uuid(path: PathBuf, load_address: Address, uuids: &HashMap<u64, [u8; 16]>) -> LoadedImage
+{
+    LoadedImage {
+        path,
+        load_address,
+        uuid: uuids.get(&load_address.value()).copied(),
+    }
+}
+
 /// dyld as a loaded image, from the prefix `bytes` of `dyld_all_image_infos`, unless
 /// `images` already holds its load address. Only a mapped `MH_DYLINKER` header at the
 /// recorded address is listed; anything else leaves dyld out rather than failing the list.
-fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage]) -> Option<LoadedImage>
+fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &HashMap<u64, [u8; 16]>)
+-> Option<LoadedImage>
 {
     let (load_address, path_address) = dyld_fields(bytes)?;
     let load_address = Address::new(load_address);
@@ -221,7 +314,7 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage]) -> Option
             PathBuf::from(DEFAULT_DYLD_PATH)
         })
     };
-    Some(LoadedImage { path, load_address })
+    Some(with_uuid(path, load_address, uuids))
 }
 
 /// Compatibility for `POSIX_SPAWN_START_SUSPENDED`: dyld has not populated its array.
@@ -237,23 +330,18 @@ fn bootstrap_images(task: mach_port_t, pid: ProcessId, infos: Option<&[u8]>) -> 
     let path = vnode_path(pid)
         .or_else(|| exec_path(pid))
         .ok_or_else(|| invalid("cannot locate main executable path"))?;
+    let uuids = infos.map(|infos| image_uuids(task, infos)).unwrap_or_default();
     let regions = get_memory_regions(task)?;
     let mut readable = regions.iter().filter(|region| region.is_readable());
     let executable = readable
         .clone()
         .find(|region| is_executable_header(task, region.start))
         .ok_or_else(|| invalid("loader is uninitialized and the executable header is unavailable"))?;
-    let mut images = vec![LoadedImage {
-        path,
-        load_address: executable.start,
-    }];
-    let dyld = infos.and_then(|infos| dyld_image(task, infos, &images)).or_else(|| {
+    let mut images = vec![with_uuid(path, executable.start, &uuids)];
+    let dyld = infos.and_then(|infos| dyld_image(task, infos, &images, &uuids)).or_else(|| {
         readable
             .find(|region| is_header_of_type(task, region.start, MH_DYLINKER))
-            .map(|region| LoadedImage {
-                path: PathBuf::from(DEFAULT_DYLD_PATH),
-                load_address: region.start,
-            })
+            .map(|region| with_uuid(PathBuf::from(DEFAULT_DYLD_PATH), region.start, &uuids))
     });
     images.extend(dyld);
     Ok(images)
@@ -313,17 +401,23 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
         images.push(LoadedImage {
             path: remote_path(task, word(record, 8))?,
             load_address: Address::new(load_address),
+            uuid: None,
         });
     }
     if read_target(task, address, 16)? != before {
         return Err(invalid("image list changed while reading"));
+    }
+    // A failed UUID read must not fail the list. Shared-cache images are absent here.
+    let uuids = image_uuids(task, &infos);
+    for image in &mut images {
+        image.uuid = uuids.get(&image.load_address.value()).copied();
     }
     // Preserve the existing main-first contract for callers; dyld's order is not an API.
     // The main image is found by its header, so this holds after its file is unlinked.
     if let Some(index) = images.iter().position(|image| is_executable_header(task, image.load_address)) {
         images.swap(0, index);
     }
-    images.extend(dyld_image(task, &infos, &images));
+    images.extend(dyld_image(task, &infos, &images, &uuids));
     Ok(images)
 }
 
@@ -384,5 +478,48 @@ mod tests
         assert_eq!(parse_exec_path(&procargs(b"")), None);
         assert_eq!(parse_exec_path(b"/no"), None);
         assert_eq!(parse_exec_path(&[0, 0, 0, 0, b'/', b'x']), None);
+    }
+
+    /// Write `count` and `array` into a version-`version` prefix of `len` bytes.
+    fn uuid_infos(version: u32, len: usize, count: u64, array: u64) -> Vec<u8>
+    {
+        let mut bytes = infos(version, ALL_IMAGE_INFOS_PREFIX, 0, 0);
+        bytes[UUID_ARRAY_COUNT_OFFSET..UUID_ARRAY_COUNT_OFFSET + 8].copy_from_slice(&count.to_le_bytes());
+        bytes[UUID_ARRAY_OFFSET..UUID_ARRAY_OFFSET + 8].copy_from_slice(&array.to_le_bytes());
+        bytes.truncate(len);
+        bytes
+    }
+
+    #[test]
+    fn uuid_array_fields_follow_version_length_and_the_count_cap()
+    {
+        let full = ALL_IMAGE_INFOS_PREFIX;
+        assert_eq!(uuid_array_fields(&uuid_infos(8, full, 2, 0x4000)), Some((2, 0x4000)));
+        assert_eq!(uuid_array_fields(&uuid_infos(17, full, 1, 0x4000)), Some((1, 0x4000)));
+        // Version 7 has no `uuidArray`, whatever those bytes hold.
+        assert_eq!(uuid_array_fields(&uuid_infos(7, full, 2, 0x4000)), None);
+        // The pointer does not fit in a shorter prefix.
+        assert_eq!(uuid_array_fields(&uuid_infos(8, UUID_ARRAY_OFFSET + 7, 2, 0x4000)), None);
+        assert_eq!(uuid_array_fields(&uuid_infos(8, full, 0, 0x4000)), None);
+        assert_eq!(uuid_array_fields(&uuid_infos(8, full, 2, 0)), None);
+        assert_eq!(uuid_array_fields(&uuid_infos(8, full, (MAX_IMAGES as u64) + 1, 0x4000)), None);
+        assert_eq!(uuid_array_fields(&[]), None);
+    }
+
+    #[test]
+    fn decode_uuid_infos_reads_load_address_and_uuid()
+    {
+        let mut records = Vec::new();
+        records.extend_from_slice(&0x1000_u64.to_le_bytes());
+        records.extend_from_slice(&[0xAB; 16]);
+        // A null load address is not an image.
+        records.extend_from_slice(&0_u64.to_le_bytes());
+        records.extend_from_slice(&[0xCD; 16]);
+        records.extend_from_slice(&0x2000_u64.to_le_bytes());
+        records.extend_from_slice(&[0x11; 16]);
+        // A trailing partial record is ignored.
+        records.extend_from_slice(&[0xFF; 8]);
+        assert_eq!(decode_uuid_infos(&records), vec![(0x1000, [0xAB; 16]), (0x2000, [0x11; 16])]);
+        assert!(decode_uuid_infos(&[]).is_empty());
     }
 }

@@ -27,8 +27,14 @@ struct FailedLoad
     error: DebuggerError,
 }
 
-/// A loaded image and what the session learned about it while it stays mapped at its
-/// load address: its mapping, its symbols, and why they could not be loaded.
+/// A loaded image and what the session learned about it while that same image stays
+/// mapped: its mapping, its symbols, and why they could not be loaded.
+///
+/// The same image is the same path, load address and Mach-O UUID. Two unknown UUIDs
+/// (`None`) compare equal, which is the whole identity for a backend that reports none.
+/// A different UUID is a different build loaded where the previous one was, so the
+/// mapping, the symbol table, the DWARF id and the failure records are dropped and read
+/// again.
 ///
 /// Symbol loading keeps one of three outcomes: the loaded symbols; missing debug info
 /// (kept until the image is unloaded); or another failure, kept only while the files it
@@ -38,13 +44,20 @@ struct FailedLoad
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
+    /// Mach-O `LC_UUID` reported with this image, or `None` when the backend had none.
+    uuid: Option<[u8; 16]>,
     /// The layout read from the image's mapped header, or why it could not be read.
-    /// Mapped memory does not change while the image stays loaded at this address, so
-    /// the result is kept until the loader reports it unloaded or moved.
+    /// Mapped memory does not change while this image stays loaded, so the result is kept
+    /// until the loader reports a different path, address or UUID.
     mapping: std::result::Result<ImageMapping, String>,
     /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
-    /// images by the canonical path resolved at load time; a relative loader path may stop
-    /// resolving later (issue #99), so retention follows this id, not the path.
+    /// images by the canonical path resolved at load time and the load address
+    /// ([`ImageId`]), not by UUID. A relative loader path may stop resolving later
+    /// (issue #99), so retention follows this id, not the path. A changed UUID builds a
+    /// new [`SessionImage`] with this unset, so [`SymbolCache::retain_ids`] drops the
+    /// previous parse and the next load reads the file again. An entry kept for the same
+    /// path and address across that change would still return the first parse; the key
+    /// is not changed here (issue #121).
     symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
     /// without repeatedly running dsymutil.
@@ -53,7 +66,7 @@ pub(super) struct SessionImage
     failed_load: Option<FailedLoad>,
     /// The image's symbol table layout as mapped in the target, read on the first frame
     /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
-    /// it holds until the image is unloaded or moved.
+    /// it holds until the loader reports a different path, address or UUID.
     pub(super) symtab: Option<SessionSymtab>,
     /// The symbol request whose read of the symbol table layout last failed. The failure
     /// is not kept past that request.
@@ -144,8 +157,9 @@ impl Session
     }
 
     /// Map a file virtual address within a particular loaded image to runtime memory.
-    /// `image` must still be loaded at the supplied load address; otherwise, or when the
-    /// address is outside the image's mapped segments, the result is `None`.
+    /// `image` must still be loaded at the supplied load address with the same UUID
+    /// (`None` matches `None`); otherwise, or when the address is outside the image's
+    /// mapped segments, the result is `None`.
     ///
     /// The layout comes from the Mach-O header the loader mapped, not from the file at
     /// `image.path`, so a file replaced or removed on disk does not change the result.
@@ -159,7 +173,9 @@ impl Session
         self.require_stopped()?;
         self.load_images()?;
         let Some(entry) = self.loaded_images.iter().find(|entry| {
-            entry.descriptor.path == image.path && entry.descriptor.load_address == image.load_address.value()
+            entry.descriptor.path == image.path
+                && entry.descriptor.load_address == image.load_address.value()
+                && entry.uuid == image.uuid
         }) else {
             return Ok(None);
         };
@@ -194,6 +210,10 @@ impl Session
     /// Refresh mappings without requesting DWARF or reading image files. Images whose
     /// mapped header has no segment at file offset zero (for example libraries in the
     /// shared cache) stay unmapped, which is harmless here.
+    ///
+    /// A previous [`SessionImage`] is reused only when its path, load address and UUID are
+    /// unchanged. A new UUID starts a fresh image, and its DWARF cache id is then absent
+    /// from the set passed to [`SymbolCache::retain_ids`].
     pub(super) fn load_images(&mut self) -> Result<()>
     {
         let images = match self.backend.images() {
@@ -201,23 +221,23 @@ impl Session
             Err(BackendError::Unsupported(_)) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let descriptors: Vec<_> = images
-            .into_iter()
-            .map(|image| ImageDescriptor {
+        let mut previous = std::mem::take(&mut self.loaded_images);
+        for image in images {
+            let descriptor = ImageDescriptor {
                 path: image.path,
                 load_address: image.load_address.value(),
-            })
-            .collect();
-        let mut previous = std::mem::take(&mut self.loaded_images);
-        for descriptor in descriptors {
+            };
             if let Some(index) = previous.iter().position(|entry| {
-                entry.descriptor.path == descriptor.path && entry.descriptor.load_address == descriptor.load_address
+                entry.descriptor.path == descriptor.path
+                    && entry.descriptor.load_address == descriptor.load_address
+                    && entry.uuid == image.uuid
             }) {
                 self.loaded_images.push(previous.swap_remove(index));
             } else {
                 let mapping = self.map_loaded_image(descriptor.load_address);
                 self.loaded_images.push(SessionImage {
                     descriptor,
+                    uuid: image.uuid,
                     mapping,
                     symbols: None,
                     no_debug_info: None,

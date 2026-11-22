@@ -692,6 +692,7 @@ fn stack_trace_reads_memory_through_the_backend_and_skips_bad_images()
         .with_image(LoadedImage {
             path: "/nonexistent/ferros-session-test-image".into(),
             load_address: Address::new(CODE),
+            uuid: None,
         });
     let mut session = launched(&mock);
     let frames = session.stack_trace(8).expect("stack trace");
@@ -717,6 +718,7 @@ fn runtime_address_reports_the_original_header_failure_once_read()
     let image = LoadedImage {
         path: "/nonexistent/ferros-session-test-image".into(),
         load_address: Address::new(CODE),
+        uuid: None,
     };
     let mock = process().with_image(image.clone());
     let mut session = launched(&mock);
@@ -741,6 +743,14 @@ fn runtime_address_reports_the_original_header_failure_once_read()
             },
             MockCall::Images
         ]
+    );
+    let different = LoadedImage {
+        uuid: Some([0x11; 16]),
+        ..image.clone()
+    };
+    assert_eq!(
+        session.runtime_address(&different, 0x1_0000_0000).expect("different image"),
+        None
     );
     let moved = LoadedImage {
         load_address: Address::new(CODE + 0x1000),
@@ -778,6 +788,7 @@ fn symbolicate_reports_an_unreadable_image_every_time_and_stack_traces_continue(
     let image = LoadedImage {
         path: "/nonexistent/ferros-session-test-image".into(),
         load_address: Address::new(IMAGE),
+        uuid: None,
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x40))

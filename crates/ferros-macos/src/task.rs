@@ -323,6 +323,9 @@ pub struct MacOSBackend
     peeked: Option<LoopEvent>,
     /// Cached memory pages for repeated reads; cleared whenever the target may run.
     memory_cache: MemoryCache,
+    /// Mapped `LC_UUID` values by load address. Headers stay valid while the image stays
+    /// mapped, so this survives stops and is cleared when the task goes away (#182).
+    mapped_uuids: images::MappedUuidCache,
     /// Threads the last resume `thread_suspend`ed (action `Suspend`), each once; balanced
     /// with `thread_resume` when the next stop is delivered and on every teardown path.
     suspended_threads: Vec<thread_act_t>,
@@ -381,6 +384,7 @@ impl MacOSBackend
             events_rx: None,
             peeked: None,
             memory_cache: MemoryCache::new(),
+            mapped_uuids: images::MappedUuidCache::default(),
             suspended_threads: Vec::new(),
             stepping_threads: Vec::new(),
         })
@@ -553,6 +557,7 @@ impl MacOSBackend
 
         *lock_shared(&self.exception_state) = ExceptionSharedState::new();
         self.memory_cache.clear();
+        self.mapped_uuids.clear();
         self.peeked = None;
 
         if let Err(err) = self.start_exception_handler() {
@@ -1091,6 +1096,7 @@ impl MacOSBackend
         self.traced = false;
         self.state = BackendState::NoProcess;
         self.memory_cache.clear();
+        self.mapped_uuids.clear();
         *lock_shared(&self.exception_state) = ExceptionSharedState::new();
     }
 
@@ -2066,7 +2072,11 @@ impl Backend for MacOSBackend
     fn images(&mut self) -> BackendResult<Vec<LoadedImage>>
     {
         self.require_stopped("images")?;
-        images::loaded_images(self.task, self.pid).map_err(backend_error)
+        let lookup = images::current_uuid_lookup();
+        if lookup == images::UuidLookup::Cache {
+            images::sync_test_epoch(&mut self.mapped_uuids);
+        }
+        images::loaded_images_with(self.task, self.pid, &mut self.mapped_uuids, lookup).map_err(backend_error)
     }
 
     fn architecture(&self) -> Architecture

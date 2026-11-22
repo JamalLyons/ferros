@@ -84,6 +84,19 @@ jobs:
       run: sudo security authorizationdb write system.privilege.taskport allow
     - name: Integration tests
       run: just test-integration
+    # `measure_mapped_uuid_and_backtrace_cost` writes the before/after #170 timings here.
+    # libtest swallows the test's own output when it passes, so print the file explicitly.
+    - name: Mapped UUID measurement
+      if: always()
+      run: |
+        file=target/ferros-uuid-measure.txt
+        if [ -f "$file" ]; then
+          echo "Mapped UUID measurement (#182):"
+          cat "$file"
+        else
+          echo "mapped UUID measurement file is missing" >&2
+          exit 1
+        fi
     - name: Authorization log
       if: always()
       run: |

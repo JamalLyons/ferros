@@ -2,6 +2,7 @@
 //! (issue #121), and the mapped-header UUID cache (issue #182).
 #![cfg(target_os = "macos")]
 
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,21 +195,36 @@ fn measure_mapped_uuid_and_backtrace_cost()
         let cached_backtrace_us = cached_backtrace.as_micros();
         let cached_backtrace_reads = mapped_uuid_header_reads().saturating_sub(cached_warm_reads);
 
-        let line = format!(
-            "images={image_count} frames={frames} before_images_us={before_images_us} \
-             before_images_header_reads={before_reads} before_backtrace_us={before_backtrace_us} \
-             after_images_us={after_images_us} after_images_header_reads={after_reads} \
-             after_backtrace_us={after_backtrace_us} cached_cold_images_us={cached_cold_images_us} \
-             cached_cold_header_reads={cached_cold_reads} cached_warm_images_us={cached_warm_images_us} \
-             cached_warm_header_reads={cached_warm_reads} cached_backtrace_us={cached_backtrace_us} \
-             cached_backtrace_header_reads={cached_backtrace_reads}"
-        );
+        // One field per `write`: a single `format!` of every sample is a stack array
+        // larger than clippy's `large_stack_arrays` limit.
+        let mut line = String::new();
+        let mut put = |key: &str, value: u128| {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            write!(line, "{key}={value}").expect("format a measurement field");
+        };
+        put("images", u128::from(image_count));
+        put("frames", u128::from(frames));
+        put("before_images_us", before_images_us);
+        put("before_images_header_reads", u128::from(before_reads));
+        put("before_backtrace_us", before_backtrace_us);
+        put("after_images_us", after_images_us);
+        put("after_images_header_reads", u128::from(after_reads));
+        put("after_backtrace_us", after_backtrace_us);
+        put("cached_cold_images_us", cached_cold_images_us);
+        put("cached_cold_header_reads", u128::from(cached_cold_reads));
+        put("cached_warm_images_us", cached_warm_images_us);
+        put("cached_warm_header_reads", u128::from(cached_warm_reads));
+        put("cached_backtrace_us", cached_backtrace_us);
+        put("cached_backtrace_header_reads", u128::from(cached_backtrace_reads));
         let path = measurement_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap_or_else(|error| panic!("create {}: {error}", parent.display()));
         }
-        fs::write(&path, format!("{line}\n")).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
         eprintln!("FERROS_UUID_MEASURE {line}");
+        line.push('\n');
+        fs::write(&path, &line).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
 
         assert_eq!(before_reads, 0, "skipping mapped reads still read headers: {line}");
         assert!(

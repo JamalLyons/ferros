@@ -31,6 +31,12 @@
 //! `images()` and a deep backtrace with the reads skipped (before #170), repeated (after
 //! #170), and cached. On the macOS runner it writes the timings to
 //! `target/ferros-uuid-measure.txt`.
+//!
+//! One run of that test on the GitHub `integration-macos` runner (macOS 15, arm64), a
+//! stopped `recursion` process with 45 images and a 77-frame trace, medians of five
+//! `images()` calls and three traces: 72 µs and 0 header reads before #170, 246 µs and
+//! 88 header reads after, 103 µs and 0 header reads once the cache was warm. The trace
+//! was 1590 µs, 1747 µs, and 1590 µs for those three. A later run prints its own line.
 
 use std::cell::Cell;
 use std::collections::HashMap;

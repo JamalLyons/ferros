@@ -74,9 +74,11 @@ pub enum SymbolSource
     /// a source location.
     DebugInfo,
     /// Only the image's symbol table (Mach-O `LC_SYMTAB`), for code without DWARF: the
-    /// nearest symbol at or before the address. Such a name has no source location, and
-    /// in a stripped or shared-cache image it can be the name of an earlier function when
-    /// the containing one has no symbol of its own.
+    /// nearest symbol at or before the address. Such a name has no source location. On
+    /// current macOS a dyld shared-cache image's mapped table includes its local symbols.
+    /// A stripped image, or an older cache that keeps locals in a separate `.symbols`
+    /// file which is not read, can name a pc after an earlier function when the
+    /// containing one has no symbol of its own.
     SymbolTable,
 }
 

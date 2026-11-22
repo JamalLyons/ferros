@@ -12,10 +12,11 @@
 //! file offsets; `__LINKEDIT`'s `fileoff` relates them to its `vmaddr`. This works the
 //! same for an image in the dyld shared cache, whose offsets are offsets in the cache file
 //! and whose `__LINKEDIT` is the cache's shared one; such an image has no file on disk to
-//! read at all. The cache keeps only the exported and global symbols in that table (its
-//! local symbols live in a separate `.symbols` file), so a static function in a cache
-//! library is named after the nearest preceding exported one. The names that a stack
-//! trace's base frames need (`_pthread_start`, `thread_start`) are exported.
+//! read at all. On current macOS the cache's mapped symbol table for each image includes
+//! its local (static) symbols. Older caches that moved locals to a separate `.symbols`
+//! file (header `localSymbolsOffset`, or a `.symbols` file beside the cache) are not read,
+//! so there a static function is named after the nearest preceding symbol or, with
+//! function starts, gets no name.
 //!
 //! A symbol names a pc only up to the next function start. The starts come from the
 //! image's `LC_FUNCTION_STARTS` (ULEB128 deltas in `__LINKEDIT`, as lldb reads them;

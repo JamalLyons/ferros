@@ -133,3 +133,8 @@ test = false
 name = "ferros-fixture-long_jump"
 path = "fixtures/long_jump.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-pthread_once"
+path = "fixtures/pthread_once.rs"
+test = false

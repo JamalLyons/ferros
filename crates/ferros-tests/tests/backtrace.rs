@@ -7,11 +7,11 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
+use ferros_core::{Address, BreakpointLocation, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
-use ferros_tests::{Fixture, fixture};
+use ferros_tests::{Fixture, find_marker, fixture};
 
 /// How long a test waits for one stop after resuming.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -893,5 +893,97 @@ fn backtrace_after_the_epilogue_of_a_frameless_function_keeps_the_callers_sp()
                 "stopped at {stop}: {frames:#?}"
             );
         }
+    });
+}
+
+/// Stopped in `init_routine`, the frame directly above it is `__pthread_once_handler`.
+///
+/// That function is static (non-external) in `libsystem_pthread`, a library in the dyld
+/// shared cache. Current macOS keeps each cache library's local symbols in the mapped
+/// symbol table: there is no separate `.symbols` file, and the cache header's
+/// local-symbols range is empty, so the name comes from the image's own `LC_SYMTAB`
+/// (issue #121). The Mach-O symbol is `___pthread_once_handler`; one leading underscore
+/// is stripped.
+#[test]
+fn backtrace_through_a_static_shared_cache_function_names_it()
+{
+    harness::run(|t| {
+        let fixture = fixture!("pthread_once");
+        let mut d = t.launch(&fixture);
+        let source_path = fixture.source_path().with_file_name("c").join("pthread_once.c");
+        let source =
+            std::fs::read_to_string(&source_path).unwrap_or_else(|err| panic!("read {}: {err}", source_path.display()));
+        let marker_line = |marker: &str| {
+            find_marker(&source, marker).unwrap_or_else(|err| panic!("marker {marker} in pthread_once.c: {err:?}"))
+        };
+        let in_init = marker_line("in_init");
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "pthread_once.c".into(),
+            line: in_init,
+        })
+        .expect("break in init_routine");
+        d.resume().expect("resume");
+        match d.wait(Some(STOP_TIMEOUT)).expect("wait") {
+            Some(StopEvent::Breakpoint { thread, .. }) => {
+                d.select_thread(thread).expect("select the stopped thread");
+            }
+            other => panic!("expected a breakpoint stop in init_routine, got {other:?}"),
+        }
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        assert!(
+            frames.len() > 1,
+            "static __pthread_once_handler is absent from the mapped symbol table of libsystem_pthread: no caller of \
+             init_routine: {frames:#?}"
+        );
+
+        let init = &frames[0];
+        let init_symbol = init.symbol.as_ref().expect("init_routine has a DWARF name");
+        assert_eq!(init_symbol.display_name(), "init_routine", "{frames:#?}");
+        assert_eq!(init_symbol.source(), SymbolSource::DebugInfo, "{frames:#?}");
+        let init_at = init.location.as_ref().expect("init_routine has a source location");
+        assert!(init_at.file.ends_with("pthread_once.c"), "{init_at:?}");
+        assert_eq!(init_at.line, Some(in_init), "{init_at:?}");
+
+        let handler = &frames[1];
+        let handler_name = handler.symbol.as_ref().map(ferros_core::SymbolName::display_name);
+        assert_eq!(
+            handler_name,
+            Some("__pthread_once_handler"),
+            "static __pthread_once_handler is absent from the mapped symbol table of libsystem_pthread (no separate \
+             .symbols file is read); the frame above init_routine is {handler_name:?}: {frames:#?}"
+        );
+        assert_symbol_table_frame(handler);
+
+        let images = d.images().expect("images");
+        let image = images
+            .iter()
+            .filter(|image| image.load_address <= handler.pc)
+            .max_by_key(|image| image.load_address)
+            .unwrap_or_else(|| panic!("no image contains {}: {images:?}", handler.pc));
+        assert!(
+            image.path.ends_with("libsystem_pthread.dylib"),
+            "pc {} of __pthread_once_handler is in {}, not libsystem_pthread.dylib",
+            handler.pc,
+            image.path.display()
+        );
+
+        let call_once = marker_line("call_once");
+        let main = frames
+            .iter()
+            .find(|frame| frame.symbol.as_ref().is_some_and(|symbol| symbol.display_name() == "main"))
+            .unwrap_or_else(|| panic!("no main frame: {frames:#?}"));
+        assert!(main.index > handler.index, "main is below the handler: {frames:#?}");
+        let main_symbol = main.symbol.as_ref().expect("main has a name");
+        assert_eq!(main_symbol.source(), SymbolSource::DebugInfo, "{main:#?}");
+        let main_at = main.location.as_ref().expect("main has a DWARF location");
+        assert!(main_at.file.ends_with("pthread_once.c"), "{main_at:?}");
+        assert_eq!(main_at.line, Some(call_once), "{main_at:?}");
+
+        assert!(
+            frames.iter().all(|frame| frame.symbol.is_some()),
+            "an unnamed frame: {frames:#?}"
+        );
     });
 }

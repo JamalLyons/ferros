@@ -9,7 +9,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines nineteen fixture binaries:
+The crate defines twenty fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -32,6 +32,18 @@ The crate defines nineteen fixture binaries:
   (marker `after_jump`). With `--handler`, a SIGUSR1 handler (marker `in_handler`) leaves
   by `siglongjmp`, and its caller then calls `raise(0)` from the same frame (marker
   `raise_again`). Used for stepping across non-local exits (issue #141).
+- `ferros-fixture-pthread_once`: A C program (`fixtures/c/pthread_once.c`, compiled and linked
+  by `build.rs`; `fixtures/pthread_once.rs` is a `#![no_main]` stub) whose markers live in the
+  C source. `main` (marker `call_once`) calls `pthread_once` on a static `pthread_once_t`. The
+  callback `init_routine` (marker `in_init`) is entered from `__pthread_once_handler`, a static
+  function of `libsystem_pthread` in the dyld shared cache. Used for a backtrace that names
+  that function from the cache image's symbol table (issue #121).
+- `ferros-fixture-caught_panic`: `inner` panics (marker `in_inner`) and `main`'s `catch_unwind`
+  catches it; `middle` (marker `call_inner`) never sees the call return. `after_catch` is the
+  first line after `catch_unwind`.
+- `ferros-fixture-step_targets`: Callees whose demangled names do not parse as paths: a trait
+  method on `Gate` with a bracket const-generic argument (markers `call_trait`, `in_trait`) and
+  a closure called through `&dyn Fn` (markers `call_closure`, `in_closure`).
 - `ferros-fixture-recursion`: `descend` recurses to the depth given by the first argument (default 60);
   marker `bottom` is reached at the deepest call. Used for deep backtraces.
 - `ferros-fixture-signal_handler`: Installs a SIGCONT observer and reports when it runs (macOS).
@@ -174,7 +186,9 @@ fn resume_runs_hello()
   a spawned thread's trace ending at its base, a 60-level `recursion` trace under one second, and
   every frame pc in an executable region, an inlined frame in `symbols`, and a stop inside the
   frameless `leaf_mix`, and a stop on the `add sp` and the `ret` of the
-  frameless `_frameless_spill` with a stack allocation (issue #130).
+  frameless `_frameless_spill` with a stack allocation (issue #130), and a stop in
+  `pthread_once`'s `init_routine` that names the static `__pthread_once_handler` in the dyld
+  shared cache from that image's symbol table (issue #121).
 - `tests/code_writes.rs` checks that code the backend writes is what the target executes next
   (issue #80): a `brk` planted over an instruction the `hot_loop` threads have cached stops them.
 - `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit

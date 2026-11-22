@@ -1,14 +1,17 @@
 # Ferros Debugger Roadmap
 
-_Last updated: 2026-11-13_
+_Last updated: 2026-11-22_
 
-**Status:** Items are ticked once a test exercises them. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26).
+**Status:** Items are ticked once a test exercises them. The tracking epic is [#26](https://github.com/JamalLyons/ferros/issues/26) (72 of 75 sub-issues closed; still open: the owner walkthrough [#40](https://github.com/JamalLyons/ferros/issues/40) and follow-ups [#182](https://github.com/JamalLyons/ferros/issues/182) and [#183](https://github.com/JamalLyons/ferros/issues/183)). Phase 2, inspecting values, stays gated on [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41). Hardware breakpoints, watchpoints, and x86-64 macOS are not done.
 
-**Verified today by automated tests (`crates/ferros-tests`):**
+**Verified today by automated tests (`crates/ferros-tests`, plus the REPL tests in `crates/ferros`):**
 - **Process control & lifecycle**: launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (`tests/lifecycle.rs`, `tests/smoke.rs`).
 - **Stop handling loop**: Mach exception port loop event pump surfaces asynchronous stops (`StopEvent` for breakpoints, signals, exits) to `Session::wait` without polling (`tests/exceptions.rs`, `tests/lifecycle.rs`).
-- **Software breakpoints**: software breakpoints (`BRK`), hit counting, enable/disable/remove, trap-hiding on memory reads, trap cleanup on drop/detach, and serial step-overs on resume (`tests/breakpoints.rs`).
-- **Single-stepping**: hardware single-step (`MDSCR_EL1.SS`) and per-thread stepping while keeping other threads suspended (`tests/single_step.rs`).
+- **Software breakpoints**: software breakpoints (`BRK`), hit counting, enable/disable/remove, trap-hiding on memory reads, trap cleanup on drop/detach, serial step-overs on resume (`tests/breakpoints.rs`), and source breakpoints by `file:line` and function name (`tests/source_breakpoints.rs`).
+- **Single-stepping**: hardware single-step (`MDSCR_EL1.SS`) and per-thread stepping while keeping other threads suspended (`tests/single_step.rs`), plus source-level step over, into, and out (`tests/stepping.rs`).
+- **Stack unwinding**: compact-unwind and DWARF CFI (`__eh_frame`, `.eh_frame_hdr`, `.debug_frame`), prologue/epilogue heuristics, signal and alternate-stack frames, inlined frames, and `FrameId`s (`tests/backtrace.rs`, `tests/unwind_eh_frame.rs`).
+- **Symbols, DWARF, and images**: Mach-O and dSYM loading, demangled names, line tables, function lookup, symbol-table names, and loader-reported images including UUIDs and universal slices (`tests/symbols.rs`, `tests/debuginfo.rs`, `tests/images.rs`, `tests/universal_images.rs`).
+- **REPL**: `ferros launch` and `attach` hold one session (interactive, piped, or `--batch`/`--command`) with run control, breakpoints, stepping, registers, memory, threads, backtrace, and images (`tests/cli.rs`, `tests/repl_pty.rs`, `crates/ferros/src/repl/tests.rs`).
 - **Platform boundary**: strict isolation between portable engine (`ferros-core` has `#![forbid(unsafe_code)]` and zero OS dependencies) and platform backend (`ferros-macos`), verified by `scripts/check-boundary.sh` and `tests/platform_boundary.rs`.
 
 This list captures concrete work needed to reach feature parity with production debuggers such as LLDB, GDB, Delve, and rr, with a focus on complete Rust language support. Items are grouped by subsystem to clarify ownership.
@@ -16,28 +19,28 @@ This list captures concrete work needed to reach feature parity with production 
 ## ferros-core (debugger engine)
 
 - [x] **Stop handling loop:** Introduce an event pump that listens for Mach exceptions/ptrace wait results and surfaces asynchronous stop reasons (signals, exits, breakpoints) to higher layers instead of the current polling-based `is_stopped`/`stop_reason` (verified on macOS by `tests/exceptions.rs` and `tests/lifecycle.rs`).
-- [ ] **Register writes + context switching:** Finish `write_registers`, allow per-thread register contexts, and expose vector/floating-point registers to match LLDB’s `register write`/`register read --all`.
-- [x] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts) and transparent trap hiding in memory reads (verified on macOS arm64 by `tests/breakpoints.rs`).
-- [x] **Single-step execution:** Implement single-step execution and per-thread stepping while keeping other threads suspended, plus automatic step-over on resume (verified by `tests/single_step.rs` and `tests/breakpoints.rs`).
-- [ ] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code.
-- [ ] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses.
-- [ ] **Stack unwinding & frame info:** Parse DWARF CFI and fallback heuristics to build accurate call stacks, detect inlined frames, and expose Frame IDs for CLI/UI consumption.
-- [ ] **Symbol + DWARF ingestion:** Build a caching symbol/type layer (object file parsing, demangling, DWARF DIE navigation) so we can resolve Rust generics, enums, trait objects, async state machines, and display names as LLDB with `rust-analyzer` scripts does.
-- [ ] **Memory APIs:** Add paged reads/writes, lazy caching, guard tracking, and utility helpers (hexdump, pattern search) similar to `memory read` in LLDB.
-- [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping.
+- [ ] **Register writes + context switching:** Per-thread general-purpose `write_registers` / `write_registers_for` is implemented and exercised (`tests/exceptions.rs` rewinds a real thread; `tests/backend_mock.rs`). Vector and floating-point registers are read and written by the arm64 macOS backend but have no test and are not shown by `registers`. The x86-64 register code is carried and unverified.
+- [x] **Software breakpoints:** Add software breakpoints (BRK/INT3) with enable/disable/toggle semantics plus lifecycle tracking (requested, resolved, hit counts) and transparent trap hiding in memory reads (verified on macOS arm64 by `tests/breakpoints.rs`). Source breakpoints by `file:line` and function name are verified by `tests/source_breakpoints.rs`.
+- [x] **Single-step execution:** Implement single-step execution and per-thread stepping while keeping other threads suspended, plus automatic step-over on resume (verified by `tests/single_step.rs` and `tests/breakpoints.rs`). Source-level step over (`next`), into (`step`), and out (`finish`) are verified by `tests/stepping.rs`.
+- [ ] **Hardware breakpoints:** Implement hardware breakpoints using CPU debug registers (DR0-DR7 on x86-64, DBGBVR/DBGBCR on ARM64) for execution breakpoints that don't modify code. Helpers in `ferros-macos` program debug registers directly; they are not on `Backend` or `Session` and no test exercises them.
+- [ ] **Watchpoints:** Implement data watchpoints (read/write/read-write) using CPU debug registers to break on memory access at specific addresses. The macOS helpers are unverified and not on `Session`.
+- [x] **Stack unwinding & frame info:** Parse DWARF CFI (via Mach-O compact unwind, `__eh_frame`, `.eh_frame_hdr`, and `.debug_frame`) and prologue/epilogue fallbacks to build call stacks, detect inlined frames, and set a `FrameId` on each `StackFrame` (verified by `tests/backtrace.rs` and `tests/unwind_eh_frame.rs`; `backtrace` prints that stack).
+- [x] **Symbol + DWARF ingestion:** Caching symbol layer: Mach-O and dSYM loading, demangling, line tables, function lookup, display names, and loaded-image identity (verified by `tests/symbols.rs`, `tests/debuginfo.rs`, `tests/images.rs`, `tests/universal_images.rs`, and `tests/backtrace.rs`). DWARF type extraction (`BinaryImage::describe_type`) has no tests and is not used by the session or the CLI. Resolving values of generics, enums, trait objects, and async state machines stays Phase 2, gated on [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41).
+- [ ] **Memory APIs:** `Session` reads, writes, and region lists are tested (trap hiding in `tests/breakpoints.rs`; the REPL `memory` hexdump in `crates/ferros/src/repl/tests.rs`). The macOS backend caches pages on read and restores protection around code writes. Pattern search (`find_pattern`) is unused and untested, and there is no portable pattern-search API.
+- [ ] **Async-aware runtime:** Understand async task schedulers (Tokio, async-std) by mapping generator frames back to async functions, surfacing pending tasks, and enabling “await-aware” stepping. Phase 4; it depends on Phase 2 and stays behind the [#40](https://github.com/JamalLyons/ferros/issues/40) gate in [#41](https://github.com/JamalLyons/ferros/issues/41).
 - [ ] **Remote/recording support:** Define a `ferros-protocol` transport (TCP/Unix socket) plus optional record/replay support (rr-style) so sessions can be remote or deterministic.
 - [ ] **Cross-platform parity:** Implement `LinuxBackend` (ptrace + /proc) and `WindowsBackend` (DbgHelp/DbgEng) implementing the `Backend` trait so we can debug on the same platforms that LLDB/GDB support by default.
-- [ ] **Testing & safety:** Add integration tests for attach/launch against fixture binaries across architectures (macOS arm64 verified in `crates/ferros-tests`; Linux/Windows and fuzzing planned).
+- [ ] **Testing & safety:** Integration tests launch and attach fixture binaries on macOS arm64 (`crates/ferros-tests`: lifecycle, breakpoints, stepping, symbols, unwinding, the REPL). Linux and Windows backends, and fuzzing, are still planned. The scripted `MockBackend` covers the engine on any OS (`tests/backend_mock.rs`).
 
 ## ferros (CLI experience)
 
-- [ ] **Persistent session manager:** Introduce a long-lived debugger daemon or REPL so subcommands like `registers`, `memory`, `threads`, etc., operate on the current target instead of erroring out when invoked without a fresh attach.
-- [ ] **LLDB/GDB-compatible commands:** Implement `break`, `run`, `continue`, `step`, `next`, `finish`, `backtrace`, `frame`, `thread`, `watch`, and `info locals/globals` so experienced users can transfer muscle memory.
-- [ ] **Expression evaluation:** Provide `expr`/`print` commands backed by DWARF + MIR evaluation so users can inspect Rust values (Options, Results, enums, trait objects) similar to `lldb --rust-format`.
+- [x] **Persistent session manager:** `ferros launch` and `ferros attach` open a line-oriented REPL (interactive, piped, or `--batch`/`--command`) whose commands operate on the current target (verified by `tests/cli.rs` and `tests/repl_pty.rs`). There is no separate debugger daemon.
+- [ ] **LLDB/GDB-compatible commands:** Verified: `break`, `run`, `continue`, `step`, `next`, `finish`, `backtrace`, and `thread`, plus `stepi`, `registers`, `memory`, and `images` (`tests/cli.rs`, `tests/stepping.rs`, `tests/backtrace.rs`, `crates/ferros/src/repl/tests.rs`). Not done: `frame` (no frame selection), `watch`, and `info locals` / `info globals`. Frame selection and locals are Phase 2, gated on [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41).
+- [ ] **Expression evaluation:** Provide `expr`/`print` commands backed by DWARF + MIR evaluation so users can inspect Rust values (Options, Results, enums, trait objects) similar to `lldb --rust-format`. Phase 2, gated on [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41).
 - [ ] **Configuration & scripting:** Support `.ferrosrc`, alias definitions, macro commands, and scripting hooks (e.g., load Python/Lua scripts) to match LLDB/GDB automation capabilities.
 - [ ] **Cargo integration:** Add `ferros run`/`test` wrappers that build with debug info, pick the right target triple, and pass binary paths automatically for a `cargo run -Zunstable-options` style flow.
 - [ ] **Remote targets:** Allow `ferros connect <uri>` to talk to a remote `ferros-core` instance (or embedded target) via `ferros-protocol`, similar to `lldb-server`/`gdbserver`.
-- [ ] **Session transcripts:** Implement logging/recording of command history and outcomes for reproducibility and sharing repro steps.
+- [ ] **Session transcripts:** The interactive editor saves command history (`~/.ferros_history` or `$FERROS_HISTORY`; `tests/repl_pty.rs`). A transcript of command outcomes for sharing repro steps is not implemented. `--batch` replays a command list but does not record one.
 
 ## ferros-ui (TUI)
 
@@ -57,6 +60,6 @@ _`ferros-ui` is currently excluded from the workspace while it is rebuilt; `ferr
 
 - [ ] **MIR integration:** Ingest MIR from `ferros-mir` to correlate machine state with high-level Rust constructs (drops, pattern matches, async state machines) and expose that context through CLI/UI.
 - [ ] **Unified protocol:** Finalize `ferros-protocol` so CLI and TUI can both talk to headless debugger cores locally or remote, enabling IDE integrations later.
-- [ ] **Documentation & tutorials:** Publish end-to-end guides (attach, stepping, async debugging) and troubleshooting docs comparable to LLDB/GDB manuals.
-- [ ] **CI & QA:** Add cross-platform CI that runs attach/launch/regression suites on fixture programs, plus nightly stress tests (massive memory, many threads).
+- [ ] **Documentation & tutorials:** A Phase 1 walkthrough is in `docs/walkthrough.md` (build a small program, break, step, backtrace). The owner has not closed [#40](https://github.com/JamalLyons/ferros/issues/40). There is no async-debugging guide.
+- [ ] **CI & QA:** Linux CI builds the workspace and tests `ferros-core`. macOS CI runs format, clippy, unit tests, and the arm64 integration suite (`.github/workflows/rust.yml`). Attach/launch is not run on Linux or Windows, and there are no nightly stress tests.
 - [ ] **Telemetry & crash reporting:** Capture anonymized crash dumps/hangs (opt-in) so stability matches production debuggers that ship with OS toolchains.

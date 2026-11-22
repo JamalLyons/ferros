@@ -172,10 +172,11 @@ impl Session
     /// main-thread trace (dyld's `start`) is named from a listed image and needs no
     /// search; a backend that leaves out an image, or code mapped outside every image,
     /// still gets one. The header is searched for at 4 KiB boundaries, from `address`
-    /// back to the start of its region. A candidate that does not parse, or whose executable sections do not
-    /// contain `address`, is skipped. Each probed page's result is kept for the rest of the
-    /// trace, so later frames in the same region reuse the probes instead of reading again;
-    /// a search that failed for one pc does not stop another pc's search.
+    /// back to the start of its region. A candidate that does not parse, or whose
+    /// executable sections do not contain `address`, is skipped. Each probed page's result
+    /// is kept for the rest of the trace, so later frames in the same region reuse the
+    /// probes instead of reading again; a search that failed for one pc does not stop
+    /// another pc's search.
     fn unlisted_symbol_table_name(&mut self, unlisted: &mut UnlistedImages, address: Address) -> Option<SymbolName>
     {
         // A backend that lists no images (one that cannot, or a mock) gets no search either.

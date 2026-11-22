@@ -1954,8 +1954,11 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
         d.interrupt().expect("stop to enumerate workers");
         assert_eq!(d.wait(Some(STOP_TIMEOUT)).expect("startup interrupt"), interrupted);
 
-        // Session steps breakpoint sites in thread-list order. Choose the earlier
-        // worker as the peer because the handler will also be at a breakpoint.
+        // Session steps breakpoint sites in the order of its thread list, which
+        // `task_threads` reports and the backend keeps across refreshes. Choose the
+        // earlier worker as the peer because the handler will also be at a breakpoint.
+        // Mach does not promise that order; if it changed between stops, Session would
+        // step the handler first and the step-bit assertion below fails, naming it.
         let worker_ids = ["tid-0", "tid-1"].map(|file| control.read(file).parse::<u64>().expect("worker id"));
         let workers: Vec<_> = d
             .threads()
@@ -2027,7 +2030,12 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
 
         d.resume().expect("start the peer step while publication is paused");
         assert!(faults.stop_publication_is_paused());
-        assert!(diagnostics::single_step_enabled(peer).expect("peer step bit"));
+        assert!(
+            diagnostics::single_step_enabled(peer).expect("peer step bit"),
+            "Session did not step the peer first: the thread list order changed between stops, so this run does not \
+             exercise #176's ordering (threads now {:?})",
+            d.threads().expect("threads")
+        );
         faults.release_stop_publication();
         wait_for_published_stop(&faults);
         // The return stop now holds the whole task. Removing the test suspension

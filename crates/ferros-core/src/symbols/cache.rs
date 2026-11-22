@@ -115,6 +115,10 @@ impl SymbolCache
     }
 
     /// Drop metadata for images no longer reported by the loader.
+    ///
+    /// The ids are computed as [`load_image`](Self::load_image) computes them, without a
+    /// UUID, so this keeps only entries loaded that way; a session tracks the ids of its
+    /// UUID-keyed loads itself and uses [`retain_ids`](Self::retain_ids) (#170).
     pub fn retain_images(&mut self, descriptors: &[ImageDescriptor])
     {
         let ids: HashSet<_> = descriptors

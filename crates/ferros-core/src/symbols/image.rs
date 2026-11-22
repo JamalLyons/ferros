@@ -331,18 +331,21 @@ impl SliceIdentity
 
 /// The Mach-O bytes of the image at `path` in its file `bytes`: the file itself, or for a
 /// universal file the slice the target mapped (#169). A slice must match `target`'s CPU
-/// type and subtype and, when `target` knows it, its UUID.
+/// type and subtype and, when `target` knows it, its UUID. A single-architecture file
+/// must match that UUID too, so a file rebuilt while the old build stays mapped is never
+/// parsed as the mapped build (#170).
 ///
 /// # Errors
 /// [`DebuggerError::NoDebugInfo`] for a universal file with no slice of `target`'s CPU
 /// type and subtype, or when `target` is unknown so no slice can be chosen.
-/// [`DebuggerError::InvalidArgument`] for a malformed universal file, or when every
-/// slice of that CPU is damaged or another build (the file was replaced): a failure the
-/// session retries once the file changes, not missing debug info it keeps.
+/// [`DebuggerError::InvalidArgument`] for a malformed universal file, when every slice
+/// of that CPU is damaged or another build, or when a single-architecture file is another
+/// build than the mapped one (the file was replaced): a failure the session retries once
+/// the file changes, not missing debug info it keeps.
 pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option<&SliceIdentity>) -> Result<&'data [u8]>
 {
     let Some(slices) = debuginfo::universal_slices(bytes) else {
-        return Ok(bytes);
+        return single_image(path, bytes, target);
     };
     let slices = slices
         .map_err(|error| DebuggerError::InvalidArgument(format!("invalid universal file {}: {error}", path.display())))?;
@@ -398,6 +401,28 @@ pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option
         )),
         None => no_slice(format!("universal file has no slice for {wanted}")),
     })
+}
+
+/// A single-architecture file is read as it is, unless `target` knows the mapped UUID and
+/// the file has another (or none): then it is another build than the mapped one (#170).
+/// A file that does not parse is left to the caller's parse, which reports it.
+fn single_image<'data>(path: &Path, bytes: &'data [u8], target: Option<&SliceIdentity>) -> Result<&'data [u8]>
+{
+    let Some(uuid) = target.and_then(|target| target.uuid) else {
+        return Ok(bytes);
+    };
+    let Ok(found) = object::File::parse(bytes).and_then(|file| file.mach_uuid()) else {
+        return Ok(bytes);
+    };
+    if found == Some(uuid) {
+        return Ok(bytes);
+    }
+    Err(DebuggerError::InvalidArgument(format!(
+        "{} is another build (UUID {}) than the mapped image (UUID {}): the file was replaced",
+        path.display(),
+        found.map_or_else(|| "none".into(), |found| hex(&found)),
+        hex(&uuid)
+    )))
 }
 
 fn hex(bytes: &[u8]) -> String
@@ -1359,9 +1384,62 @@ mod universal_tests
         assert_eq!(image_slice(path, &bytes, Some(&target)).unwrap(), &second[..]);
         let unknown_uuid = SliceIdentity { uuid: None, ..target };
         assert_eq!(image_slice(path, &bytes, Some(&unknown_uuid)).unwrap(), &first[..]);
-        // A single image is read as it is, whatever the target.
-        assert_eq!(image_slice(path, &first, Some(&target)).unwrap(), &first[..]);
+        // A single image is read as it is when its UUID is the mapped one or unknown.
+        assert_eq!(image_slice(path, &second, Some(&target)).unwrap(), &second[..]);
+        assert_eq!(image_slice(path, &first, Some(&unknown_uuid)).unwrap(), &first[..]);
         assert_eq!(image_slice(path, &first, None).unwrap(), &first[..]);
+    }
+
+    /// The symbol cache keys a parse on the mapped UUID too: two builds at the same path
+    /// and load address get their own entries, and the second load never returns the
+    /// first's parse (#170).
+    #[test]
+    fn the_symbol_cache_keys_a_parse_on_the_mapped_uuid()
+    {
+        let first = slice(ARM64, ARM64E, [8; 16], 0x1_0000_0000);
+        let second = slice(ARM64, ARM64E, [9; 16], 0x2_0000_0000);
+        let path = write(
+            "cache-key",
+            &universal(&[&first, &second], &[(ARM64, ARM64E), (ARM64, ARM64E)]),
+        );
+        let mut cache = crate::symbols::SymbolCache::with_debug_info_options(DebugInfoOptions {
+            dsymutil: None,
+            ..DebugInfoOptions::default()
+        });
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x5_0000_0000,
+        };
+        let load = |cache: &mut crate::symbols::SymbolCache, bytes: &[u8]| {
+            let target = SliceIdentity::from_header(bytes).unwrap();
+            cache.load_mapped_image(descriptor.clone(), Some(&target))
+        };
+        let first_image = load(&mut cache, &first);
+        let second_image = load(&mut cache, &second);
+        let _ = fs::remove_file(&path);
+
+        let (first_image, second_image) = (first_image.expect("first build"), second_image.expect("second build"));
+        assert_ne!(first_image.id(), second_image.id());
+        assert_eq!(text(&first_image), Some(0x1_0000_0000));
+        assert_eq!(text(&second_image), Some(0x2_0000_0000), "the second build's own parse");
+    }
+
+    /// A single-architecture file rebuilt while the old build stays mapped is another
+    /// build: a retryable failure, never a parse labelled with the mapped UUID (#170).
+    #[test]
+    fn a_replaced_single_image_is_another_build()
+    {
+        let mapped = slice(ARM64, ARM64E, [6; 16], 0x1_0000_0000);
+        let rebuilt = slice(ARM64, ARM64E, [7; 16], 0x1_0000_0000);
+        let target = SliceIdentity::from_header(&mapped).unwrap();
+        let path = write("replaced", &rebuilt);
+        let parsed = parse(&path, Some(&target));
+        let reparsed = parse(&path, Some(&SliceIdentity { uuid: None, ..target }));
+        let _ = fs::remove_file(&path);
+        let error = parsed.err().expect("another build");
+        assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+        assert!(error.to_string().contains("another build"), "{error}");
+        assert!(reparsed.is_ok(), "an unknown mapped UUID reads the file as it is");
     }
 
     #[test]

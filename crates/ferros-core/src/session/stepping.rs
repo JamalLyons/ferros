@@ -377,10 +377,16 @@ impl Session
     /// instead, unless it is one `pending_event` drops (see `refusal`): the rest of the
     /// queue is drained and the resume started again (#165). A refused start ran nothing
     /// and left the rendezvous, carried signals and exit traps as they were.
+    /// Clear `stale_step` once a resume starts so the next `SingleStep` can complete the
+    /// new step, including a step over a breakpoint on the same thread (#167).
     fn retry_refused(&mut self, mut start: impl FnMut(&mut Self) -> Result<()>) -> Result<Option<StopEvent>>
     {
         loop {
             match start(self) {
+                Ok(()) => {
+                    self.stale_step = None;
+                    return Ok(None);
+                }
                 Err(error) if is_stop_pending(&error) => match self.refusal()? {
                     Refusal::Stop(event) => return Ok(Some(event)),
                     Refusal::Retry => {
@@ -390,7 +396,7 @@ impl Session
                     }
                     Refusal::Pending => return Ok(None),
                 },
-                started => return started.map(|()| None),
+                Err(error) => return Err(error),
             }
         }
     }

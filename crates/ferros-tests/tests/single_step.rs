@@ -1932,3 +1932,113 @@ fn backend_drop_releases_directly_observed_step_suspends()
         }
     });
 }
+
+/// A handler's return can be published after a peer's breakpoint step starts (#176).
+/// The reissued continue must consume the fresh step of that same peer and run to exit.
+#[test]
+fn handler_return_reissues_a_real_peer_breakpoint_step()
+{
+    use ferros_core::BreakpointLocation;
+    use ferros_macos::guards::ThreadSuspendGuard;
+
+    harness::run(|t| {
+        let control = ControlDir::new();
+        let fixture = fixture!("step_races");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[control.path().to_str().expect("path")], debugger);
+        let interrupted = Some(StopEvent::Interrupted { thread: None });
+        d.resume().expect("start gated workers");
+        control.wait("ready-0");
+        control.wait("ready-1");
+        d.interrupt().expect("stop to enumerate workers");
+        assert_eq!(d.wait(Some(STOP_TIMEOUT)).expect("startup interrupt"), interrupted);
+
+        // Session steps breakpoint sites in thread-list order. Choose the earlier
+        // worker as the peer because the handler will also be at a breakpoint.
+        let worker_ids = ["tid-0", "tid-1"].map(|file| control.read(file).parse::<u64>().expect("worker id"));
+        let workers: Vec<_> = d
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .filter_map(|thread| {
+                let id = diagnostics::thread_unique_id(thread).expect("thread id");
+                worker_ids.iter().position(|&worker| worker == id).map(|slot| (thread, slot))
+            })
+            .collect();
+        let &[(peer, peer_slot), (handler, handler_slot)] = workers.as_slice() else {
+            panic!("expected two gated workers, got {workers:?}");
+        };
+
+        let handler_breakpoint = d
+            .set_breakpoint(BreakpointLocation::Function(
+                "ferros_macos::diagnostics::observe_sigusr1".into(),
+            ))
+            .expect("breakpoint inside the handler");
+        control.release(&format!("signal-{handler_slot}"));
+        control.release(&format!("run-{handler_slot}"));
+        d.resume().expect("run the signal worker");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("signal stop"),
+            Some(StopEvent::Signal {
+                thread: handler,
+                signal: SIGUSR1
+            })
+        );
+        let saved = d.read_registers_for(handler).expect("interrupted registers");
+        d.add_breakpoint(BreakpointRequest::Software { address: saved.pc })
+            .expect("return trap");
+        d.resume_with_signal().expect("run to the handler breakpoint");
+        assert!(matches!(d.wait(Some(STOP_TIMEOUT)).expect("handler stop"),
+            Some(StopEvent::Breakpoint { thread, .. }) if thread == handler));
+        assert_eq!(d.breakpoint_hit().expect("handler hit").id, handler_breakpoint);
+        d.delete_breakpoint(handler_breakpoint).expect("remove handler breakpoint");
+
+        let peer_site = marker_address(&mut d, &fixture, "step_site");
+        d.add_breakpoint(BreakpointRequest::Software { address: peer_site })
+            .expect("peer breakpoint");
+        control.release(&format!("run-{peer_slot}"));
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all().with_thread(handler, ThreadAction::Suspend))
+            .expect("run the peer while keeping the handler stopped");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("peer stop"),
+            Some(StopEvent::Breakpoint {
+                thread: peer,
+                pc: peer_site
+            })
+        );
+
+        // Keep the peer at its original PC even after Session arms its first step.
+        // The kernel takes the handler's return trap, but the hook hides it across
+        // the interrupt and the next resume so that resume can accept the peer step.
+        let held_peer = ThreadSuspendGuard::new(u32::try_from(peer.raw()).expect("peer port")).expect("hold peer");
+        let _release = ReleasePublication(faults.clone());
+        faults.pause_next_stop_publication();
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all())
+            .expect("run handler to the return trap");
+        wait_for_publication_pause(&faults);
+        backend(&mut d).interrupt().expect("interrupt ahead of the paused return");
+        assert_eq!(d.wait(Some(STOP_TIMEOUT)).expect("racing interrupt"), interrupted);
+        let returned = d.read_registers_for(handler).expect("handler return registers");
+        assert_eq!((returned.pc, returned.sp), (saved.pc, saved.sp));
+        assert_eq!(pc_of(&mut d, peer), peer_site);
+
+        d.resume().expect("start the peer step while publication is paused");
+        assert!(faults.stop_publication_is_paused());
+        assert!(diagnostics::single_step_enabled(peer).expect("peer step bit"));
+        faults.release_stop_publication();
+        wait_for_published_stop(&faults);
+        // The return stop now holds the whole task. Removing the test suspension
+        // lets the *reissued* step run after the backend cancels the first one.
+        held_peer.resume().expect("release peer under the task stop");
+        control.release("exit");
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("wait through both step-overs"),
+            Some(StopEvent::Exited { code: 0 })
+        );
+        control.wait("done-0");
+        control.wait("done-1");
+    });
+}

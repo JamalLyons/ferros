@@ -2692,3 +2692,54 @@ fn handler_exit_step_reports_a_real_trap_stop_that_refuses_it()
         assert_eq!(mock.pending_len(), 0);
     }
 }
+
+/// #165 review: `resume` steps `THREAD` over a breakpoint, and the step is given up for
+/// the stopped handler's return to its rendezvous, so the step's completion comes late.
+/// The session consumes the return and reissues the continue, whose step of the handler
+/// off its breakpoint is refused for that late completion. It belongs to no request: it is
+/// dropped, the step issued again and the continue goes on. (Before, the refusal was
+/// returned from `resume` as a `StopPending` error.)
+#[test]
+fn handler_continue_drops_an_abandoned_steps_completion_that_refuses_it()
+{
+    use ferros_core::BreakpointRequest;
+
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session
+        .launch(&LaunchSpec::new("scripted-late-step-handler"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let elsewhere = INTERRUPTED + 8;
+    session
+        .add_breakpoint(BreakpointRequest::Software { address: elsewhere })
+        .expect("breakpoint elsewhere");
+    let mut at_elsewhere = session.read_registers_for(THREAD).expect("registers");
+    at_elsewhere.pc = elsewhere;
+    session.write_registers_for(THREAD, &at_elsewhere).expect("move");
+
+    // The step of `THREAD` runs, but the handler's return is reported first.
+    mock.script(
+        handler_return(&registers)
+            .set_pc(THREAD, elsewhere + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    mock.stop_before_nth_resume(2, std::iter::once(MockStop::new(StopEvent::SingleStep { thread: THREAD })));
+    mock.script(handler_step_off());
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("let the handler return");
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::step(THREAD),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all()
+        ],
+        "the refused step was issued again, then the continue"
+    );
+    assert_eq!(mock.script_len(), 0);
+}

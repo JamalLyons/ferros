@@ -93,8 +93,9 @@ impl Session
     /// The backend's images are loaded into the symbol cache first (see
     /// [`images`](Self::images)). A frame whose code has no DWARF (std linked without
     /// debug info, dyld, the system libraries in the dyld shared cache) is named from its
-    /// image's Mach-O symbol table instead, read from the target's memory: its symbol's
-    /// [`source`](crate::types::SymbolName::source) is
+    /// image's Mach-O symbol table instead, read from the target's memory; code in no
+    /// listed image is named from the image whose header precedes it in memory, if any.
+    /// Its symbol's [`source`](crate::types::SymbolName::source) is
     /// [`SymbolSource::SymbolTable`](crate::types::SymbolSource::SymbolTable) and it has
     /// no location (see [`symbols::symtab`](crate::symbols)). A frame with neither has
     /// no symbol. Memory is read through the backend as little-endian 64-bit words.
@@ -166,10 +167,12 @@ impl Session
     /// Name `address` from the symbol table of an image the backend does not list, found
     /// by the nearest Mach-O header before `address` in its executable region.
     ///
-    /// dyld leaves itself out of the image list it publishes, yet its `start` is the base
-    /// of every main-thread trace (on current macOS dyld itself lives in the shared cache).
-    /// The header is searched for at 4 KiB boundaries, from `address` back to the start of
-    /// its region. A candidate that does not parse, or whose executable sections do not
+    /// This is a fallback for code no listed image contains. The macOS backend lists dyld
+    /// itself, though dyld leaves itself out of the array it publishes, so the base of a
+    /// main-thread trace (dyld's `start`) is named from a listed image and needs no
+    /// search; a backend that leaves out an image, or code mapped outside every image,
+    /// still gets one. The header is searched for at 4 KiB boundaries, from `address`
+    /// back to the start of its region. A candidate that does not parse, or whose executable sections do not
     /// contain `address`, is skipped. Each probed page's result is kept for the rest of the
     /// trace, so later frames in the same region reuse the probes instead of reading again;
     /// a search that failed for one pc does not stop another pc's search.
@@ -205,6 +208,7 @@ impl Session
             .iter()
             .find(|region| region.start <= address && address < region.end)?;
         let start = region.start.value();
+        tracing::debug!("searching for the header of an unlisted image containing {address}");
         let layout = self.search_image_header(&mut unlisted.probes, start, address)?;
         unlisted.images.push(SessionSymtab::new(layout));
         let entry = unlisted.images.last_mut()?;

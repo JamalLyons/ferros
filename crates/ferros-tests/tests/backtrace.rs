@@ -218,6 +218,90 @@ fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
     });
 }
 
+/// dyld leaves itself out of the image array it publishes; the backend lists it from
+/// `dyldImageLoadAddress`, after the main executable. The main-thread base frame, dyld's
+/// `start`, then lies in a listed image and is named from its symbol table without the
+/// header search for unlisted code (issue #121).
+#[test]
+fn dyld_is_a_listed_image_and_names_the_main_thread_base()
+{
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const MH_DYLINKER: u32 = 7;
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let in_c = marker_address(&mut d, &fixture, "in_c");
+        run_to(&mut d, in_c);
+
+        let images = d.images().expect("images");
+        assert_eq!(
+            images.first().map(|image| image.path.as_path()),
+            Some(fixture.path()),
+            "the main executable is first: {images:#?}"
+        );
+        let dylds: Vec<_> = images
+            .iter()
+            .filter(|image| image.path.file_name().is_some_and(|name| name == "dyld"))
+            .collect();
+        assert_eq!(dylds.len(), 1, "dyld is listed once: {images:#?}");
+        let dyld = dylds[0];
+        assert!(dyld.path.is_absolute(), "{dyld:?}");
+        let header = d.read_memory(dyld.load_address, 16).expect("read dyld's header");
+        assert_eq!(header[..4], MH_MAGIC_64.to_le_bytes(), "{dyld:?}");
+        assert_eq!(header[12..16], MH_DYLINKER.to_le_bytes(), "dyld's filetype: {dyld:?}");
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let base = frames.last().expect("a base frame");
+        assert_symbol_table_frame(base);
+        assert_eq!(
+            base.symbol.as_ref().map(ferros_core::SymbolName::display_name),
+            Some("start"),
+            "{frames:#?}"
+        );
+        // `start` lies in dyld: the listed image that contains the base pc is dyld, so
+        // the name comes from a listed image rather than an image found by search.
+        let owner = images
+            .iter()
+            .filter(|image| image.load_address <= base.pc)
+            .max_by_key(|image| image.load_address)
+            .expect("an image below the base pc");
+        assert_eq!(owner.load_address, dyld.load_address, "base {base:#?} in {images:#?}");
+    });
+}
+
+/// At the launch stop dyld has run no instruction and records nothing, yet it is listed:
+/// the `MH_DYLINKER` header the kernel mapped, after the main executable. The stopped pc
+/// (dyld's entry) lies in its code and is named from its symbol table (issue #121).
+#[test]
+fn dyld_is_listed_at_the_launch_stop()
+{
+    const MH_DYLINKER: u32 = 7;
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let images = d.images().expect("images at the launch stop");
+        assert_eq!(
+            images.first().map(|image| image.path.as_path()),
+            Some(fixture.path()),
+            "{images:#?}"
+        );
+        let dylds: Vec<_> = images
+            .iter()
+            .filter(|image| image.path.file_name().is_some_and(|name| name == "dyld"))
+            .collect();
+        assert_eq!(dylds.len(), 1, "dyld is listed once: {images:#?}");
+        let header = d.read_memory(dylds[0].load_address, 16).expect("read dyld's header");
+        assert_eq!(header[12..16], MH_DYLINKER.to_le_bytes(), "{images:#?}");
+
+        let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
+        assert_sane(&mut d, &frames);
+        let entry = &frames[0];
+        assert!(dylds[0].load_address < entry.pc, "{entry:#?} in {images:#?}");
+        assert_symbol_table_frame(entry);
+    });
+}
+
 /// Stopped on the first instruction of `level_c`, before its prologue saved anything, the
 /// caller is still `level_b` at its call site (the return address is in the link
 /// register), and the rest of the trace is unchanged.

@@ -21,7 +21,8 @@ impl ReplCommand for Images
     fn help(&self) -> &'static str
     {
         "images\n\nList each image the loader reports as '<load address> <path>', the main executable first \
-         when the loader reports it first. The load address includes the ASLR slide."
+         when the loader reports it first. dyld is listed too, though it leaves itself out of the list it \
+         publishes. The load address includes the ASLR slide."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult

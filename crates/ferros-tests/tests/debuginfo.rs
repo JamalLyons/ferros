@@ -584,7 +584,13 @@ fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
                 Some(StopEvent::Breakpoint { pc, .. }) if pc == address
             ));
             let images = debuggee.images().expect("dyld images");
-            assert!(images.len() > 1, "dyld must enumerate libraries as well as the executable");
+            // dyld lists itself as well (issue #121); a library is anything else.
+            assert!(
+                images
+                    .iter()
+                    .any(|image| image.path != fixture.path() && image.path.file_name().is_none_or(|name| name != "dyld")),
+                "dyld must enumerate libraries as well as the executable"
+            );
             for library in images.iter().filter(|image| image.path != fixture.path()) {
                 assert_eq!(
                     debuggee.read_memory(library.load_address, 4).expect("loaded library header"),

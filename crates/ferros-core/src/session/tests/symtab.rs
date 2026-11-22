@@ -204,3 +204,29 @@ fn header_search_runs_once_per_region_in_a_trace()
         .count();
     assert_eq!(probes, 4, "one probe per page, for the first frame only");
 }
+
+#[test]
+fn a_listed_image_is_named_without_a_header_search()
+{
+    // Issue #121: dyld is now a listed image, so its code (the base of a main-thread
+    // trace) is named from its own symbol table. The pc's region is executable, where a
+    // search would probe each 4 KiB page below the pc for `MH_MAGIC_64`; for a listed
+    // image no such probe is read.
+    const IMAGE: u64 = 0x40_0000;
+    let (header, nlists, strings) = image();
+    let mock = MockBackend::new()
+        .with_thread(T1, regs_at(IMAGE + 0x1010))
+        .with_region(Address::new(IMAGE), "r-x", header)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_image(image_at("dyld", IMAGE));
+    let mut session = launched(&mock);
+    let frames = session.stack_trace(4).expect("stack trace");
+    assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
+    let probes: Vec<_> = mock
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, MockCall::ReadMemory { len: 4, .. }))
+        .collect();
+    assert_eq!(probes, [], "no header probe for a listed image");
+}

@@ -983,9 +983,13 @@ fn backtrace_after_the_epilogue_of_a_frameless_function_keeps_the_callers_sp()
 /// (issue #121). The Mach-O symbol is `___pthread_once_handler`; one leading underscore
 /// is stripped.
 ///
-/// Older caches move local symbols out of the mapped table into a separate `.symbols`
-/// file beside the cache, which is not read. There the function cannot be named, and the
-/// test only reports why (issue #121 accepts a trace that documents it).
+/// Caches built for iOS-based platforms move local symbols out of the mapped table (into
+/// the cache file's `localSymbolsOffset` range or a separate `.symbols` subcache named by
+/// `symbolFileUUID`). Apple's cache builder keeps them mapped for macOS in every open-source
+/// dyld from dyld-832.7.1 (macOS 11) on (`platformExcludeLocalSymbols` in
+/// `mrm_shared_cache_builder.cpp`), so ferros does not read unmapped locals (#171). The test
+/// checks the cache header first and fails, naming #171, if this system's cache does unmap
+/// them, rather than passing without the name.
 #[test]
 fn backtrace_through_a_static_shared_cache_function_names_it()
 {
@@ -1030,21 +1034,18 @@ fn backtrace_through_a_static_shared_cache_function_names_it()
 
         let handler = &frames[1];
         let handler_name = handler.symbol.as_ref().map(ferros_core::SymbolName::display_name);
-        let separate = separate_local_symbols();
-        if let Some(file) = &separate {
-            eprintln!(
-                "the dyld shared cache keeps local symbols in {}, which is not read, so __pthread_once_handler cannot be \
-                 named (the frame above init_routine is {handler_name:?})",
-                file.display()
+        if let Some(unmapped) = unmapped_local_symbols() {
+            panic!(
+                "this dyld shared cache keeps local symbols outside its mapped symbol tables ({unmapped}), which ferros \
+                 does not read (#171); the frame above init_routine is {handler_name:?}: {frames:#?}"
             );
-        } else {
-            assert_eq!(
-                handler_name,
-                Some("__pthread_once_handler"),
-                "the frame above init_routine is {handler_name:?}: {frames:#?}"
-            );
-            assert_symbol_table_frame(handler);
         }
+        assert_eq!(
+            handler_name,
+            Some("__pthread_once_handler"),
+            "the frame above init_routine is {handler_name:?}: {frames:#?}"
+        );
+        assert_symbol_table_frame(handler);
 
         let images = d.images().expect("images");
         let image = images
@@ -1072,7 +1073,7 @@ fn backtrace_through_a_static_shared_cache_function_names_it()
         assert_eq!(main_at.line, Some(call_once), "{main_at:?}");
 
         assert!(
-            separate.is_some() || frames.iter().all(|frame| frame.symbol.is_some()),
+            frames.iter().all(|frame| frame.symbol.is_some()),
             "an unnamed frame: {frames:#?}"
         );
         assert_eq!(image.uuid, Some(mapped_uuid(&mut d, image.load_address)), "{image:?}");
@@ -1085,15 +1086,71 @@ const SHARED_CACHE_DIRS: [&str; 2] = [
     "/System/Library/dyld",
 ];
 
-/// The separate local-symbols file of this system's dyld shared cache, if it has one: a
-/// `*.symbols` file beside the cache files.
-fn separate_local_symbols() -> Option<std::path::PathBuf>
+/// Where this system's dyld shared cache keeps local symbols outside its mapped symbol
+/// tables, if anywhere; `None` when every main cache file keeps them mapped (#171).
+///
+/// Each main cache file (`dyld_shared_cache_<arch>`, without a suffix) is checked by its
+/// header, as `dyld_cache_format.h` lays it out: `localSymbolsOffset` and
+/// `localSymbolsSize` at 0x48 and 0x50 locate unmapped locals inside that file, and a
+/// non-null `symbolFileUUID` at 0x190 names a separate `.symbols` subcache. That field is
+/// only present when the header (which ends where `mappingOffset`, at 0x10, points) reaches
+/// past it. A `*.symbols` file beside the cache also counts.
+///
+/// # Panics
+/// If no main cache file is found or one cannot be read, so the check never passes by
+/// looking nowhere.
+fn unmapped_local_symbols() -> Option<String>
 {
-    SHARED_CACHE_DIRS
+    let files: Vec<std::path::PathBuf> = SHARED_CACHE_DIRS
         .iter()
         .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
+        .collect();
+    if let Some(file) = files
+        .iter()
         .find(|path| path.extension().is_some_and(|extension| extension == "symbols"))
+    {
+        return Some(format!("a separate local-symbols file {}", file.display()));
+    }
+    let main_caches: Vec<&std::path::PathBuf> = files
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dyld_shared_cache_") && !name.contains('.'))
+        })
+        .collect();
+    assert!(
+        !main_caches.is_empty(),
+        "no main dyld shared cache file in {SHARED_CACHE_DIRS:?}: {files:?}"
+    );
+    for path in main_caches {
+        let mut header = Vec::with_capacity(0x1a0);
+        let file = std::fs::File::open(path).unwrap_or_else(|err| panic!("open {}: {err}", path.display()));
+        std::io::Read::read_to_end(&mut std::io::Read::take(file, 0x1a0), &mut header)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let read = header.len();
+        assert!(read >= 0x58, "{} is too short for a cache header", path.display());
+        assert!(header.starts_with(b"dyld_v1"), "{} has no cache magic", path.display());
+        let u32_at = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("4 bytes"));
+        let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().expect("8 bytes"));
+        let (offset, size) = (u64_at(0x48), u64_at(0x50));
+        if size != 0 {
+            return Some(format!(
+                "{} header's localSymbolsOffset {offset:#x}, localSymbolsSize {size:#x}",
+                path.display()
+            ));
+        }
+        let header_end = usize::try_from(u32_at(0x10)).expect("mappingOffset fits usize");
+        if header_end >= 0x1a0 && read >= 0x1a0 && header[0x190..0x1a0].iter().any(|&byte| byte != 0) {
+            return Some(format!(
+                "{} header's symbolFileUUID {:02x?}",
+                path.display(),
+                &header[0x190..0x1a0]
+            ));
+        }
+    }
+    None
 }

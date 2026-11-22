@@ -41,11 +41,13 @@ Ferros is **early and actively developed**. What is verified today:
 - The workspace targets Rust 1.100.0 (Edition 2024); formatting uses nightly rustfmt.
 - **Process lifecycle & control**: On macOS arm64, launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (verified by `tests/lifecycle.rs` and `tests/smoke.rs`).
 - **Mach exception loop**: Queueing simultaneous stops, exception port rights lifecycle, port restoration on detach, and signal delivery (verified by `tests/exceptions.rs`).
-- **Single-stepping**: Hardware single-step (`MDSCR_EL1.SS`), per-thread single-stepping while other threads remain suspended (verified by `tests/single_step.rs`).
-- **Software breakpoints**: Trap insertion, hit counting, transparent trap-hiding in memory reads, automatic serial step-over on resume, and trap restoration on detach and drop (verified by `tests/breakpoints.rs`).
+- **Single-stepping**: Hardware single-step (`MDSCR_EL1.SS`) and per-thread single-stepping while other threads remain suspended (verified by `tests/single_step.rs`). Source-level step over, into, and out (verified by `tests/stepping.rs`).
+- **Software breakpoints**: Trap insertion, hit counting, transparent trap-hiding in memory reads, automatic serial step-over on resume, and trap restoration on detach and drop (verified by `tests/breakpoints.rs`). Source breakpoints by file:line and function name (verified by `tests/source_breakpoints.rs`).
+- **Stack unwinding**: Call stacks with demangled names, source locations, and inlined frames (verified by `tests/backtrace.rs` and `tests/unwind_eh_frame.rs`).
+- **Symbols, DWARF, and images**: Line tables, function lookup, dSYM loading, and loader-reported images (verified by `tests/symbols.rs`, `tests/debuginfo.rs`, `tests/images.rs`, and `tests/universal_images.rs`).
 - **Platform boundary**: Zero unsafe code and zero OS dependencies in `ferros-core`, strictly enforced by `just check-boundary` and `tests/platform_boundary.rs`.
 
-- **Command line**: `ferros launch` and `attach` open a line-oriented session (interactive, piped or batch with `--batch`/`--command`) with run control, breakpoints, stepping, registers, memory, threads and images (verified by `tests/cli.rs`). The interactive TUI is being rebuilt. Areas currently in progress include DWARF/symbol ingestion, call stack unwinding, and Linux support.
+- **Command line**: `ferros launch` and `attach` open a line-oriented session (interactive, piped or batch with `--batch`/`--command`) with run control, breakpoints, stepping, backtrace, registers, memory, threads and images (verified by `tests/cli.rs`). The interactive TUI is being rebuilt. Still open: value inspection (Phase 2, gated on the owner walkthrough [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41)), hardware breakpoints and watchpoints, x86-64 macOS, and Linux support.
 
 The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for milestone tracking.
 

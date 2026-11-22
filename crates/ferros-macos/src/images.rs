@@ -806,6 +806,8 @@ pub fn reset_mapped_uuid_header_reads() -> u64
 #[cfg(test)]
 mod tests
 {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
 
     #[test]
@@ -939,20 +941,22 @@ mod tests
         let path_a = "/usr/lib/libSystem.B.dylib";
         let path_b = "/usr/lib/libc++.1.dylib";
         let mut images = vec![listed(path_a, 0x1000), listed(path_b, 0x2000)];
-        let mut reads = Vec::new();
+        // The closure outlives each assertion, so the log cannot be a plain `&mut Vec`.
+        let reads = RefCell::new(Vec::new());
         let mut read = |address: u64| {
-            reads.push(address);
-            MappedUuidRead::Parsed(Some([u8::try_from(reads.len()).expect("few reads"); 16]))
+            reads.borrow_mut().push(address);
+            let len = reads.borrow().len();
+            MappedUuidRead::Parsed(Some([u8::try_from(len).expect("few reads"); 16]))
         };
         let mut cache = MappedUuidCache::default();
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
-        assert_eq!(reads, vec![0x1000, 0x2000]);
+        assert_eq!(reads.borrow().as_slice(), &[0x1000, 0x2000]);
         let first = images.clone();
 
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
         assert_eq!(
-            reads,
-            vec![0x1000, 0x2000],
+            reads.borrow().as_slice(),
+            &[0x1000, 0x2000],
             "an unchanged list does not re-read known headers"
         );
         assert_eq!(images, first);
@@ -961,8 +965,8 @@ mod tests
         images[0].path = PathBuf::from("/usr/lib/libreplaced.dylib");
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
         assert_eq!(
-            reads,
-            vec![0x1000, 0x2000, 0x1000],
+            reads.borrow().as_slice(),
+            &[0x1000, 0x2000, 0x1000],
             "a different path at the same address is read again"
         );
         assert_ne!(images[0].uuid, first[0].uuid);
@@ -976,8 +980,8 @@ mod tests
         images[0].path = PathBuf::from(path_a);
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(11), &mut read);
         assert_eq!(
-            reads,
-            vec![0x1000, 0x2000, 0x1000, 0x1000, 0x2000],
+            reads.borrow().as_slice(),
+            &[0x1000, 0x2000, 0x1000, 0x1000, 0x2000],
             "a new image list re-reads the image at the same address"
         );
         assert_ne!(images[0].uuid, first[0].uuid);
@@ -987,11 +991,12 @@ mod tests
     fn a_failed_mapped_uuid_read_is_not_cached()
     {
         let mut images = vec![listed("/usr/lib/libdyld.dylib", 0x2000)];
-        let mut reads = 0;
+        let reads = Cell::new(0_u32);
         // The first two lookups fail; the third parses. A later lookup must not read again.
         let mut read = |_| {
-            reads += 1;
-            if reads < 3 {
+            let count = reads.get() + 1;
+            reads.set(count);
+            if count < 3 {
                 MappedUuidRead::Failed
             } else {
                 MappedUuidRead::Parsed(Some([9; 16]))
@@ -1000,15 +1005,15 @@ mod tests
         let mut cache = MappedUuidCache::default();
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
         assert_eq!(images[0].uuid, None);
-        assert_eq!(reads, 1);
+        assert_eq!(reads.get(), 1);
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
-        assert_eq!(reads, 2, "a failed read is retried on the next list");
+        assert_eq!(reads.get(), 2, "a failed read is retried on the next list");
         assert_eq!(images[0].uuid, None);
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
         assert_eq!(images[0].uuid, Some([9; 16]));
-        assert_eq!(reads, 3);
+        assert_eq!(reads.get(), 3);
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
-        assert_eq!(reads, 3, "the successful read is kept");
+        assert_eq!(reads.get(), 3, "the successful read is kept");
     }
 
     #[test]
@@ -1051,17 +1056,17 @@ mod tests
             listed("/usr/lib/libSystem.B.dylib", 0x1000),
             listed("/usr/lib/libc++.1.dylib", 0x2000),
         ];
-        let mut reads = Vec::new();
+        let reads = RefCell::new(Vec::new());
         let mut read = |address: u64| {
-            reads.push(address);
+            reads.borrow_mut().push(address);
             MappedUuidRead::Parsed(Some([1; 16]))
         };
         let mut cache = MappedUuidCache::default();
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
-        assert_eq!(reads, vec![0x1000, 0x2000]);
+        assert_eq!(reads.borrow().as_slice(), &[0x1000, 0x2000]);
         images[0].path = PathBuf::from("/tmp/replaced.dylib");
         assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
-        assert_eq!(reads, vec![0x1000, 0x2000, 0x1000, 0x2000]);
+        assert_eq!(reads.borrow().as_slice(), &[0x1000, 0x2000, 0x1000, 0x2000]);
     }
 }

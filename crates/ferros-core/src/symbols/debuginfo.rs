@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
-use object::{Object, ObjectSection};
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64, Nlist};
+use object::{Object, ObjectSection, macho};
 
 use crate::error::{DebuggerError, Result};
 
@@ -22,7 +22,7 @@ pub struct DebugInfoOptions
 {
     /// Directory containing UUID- and architecture-keyed DWARF files.
     pub cache_directory: PathBuf,
-    /// Tool to invoke when no valid companion is present.
+    /// Tool to link a debug map when no valid companion is present.
     pub dsymutil: Option<PathBuf>,
     /// Maximum wall time allowed for a single tool invocation.
     pub tool_timeout: Duration,
@@ -57,6 +57,23 @@ fn has_dwarf(file: &object::File<'_>) -> bool
             .iter()
             .any(|name| file.section_by_name(name).is_some_and(|section| section.size() != 0))
     })
+}
+
+// Mach-O's <mach-o/stab.h> defines N_LIB alongside N_OSO.
+const N_LIB: u8 = 0x68;
+
+fn has_debug_map(file: &object::File<'_>) -> bool
+{
+    fn is_debug_map_entry(entry: &impl Nlist) -> bool
+    {
+        entry.is_stab() && matches!(entry.n_type(), macho::N_OSO | N_LIB)
+    }
+
+    match file {
+        object::File::MachO32(file) => file.macho_symbol_table().iter().any(is_debug_map_entry),
+        object::File::MachO64(file) => file.macho_symbol_table().iter().any(is_debug_map_entry),
+        _ => false,
+    }
 }
 
 fn no_debug_info(path: &Path, detail: impl Into<String>) -> DebuggerError
@@ -156,6 +173,9 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
     let cache_path = options.cache_directory.join(format!("{uuid_key}-{architecture:?}.dwarf"));
     if let Some(bytes) = companion(&cache_path, uuid, architecture) {
         return Ok(bytes);
+    }
+    if !has_debug_map(&file) {
+        return Err(no_debug_info(path, "executable slice has no debug map for dsymutil"));
     }
     let tool = options
         .dsymutil
@@ -367,6 +387,32 @@ mod tests
         bytes
     }
 
+    fn image_with_symbol(n_type: u8) -> Vec<u8>
+    {
+        let mut bytes = image([1; 16], false);
+        let command_size = 24;
+        let symbols_offset = u32::try_from(bytes.len()).unwrap() + command_size;
+        let strings_offset = symbols_offset + 16;
+        let strings = b"\0fixture.o\0";
+        bytes[16..20].copy_from_slice(&2_u32.to_le_bytes()); // Command count.
+        bytes[20..24].copy_from_slice(&(2 * command_size).to_le_bytes());
+        for field in [
+            macho::LC_SYMTAB,
+            command_size,
+            symbols_offset,
+            1,
+            strings_offset,
+            u32::try_from(strings.len()).unwrap(),
+        ] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // Symbol name offset.
+        bytes.extend_from_slice(&[n_type, 0, 0, 0]); // Type, section, description.
+        bytes.extend_from_slice(&0_u64.to_le_bytes()); // Symbol value.
+        bytes.extend_from_slice(strings);
+        bytes
+    }
+
     fn options(root: &Path) -> DebugInfoOptions
     {
         DebugInfoOptions {
@@ -488,13 +534,28 @@ mod tests
         );
     }
 
+    /// Only object-file and library stabs establish a debug map (#174).
+    #[test]
+    fn debug_map_requires_object_file_or_library_stabs()
+    {
+        for (bytes, expected) in [
+            (image([1; 16], false), false),
+            (image_with_symbol(macho::N_SECT), false),
+            (image_with_symbol(macho::N_SO), false),
+            (image_with_symbol(macho::N_OSO), true),
+            (image_with_symbol(N_LIB), true),
+        ] {
+            assert_eq!(has_debug_map(&object::File::parse(bytes.as_slice()).unwrap()), expected);
+        }
+    }
+
     #[test]
     fn unavailable_tool_yields_typed_actionable_error_and_cleans_workspace()
     {
         let workspace = Workspace::create(&std::env::temp_dir()).unwrap();
         let mut options = options(&workspace.0);
         options.dsymutil = Some(workspace.0.join("missing-dsymutil"));
-        let error = discover(&workspace.0.join("program"), &image([1; 16], false), &options).unwrap_err();
+        let error = discover(&workspace.0.join("program"), &image_with_symbol(macho::N_OSO), &options).unwrap_err();
         assert!(matches!(error, DebuggerError::NoDebugInfo { .. }));
         assert!(error.to_string().contains("split-debuginfo"));
         assert!(error.to_string().contains("dsymutil"));

@@ -843,3 +843,63 @@ fn bootstrap_main_image_is_reported_after_its_file_is_removed()
         );
     });
 }
+
+/// Symbolicating dyld's entry at the launch stop skips generation when its mapped slice
+/// has no debug map (#174).
+#[test]
+fn dyld_entry_skips_dsymutil_without_a_debug_map()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        let invocations = scratch.0.join("invocations");
+        fs::write(&invocations, "").expect("create invocation log");
+        let tool = scratch.0.join("record-dsymutil");
+        fs::write(&tool, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"${0%/*}/invocations\"\nexit 1\n")
+            .expect("write tool script");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).expect("make tool executable");
+        let mut options = scratch.options();
+        options.dsymutil = Some(tool);
+
+        let tag = t.tag();
+        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend"))).with_debug_info_options(options);
+        session
+            .launch(&LaunchSpec::new(fixture.path()).arg(tag.as_str()))
+            .expect("launch at dyld entry");
+        let entry = session.read_registers().expect("registers at launch stop").pc;
+        let (owner, _) = session.file_address(entry).expect("file address").expect("entry is mapped");
+        assert_eq!(owner, Path::new("/usr/lib/dyld"));
+        let result = session.symbolicate(entry);
+        session.kill().expect("kill and reap fixture");
+
+        let invocations = fs::read_to_string(invocations).expect("read invocation log");
+        assert!(invocations.is_empty(), "dsymutil was invoked with:\n{invocations}");
+        let error = result.expect_err("dyld has no DWARF");
+        assert!(
+            matches!(&error, DebuggerError::NoDebugInfo { path, detail } if *path == owner && detail.contains("no debug map")),
+            "{error}"
+        );
+    });
+}
+
+/// A Cargo-built fixture contains object-file stabs for dsymutil to link (#174).
+#[test]
+fn cargo_built_fixture_contains_debug_map_stabs()
+{
+    use object::read::macho::Nlist;
+
+    harness::run(|_| {
+        let fixture = fixture!("hello");
+        let bytes = fs::read(fixture.path()).expect("read fixture");
+        let object::File::MachO64(file) = object::File::parse(&*bytes).expect("parse fixture") else {
+            panic!("expected a 64-bit Mach-O fixture");
+        };
+        let object_files = file
+            .macho_symbol_table()
+            .iter()
+            .filter(|entry| entry.is_stab() && entry.n_type() == object::macho::N_OSO)
+            .count();
+        assert!(object_files > 0, "fixture must have N_OSO stabs");
+        println!("hello fixture N_OSO stabs: {object_files}");
+    });
+}

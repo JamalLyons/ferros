@@ -70,11 +70,25 @@ A suspended fixture keeps inherited pipes open and can hang the next command. Af
 ```sh
 pgrep -fl ferros-fixture-
 ```
-The command prints nothing and exits 1 when nothing matches. If a run was interrupted, clean up with:
+The command prints nothing and exits 1 when nothing matches; it also lists fixtures from other worktrees. If a run was interrupted, clean up only this worktree's fixtures:
 ```sh
-pkill -9 -f ferros-fixture-
+just kill-fixtures
 ```
-Note that `pkill` exits 1 when no matching processes are found.
+It prints each process it kills and exits 0 when none match. Do not use `pkill -f ferros-fixture-`: it also kills fixtures that agents in other worktrees are debugging and fails their runs.
+
+## Parallel worktrees
+Agents work in parallel git worktrees. [Worktrunk](https://worktrunk.dev) (`brew install worktrunk`, command `wt`) runs the project hooks in `.config/wt.toml`; the first run asks you to approve them.
+- Create a worktree with `wt switch -c <branch>`. Its `pre-start` hook clones the primary worktree's `target/` (the only path in `.worktreeinclude`) as an APFS reflink: about 3 s, no extra disk, and the first build reuses compiled dependencies.
+- A worktree made by another tool starts with an empty `target/`. Warm it once with `wt step copy-ignored` before the first build.
+- `wt merge` runs the five checks from the Test section as its `pre-merge` hook, after rebasing. Run them alone with `wt hook pre-merge`.
+- `wt remove` kills the worktree's leaked fixtures (`pre-remove`) before deleting it.
+
+T3 Code creates its worktrees without `wt`, so these hooks do not run there. Each person adds two project scripts once in their own T3 app (top-right panel, **Add project script**). They are stored per machine, not in the repo, and scripts set through T3's API are ignored:
+
+| Name | Command | Toggles |
+|---|---|---|
+| Warm build cache | `wt step copy-ignored --require-include` | Run automatically on worktree creation; Wait for it to finish before the agent starts |
+| Kill fixtures | `just kill-fixtures` | Run in the thread's worktree when the thread settles |
 
 ## Troubleshooting
 If a test fails with "task_for_pid was denied":

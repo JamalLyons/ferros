@@ -1,0 +1,26 @@
+# Worktrunk (https://worktrunk.dev) project hooks for parallel agent worktrees.
+# The first run asks for approval; see `wt config approvals`.
+
+# Clone the primary worktree's build cache before the agent starts. Paths are limited by
+# .worktreeinclude to `target/`; on APFS the clone is a reflink and costs no extra disk.
+# Blocking (pre-start) so the agent's first `cargo` command already sees the warm cache.
+[pre-start]
+copy = "wt step copy-ignored"
+
+# The five checks AGENTS.md requires before a commit lands, run after the rebase in
+# `wt merge`. The quick checks run together, then the two test suites in order.
+[[pre-merge]]
+fmt = "just fmt-check"
+boundary = "just check-boundary"
+lint = "just lint"
+
+[[pre-merge]]
+test = "just test"
+
+[[pre-merge]]
+integration = "just test-integration"
+
+# Kill fixtures this worktree leaked before deleting it. Unlike
+# `pkill -f ferros-fixture-`, this leaves other worktrees' test runs alone.
+[pre-remove]
+fixtures = "sh scripts/kill-worktree-fixtures.sh {{ worktree_path }}"

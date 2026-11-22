@@ -73,23 +73,53 @@ fn valid_slice(bytes: &[u8], uuid: [u8; 16], architecture: object::Architecture)
     (file.architecture() == architecture && file.mach_uuid().ok()? == Some(uuid) && has_dwarf(&file)).then_some(bytes)
 }
 
+/// One architecture's Mach-O in a universal (fat) file.
+pub(crate) struct UniversalSlice<'data>
+{
+    /// `cputype` from the slice's fat header entry.
+    pub(crate) cpu_type: u32,
+    /// `cpusubtype` from the slice's fat header entry, capability bits included.
+    pub(crate) cpu_subtype: u32,
+    pub(crate) architecture: object::Architecture,
+    /// The slice's bytes, or why its range in the file is malformed. Kept per slice, so a
+    /// damaged slice of another architecture does not hide an intact one.
+    pub(crate) data: object::Result<&'data [u8]>,
+}
+
+/// The slices of a universal Mach-O file, in file order. `None` when `bytes` is not a
+/// universal file (a single image, or not a Mach-O at all); an error when its fat header
+/// is malformed.
+pub(crate) fn universal_slices(bytes: &[u8]) -> Option<object::Result<Vec<UniversalSlice<'_>>>>
+{
+    fn collect<'data, Arch: FatArch>(bytes: &'data [u8], arches: &[Arch]) -> Vec<UniversalSlice<'data>>
+    {
+        arches
+            .iter()
+            .map(|arch| UniversalSlice {
+                cpu_type: arch.cputype(),
+                cpu_subtype: arch.cpusubtype(),
+                architecture: arch.architecture(),
+                data: arch.data(bytes),
+            })
+            .collect()
+    }
+    match object::FileKind::parse(bytes).ok()? {
+        object::FileKind::MachOFat32 => Some(MachOFatFile32::parse(bytes).map(|fat| collect(bytes, fat.arches()))),
+        object::FileKind::MachOFat64 => Some(MachOFatFile64::parse(bytes).map(|fat| collect(bytes, fat.arches()))),
+        _ => None,
+    }
+}
+
 /// Architecture variants can share object::Architecture, so test UUID on every slice.
 fn matching_slice(bytes: &[u8], uuid: [u8; 16], architecture: object::Architecture) -> Option<&[u8]>
 {
-    match object::FileKind::parse(bytes).ok()? {
-        object::FileKind::MachOFat32 => MachOFatFile32::parse(bytes)
+    match universal_slices(bytes) {
+        Some(slices) => slices
             .ok()?
-            .arches()
-            .iter()
-            .filter(|arch| arch.architecture() == architecture)
-            .find_map(|arch| valid_slice(arch.data(bytes).ok()?, uuid, architecture)),
-        object::FileKind::MachOFat64 => MachOFatFile64::parse(bytes)
-            .ok()?
-            .arches()
-            .iter()
-            .filter(|arch| arch.architecture() == architecture)
-            .find_map(|arch| valid_slice(arch.data(bytes).ok()?, uuid, architecture)),
-        _ => valid_slice(bytes, uuid, architecture),
+            .into_iter()
+            .filter(|slice| slice.architecture == architecture)
+            .find_map(|slice| valid_slice(slice.data.ok()?, uuid, architecture)),
+        None => valid_slice(bytes, uuid, architecture),
     }
 }
 
@@ -410,6 +440,33 @@ mod tests
             fat[offsets[index]..offsets[index] + data.len()].copy_from_slice(data);
         }
         let path = workspace.0.join("universal.dwarf");
+        fs::write(&path, fat).unwrap();
+        assert_eq!(companion(&path, [1; 16], object::Architecture::Aarch64), Some(matching));
+    }
+
+    /// A universal companion whose x86_64 member's range lies outside the file still
+    /// yields its intact arm64 member (#169).
+    #[test]
+    fn universal_companion_skips_a_damaged_member_of_another_architecture()
+    {
+        let workspace = Workspace::create(&std::env::temp_dir()).unwrap();
+        let matching = image([1; 16], true);
+        let offset = 256;
+        let mut fat = vec![0; offset + matching.len()];
+        fat[..4].copy_from_slice(&0xcafe_babe_u32.to_be_bytes());
+        fat[4..8].copy_from_slice(&2_u32.to_be_bytes());
+        let entries = [
+            (0x0100_0007, 3, 0x7fff_0000, 0x1000),
+            (0x0100_000c, 0, offset as u32, matching.len() as u32),
+        ];
+        for (index, (cpu_type, cpu_subtype, start, size)) in entries.into_iter().enumerate() {
+            let header = 8 + index * 20;
+            for (field, value) in [(0, cpu_type), (4, cpu_subtype), (8, start), (12, size), (16, 3)] {
+                fat[header + field..header + field + 4].copy_from_slice(&value.to_be_bytes());
+            }
+        }
+        fat[offset..].copy_from_slice(&matching);
+        let path = workspace.0.join("damaged.dwarf");
         fs::write(&path, fat).unwrap();
         assert_eq!(companion(&path, [1; 16], object::Architecture::Aarch64), Some(matching));
     }

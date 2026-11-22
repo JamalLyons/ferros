@@ -7,6 +7,7 @@ use super::Session;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
 use crate::symbols::debuginfo::LoadInputs;
+use crate::symbols::image::SliceIdentity;
 use crate::symbols::symtab::{SymbolTable, SymtabLayout};
 use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::Address;
@@ -53,6 +54,10 @@ pub(super) struct SessionImage
     /// Mapped memory does not change while this image stays loaded, so the result is kept
     /// until the loader reports a different path, address or a conflicting UUID.
     mapping: std::result::Result<ImageMapping, String>,
+    /// CPU type, subtype and UUID of the mapped header, read with `mapping`: which slice
+    /// of a universal file the symbols are loaded from (#169). `None` when the header
+    /// could not be read.
+    slice: Option<SliceIdentity>,
     /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
     /// images by the canonical path resolved at load time and the load address
     /// ([`ImageId`]), not by UUID. A relative loader path may stop resolving later
@@ -248,11 +253,12 @@ impl Session
                 kept.uuid = kept.uuid.or(image.uuid);
                 self.loaded_images.push(kept);
             } else {
-                let mapping = self.map_loaded_image(descriptor.load_address);
+                let (mapping, slice) = self.map_loaded_image(descriptor.load_address, image.uuid);
                 self.loaded_images.push(SessionImage {
                     descriptor,
                     uuid: image.uuid,
                     mapping,
+                    slice,
                     symbols: None,
                     no_debug_info: None,
                     failed_load: None,
@@ -266,13 +272,27 @@ impl Session
         Ok(())
     }
 
-    /// Read the segment layout from the header mapped at `load_address`. Trap bytes are
-    /// irrelevant: breakpoints are never planted in a Mach-O header.
-    fn map_loaded_image(&mut self, load_address: u64) -> std::result::Result<ImageMapping, String>
+    /// Read the segment layout and the slice identity from the header mapped at
+    /// `load_address`. Trap bytes are irrelevant: breakpoints are never planted in a
+    /// Mach-O header. The header's `LC_UUID` is the identity's UUID; the loader-reported
+    /// `uuid` stands in only when the header has none.
+    fn map_loaded_image(
+        &mut self,
+        load_address: u64,
+        uuid: Option<[u8; 16]>,
+    ) -> (std::result::Result<ImageMapping, String>, Option<SliceIdentity>)
     {
-        let header = self.read_mapped_header(load_address)?;
-        ImageMapping::from_header(&header, load_address)
-            .map_err(|error| format!("header at {}: {error}", Address::new(load_address)))
+        let header = match self.read_mapped_header(load_address) {
+            Ok(header) => header,
+            Err(detail) => return (Err(detail), None),
+        };
+        let slice = SliceIdentity::from_header(&header).ok().map(|slice| SliceIdentity {
+            uuid: slice.uuid.or(uuid),
+            ..slice
+        });
+        let mapping = ImageMapping::from_header(&header, load_address)
+            .map_err(|error| format!("header at {}: {error}", Address::new(load_address)));
+        (mapping, slice)
     }
 
     /// The Mach-O header and load commands mapped at `load_address`.
@@ -337,7 +357,7 @@ impl Session
                 });
             }
         }
-        match self.symbols.load_image(image.descriptor.clone()) {
+        match self.symbols.load_mapped_image(image.descriptor.clone(), image.slice.as_ref()) {
             Ok(loaded) => {
                 image.symbols = Some(loaded.id());
                 image.failed_load = None;

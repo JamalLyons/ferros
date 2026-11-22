@@ -7,7 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, BreakpointLocation, BreakpointRequest, FrameKind, Session, StackFrame, StopEvent, SymbolSource};
+use ferros_core::{
+    Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, Session, StackFrame, StopEvent, SymbolSource,
+};
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
@@ -310,6 +312,43 @@ fn dyld_is_listed_at_the_launch_stop()
             Some("_dyld_start"),
             "{entry:#?}"
         );
+    });
+}
+
+/// At the launch stop dyld runs from its file, `/usr/lib/dyld`, which is universal: one
+/// slice per architecture. Its symbols are read from the slice the kernel mapped, so
+/// symbolicating dyld's entry finds a name or reports that slice's missing debug info;
+/// it never fails to parse the universal file (issue #169).
+#[test]
+fn dyld_entry_symbolicates_from_its_universal_file_at_the_launch_stop()
+{
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let images = d.images().expect("images at the launch stop");
+        let dyld = images
+            .iter()
+            .find(|image| image.path.file_name().is_some_and(|name| name == "dyld"))
+            .unwrap_or_else(|| panic!("dyld is listed: {images:#?}"))
+            .clone();
+        let entry = d.stack_trace(1).expect("stack trace")[0].pc;
+        assert!(dyld.load_address < entry, "{entry} in {images:#?}");
+        // The session maps the entry to dyld from its mapped header, so `symbolicate`
+        // below reads dyld's file rather than finding no image (`Ok(None)`).
+        let (owner, _) = d
+            .file_address(entry)
+            .expect("file address")
+            .unwrap_or_else(|| panic!("{entry} is mapped: {images:#?}"));
+        assert_eq!(owner, dyld.path);
+        for attempt in 0..2 {
+            match d.symbolicate(entry) {
+                Ok(_) => {}
+                Err(DebuggerError::NoDebugInfo { path, detail }) => {
+                    assert_eq!(path, dyld.path, "attempt {attempt}: {detail}");
+                }
+                Err(error) => panic!("attempt {attempt}: symbolicating dyld's entry {entry}: {error}"),
+            }
+        }
     });
 }
 

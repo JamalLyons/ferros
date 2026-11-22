@@ -52,5 +52,5 @@ pub use cache::{SymbolCache, SymbolFrame, Symbolication};
 pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use functions::FunctionAddress;
-pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping};
+pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping, SliceIdentity};
 pub use lines::{AddressLine, LineAddresses, SkippedDebugInfo, SourceLookupError};

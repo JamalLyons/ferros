@@ -116,9 +116,9 @@ impl SymbolCache
 
     /// Drop metadata for images no longer reported by the loader.
     ///
-    /// The ids are computed as [`load_image`](Self::load_image) computes them, without a
-    /// UUID, so this keeps only entries loaded that way; a session tracks the ids of its
-    /// UUID-keyed loads itself and uses [`retain_ids`](Self::retain_ids) (#170).
+    /// The ids are computed as [`load_image`](Self::load_image) computes them. To
+    /// keep entries loaded with a slice selector, use [`retain_ids`](Self::retain_ids)
+    /// with the returned images' IDs (#170, #175).
     pub fn retain_images(&mut self, descriptors: &[ImageDescriptor])
     {
         let ids: HashSet<_> = descriptors
@@ -170,11 +170,39 @@ impl SymbolCache
     /// - DWARF sections cannot be loaded
     ///
     /// The descriptor does not say which architecture the target runs, so a universal
-    /// (fat) file reports [`DebuggerError::NoDebugInfo`]; a session loads the slice the
-    /// target mapped (#169).
+    /// (fat) file reports [`DebuggerError::NoDebugInfo`]. Use
+    /// [`load_image_slice`](Self::load_image_slice) to select a slice (#175).
     pub fn load_image(&mut self, descriptor: ImageDescriptor) -> Result<Arc<BinaryImage>>
     {
         self.load_mapped_image(descriptor, None)
+    }
+
+    /// Load and cache DWARF for the selected Mach-O slice (#175).
+    ///
+    /// The cache key includes the CPU type, subtype, and supplied UUID. When
+    /// loading several slices at the same address, use the returned images directly
+    /// for symbol lookups to specify which slice to query.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`load_image`](Self::load_image), including
+    /// [`DebuggerError::NoDebugInfo`] if the universal file has no slice of the
+    /// requested CPU type and subtype. A UUID mismatch returns
+    /// [`DebuggerError::InvalidArgument`].
+    ///
+    /// ```rust,no_run
+    /// use ferros_core::symbols::{ImageDescriptor, SliceIdentity, SymbolCache};
+    ///
+    /// let descriptor = ImageDescriptor {
+    ///     path: "/path/to/universal-binary".into(),
+    ///     load_address: 0x100000000,
+    /// };
+    /// let arm64e = SliceIdentity::new(0x0100_000c, 2, None);
+    /// let image = SymbolCache::new().load_image_slice(descriptor, &arm64e)?;
+    /// # Ok::<(), ferros_core::DebuggerError>(())
+    /// ```
+    pub fn load_image_slice(&mut self, descriptor: ImageDescriptor, selector: &SliceIdentity) -> Result<Arc<BinaryImage>>
+    {
+        self.load_mapped_image(descriptor, Some(selector))
     }
 
     /// [`load_image`](Self::load_image), reading the slice `target` identifies when the
@@ -193,7 +221,7 @@ impl SymbolCache
             })?
         };
 
-        let id = ImageId::with_uuid(&canonical, descriptor.load_address, target.and_then(|slice| slice.uuid));
+        let id = ImageId::with_slice(&canonical, descriptor.load_address, target);
         if let Some(existing) = self.images.get(&id) {
             return Ok(existing.clone());
         }

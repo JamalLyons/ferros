@@ -18,11 +18,25 @@
 //! later), matched by load address. For images absent from the array, including shared-cache
 //! libraries, dyld and the executable at the bootstrap stop, read `LC_UUID` from the mapped
 //! load commands. Both reads are bounded, and a failed UUID lookup still returns the image (#170).
+//!
+//! A mapped header does not change while that image stays mapped, so a successful read is
+//! cached by load address (#182). The entry is used only when the loader still reports the
+//! same path there. Every entry is dropped when `infoArrayChangeTimestamp` changes, or, when
+//! that field is absent, when the path and address list changes, so a different image at the
+//! same address is read again. A failed read is not cached.
+//!
+//! #170 added those two remote reads for every image the UUID array omits, on every
+//! `images()` call (`Session::load_images` does that for each backtrace, address mapping,
+//! and step-out). The integration test `measure_mapped_uuid_and_backtrace_cost` times
+//! `images()` and a deep backtrace with the reads skipped (before #170), repeated (after
+//! #170), and cached. On the macOS runner it writes the timings to
+//! `target/ferros-uuid-measure.txt`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::error::{DebuggerError, Result};
@@ -182,6 +196,12 @@ const DYLD_LOAD_ADDRESS_OFFSET: usize = 32;
 /// Offset of `dyldPath` in the 64-bit `dyld_all_image_infos` (version 15+).
 const DYLD_PATH_OFFSET: usize = 192;
 
+/// Offset of `infoArrayChangeTimestamp` in the 64-bit `dyld_all_image_infos` (version 15+).
+///
+/// The `uint64_t` immediately before [`DYLD_PATH_OFFSET`]. Dyld updates it when the image
+/// list changes, including when a different image is mapped at an address already in use.
+const INFO_ARRAY_CHANGE_TIMESTAMP_OFFSET: usize = 184;
+
 /// Offset of `uuidArrayCount` in the 64-bit `dyld_all_image_infos` (version 8+).
 const UUID_ARRAY_COUNT_OFFSET: usize = 88;
 
@@ -242,6 +262,19 @@ fn uuid_array_fields(bytes: &[u8]) -> Option<(usize, u64)>
     Some((count, array))
 }
 
+/// `infoArrayChangeTimestamp` when `infos` is long enough to be a version-15 structure.
+///
+/// `None` for an older or shorter prefix: those builds have no list generation, and the
+/// cache then compares paths and addresses instead.
+fn image_list_timestamp(infos: &[u8]) -> Option<u64>
+{
+    let version = u32::from_le_bytes(infos.get(..4)?.try_into().ok()?);
+    if version < 15 || infos.len() < DYLD_PATH_OFFSET {
+        return None;
+    }
+    Some(word(infos, INFO_ARRAY_CHANGE_TIMESTAMP_OFFSET))
+}
+
 /// `dyld_uuid_info` records. A trailing partial record is ignored. A null load address
 /// is not an image and is skipped.
 fn decode_uuid_infos(records: &[u8]) -> Vec<(u64, [u8; 16])>
@@ -282,33 +315,237 @@ fn image_uuids(task: mach_port_t, infos: &[u8]) -> HashMap<u64, [u8; 16]>
     decode_uuid_infos(&records).into_iter().collect()
 }
 
-/// Read only the mapped header and load commands, with the read cap in `read_target`.
-fn mapped_uuid(task: mach_port_t, address: Address) -> Option<[u8; 16]>
+/// How `images()` obtains a UUID the dyld array does not already have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UuidLookup
 {
-    let header = read_target(task, address, ImageMapping::MACH_HEADER_SIZE).ok()?;
-    let size = ImageMapping::header_size(&header).ok()?;
-    let bytes = read_target(task, address, size).ok()?;
-    let mach = MachHeader64::<Endianness>::parse(&*bytes, 0).ok()?;
-    mach.uuid(mach.endian().ok()?, &*bytes, 0).ok()?
+    /// Read the mapped header and remember a successful parse (#182).
+    Cache,
+    /// Read the mapped header on every call and ignore the cache. This is the #170 cost.
+    Always,
+    /// Do not read mapped headers. This is the cost from before #170.
+    Never,
 }
 
-fn with_uuid(task: mach_port_t, path: PathBuf, load_address: Address, uuids: &HashMap<u64, [u8; 16]>) -> LoadedImage
+/// Outcome of one mapped `LC_UUID` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappedUuidRead
 {
-    LoadedImage {
-        path,
-        load_address,
-        uuid: uuids
-            .get(&load_address.value())
-            .copied()
-            .or_else(|| mapped_uuid(task, load_address)),
+    /// The header parsed. `None` means it has no `LC_UUID`.
+    Parsed(Option<[u8; 16]>),
+    /// The remote read or the parse failed. Not cached, and not fatal to the image list.
+    Failed,
+}
+
+impl MappedUuidRead
+{
+    fn parsed(self) -> Option<[u8; 16]>
+    {
+        match self {
+            Self::Parsed(uuid) => uuid,
+            Self::Failed => None,
+        }
+    }
+}
+
+/// One cached mapped UUID. The path is part of the key: a different image at the same
+/// address must not reuse it.
+struct CachedUuid
+{
+    path: PathBuf,
+    uuid: Option<[u8; 16]>,
+}
+
+/// Mapped `LC_UUID` values for the current task, keyed by load address.
+#[derive(Default)]
+pub(crate) struct MappedUuidCache
+{
+    entries: HashMap<u64, CachedUuid>,
+    /// Last `infoArrayChangeTimestamp` applied. `None` until a timestamped list is seen
+    /// and after [`clear`](Self::clear).
+    timestamp: Option<u64>,
+    /// Last path and address list, compared when dyld records no timestamp.
+    paths: Vec<(u64, PathBuf)>,
+    /// [`invalidate_mapped_uuid_cache`] generation last applied to `entries`.
+    test_epoch: u64,
+}
+
+impl MappedUuidCache
+{
+    /// Drop every cached UUID. Used when this backend takes a new task or loses the one
+    /// it had, so a reused address cannot report the previous process's image.
+    pub(crate) fn clear(&mut self)
+    {
+        self.entries.clear();
+        self.timestamp = None;
+        self.paths.clear();
+    }
+
+    /// Remember `images` as the current list. A new timestamp, or a different path and
+    /// address list when there is no timestamp, drops every entry first.
+    fn begin(&mut self, timestamp: Option<u64>, images: &[LoadedImage])
+    {
+        let changed = match timestamp {
+            Some(timestamp) => self.timestamp != Some(timestamp),
+            None => self.paths_differ(images),
+        };
+        if changed {
+            self.entries.clear();
+        }
+        self.timestamp = timestamp;
+        if timestamp.is_none() {
+            self.paths = images
+                .iter()
+                .map(|image| (image.load_address.value(), image.path.clone()))
+                .collect();
+        }
+    }
+
+    fn paths_differ(&self, images: &[LoadedImage]) -> bool
+    {
+        self.paths.len() != images.len()
+            || self
+                .paths
+                .iter()
+                .zip(images)
+                .any(|((address, path), image)| *address != image.load_address.value() || path != &image.path)
+    }
+
+    /// A cached UUID for `path` at `address`, including a confirmed absence. `None` when
+    /// this address is unknown or holds a different path.
+    fn get(&self, address: u64, path: &Path) -> Option<Option<[u8; 16]>>
+    {
+        let cached = self.entries.get(&address)?;
+        (cached.path == path).then_some(cached.uuid)
+    }
+
+    fn insert(&mut self, address: u64, path: PathBuf, uuid: Option<[u8; 16]>)
+    {
+        self.entries.insert(address, CachedUuid { path, uuid });
+    }
+
+    fn retain(&mut self, addresses: &[u64])
+    {
+        self.entries.retain(|address, _| addresses.contains(address));
+    }
+}
+
+/// Read only the mapped header and load commands, with the read cap in `read_target`.
+///
+/// Each remote read counts toward [`mapped_uuid_header_reads`]. A parsed header is
+/// [`MappedUuidRead::Parsed`] even when it has no `LC_UUID`; a failed read or parse is
+/// [`MappedUuidRead::Failed`] and must not be cached.
+fn mapped_uuid(task: mach_port_t, address: Address) -> MappedUuidRead
+{
+    note_mapped_uuid_header_read();
+    let header = match read_target(task, address, ImageMapping::MACH_HEADER_SIZE) {
+        Ok(header) => header,
+        Err(_) => return MappedUuidRead::Failed,
+    };
+    let size = match ImageMapping::header_size(&header) {
+        Ok(size) => size,
+        Err(_) => return MappedUuidRead::Failed,
+    };
+    note_mapped_uuid_header_read();
+    let bytes = match read_target(task, address, size) {
+        Ok(bytes) => bytes,
+        Err(_) => return MappedUuidRead::Failed,
+    };
+    let Ok(mach) = MachHeader64::<Endianness>::parse(&*bytes, 0) else {
+        return MappedUuidRead::Failed;
+    };
+    let Ok(endian) = mach.endian() else {
+        return MappedUuidRead::Failed;
+    };
+    match mach.uuid(endian, &*bytes, 0) {
+        Ok(uuid) => MappedUuidRead::Parsed(uuid),
+        Err(_) => MappedUuidRead::Failed,
+    }
+}
+
+/// UUID for one image. The dyld array wins. Otherwise the cache, then one mapped read.
+fn resolve_mapped_uuid(
+    address: u64,
+    path: &Path,
+    dyld_uuid: Option<[u8; 16]>,
+    cache: &mut MappedUuidCache,
+    read_mapped: &mut impl FnMut(u64) -> MappedUuidRead,
+) -> Option<[u8; 16]>
+{
+    if let Some(uuid) = dyld_uuid {
+        return Some(uuid);
+    }
+    if let Some(uuid) = cache.get(address, path) {
+        return uuid;
+    }
+    match read_mapped(address) {
+        MappedUuidRead::Parsed(uuid) => {
+            cache.insert(address, path.to_path_buf(), uuid);
+            uuid
+        }
+        MappedUuidRead::Failed => None,
+    }
+}
+
+/// Fill `images` from the cache, after dropping entries the new list invalidates.
+fn assign_cached_uuids(
+    images: &mut [LoadedImage],
+    dyld_uuids: &HashMap<u64, [u8; 16]>,
+    cache: &mut MappedUuidCache,
+    timestamp: Option<u64>,
+    mut read_mapped: impl FnMut(u64) -> MappedUuidRead,
+)
+{
+    cache.begin(timestamp, images);
+    for image in &mut *images {
+        let address = image.load_address.value();
+        image.uuid = resolve_mapped_uuid(
+            address,
+            &image.path,
+            dyld_uuids.get(&address).copied(),
+            cache,
+            &mut read_mapped,
+        );
+    }
+    let addresses: Vec<u64> = images.iter().map(|image| image.load_address.value()).collect();
+    cache.retain(&addresses);
+}
+
+fn fill_uuids(
+    task: mach_port_t,
+    images: &mut [LoadedImage],
+    dyld_uuids: &HashMap<u64, [u8; 16]>,
+    cache: &mut MappedUuidCache,
+    lookup: UuidLookup,
+    timestamp: Option<u64>,
+)
+{
+    match lookup {
+        UuidLookup::Never => {
+            for image in &mut *images {
+                image.uuid = dyld_uuids.get(&image.load_address.value()).copied();
+            }
+        }
+        UuidLookup::Always => {
+            for image in &mut *images {
+                let address = image.load_address;
+                image.uuid = dyld_uuids
+                    .get(&address.value())
+                    .copied()
+                    .or_else(|| mapped_uuid(task, address).parsed());
+            }
+        }
+        UuidLookup::Cache => assign_cached_uuids(images, dyld_uuids, cache, timestamp, |address| {
+            mapped_uuid(task, Address::new(address))
+        }),
     }
 }
 
 /// dyld as a loaded image, from the prefix `bytes` of `dyld_all_image_infos`, unless
 /// `images` already holds its load address. Only a mapped `MH_DYLINKER` header at the
 /// recorded address is listed; anything else leaves dyld out rather than failing the list.
-fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &HashMap<u64, [u8; 16]>)
--> Option<LoadedImage>
+/// The UUID is filled later with the rest of the list.
+fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage]) -> Option<LoadedImage>
 {
     let (load_address, path_address) = dyld_fields(bytes)?;
     let load_address = Address::new(load_address);
@@ -327,7 +564,11 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &H
             PathBuf::from(DEFAULT_DYLD_PATH)
         })
     };
-    Some(with_uuid(task, path, load_address, uuids))
+    Some(LoadedImage {
+        path,
+        load_address,
+        uuid: None,
+    })
 }
 
 /// Compatibility for `POSIX_SPAWN_START_SUSPENDED`: dyld has not populated its array.
@@ -338,7 +579,13 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &H
 /// when that records a mapped dyld header; before dyld relocates itself those fields are
 /// not yet usable, so otherwise dyld is the `MH_DYLINKER` header the kernel mapped at a
 /// region's start, under [`DEFAULT_DYLD_PATH`].
-fn bootstrap_images(task: mach_port_t, pid: ProcessId, infos: Option<&[u8]>) -> Result<Vec<LoadedImage>>
+fn bootstrap_images(
+    task: mach_port_t,
+    pid: ProcessId,
+    infos: Option<&[u8]>,
+    cache: &mut MappedUuidCache,
+    lookup: UuidLookup,
+) -> Result<Vec<LoadedImage>>
 {
     let path = vnode_path(pid)
         .or_else(|| exec_path(pid))
@@ -350,17 +597,39 @@ fn bootstrap_images(task: mach_port_t, pid: ProcessId, infos: Option<&[u8]>) -> 
         .clone()
         .find(|region| is_executable_header(task, region.start))
         .ok_or_else(|| invalid("loader is uninitialized and the executable header is unavailable"))?;
-    let mut images = vec![with_uuid(task, path, executable.start, &uuids)];
-    let dyld = infos.and_then(|infos| dyld_image(task, infos, &images, &uuids)).or_else(|| {
+    let mut images = vec![LoadedImage {
+        path,
+        load_address: executable.start,
+        uuid: None,
+    }];
+    let dyld = infos.and_then(|infos| dyld_image(task, infos, &images)).or_else(|| {
         readable
             .find(|region| is_header_of_type(task, region.start, MH_DYLINKER))
-            .map(|region| with_uuid(task, PathBuf::from(DEFAULT_DYLD_PATH), region.start, &uuids))
+            .map(|region| LoadedImage {
+                path: PathBuf::from(DEFAULT_DYLD_PATH),
+                load_address: region.start,
+                uuid: None,
+            })
     });
     images.extend(dyld);
+    fill_uuids(task, &mut images, &uuids, cache, lookup, infos.and_then(image_list_timestamp));
     Ok(images)
 }
 
 pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<LoadedImage>>
+{
+    // Birth-site setup asks once, then keeps the sites. A cache that dies with the call
+    // still reads each missing UUID a single time.
+    let mut cache = MappedUuidCache::default();
+    loaded_images_with(task, pid, &mut cache, UuidLookup::Cache)
+}
+
+pub(crate) fn loaded_images_with(
+    task: mach_port_t,
+    pid: ProcessId,
+    cache: &mut MappedUuidCache,
+    lookup: UuidLookup,
+) -> Result<Vec<LoadedImage>>
 {
     let mut info = task_dyld_info::default();
     let mut count = TASK_DYLD_INFO_COUNT;
@@ -374,7 +643,7 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
         });
     }
     if info.all_image_info_addr == 0 {
-        return bootstrap_images(task, pid, None);
+        return bootstrap_images(task, pid, None, cache, lookup);
     }
     if info.all_image_info_format != 1 || info.all_image_info_size < 16 {
         return Err(invalid("unsupported image-info format"));
@@ -391,7 +660,7 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
         before.clone()
     });
     if length == 0 {
-        return bootstrap_images(task, pid, Some(&infos));
+        return bootstrap_images(task, pid, Some(&infos), cache, lookup);
     }
     if array == 0 {
         return Err(invalid("loader is modifying the image list; resume to a stable stop"));
@@ -413,18 +682,119 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
             return Err(invalid("null image load address"));
         }
         let path = remote_path(task, word(record, 8))?;
-        images.push(with_uuid(task, path, Address::new(load_address), &uuids));
+        images.push(LoadedImage {
+            path,
+            load_address: Address::new(load_address),
+            uuid: None,
+        });
     }
     // Preserve the existing main-first contract for callers; dyld's order is not an API.
     // The main image is found by its header, so this holds after its file is unlinked.
     if let Some(index) = images.iter().position(|image| is_executable_header(task, image.load_address)) {
         images.swap(0, index);
     }
-    images.extend(dyld_image(task, &infos, &images, &uuids));
+    images.extend(dyld_image(task, &infos, &images));
+    // UUID reads run before the stability check, as #170 required: a list that changes
+    // while they run is rejected. A rejected list drops the cache updates from this call.
+    fill_uuids(task, &mut images, &uuids, cache, lookup, image_list_timestamp(&infos));
     if read_target(task, address, 16)? != before {
+        if lookup == UuidLookup::Cache {
+            cache.clear();
+        }
         return Err(invalid("image list changed while reading"));
     }
     Ok(images)
+}
+
+thread_local! {
+    static UUID_LOOKUP: Cell<UuidLookup> = const { Cell::new(UuidLookup::Cache) };
+    static UUID_CACHE_EPOCH: Cell<u64> = const { Cell::new(0) };
+    static MAPPED_UUID_HEADER_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_mapped_uuid_header_read()
+{
+    MAPPED_UUID_HEADER_READS.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// The lookup mode for `images()` calls on this thread. Production stays [`UuidLookup::Cache`].
+pub(crate) fn current_uuid_lookup() -> UuidLookup
+{
+    UUID_LOOKUP.with(Cell::get)
+}
+
+/// Drop cached UUIDs on the next `images()` call when a test has bumped the epoch.
+pub(crate) fn sync_test_epoch(cache: &mut MappedUuidCache)
+{
+    let epoch = UUID_CACHE_EPOCH.with(Cell::get);
+    if cache.test_epoch != epoch {
+        cache.clear();
+        cache.test_epoch = epoch;
+    }
+}
+
+/// Restores the previous mapped-UUID lookup mode when dropped.
+///
+/// Integration tests use this to time the pre-#170 and post-#170 costs. The mode is
+/// thread-local, and libtest reuses threads, so it must not outlive the test section.
+#[doc(hidden)]
+#[must_use = "the lookup mode is restored when this guard drops"]
+pub struct UuidLookupGuard
+{
+    previous: UuidLookup,
+}
+
+impl Drop for UuidLookupGuard
+{
+    fn drop(&mut self)
+    {
+        UUID_LOOKUP.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn force_uuid_lookup(lookup: UuidLookup) -> UuidLookupGuard
+{
+    UuidLookupGuard {
+        previous: UUID_LOOKUP.with(|cell| cell.replace(lookup)),
+    }
+}
+
+/// Skip mapped `LC_UUID` reads until the guard drops (the cost from before #170).
+#[doc(hidden)]
+#[must_use = "mapped UUID reads stay skipped until this guard drops"]
+pub fn without_mapped_uuid_reads() -> UuidLookupGuard
+{
+    force_uuid_lookup(UuidLookup::Never)
+}
+
+/// Read every mapped `LC_UUID` and ignore the cache until the guard drops (the #170 cost).
+#[doc(hidden)]
+#[must_use = "mapped UUID reads stay uncached until this guard drops"]
+pub fn reread_mapped_uuids() -> UuidLookupGuard
+{
+    force_uuid_lookup(UuidLookup::Always)
+}
+
+/// Forget cached UUIDs on the next `images()` call on this thread.
+#[doc(hidden)]
+pub fn invalidate_mapped_uuid_cache()
+{
+    UUID_CACHE_EPOCH.with(|cell| cell.set(cell.get().wrapping_add(1)));
+}
+
+/// Remote header reads performed by mapped `LC_UUID` lookup since the last reset, on
+/// this thread.
+#[doc(hidden)]
+pub fn mapped_uuid_header_reads() -> u64
+{
+    MAPPED_UUID_HEADER_READS.with(Cell::get)
+}
+
+/// Zero [`mapped_uuid_header_reads`] and return the previous count.
+#[doc(hidden)]
+pub fn reset_mapped_uuid_header_reads() -> u64
+{
+    MAPPED_UUID_HEADER_READS.with(|cell| cell.replace(0))
 }
 
 #[cfg(test)]
@@ -527,5 +897,165 @@ mod tests
         records.extend_from_slice(&[0xFF; 8]);
         assert_eq!(decode_uuid_infos(&records), vec![(0x1000, [0xAB; 16]), (0x2000, [0x11; 16])]);
         assert!(decode_uuid_infos(&[]).is_empty());
+    }
+
+    #[test]
+    fn image_list_timestamp_is_the_version_15_field_before_dyld_path()
+    {
+        let mut bytes = infos(15, ALL_IMAGE_INFOS_PREFIX, 0, 0);
+        bytes[INFO_ARRAY_CHANGE_TIMESTAMP_OFFSET..INFO_ARRAY_CHANGE_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&0x1111_u64.to_le_bytes());
+        assert_eq!(image_list_timestamp(&bytes), Some(0x1111));
+        // Version 14 has no timestamp, whatever those bytes hold.
+        assert_eq!(image_list_timestamp(&infos(14, ALL_IMAGE_INFOS_PREFIX, 0, 0)), None);
+        assert_eq!(
+            image_list_timestamp(&infos(15, INFO_ARRAY_CHANGE_TIMESTAMP_OFFSET + 7, 0, 0)),
+            None
+        );
+        assert_eq!(image_list_timestamp(&[]), None);
+    }
+
+    fn listed(path: &str, address: u64) -> LoadedImage
+    {
+        LoadedImage {
+            path: PathBuf::from(path),
+            load_address: Address::new(address),
+            uuid: None,
+        }
+    }
+
+    /// An unchanged list does no header reads. A different image at the same address,
+    /// whether dyld's list generation moved or the path at that address changed, is read
+    /// again. The sibling image that did not change is not.
+    #[test]
+    fn unchanged_image_list_skips_header_reads_and_a_replacement_is_reread()
+    {
+        let path_a = "/usr/lib/libSystem.B.dylib";
+        let path_b = "/usr/lib/libc++.1.dylib";
+        let mut images = vec![listed(path_a, 0x1000), listed(path_b, 0x2000)];
+        let mut reads = Vec::new();
+        let mut read = |address: u64| {
+            reads.push(address);
+            MappedUuidRead::Parsed(Some([u8::try_from(reads.len()).expect("few reads"); 16]))
+        };
+        let mut cache = MappedUuidCache::default();
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
+        assert_eq!(reads, vec![0x1000, 0x2000]);
+        let first = images.clone();
+
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
+        assert_eq!(
+            reads,
+            vec![0x1000, 0x2000],
+            "an unchanged list does not re-read known headers"
+        );
+        assert_eq!(images, first);
+
+        // Same list generation, but a different file is now mapped at the first address.
+        images[0].path = PathBuf::from("/usr/lib/libreplaced.dylib");
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(10), &mut read);
+        assert_eq!(
+            reads,
+            vec![0x1000, 0x2000, 0x1000],
+            "a different path at the same address is read again"
+        );
+        assert_ne!(images[0].uuid, first[0].uuid);
+        assert_eq!(
+            images[1].uuid, first[1].uuid,
+            "the image that stayed mapped is not read again"
+        );
+
+        // The loader reports the original path again, and bumps the list generation, which
+        // is how a rebuilt image replaces one at the same address without a path change.
+        images[0].path = PathBuf::from(path_a);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(11), &mut read);
+        assert_eq!(
+            reads,
+            vec![0x1000, 0x2000, 0x1000, 0x1000, 0x2000],
+            "a new image list re-reads the image at the same address"
+        );
+        assert_ne!(images[0].uuid, first[0].uuid);
+    }
+
+    #[test]
+    fn a_failed_mapped_uuid_read_is_not_cached()
+    {
+        let mut images = vec![listed("/usr/lib/libdyld.dylib", 0x2000)];
+        let mut reads = 0;
+        // The first two lookups fail; the third parses. A later lookup must not read again.
+        let mut read = |_| {
+            reads += 1;
+            if reads < 3 {
+                MappedUuidRead::Failed
+            } else {
+                MappedUuidRead::Parsed(Some([9; 16]))
+            }
+        };
+        let mut cache = MappedUuidCache::default();
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
+        assert_eq!(images[0].uuid, None);
+        assert_eq!(reads, 1);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
+        assert_eq!(reads, 2, "a failed read is retried on the next list");
+        assert_eq!(images[0].uuid, None);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
+        assert_eq!(images[0].uuid, Some([9; 16]));
+        assert_eq!(reads, 3);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(1), &mut read);
+        assert_eq!(reads, 3, "the successful read is kept");
+    }
+
+    #[test]
+    fn a_header_without_lc_uuid_is_cached_as_absent()
+    {
+        let mut images = vec![listed("/usr/lib/libcache.dylib", 0x3000)];
+        let mut reads = 0;
+        let mut read = |_| {
+            reads += 1;
+            MappedUuidRead::Parsed(None)
+        };
+        let mut cache = MappedUuidCache::default();
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(4), &mut read);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, Some(4), &mut read);
+        assert_eq!(images[0].uuid, None);
+        assert_eq!(reads, 1, "a parsed header with no LC_UUID is not read again");
+    }
+
+    #[test]
+    fn a_dyld_uuid_is_used_without_reading_the_mapped_header()
+    {
+        let mut images = vec![listed("/usr/lib/libSystem.B.dylib", 0x1000)];
+        let mut reads = 0;
+        let mut read = |_| {
+            reads += 1;
+            MappedUuidRead::Failed
+        };
+        let dyld = HashMap::from([(0x1000, [7_u8; 16])]);
+        let mut cache = MappedUuidCache::default();
+        assign_cached_uuids(&mut images, &dyld, &mut cache, Some(1), &mut read);
+        assert_eq!(reads, 0);
+        assert_eq!(images[0].uuid, Some([7; 16]));
+    }
+
+    /// Without `infoArrayChangeTimestamp`, the path and address list is the generation.
+    #[test]
+    fn an_untimestamped_list_change_rereads_a_replaced_image()
+    {
+        let mut images = vec![
+            listed("/usr/lib/libSystem.B.dylib", 0x1000),
+            listed("/usr/lib/libc++.1.dylib", 0x2000),
+        ];
+        let mut reads = Vec::new();
+        let mut read = |address: u64| {
+            reads.push(address);
+            MappedUuidRead::Parsed(Some([1; 16]))
+        };
+        let mut cache = MappedUuidCache::default();
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
+        assert_eq!(reads, vec![0x1000, 0x2000]);
+        images[0].path = PathBuf::from("/tmp/replaced.dylib");
+        assign_cached_uuids(&mut images, &HashMap::new(), &mut cache, None, &mut read);
+        assert_eq!(reads, vec![0x1000, 0x2000, 0x1000, 0x2000]);
     }
 }

@@ -204,8 +204,8 @@ fn measure_mapped_uuid_and_backtrace_cost()
             }
             write!(line, "{key}={value}").expect("format a measurement field");
         };
-        put("images", u128::from(image_count));
-        put("frames", u128::from(frames));
+        put("images", u128::from(u64::try_from(image_count).expect("image count")));
+        put("frames", u128::from(u64::try_from(frames).expect("frame count")));
         put("before_images_us", before_images_us);
         put("before_images_header_reads", u128::from(before_reads));
         put("before_backtrace_us", before_backtrace_us);

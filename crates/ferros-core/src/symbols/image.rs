@@ -83,7 +83,8 @@ pub struct ImageDescriptor
 /// `load_address` names the runtime Mach-O header; the corresponding file virtual
 /// address comes from the segment covering file offset zero, excluding `__PAGEZERO`.
 ///
-/// [`parse`](Self::parse) reads the layout from the file on disk;
+/// [`parse`](Self::parse) reads the layout from the file on disk.
+/// [`parse_slice`](Self::parse_slice) selects a slice from a universal file.
 /// [`from_header`](Self::from_header) reads it from the header and load commands the
 /// loader mapped, which stay valid while the file is replaced or removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,24 +99,43 @@ impl ImageMapping
 {
     /// Read an executable's segment layout without discovering debug information.
     ///
-    /// The descriptor does not say which architecture the target runs, so a universal
-    /// file has no slice to read; [`from_header`](Self::from_header) reads the layout of
-    /// the slice the target mapped (#169).
+    /// Use [`parse_slice`](Self::parse_slice) to select a slice of a universal file
+    /// on disk, or [`from_header`](Self::from_header) to read from target memory.
     ///
     /// # Errors
     /// Returns an error for unreadable/malformed files, universal files or overflowing
     /// mappings.
     pub fn parse(descriptor: &ImageDescriptor) -> Result<Self>
     {
+        Self::parse_file(descriptor, None)
+    }
+
+    /// Read the segment layout of the selected Mach-O slice without discovering
+    /// debug information (#175).
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or malformed files, a missing slice,
+    /// a UUID mismatch, or overflowing mappings.
+    pub fn parse_slice(descriptor: &ImageDescriptor, selector: &SliceIdentity) -> Result<Self>
+    {
+        Self::parse_file(descriptor, Some(selector))
+    }
+
+    fn parse_file(descriptor: &ImageDescriptor, selector: Option<&SliceIdentity>) -> Result<Self>
+    {
         let bytes = fs::read(&descriptor.path)?;
-        if debuginfo::universal_slices(&bytes).is_some() {
-            return Err(DebuggerError::InvalidArgument(format!(
-                "{} is a universal file: which slice the target mapped is unknown; read the mapped header instead",
-                descriptor.path.display()
-            )));
-        }
-        let file = object::File::parse(&*bytes)
-            .map_err(|error| DebuggerError::InvalidArgument(format!("invalid image: {error}")))?;
+        let data = match selector {
+            Some(selector) => image_slice(&descriptor.path, &bytes, Some(selector))?,
+            None if debuginfo::universal_slices(&bytes).is_some() => {
+                return Err(DebuggerError::InvalidArgument(format!(
+                    "{} is a universal file: which slice the target mapped is unknown; read the mapped header instead",
+                    descriptor.path.display()
+                )));
+            }
+            None => bytes.as_slice(),
+        };
+        let file =
+            object::File::parse(data).map_err(|error| DebuggerError::InvalidArgument(format!("invalid image: {error}")))?;
         Self::from_file(&file, descriptor.load_address)
     }
 
@@ -275,14 +295,14 @@ struct SegmentLayout
     file_size: u64,
 }
 
-/// Which slice of a universal (fat) Mach-O file the target mapped: the CPU type and
-/// subtype and the `LC_UUID` of the image's mapped header (#169).
+/// Selects a slice of a universal (fat) Mach-O file by its CPU type, CPU subtype,
+/// and optional `LC_UUID` (#175).
 ///
-/// arm64 and arm64e (and arm64e variants such as `/usr/lib/dyld`'s `arm64e.x1`) share
-/// `CPU_TYPE_ARM64`, so the subtype tells them apart, and the UUID confirms the slice is
-/// the build that is mapped.
+/// CPU subtype capability bits are ignored. When the UUID is omitted, the first
+/// readable slice of the requested CPU type and subtype is selected. For a
+/// single-architecture file, only the supplied UUID is checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SliceIdentity
+pub struct SliceIdentity
 {
     /// `cputype` of the mapped header.
     pub(crate) cpu_type: u32,
@@ -294,6 +314,24 @@ pub(crate) struct SliceIdentity
 
 impl SliceIdentity
 {
+    /// Create a selector from Mach-O `cputype`, `cpusubtype`, and an optional `LC_UUID`
+    /// (#175). The UUID distinguishes builds of the same CPU type and subtype.
+    ///
+    /// ```rust
+    /// use ferros_core::symbols::SliceIdentity;
+    ///
+    /// let arm64e = SliceIdentity::new(0x0100_000c, 2, None);
+    /// ```
+    #[must_use]
+    pub const fn new(cpu_type: u32, cpu_subtype: u32, uuid: Option<[u8; 16]>) -> Self
+    {
+        Self {
+            cpu_type,
+            cpu_subtype,
+            uuid,
+        }
+    }
+
     /// Read the identity from a 64-bit Mach-O header and its load commands, as
     /// [`ImageMapping::from_header`] takes them.
     ///
@@ -324,9 +362,13 @@ impl SliceIdentity
     /// part of the subtype.
     fn names(&self, cpu_type: u32, cpu_subtype: u32) -> bool
     {
-        let subtype = |value: u32| value & !object::macho::CPU_SUBTYPE_MASK;
-        cpu_type == self.cpu_type && subtype(cpu_subtype) == subtype(self.cpu_subtype)
+        cpu_type == self.cpu_type && base_subtype(cpu_subtype) == base_subtype(self.cpu_subtype)
     }
+}
+
+fn base_subtype(cpu_subtype: u32) -> u32
+{
+    cpu_subtype & !object::macho::CPU_SUBTYPE_MASK
 }
 
 /// The Mach-O bytes of the image at `path` in its file `bytes`: the file itself, or for a
@@ -432,9 +474,9 @@ fn hex(bytes: &[u8]) -> String
 
 /// Unique identifier for a binary image.
 ///
-/// The symbol cache keys on path, load address, and the mapped UUID when known.
-/// Each Mach-O slice has its own UUID, so it also identifies the slice of a
-/// universal file (#170).
+/// The symbol cache keys on path and load address. When a slice is selected,
+/// its CPU type, subtype, and UUID (if supplied) also contribute to the key
+/// (#170, #175).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImageId(u64);
 
@@ -463,17 +505,17 @@ impl ImageId
     /// ```
     pub fn from_parts(path: &Path, load_address: u64) -> Self
     {
-        Self::with_uuid(path, load_address, None)
+        Self::with_slice(path, load_address, None)
     }
 
-    pub(crate) fn with_uuid(path: &Path, load_address: u64, uuid: Option<[u8; 16]>) -> Self
+    pub(crate) fn with_slice(path: &Path, load_address: u64, selector: Option<&SliceIdentity>) -> Self
     {
         use std::collections::hash_map::DefaultHasher;
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         load_address.hash(&mut hasher);
-        if let Some(uuid) = uuid {
-            uuid.hash(&mut hasher);
+        if let Some(selector) = selector {
+            (selector.cpu_type, base_subtype(selector.cpu_subtype), selector.uuid).hash(&mut hasher);
         }
         ImageId(hasher.finish())
     }
@@ -481,7 +523,7 @@ impl ImageId
     /// Get the raw `u64` value of this image ID.
     ///
     /// This is useful for serialization or debugging. The value hashes the path,
-    /// load address, and mapped UUID when known.
+    /// load address, and any slice selector.
     ///
     /// ## Example
     ///
@@ -651,7 +693,7 @@ impl BinaryImage
         let unwind_info = load_section_blob(&file, &["__unwind_info"])?;
 
         Ok(Self {
-            id: ImageId::with_uuid(&desc.path, desc.load_address, target.and_then(|slice| slice.uuid)),
+            id: ImageId::with_slice(&desc.path, desc.load_address, target),
             path: desc.path,
             architecture,
             endian,
@@ -730,7 +772,7 @@ impl BinaryImage
 
     /// Get the unique identifier for this image.
     ///
-    /// The ID is computed from the image's path and load address.
+    /// The ID is computed from the image's path, load address, and any slice selector.
     ///
     /// ## Example
     ///
@@ -1228,6 +1270,8 @@ mod mapping_tests
 mod universal_tests
 {
     use super::*;
+    use crate::symbols::SymbolCache;
+    use crate::symbols::lines::synthetic;
 
     const ARM64: u32 = 0x0100_000c;
     const X86_64: u32 = 0x0100_0007;
@@ -1239,10 +1283,21 @@ mod universal_tests
     /// embedded debug info and no tool.
     fn slice(cpu_type: u32, cpu_subtype: u32, uuid: [u8; 16], text: u64) -> Vec<u8>
     {
-        let names = ["__debug_info", "__debug_abbrev", "__debug_line"];
-        let dwarf_size = 72 + 80 * names.len();
+        let sections = [
+            ("__debug_info", &[0][..]),
+            ("__debug_abbrev", &[0][..]),
+            ("__debug_line", &[0][..]),
+        ];
+        slice_with_sections(cpu_type, cpu_subtype, uuid, text, &sections)
+    }
+
+    fn slice_with_sections(cpu_type: u32, cpu_subtype: u32, uuid: [u8; 16], text: u64, sections: &[(&str, &[u8])])
+    -> Vec<u8>
+    {
+        let dwarf_size = 72 + 80 * sections.len();
         let commands_size = 24 + 72 + dwarf_size;
-        let len = 32 + commands_size + names.len();
+        let mut data_offset = 32 + commands_size;
+        let len = data_offset + sections.iter().map(|(_, data)| data.len()).sum::<usize>();
         let mut bytes = vec![0; len];
         let word =
             |bytes: &mut [u8], offset: usize, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -1268,13 +1323,15 @@ mod universal_tests
         word(&mut bytes, segment, 0x19);
         word(&mut bytes, segment + 4, u32::try_from(dwarf_size).unwrap());
         bytes[segment + 8..segment + 15].copy_from_slice(b"__DWARF");
-        word(&mut bytes, segment + 64, 3);
-        for (index, name) in names.iter().enumerate() {
+        word(&mut bytes, segment + 64, u32::try_from(sections.len()).unwrap());
+        for (index, &(name, data)) in sections.iter().enumerate() {
             let section = segment + 72 + 80 * index;
             bytes[section..section + name.len()].copy_from_slice(name.as_bytes());
             bytes[section + 16..section + 23].copy_from_slice(b"__DWARF");
-            quad(&mut bytes, section + 40, 1);
-            word(&mut bytes, section + 48, u32::try_from(32 + commands_size + index).unwrap());
+            quad(&mut bytes, section + 40, data.len() as u64);
+            word(&mut bytes, section + 48, u32::try_from(data_offset).unwrap());
+            bytes[data_offset..data_offset + data.len()].copy_from_slice(data);
+            data_offset += data.len();
         }
         bytes
     }
@@ -1330,6 +1387,82 @@ mod universal_tests
     fn text(image: &BinaryImage) -> Option<u64>
     {
         image.mapping.file_address(Address::new(0x5_0000_0000))
+    }
+
+    #[test]
+    fn public_slice_selection_reads_matching_symbols_and_mapping()
+    {
+        let with_function = |subtype, uuid, text, name| {
+            let mut unit = synthetic::TestUnit::new("/src", "example.rs");
+            let entry = text + 0x100;
+            unit.rows = vec![(entry, 1)];
+            unit.end = entry + 4;
+            unit.functions = vec![(name, vec![(entry, unit.end)], None)];
+            let dwarf = synthetic::write(&[unit]);
+            let sections = [
+                ("__debug_info", dwarf.sections[&SectionId::DebugInfo].as_slice()),
+                ("__debug_abbrev", dwarf.sections[&SectionId::DebugAbbrev].as_slice()),
+                ("__debug_line", dwarf.sections[&SectionId::DebugLine].as_slice()),
+                ("__debug_ranges", dwarf.sections[&SectionId::DebugRanges].as_slice()),
+            ];
+            slice_with_sections(ARM64, subtype, uuid, text, &sections)
+        };
+        let arm64 = with_function(0, [1; 16], 0x1_0000_0000, "plain_arm64");
+        let arm64e = with_function(ARM64E, [2; 16], 0x2_0000_0000, "arm64e_only");
+        let path = write("public-slice", &universal(&[&arm64, &arm64e], &[(ARM64, 0), (ARM64, ARM64E)]));
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x5_0000_0000,
+        };
+        let mut cache = SymbolCache::new();
+        let plain = cache.load_image_slice(descriptor.clone(), &SliceIdentity::new(ARM64, 0, None));
+        let selector = SliceIdentity::new(ARM64, 2, None);
+        let arm64e_image = cache.load_image_slice(descriptor.clone(), &selector);
+        let mapping = ImageMapping::parse_slice(&descriptor, &selector);
+        let unselected = cache.load_image(descriptor);
+        fs::remove_file(&path).unwrap();
+
+        let runtime = Address::new(0x5_0000_0100);
+        let plain = plain.expect("plain arm64 image");
+        let arm64e_image = arm64e_image.expect("arm64e image");
+        assert_ne!(plain.id(), arm64e_image.id());
+        assert_eq!(plain.function_containing(runtime).unwrap().unwrap().name, "plain_arm64");
+        assert_eq!(
+            arm64e_image.function_containing(runtime).unwrap().unwrap().name,
+            "arm64e_only"
+        );
+        assert_eq!(arm64e_image.file_address(runtime), Some(0x2_0000_0100));
+        assert_eq!(mapping.unwrap().file_address(runtime), Some(0x2_0000_0100));
+        assert!(matches!(unselected, Err(DebuggerError::NoDebugInfo { .. })));
+    }
+
+    #[test]
+    fn public_slice_selection_refuses_the_wrong_uuid()
+    {
+        let arm64e = slice(ARM64, ARM64E, [1; 16], 0x2_0000_0000);
+        let path = write("public-uuid", &universal(&[&arm64e], &[(ARM64, ARM64E)]));
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x5_0000_0000,
+        };
+        let mut cache = SymbolCache::new();
+        let correct = SliceIdentity::new(ARM64, 2, Some([1; 16]));
+        let wrong = SliceIdentity::new(ARM64, 2, Some([2; 16]));
+        assert!(cache.load_image_slice(descriptor.clone(), &correct).is_ok());
+        let assert_refused = |cache: &mut SymbolCache| {
+            for error in [
+                cache.load_image_slice(descriptor.clone(), &wrong).err(),
+                ImageMapping::parse_slice(&descriptor, &wrong).err(),
+            ] {
+                let error = error.expect("another build");
+                assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+                assert!(error.to_string().contains("another build"), "{error}");
+            }
+        };
+        assert_refused(&mut cache);
+        fs::write(&path, arm64e).unwrap();
+        assert_refused(&mut cache);
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

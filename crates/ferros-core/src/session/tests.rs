@@ -744,14 +744,6 @@ fn runtime_address_reports_the_original_header_failure_once_read()
             MockCall::Images
         ]
     );
-    let different = LoadedImage {
-        uuid: Some([0x11; 16]),
-        ..image.clone()
-    };
-    assert_eq!(
-        session.runtime_address(&different, 0x1_0000_0000).expect("different image"),
-        None
-    );
     let moved = LoadedImage {
         load_address: Address::new(CODE + 0x1000),
         ..image

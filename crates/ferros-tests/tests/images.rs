@@ -58,9 +58,5 @@ fn main_executable_uuid_matches_its_file()
             .find(|image| image.path == fixture.path())
             .expect("the main executable image");
         assert_eq!(main.uuid, Some(file_uuid(fixture.path())), "{main:?}");
-        assert!(
-            images.iter().any(|image| image.uuid.is_some()),
-            "the non-cache executable must carry its UUID: {images:?}"
-        );
     });
 }

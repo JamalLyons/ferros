@@ -303,7 +303,7 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage], uuids: &H
         return None;
     }
     if !is_header_of_type(task, load_address, MH_DYLINKER) {
-        tracing::debug!("dyld's recorded load address {load_address} holds no MH_DYLINKER header");
+        tracing::trace!("dyld's recorded load address {load_address} holds no MH_DYLINKER header");
         return None;
     }
     let path = if path_address == 0 {
@@ -404,11 +404,12 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
             uuid: None,
         });
     }
+    // Read before the stability check below, so a list that changed under it is refused
+    // too. A failed UUID read must not fail the list. Shared-cache images are absent here.
+    let uuids = image_uuids(task, &infos);
     if read_target(task, address, 16)? != before {
         return Err(invalid("image list changed while reading"));
     }
-    // A failed UUID read must not fail the list. Shared-cache images are absent here.
-    let uuids = image_uuids(task, &infos);
     for image in &mut images {
         image.uuid = uuids.get(&image.load_address.value()).copied();
     }

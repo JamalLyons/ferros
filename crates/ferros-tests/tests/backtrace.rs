@@ -333,6 +333,13 @@ fn dyld_entry_symbolicates_from_its_universal_file_at_the_launch_stop()
             .clone();
         let entry = d.stack_trace(1).expect("stack trace")[0].pc;
         assert!(dyld.load_address < entry, "{entry} in {images:#?}");
+        // The session maps the entry to dyld from its mapped header, so `symbolicate`
+        // below reads dyld's file rather than finding no image (`Ok(None)`).
+        let (owner, _) = d
+            .file_address(entry)
+            .expect("file address")
+            .unwrap_or_else(|| panic!("{entry} is mapped: {images:#?}"));
+        assert_eq!(owner, dyld.path);
         for attempt in 0..2 {
             match d.symbolicate(entry) {
                 Ok(_) => {}

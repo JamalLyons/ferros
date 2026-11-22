@@ -334,9 +334,11 @@ impl SliceIdentity
 /// type and subtype and, when `target` knows it, its UUID.
 ///
 /// # Errors
-/// [`DebuggerError::NoDebugInfo`] for a universal file with no slice matching `target`,
-/// or when `target` is unknown so no slice can be chosen; [`DebuggerError::InvalidArgument`]
-/// for a malformed universal file.
+/// [`DebuggerError::NoDebugInfo`] for a universal file with no slice of `target`'s CPU
+/// type and subtype, or when `target` is unknown so no slice can be chosen.
+/// [`DebuggerError::InvalidArgument`] for a malformed universal file, or when every
+/// slice of that CPU is damaged or another build (the file was replaced): a failure the
+/// session retries once the file changes, not missing debug info it keeps.
 pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option<&SliceIdentity>) -> Result<&'data [u8]>
 {
     let Some(slices) = debuginfo::universal_slices(bytes) else {
@@ -351,22 +353,51 @@ pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option
     let Some(target) = target else {
         return Err(no_slice("universal file, and the target's architecture is unknown".into()));
     };
-    let uuid_of = |data: &[u8]| object::File::parse(data).ok()?.mach_uuid().ok().flatten();
-    slices
-        .iter()
-        .filter(|slice| target.names(slice.cpu_type, slice.cpu_subtype))
-        .find(|slice| target.uuid.is_none() || uuid_of(slice.data) == target.uuid)
-        .map(|slice| slice.data)
-        .ok_or_else(|| {
-            no_slice(format!(
-                "universal file has no slice for cputype {:#x} cpusubtype {:#x}{}",
-                target.cpu_type,
-                target.cpu_subtype,
-                target
-                    .uuid
-                    .map_or_else(String::new, |uuid| format!(" with UUID {}", hex(&uuid)))
-            ))
-        })
+    // The first slice whose CPU type and subtype match and whose UUID matches when the
+    // target knows it. Why a candidate was rejected is kept: a damaged slice is reported
+    // as such, and a slice of another build as a replaced file, not as missing debug info.
+    let mut rejected = None;
+    for slice in slices.iter().filter(|slice| target.names(slice.cpu_type, slice.cpu_subtype)) {
+        let data = match slice.data {
+            Ok(data) => data,
+            Err(error) => {
+                rejected.get_or_insert_with(|| format!("slice range: {error}"));
+                continue;
+            }
+        };
+        let Some(uuid) = target.uuid else {
+            return Ok(data);
+        };
+        match object::File::parse(data).and_then(|file| file.mach_uuid()) {
+            Ok(Some(found)) if found == uuid => return Ok(data),
+            Ok(found) => {
+                rejected.get_or_insert_with(|| {
+                    format!(
+                        "slice is another build (UUID {}) than the mapped image",
+                        found.map_or_else(|| "none".into(), |found| hex(&found))
+                    )
+                });
+            }
+            Err(error) => {
+                rejected.get_or_insert_with(|| format!("slice: {error}"));
+            }
+        }
+    }
+    let wanted = format!(
+        "cputype {:#x} cpusubtype {:#x}{}",
+        target.cpu_type,
+        target.cpu_subtype,
+        target
+            .uuid
+            .map_or_else(String::new, |uuid| format!(" with UUID {}", hex(&uuid)))
+    );
+    Err(match rejected {
+        Some(detail) => DebuggerError::InvalidArgument(format!(
+            "invalid universal file {}: {detail}, and no other slice for {wanted}",
+            path.display()
+        )),
+        None => no_slice(format!("universal file has no slice for {wanted}")),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String
@@ -1341,8 +1372,8 @@ mod universal_tests
             cpu_subtype: 0,
             uuid: None,
         };
+        let replaced = parse(&path, Some(&other_build)).err();
         let results = [
-            parse(&path, Some(&other_build)).err(),
             parse(&path, Some(&plain_arm64)).err(),
             parse(&path, None).err(),
             crate::symbols::SymbolCache::with_debug_info_options(DebugInfoOptions {
@@ -1368,9 +1399,28 @@ mod universal_tests
             );
             assert!(error.to_string().contains("universal"), "{error}");
         }
+        // A slice of the mapped CPU from another build means the file was replaced: a
+        // load failure, retried once the file changes, not debug info that is missing.
+        let error = replaced.expect("another build");
+        assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+        assert!(error.to_string().contains("another build"), "{error}");
         let error = mapping.expect_err("no slice to map");
         assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
         assert!(error.to_string().contains("universal"), "{error}");
+    }
+
+    /// With the mapped UUID known, a candidate slice that is not a valid Mach-O is
+    /// reported as damaged, not as a build mismatch or missing debug info.
+    #[test]
+    fn a_damaged_candidate_slice_is_reported_as_damaged()
+    {
+        let arm64e = slice(ARM64, ARM64E, [3; 16], 0x2_0000_0000);
+        let target = SliceIdentity::from_header(&arm64e).unwrap();
+        let damaged = vec![0xab; arm64e.len()];
+        let bytes = universal(&[&damaged], &[(ARM64, ARM64E)]);
+        let error = image_slice(Path::new("/universal"), &bytes, Some(&target)).unwrap_err();
+        assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+        assert!(!error.to_string().contains("another build"), "{error}");
     }
 
     #[test]

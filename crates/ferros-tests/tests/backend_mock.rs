@@ -2745,3 +2745,60 @@ fn handler_continue_drops_an_abandoned_steps_completion_that_refuses_it()
     );
     assert_eq!(mock.script_len(), 0);
 }
+
+/// #167: a handler return cuts short a peer's step before it executes the instruction.
+/// The reissued continue starts a fresh step of the peer at the same breakpoint.
+#[test]
+fn handler_continue_consumes_a_fresh_step_of_the_previously_stepped_thread()
+{
+    use ferros_core::BreakpointRequest;
+
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()));
+    session
+        .launch(&LaunchSpec::new("scripted-handler-fresh-step"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let address = HANDLER_PEER_SITE;
+    session
+        .add_breakpoint(BreakpointRequest::Software { address })
+        .expect("peer breakpoint");
+    let peer_breakpoint = StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: address,
+    };
+    mock.script(
+        MockStop::new(peer_breakpoint.clone())
+            .set_pc(THREAD, address)
+            .expect_resume(ResumeRequest::continue_all()),
+    );
+    session.resume().expect("run both threads");
+    assert_eq!(session.wait(None).expect("wait"), Some(peer_breakpoint));
+
+    // The handler's in-flight return stop arrives after the peer's first step starts.
+    // The peer is still on its breakpoint, so the reissued continue steps it again.
+    mock.script(handler_return(&registers).expect_resume(ResumeRequest::step(THREAD)));
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, address + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    mock.script(handler_step_off());
+    let exited = StopEvent::Exited { code: 0 };
+    mock.script(MockStop::new(exited.clone()).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("complete the fresh step after the handler returns");
+    assert_eq!(session.wait(None).expect("wait through both step-overs"), Some(exited));
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::step(THREAD),
+            ResumeRequest::step(THREAD),
+            ResumeRequest::step(HANDLER),
+            ResumeRequest::continue_all(),
+        ],
+    );
+    assert_eq!(session.state(), SessionState::Exited);
+    assert_eq!(mock.script_len(), 0);
+}

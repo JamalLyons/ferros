@@ -238,7 +238,7 @@ mod tests
     fn frame(function: &str, file: &str, line: u32) -> SymbolFrame
     {
         SymbolFrame {
-            symbol: SymbolName::new(function.to_owned(), None, SymbolLanguage::Rust),
+            symbol: SymbolName::from_debug_info(function.to_owned(), None, SymbolLanguage::Rust),
             location: Some(SourceLocation {
                 file: file.to_owned(),
                 line: Some(line),

@@ -426,7 +426,7 @@ fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Addres
         }
     }?;
     let name = symtab::strip_symbol_prefix(&raw).to_owned();
-    Some(make_symbol_name(name).with_source(SymbolSource::SymbolTable))
+    Some(make_symbol_name(name, SymbolSource::SymbolTable))
 }
 
 /// Read an image's `nlist` entries and, when it records them, its function starts.

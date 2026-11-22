@@ -65,13 +65,13 @@ impl fmt::Display for SymbolLanguage
     }
 }
 
-/// Where a [`SymbolName`] came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Where a [`SymbolName`] came from. Every constructor of [`SymbolName`] names it; there
+/// is no default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSource
 {
     /// Debug information (DWARF): the name of the function or inlined call, usually with
     /// a source location.
-    #[default]
     DebugInfo,
     /// Only the image's symbol table (Mach-O `LC_SYMTAB`), for code without DWARF: the
     /// nearest symbol at or before the address. Such a name has no source location, and
@@ -92,27 +92,30 @@ pub struct SymbolName
 
 impl SymbolName
 {
-    /// Construct from a raw linkage name.
-    pub fn new(raw: String, demangled: Option<String>, language: SymbolLanguage) -> Self
+    /// Construct from a raw linkage name, stating where it came from.
+    pub fn new(raw: String, demangled: Option<String>, language: SymbolLanguage, source: SymbolSource) -> Self
     {
         Self {
             raw,
             demangled,
             language,
-            source: SymbolSource::DebugInfo,
+            source,
         }
     }
 
-    /// The same name, marked as coming from `source`.
-    #[must_use]
-    pub fn with_source(mut self, source: SymbolSource) -> Self
+    /// A name from debug information (DWARF).
+    pub fn from_debug_info(raw: String, demangled: Option<String>, language: SymbolLanguage) -> Self
     {
-        self.source = source;
-        self
+        Self::new(raw, demangled, language, SymbolSource::DebugInfo)
     }
 
-    /// Where the name came from: debug information unless set by
-    /// [`with_source`](Self::with_source).
+    /// A name from an image's symbol table only (see [`SymbolSource::SymbolTable`]).
+    pub fn from_symbol_table(raw: String, demangled: Option<String>, language: SymbolLanguage) -> Self
+    {
+        Self::new(raw, demangled, language, SymbolSource::SymbolTable)
+    }
+
+    /// Where the name came from, as stated when it was constructed.
     pub fn source(&self) -> SymbolSource
     {
         self.source
@@ -172,6 +175,29 @@ impl SourceLocation
             file: file.into(),
             line: None,
             column: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn every_constructor_states_its_source()
+    {
+        let raw = || "_foo".to_owned();
+        assert_eq!(
+            SymbolName::from_debug_info(raw(), None, SymbolLanguage::C).source(),
+            SymbolSource::DebugInfo
+        );
+        assert_eq!(
+            SymbolName::from_symbol_table(raw(), None, SymbolLanguage::C).source(),
+            SymbolSource::SymbolTable
+        );
+        for source in [SymbolSource::DebugInfo, SymbolSource::SymbolTable] {
+            assert_eq!(SymbolName::new(raw(), None, SymbolLanguage::C, source).source(), source);
         }
     }
 }

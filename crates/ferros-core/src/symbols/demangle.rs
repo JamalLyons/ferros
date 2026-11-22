@@ -23,7 +23,7 @@
 use rustc_demangle::try_demangle;
 
 use crate::error::DebuggerError;
-use crate::types::{SymbolLanguage, SymbolName};
+use crate::types::{SymbolLanguage, SymbolName, SymbolSource};
 
 /// Create a `SymbolName` from a raw mangled symbol string.
 ///
@@ -48,7 +48,7 @@ use crate::types::{SymbolLanguage, SymbolName};
 /// // Note: This function is internal to the crate.
 /// // In practice, symbol names are created automatically during symbolication.
 /// ```
-pub(crate) fn make_symbol_name(raw: String) -> SymbolName
+pub(crate) fn make_symbol_name(raw: String, source: SymbolSource) -> SymbolName
 {
     // The alternate form leaves out crate disambiguators (`[e9e28b783c7f9d4c]`) and legacy
     // `::h<hash>` suffixes, as the function index does.
@@ -61,7 +61,7 @@ pub(crate) fn make_symbol_name(raw: String) -> SymbolName
         SymbolLanguage::Unknown
     };
 
-    SymbolName::new(raw, demangled, language)
+    SymbolName::new(raw, demangled, language, source)
 }
 
 /// Check if a type name represents a Rust trait object.

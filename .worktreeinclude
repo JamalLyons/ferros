@@ -1,0 +1,3 @@
+# Gitignored paths `wt step copy-ignored` clones into a new worktree.
+# Only the Cargo build cache: reflinked on APFS, so it costs no extra disk.
+target/

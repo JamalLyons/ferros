@@ -310,7 +310,7 @@ impl TestContext
             .stderr(StdioSpec::Path(capture.stderr_path()));
 
         let child_cleanup = backend.child_cleanup();
-        let mut session = Session::new(Box::new(backend));
+        let mut session = ferros_macos::session_with(backend);
 
         self.shared.tracked().push(Tracked {
             tag: tag.clone(),
@@ -682,7 +682,7 @@ impl Drop for Debuggee
 {
     fn drop(&mut self)
     {
-        let empty = Session::new(Box::new(ferros_macos::MacOSBackend::new().expect("empty backend")));
+        let empty = ferros_macos::new_session().expect("empty session");
         drop(std::mem::replace(&mut self.session, empty));
         kill_debuggee(&self.tag);
         // Detaching a launched target transfers execution ownership but we are still

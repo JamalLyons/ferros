@@ -14,7 +14,6 @@ use ferros_core::symbols::SourceLookupError;
 use ferros_core::{
     BreakpointHit, BreakpointLocation, DebuggerError, LaunchSpec, LogicalBreakpointId, Session, SessionState, StopEvent,
 };
-use ferros_macos::MacOSBackend;
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::function_address;
 use ferros_tests::transcript::{self, Interactive, normalize};
@@ -306,7 +305,7 @@ fn breakpoint_set_before_launch_is_resolved_at_entry()
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let tag = t.tag();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         let id = set(&mut session, function("tick"));
         assert!(session.logical_breakpoints()[0].pending.is_some());
         assert_eq!(sites(&session, id).len(), 0);
@@ -548,7 +547,7 @@ fn assert_running(pid: u32, what: &str)
 
 fn new_session() -> Session
 {
-    Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")))
+    ferros_macos::new_session().expect("MacOSBackend::new")
 }
 
 /// A function breakpoint set with no process is resolved when the session attaches to a

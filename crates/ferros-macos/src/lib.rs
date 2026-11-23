@@ -12,10 +12,9 @@
 //! # // building where the crate is empty; on macOS this body is the one that compiles.
 //! # #[cfg(target_os = "macos")]
 //! # fn main() -> Result<(), ferros_core::error::DebuggerError> {
-//! use ferros_core::{LaunchSpec, Session};
-//! use ferros_macos::MacOSBackend;
+//! use ferros_core::LaunchSpec;
 //!
-//! let mut session = Session::new(Box::new(MacOSBackend::new()?));
+//! let mut session = ferros_macos::new_session()?;
 //! session.launch(&LaunchSpec::new("/bin/echo").arg("hello"))?;
 //! let regs = session.read_registers()?;
 //! println!("stopped at entry, pc = {}", regs.pc);
@@ -75,6 +74,13 @@
 //!   breakpoints and watchpoints are not part of the `Backend` interface; the unverified
 //!   helpers in [`breakpoints`] program debug registers directly.
 //! - **Images**: the main executable and dyld-loaded libraries are reported (see [`images`]).
+//!
+//! ## Object files
+//!
+//! [`macho::MachOFormat`] implements the portable [`ferros_core::objfile::ObjectFormat`]
+//! for Mach-O: symbol tables of code without DWARF, and the `MH_MAGIC_64` search for
+//! images the loader does not list. [`new_session`] and [`session_with`] pair it with a
+//! [`MacOSBackend`].
 //!
 //! ## Known gaps
 //!
@@ -192,6 +198,7 @@ pub mod guards;
 pub mod images;
 pub mod launch;
 mod lifecycle;
+pub mod macho;
 pub mod memory;
 pub mod registers;
 pub mod task;
@@ -199,4 +206,23 @@ pub mod terminal;
 pub mod threads;
 pub mod types;
 
+pub use macho::MachOFormat;
 pub use task::MacOSBackend;
+
+/// A [`ferros_core::Session`] with no process on a new [`MacOSBackend`], reading images
+/// as Mach-O ([`MachOFormat`]).
+///
+/// # Errors
+/// The error from [`MacOSBackend::new`].
+pub fn new_session() -> ferros_core::Result<ferros_core::Session>
+{
+    Ok(session_with(MacOSBackend::new()?))
+}
+
+/// A [`ferros_core::Session`] driving `backend`, which the caller may have prepared first
+/// (for example to keep a test hook handle of it), reading images as Mach-O.
+#[must_use]
+pub fn session_with(backend: MacOSBackend) -> ferros_core::Session
+{
+    ferros_core::Session::new(Box::new(backend), MachOFormat::shared())
+}

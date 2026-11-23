@@ -22,6 +22,10 @@ once_cell = "1.19"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# The session tests in `macho` drive the scripted mock backend over Mach-O bytes.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ferros-core = { path = "../ferros-core", features = ["test-util"] }
+
 # ferros-macos is the one crate in the workspace allowed to use `unsafe`, for raw
 # Mach FFI. Mirror the workspace lints minus `unsafe_code = "forbid"` and minus
 # clippy pedantic (to avoid churn in the moved Mach code; revisit later).

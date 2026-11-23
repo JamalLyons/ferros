@@ -7,6 +7,7 @@ use crate::arch::Arm64;
 use crate::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use crate::backend::{BackendError, LaunchSpec, LoadedImage, ResumeRequest, ThreadAction};
 use crate::breakpoints::{BreakpointId, BreakpointRequest, BreakpointState, WatchpointAccess};
+use crate::objfile::mock::MockObjectFormat;
 
 const T1: ThreadId = ThreadId(1);
 const T2: ThreadId = ThreadId(2);
@@ -39,7 +40,7 @@ fn spec() -> LaunchSpec
 
 fn session(mock: &MockBackend) -> Session
 {
-    Session::new(Box::new(mock.clone()))
+    Session::new(Box::new(mock.clone()), MockObjectFormat::shared())
 }
 
 fn launched(mock: &MockBackend) -> Session
@@ -1455,5 +1456,5 @@ mod logical
     }
 }
 
-#[path = "tests/symtab.rs"]
-mod symtab;
+#[path = "tests/symbol_tables.rs"]
+mod symbol_tables;

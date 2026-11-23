@@ -1,4 +1,4 @@
-//! Selection of the backend and the job control for the host operating system.
+//! Selection of the backend, the object format and the job control for the host operating system.
 //!
 //! `ferros-core` holds no OS-specific code, so the choice of backend is made here, in
 //! the binary. This module is the only place outside the platform crates (and the test
@@ -6,24 +6,25 @@
 
 use std::io;
 
-use ferros_core::Backend;
+use ferros_core::Session;
 
 use crate::repl::jobs::JobControl;
 
-/// Create the [`Backend`] for the current operating system.
+/// Create a [`Session`] for the current operating system: its backend and the object
+/// format of its images.
 ///
-/// - macOS: `ferros_macos::MacOSBackend`
+/// - macOS: `ferros_macos::MacOSBackend` with `ferros_macos::MachOFormat`
 /// - any other OS: not implemented yet, returns an error
 ///
 /// # Errors
 ///
 /// On macOS, returns the error from `MacOSBackend::new()`. On any other OS, returns
 /// `DebuggerError::Backend(BackendError::Unsupported(..))` naming the platform.
-pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
+pub fn create_session() -> ferros_core::Result<Session>
 {
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(ferros_macos::MacOSBackend::new()?))
+        ferros_macos::new_session()
     }
 
     #[cfg(not(target_os = "macos"))]

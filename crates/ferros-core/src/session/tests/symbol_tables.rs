@@ -1,77 +1,27 @@
-//! Frames named from a mapped image's symbol table, on the mock backend.
+//! Frames named from a mapped image's symbol table, on the mock backend and the neutral
+//! [`MockObjectFormat`].
 
 use super::*;
+use crate::objfile::mock::MockObjectImage;
 use crate::types::{BuildId, StackFrame, SymbolSource};
 
-/// A 64-bit Mach-O image for the mapped layout: `__TEXT` (vmaddr 0x1_0000_0000, file
-/// offset 0, 0x4000 bytes) with `__text` code at 0x1000..0x1100, `__LINKEDIT` at file
-/// offset 0x4000 (0x2000 bytes), one symbol `_foo` at `__text`'s start in an `nlist` at
-/// file offset 0x4000, and the string table at file offset 0x5000.
+/// An image in the neutral [`MockObjectFormat`], laid out from `base`: its header at
+/// `base`, code at `base + 0x1000..base + 0x1100` with one symbol `foo` at its start, the
+/// table at `base + 0x4000` and the names at `base + 0x5000`.
 ///
-/// Returns the header page, the `nlist` page and the string page, each as mapped bytes.
-fn image() -> (Vec<u8>, Vec<u8>, Vec<u8>)
+/// Returns the header page (0x4000 bytes, so the code lies in it), the table page and the
+/// names page, each as mapped bytes.
+fn image(base: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>)
 {
-    fn u32s(out: &mut Vec<u8>, values: &[u32])
-    {
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    fn u64s(out: &mut Vec<u8>, values: &[u64])
-    {
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    fn name(out: &mut Vec<u8>, name: &str)
-    {
-        let mut bytes = [0; 16];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        out.extend_from_slice(&bytes);
-    }
-    let mut commands = Vec::new();
-    // __TEXT with one section.
-    u32s(&mut commands, &[0x19, 72 + 80]);
-    name(&mut commands, "__TEXT");
-    u64s(&mut commands, &[0x1_0000_0000, 0x4000, 0, 0x4000]);
-    u32s(&mut commands, &[5, 5, 1, 0]);
-    name(&mut commands, "__text");
-    name(&mut commands, "__TEXT");
-    u64s(&mut commands, &[0x1_0000_1000, 0x100]);
-    u32s(&mut commands, &[0x1000, 2, 0, 0, 0x8000_0400, 0, 0, 0]);
-    // __LINKEDIT.
-    u32s(&mut commands, &[0x19, 72]);
-    name(&mut commands, "__LINKEDIT");
-    u64s(&mut commands, &[0x1_0000_4000, 0x2000, 0x4000, 0x2000]);
-    u32s(&mut commands, &[1, 1, 0, 0]);
-    // LC_SYMTAB.
-    u32s(&mut commands, &[0x2, 24, 0x4000, 1, 0x5000, 0x10]);
-    let mut header = Vec::new();
-    u32s(
-        &mut header,
-        &[
-            0xfeed_facf,
-            0x0100_000c,
-            0,
-            2,
-            3,
-            u32::try_from(commands.len()).unwrap(),
-            0,
-            0,
-        ],
-    );
-    header.extend(commands);
+    let image =
+        MockObjectImage::new(base + 0x1000..base + 0x1100, base + 0x4000, base + 0x5000).with_symbol(base + 0x1000, "foo");
+    let mut header = image.header_bytes();
     header.resize(0x4000, 0);
-
-    let mut nlists = Vec::new();
-    u32s(&mut nlists, &[1]);
-    nlists.extend_from_slice(&[0x0f, 1, 0, 0]);
-    u64s(&mut nlists, &[0x1_0000_1000]);
-    nlists.resize(0x1000, 0);
-
-    let mut strings = b"\0_foo\0".to_vec();
-    strings.resize(0x1000, 0);
-    (header, nlists, strings)
+    let mut table = image.table_bytes();
+    table.resize(0x1000, 0);
+    let mut names = image.name_bytes();
+    names.resize(0x1000, 0);
+    (header, table, names)
 }
 
 fn image_at(path: &str, address: u64) -> LoadedImage
@@ -91,28 +41,28 @@ fn symbol(frame: &StackFrame) -> Option<(&str, SymbolSource)>
 #[test]
 fn failed_symbol_table_reads_are_retried_by_a_later_trace()
 {
-    // Issue #104 review: a failed `nlist` or string read leaves the frame unnamed for
+    // Issue #104 review: a failed table or name read leaves the frame unnamed for
     // that trace only; a later trace reads again and names it. The image is mapped
     // without execute permission so the unlisted-header search cannot find it: the name
     // must come from the listed image's own symbol table state.
     const IMAGE: u64 = 0x10_0000;
-    let (header, nlists, strings) = image();
+    let (header, table, names) = image(IMAGE);
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
         .with_region(Address::new(IMAGE), "r--", header)
         .with_image(image_at("ferros-symtab-image", IMAGE));
     let mut session = launched(&mock);
 
-    // Neither the `nlist` entries nor the strings are mapped.
+    // Neither the table nor the names are mapped.
     let frames = session.stack_trace(4).expect("stack trace");
     assert_eq!(symbol(&frames[0]), None);
 
-    // The `nlist` entries are, but the strings are not.
-    let _ = mock.clone().with_region(Address::new(IMAGE + 0x4000), "r--", nlists);
+    // The table is, but the names are not.
+    let _ = mock.clone().with_region(Address::new(IMAGE + 0x4000), "r--", table);
     let frames = session.stack_trace(4).expect("stack trace");
     assert_eq!(symbol(&frames[0]), None);
 
-    let _ = mock.clone().with_region(Address::new(IMAGE + 0x5000), "r--", strings);
+    let _ = mock.clone().with_region(Address::new(IMAGE + 0x5000), "r--", names);
     let frames = session.stack_trace(4).expect("stack trace");
     assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
 }
@@ -120,19 +70,19 @@ fn failed_symbol_table_reads_are_retried_by_a_later_trace()
 #[test]
 fn header_search_skips_a_false_magic_word_before_the_real_header()
 {
-    // Issue #104 review: an `MH_MAGIC_64` word that is not a usable header (here at the
-    // start of the pc's page, in code) does not end the search for the image's header.
+    // Issue #104 review: a magic word that is not a usable header (here at the start of
+    // the pc's page, in code) does not end the search for the image's header.
     const LISTED: u64 = 0x10_0000;
     const UNLISTED: u64 = 0x40_0000;
-    let (listed, ..) = image();
-    let (mut header, nlists, strings) = image();
-    header[0x1000..0x1004].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
+    let (listed, ..) = image(LISTED);
+    let (mut header, table, names) = image(UNLISTED);
+    header[0x1000..0x1004].copy_from_slice(&MockObjectFormat::MAGIC);
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(UNLISTED + 0x1010))
         .with_region(Address::new(LISTED), "r-x", listed)
         .with_region(Address::new(UNLISTED), "r-x", header)
-        .with_region(Address::new(UNLISTED + 0x4000), "r--", nlists)
-        .with_region(Address::new(UNLISTED + 0x5000), "r--", strings)
+        .with_region(Address::new(UNLISTED + 0x4000), "r--", table)
+        .with_region(Address::new(UNLISTED + 0x5000), "r--", names)
         .with_image(image_at("ferros-symtab-listed", LISTED));
     let mut session = launched(&mock);
     let frames = session.stack_trace(4).expect("stack trace");
@@ -146,8 +96,8 @@ fn a_failed_header_search_does_not_hide_a_later_frames_image()
     // later frame inside that image, in the same region, must still find its header.
     const LISTED: u64 = 0x10_0000;
     const CODE: u64 = 0x40_0000;
-    let (listed, ..) = image();
-    let (header, nlists, strings) = image();
+    let (listed, ..) = image(LISTED);
+    let (header, table, names) = image(CODE + 0x1000);
     let mut region = vec![0u8; 0x1000];
     region.extend(header);
     let mut registers = regs_at(CODE + 0x10);
@@ -159,8 +109,8 @@ fn a_failed_header_search_does_not_hide_a_later_frames_image()
         .with_thread(T1, registers)
         .with_region(Address::new(LISTED), "r-x", listed)
         .with_region(Address::new(CODE), "r-x", region)
-        .with_region(Address::new(CODE + 0x5000), "r--", nlists)
-        .with_region(Address::new(CODE + 0x6000), "r--", strings)
+        .with_region(Address::new(CODE + 0x5000), "r--", table)
+        .with_region(Address::new(CODE + 0x6000), "r--", names)
         .with_region(Address::new(0x2000), "rw-", stack)
         .with_image(image_at("ferros-symtab-listed", LISTED));
     let mut session = launched(&mock);
@@ -174,11 +124,11 @@ fn a_failed_header_search_does_not_hide_a_later_frames_image()
 #[test]
 fn header_search_runs_once_per_region_in_a_trace()
 {
-    // Two frames in a code region without any Mach-O header: the region is searched
-    // for the first and remembered as headerless for the second.
+    // Two frames in a code region without any image header: the region is searched for
+    // the first and remembered as headerless for the second.
     const LISTED: u64 = 0x10_0000;
     const CODE: u64 = 0x40_0000;
-    let (listed, ..) = image();
+    let (listed, ..) = image(LISTED);
     let mut registers = regs_at(CODE + 0x3010);
     registers.fp = Address::new(0x2000);
     registers.sp = Address::new(0x2000);
@@ -211,15 +161,15 @@ fn a_listed_image_is_named_without_a_header_search()
 {
     // Issue #121: dyld is now a listed image, so its code (the base of a main-thread
     // trace) is named from its own symbol table. The pc's region is executable, where a
-    // search would probe each 4 KiB page below the pc for `MH_MAGIC_64`; for a listed
-    // image no such probe is read.
+    // search would probe each 4 KiB page below the pc for a header's magic word; for a
+    // listed image no such probe is read.
     const IMAGE: u64 = 0x40_0000;
-    let (header, nlists, strings) = image();
+    let (header, table, names) = image(IMAGE);
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
         .with_region(Address::new(IMAGE), "r-x", header)
-        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
-        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", table)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", names)
         .with_image(image_at("dyld", IMAGE));
     let mut session = launched(&mock);
     let frames = session.stack_trace(4).expect("stack trace");
@@ -242,7 +192,7 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     // on either side, preserves the cached name even when the mocked bytes change.
     // Only two known, different UUIDs trigger a re-read.
     const IMAGE: u64 = 0x10_0000;
-    let (header, nlists, strings) = image();
+    let (header, table, names) = image(IMAGE);
     let path = "/nonexistent/ferros-symtab-replaced";
     let listed = |uuid: Option<[u8; 16]>| LoadedImage {
         path: path.into(),
@@ -252,8 +202,8 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
         .with_region(Address::new(IMAGE), "r--", header)
-        .with_region(Address::new(IMAGE + 0x4000), "r--", nlists)
-        .with_region(Address::new(IMAGE + 0x5000), "r--", strings)
+        .with_region(Address::new(IMAGE + 0x4000), "r--", table)
+        .with_region(Address::new(IMAGE + 0x5000), "r--", names)
         .with_image(listed(None));
     let mut session = launched(&mock);
     let name = |session: &mut Session| {
@@ -264,8 +214,8 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
 
     assert_eq!(name(&mut session), named("foo"));
 
-    // Both UUIDs unknown, and the string table now says `_bar`: the cached name is kept.
-    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_bar\0");
+    // Both UUIDs unknown, and the names now say `bar`: the cached name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"bar");
     assert_eq!(name(&mut session), named("foo"));
 
     // The UUID becomes known: still the same image, so the name is kept and the UUID
@@ -282,11 +232,11 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     mock.set_images(vec![listed(Some([2; 16]))]);
     assert_eq!(name(&mut session), named("bar"));
 
-    // The same UUID again, with the string table now saying `_baz`: the name is kept.
-    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"\0_baz\0");
+    // The same UUID again, with the names now saying `baz`: the name is kept.
+    mock.overwrite_memory(Address::new(IMAGE + 0x5000), b"baz");
     assert_eq!(name(&mut session), named("bar"));
 
-    // And another build replaces it: `_baz`.
+    // And another build replaces it: `baz`.
     mock.set_images(vec![listed(Some([3; 16]))]);
     assert_eq!(name(&mut session), named("baz"));
 }
@@ -297,7 +247,7 @@ fn runtime_address_refuses_an_image_whose_known_uuid_differs()
     // Issue #121: an image at the same path and address with a different known UUID is
     // a different build, so its file addresses do not apply. An unknown UUID on either
     // side is no evidence of a change.
-    let (header, _, _) = image();
+    // The mapping is still read from a Mach-O header in core (`ImageMapping`).
     let listed = |uuid: Option<[u8; 16]>| LoadedImage {
         path: "/nonexistent/ferros-uuid-image".into(),
         load_address: Address::new(0x10_0000),
@@ -305,15 +255,15 @@ fn runtime_address_refuses_an_image_whose_known_uuid_differs()
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(0x10_1010))
-        .with_region(Address::new(0x10_0000), "r-x", header)
+        .with_region(Address::new(0x10_0000), "r-x", mapped_text_header())
         .with_image(listed(Some([1; 16])));
     let mut session = launched(&mock);
     let at = |session: &mut Session, uuid| {
         session
-            .runtime_address(&listed(uuid), 0x1_0000_1000)
+            .runtime_address(&listed(uuid), 0x1_0000_0800)
             .expect("runtime address")
     };
-    assert_eq!(at(&mut session, Some([1; 16])), Some(Address::new(0x10_1000)));
-    assert_eq!(at(&mut session, None), Some(Address::new(0x10_1000)));
+    assert_eq!(at(&mut session, Some([1; 16])), Some(Address::new(0x10_0800)));
+    assert_eq!(at(&mut session, None), Some(Address::new(0x10_0800)));
     assert_eq!(at(&mut session, Some([2; 16])), None);
 }

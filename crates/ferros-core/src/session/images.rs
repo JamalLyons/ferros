@@ -2,13 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::Session;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
+use crate::objfile::{MappedSymbols, SymbolIndex, SymbolKey};
 use crate::symbols::debuginfo::LoadInputs;
 use crate::symbols::image::SliceIdentity;
-use crate::symbols::symtab::{SymbolTable, SymtabLayout};
 use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::{Address, BuildId, BuildIdentity, same_build};
 
@@ -83,24 +84,25 @@ pub(super) struct SessionImage
 /// within the one where it failed (`table`), or on the next lookup (names).
 pub(super) struct SessionSymtab
 {
-    pub(super) layout: SymtabLayout,
+    /// Where the table and the image's code lie, from the session's
+    /// [`ObjectFormat`](crate::objfile::ObjectFormat).
+    pub(super) symbols: Arc<dyn MappedSymbols>,
     /// Unset until a pc in the image's code needs a name.
-    pub(super) table: Option<SymbolTable>,
-    /// The symbol request whose read of the `nlist` entries or function starts failed.
-    pub(super) table_failed_in_request: Option<u64>,
-    /// Names read from the target, by string table index; `None` for one that is empty or
-    /// not UTF-8.
-    pub(super) names: HashMap<u32, Option<String>>,
+    pub(super) index: Option<Box<dyn SymbolIndex>>,
+    /// The symbol request whose read of the table failed.
+    pub(super) index_failed_in_request: Option<u64>,
+    /// Names read from the target, by symbol; `None` for one that is empty or not UTF-8.
+    pub(super) names: HashMap<SymbolKey, Option<String>>,
 }
 
 impl SessionSymtab
 {
-    pub(super) fn new(layout: SymtabLayout) -> Self
+    pub(super) fn new(symbols: Arc<dyn MappedSymbols>) -> Self
     {
         Self {
-            layout,
-            table: None,
-            table_failed_in_request: None,
+            symbols,
+            index: None,
+            index_failed_in_request: None,
             names: HashMap::new(),
         }
     }

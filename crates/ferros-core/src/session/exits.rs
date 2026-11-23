@@ -7,11 +7,14 @@
 //! a branch to it). A thread that hits one is single-stepped until it leaves that image
 //! above the stack it entered with: it has then landed where the exit goes.
 
+use std::sync::Arc;
+
 use super::Session;
+use super::stack::BackendTarget;
 use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
-use crate::symbols::symtab::SymtabLayout;
+use crate::objfile::MappedSymbols;
 use crate::types::{Address, BuildIdentity, ThreadId, same_build};
 
 /// Functions through which the unwinder transfers control to a landing pad:
@@ -66,7 +69,8 @@ pub(super) struct ExitImage
     source: usize,
     load_address: u64,
     build_id: BuildIdentity,
-    code: SymtabLayout,
+    /// The image's code, which an exit is stepped through until it leaves.
+    code: Arc<dyn MappedSymbols>,
     entries: Vec<Address>,
 }
 
@@ -322,12 +326,12 @@ impl Session
     ) -> std::result::Result<ExitImage, String>
     {
         let exit = &SOURCES[source];
-        let header = self.read_mapped_header(load_address)?;
-        let code = SymtabLayout::from_header(&header, load_address).map_err(|error| error.to_string())?;
-        let table = super::stack::read_symbol_table(self.backend.as_mut(), &code)?;
+        let mut memory = BackendTarget(self.backend.as_mut());
+        let code = self.format.mapped_symbols(&mut memory, Address::new(load_address))?;
+        let index = code.load(&mut memory)?;
         let mut entries = Vec::new();
-        for (address, strx) in table.symbols().filter(|&(address, _)| code.contains(address)) {
-            let name = super::stack::read_symbol_string(self.backend.as_mut(), &code, strx)?;
+        for (address, key) in index.symbols().filter(|&(address, _)| code.contains(address)) {
+            let name = index.read_name(&mut memory, key)?;
             if name.is_some_and(|name| (exit.entry)(&name)) && !entries.contains(&address) {
                 entries.push(address);
             }

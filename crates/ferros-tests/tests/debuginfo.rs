@@ -13,7 +13,6 @@ use ferros_core::symbols::{BinaryImage, DebugInfoOptions, ImageDescriptor, Image
 use ferros_core::{
     Address, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache, ThreadId,
 };
-use ferros_macos::MacOSBackend;
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
@@ -309,7 +308,8 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
                 load_address: Address::new(0x2_0000_0000),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session =
+            Session::new(Box::new(mock), ferros_macos::MachOFormat::shared()).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         for _ in 0..2 {
             let error = session.symbolicate(address).expect_err("missing debug info");
@@ -352,7 +352,8 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session =
+            Session::new(Box::new(mock), ferros_macos::MachOFormat::shared()).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
 
         for _ in 0..2 {
@@ -409,7 +410,8 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session =
+            Session::new(Box::new(mock), ferros_macos::MachOFormat::shared()).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         let assert_parse_failure = |error: DebuggerError| {
             let DebuggerError::SymbolLoad { path, source } = &error else {
@@ -486,7 +488,8 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
             .with_region(load_address, "r-x", header)
             .with_thread(ThreadId(1), Registers::default())
             .with_image(loaded(None));
-        let mut session = Session::new(Box::new(mock.clone())).with_debug_info_options(scratch.options());
+        let mut session = Session::new(Box::new(mock.clone()), ferros_macos::MachOFormat::shared())
+            .with_debug_info_options(scratch.options());
         let install = |fixture: &Fixture| {
             fs::copy(fixture.path(), &executable).expect("copy executable");
             std::os::unix::fs::symlink(fixture.dsym_path(), &dsym).expect("link matching dSYM");
@@ -553,7 +556,8 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
                 load_address,
                 build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session =
+            Session::new(Box::new(mock), ferros_macos::MachOFormat::shared()).with_debug_info_options(scratch.options());
         let install = |fixture: &Fixture| {
             let _ = fs::remove_file(&executable);
             let _ = fs::remove_file(&dsym);
@@ -617,7 +621,7 @@ fn session_refreshes_unloaded_and_relocated_images()
         let mock = with_mapped_header(mock, fixture.path(), second.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(first.clone());
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), ferros_macos::MachOFormat::shared());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         assert!(session.symbolicate(old_address).expect("symbolicate").is_some());
         assert_eq!(
@@ -652,7 +656,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
         let mock = with_mapped_header(MockBackend::new(), fixture.path(), image.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(image);
-        let mut session = Session::new(Box::new(mock));
+        let mut session = Session::new(Box::new(mock), ferros_macos::MachOFormat::shared());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         assert!(session.symbolicate(address).expect("first lookup").is_some());
         assert!(session.symbolicate(address).expect("second lookup").is_some());
@@ -687,7 +691,8 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session =
+            Session::new(Box::new(mock), ferros_macos::MachOFormat::shared()).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         let is_main = |symbolication: &ferros_core::Symbolication| {
             symbolication.frames.iter().any(|frame| {
@@ -790,7 +795,7 @@ fn loaded_image_maps_after_its_file_is_removed()
         };
         let path_text: &'static str = Box::leak(path.to_str().expect("UTF-8 scratch path").into());
         let target = t.spawn(&Fixture::from_built("spawn_thread", path_text), &["pause=4000"]);
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         // Attach once the first worker runs: dyld has then published the image list, as
         // it had in the reported failure, so the main image's path is the loader's.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -862,7 +867,7 @@ fn dyld_entry_skips_dsymutil_without_a_debug_map()
         options.dsymutil = Some(tool);
 
         let tag = t.tag();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend"))).with_debug_info_options(options);
+        let mut session = ferros_macos::new_session().expect("backend").with_debug_info_options(options);
         session
             .launch(&LaunchSpec::new(fixture.path()).arg(tag.as_str()))
             .expect("launch at dyld entry");

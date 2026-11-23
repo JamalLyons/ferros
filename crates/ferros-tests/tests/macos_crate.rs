@@ -5,8 +5,7 @@
 
 use std::process::Command;
 
-use ferros_core::{BackendError, DebuggerError, ProcessId, Session, SessionState};
-use ferros_macos::MacOSBackend;
+use ferros_core::{BackendError, DebuggerError, ProcessId, SessionState};
 use ferros_tests::{fixture, harness};
 
 /// Attaching to a pid whose process has exited reports the portable `NotFound`.
@@ -21,7 +20,7 @@ fn attach_to_exited_pid_returns_not_found()
     let status = child.wait().expect("wait for /usr/bin/true");
     assert!(status.success(), "/usr/bin/true failed: {status}");
 
-    let mut session = Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")));
+    let mut session = ferros_macos::new_session().expect("MacOSBackend::new");
     match session.attach(ProcessId::from(pid)) {
         Err(DebuggerError::Backend(BackendError::NotFound(_))) => {}
         other => panic!("expected Backend(NotFound) for pid {pid}, got {other:?}"),

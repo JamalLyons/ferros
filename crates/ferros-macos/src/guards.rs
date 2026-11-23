@@ -12,11 +12,9 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use ferros_core::Session;
-//! use ferros_macos::MacOSBackend;
 //! use ferros_macos::guards::ThreadSuspendGuard;
 //!
-//! # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+//! # let mut session = ferros_macos::new_session()?;
 //! # session.attach(ferros_core::types::ProcessId::from(12345))?;
 //! let threads = session.threads()?;
 //! if let Some(thread_id) = threads.first() {
@@ -45,11 +43,9 @@ use crate::ffi;
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Session;
-/// use ferros_macos::MacOSBackend;
 /// use ferros_macos::guards::ThreadSuspendGuard;
 ///
-/// # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+/// # let mut session = ferros_macos::new_session()?;
 /// # session.attach(ferros_core::types::ProcessId::from(12345))?;
 /// let threads = session.threads()?;
 /// if let Some(thread_id) = threads.first() {
@@ -143,13 +139,11 @@ impl Drop for ThreadSuspendGuard
 /// ## Example
 ///
 /// ```rust,no_run
-/// use ferros_core::Session;
 /// use ferros_core::breakpoints::BreakpointRequest;
 /// use ferros_core::types::Address;
-/// use ferros_macos::MacOSBackend;
 /// use ferros_macos::guards::BreakpointRestoreGuard;
 ///
-/// # let mut session = Session::new(Box::new(MacOSBackend::new()?));
+/// # let mut session = ferros_macos::new_session()?;
 /// # session.attach(ferros_core::types::ProcessId::from(12345))?;
 /// let bp_id = session.add_breakpoint(BreakpointRequest::Software {
 ///     address: Address::from(0x1000),

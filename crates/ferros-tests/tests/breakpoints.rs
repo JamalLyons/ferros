@@ -16,7 +16,6 @@ use std::time::Duration;
 use ferros_core::{
     Address, BreakpointId, BreakpointRequest, DebuggerError, Session, SessionState, StopEvent, ThreadId, arch,
 };
-use ferros_macos::MacOSBackend;
 use ferros_tests::arm64::{Flow, NOP, TRAP, flow, sp_decrement};
 use ferros_tests::harness::{self, Spawned};
 use ferros_tests::symbols::function_address;
@@ -134,7 +133,7 @@ fn assert_running(pid: u32, what: &str)
 /// Attach a fresh session to `target`.
 fn attach(target: &Spawned) -> Session
 {
-    let mut session = Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")));
+    let mut session = ferros_macos::new_session().expect("MacOSBackend::new");
     session.attach(target.pid()).expect("attach");
     session
 }

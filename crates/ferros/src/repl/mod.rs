@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferros_core::backend::ProcessGroup;
-use ferros_core::{Backend, LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent, ThreadId};
+use ferros_core::{LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent, ThreadId};
 use ferros_utils::warn;
 
 use self::commands::{CommandError, Flow};
@@ -71,7 +71,7 @@ pub struct Debugger
 
 impl Debugger
 {
-    /// Launch or attach to `target` with a new session on `backend`.
+    /// Launch or attach to `target` with `session`, which has no process yet.
     ///
     /// Returns the debugger and the line to print (`launched process <pid>` or
     /// `attached to process <pid>`).
@@ -79,9 +79,8 @@ impl Debugger
     /// # Errors
     ///
     /// The launch or attach error of the session.
-    pub fn start(backend: Box<dyn Backend>, target: Target) -> ferros_core::Result<(Self, String)>
+    pub fn start(mut session: Session, target: Target) -> ferros_core::Result<(Self, String)>
     {
-        let mut session = Session::new(backend);
         let message = match &target {
             Target::Launch(spec) => format!("launched process {}", session.launch(spec)?.0),
             Target::Attach(pid) => {

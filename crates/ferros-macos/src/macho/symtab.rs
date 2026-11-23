@@ -1,5 +1,8 @@
 //! Function names from a Mach-O image's symbol table (`LC_SYMTAB`), for code without DWARF.
 //!
+//! [`super::MachOFormat`] exposes this to the engine through the format-neutral
+//! [`ferros_core::objfile`] traits.
+//!
 //! Some code has no DWARF: Rust's standard library linked without debug info
 //! (`std::rt::lang_start_internal`), the C `main` shim, dyld's `start`, and the system
 //! libraries in the dyld shared cache (`libsystem_pthread`'s `_pthread_start` and
@@ -38,12 +41,11 @@
 //! `S_ATTR_SOME_INSTRUCTIONS`) count, and only for a pc in the same section, so a pc
 //! never takes a name from data or from a symbol in another section.
 
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::Address;
 use object::macho::{LC_FUNCTION_STARTS, MachHeader64, N_SECT, Nlist64, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS};
 use object::read::macho::{MachHeader as _, Section as _, Segment as _};
 use object::{Endianness, LittleEndian, pod};
-
-use crate::error::{DebuggerError, Result};
-use crate::types::Address;
 
 /// Size of one 64-bit `nlist` entry.
 pub(crate) const NLIST_SIZE: usize = 16;

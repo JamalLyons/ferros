@@ -362,9 +362,9 @@ impl MacOSBackend
     /// ```rust,no_run
     /// use ferros_core::Session;
     /// use ferros_core::types::ProcessId;
-    /// use ferros_macos::MacOSBackend;
+    /// use ferros_macos::{MacOSBackend, MachOFormat};
     ///
-    /// let mut session = Session::new(Box::new(MacOSBackend::new()?));
+    /// let mut session = Session::new(Box::new(MacOSBackend::new()?), MachOFormat::shared());
     /// session.attach(ProcessId::from(12345))?;
     /// # Ok::<(), ferros_core::error::DebuggerError>(())
     /// ```

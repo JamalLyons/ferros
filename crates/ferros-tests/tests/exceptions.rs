@@ -1,7 +1,7 @@
 //! Mach exception plumbing of the macOS backend: simultaneous stops are queued, the
 //! port rights of exception messages are released, detaching restores the target's
-//! exception ports, and a failed exception reply is reported without ending stop
-//! reporting.
+//! exception ports, and a failed exception reply or task suspend is reported without
+//! ending stop reporting.
 #![cfg(target_os = "macos")]
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -239,6 +239,49 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
         d.resume().expect("resume with the breakpoint enabled");
         expect_breakpoint(&mut d, address, "a breakpoint stop after the failed reply");
         d.remove_breakpoint(id).expect("remove_breakpoint");
+    });
+}
+
+/// A failed `task_suspend` in the exception loop is not published as a stop (#191):
+/// other threads could still be running while the engine reads memory or writes
+/// traps. The next `wait` returns the failure, the session stays running, and the
+/// thread, whose exception was answered, raises its breakpoint again, which is then
+/// reported with the task really suspended.
+#[test]
+fn failed_exception_suspend_is_reported_by_wait_not_as_a_stop()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], backend);
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        d.add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at tick_body");
+        faults.fail_next_exception_suspend();
+        d.resume().expect("resume");
+        match d.wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(
+                err.to_string().contains("task_suspend"),
+                "the error does not name the failed task_suspend: {err}"
+            ),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        assert_eq!(
+            d.state(),
+            SessionState::Running,
+            "a stop without a task suspension was reported as stopped"
+        );
+        // The answered thread runs into the trap again at once, so by now the loop may
+        // already hold that new stop, with the task really suspended: checked below.
+        expect_breakpoint(&mut d, address, "the breakpoint stop after the failed suspend");
+        assert_eq!(d.state(), SessionState::Stopped);
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the reported stop does not hold the task suspended"
+        );
     });
 }
 

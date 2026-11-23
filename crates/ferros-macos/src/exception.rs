@@ -27,6 +27,10 @@
 //! answering newly arriving signals without resuming user code. Only the exit
 //! watcher marks death and publishes terminal status.
 //!
+//! If that `task_suspend` fails, nothing of the batch is published and no Continue is
+//! awaited: the loop answers its exceptions and queues the failure as an `Err` for
+//! the next `wait` (#191).
+//!
 //! ## Held signals and retained thread rights
 //!
 //! Client Unix signals are suppressed with `PT_THUPDATE(0)` and answered while
@@ -91,7 +95,7 @@ use mach2::exception_types::{
     exception_mask_t, exception_type_t,
 };
 #[cfg(target_os = "macos")]
-use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
+use mach2::kern_return::{KERN_FAILURE, KERN_SUCCESS, kern_return_t};
 #[cfg(target_os = "macos")]
 use mach2::message::{
     MACH_MSG_SUCCESS, MACH_MSG_TIMEOUT_NONE, MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS,
@@ -202,6 +206,8 @@ pub struct ReplyFaultInjector
     birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
     birth_suspend: Arc<AtomicBool>,
+    /// Fail the exception loop's next `task_suspend` for a new stop. Tests only.
+    exception_suspend: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -382,6 +388,13 @@ impl ReplyFaultInjector
     pub fn fail_next_birth_suspend(&self)
     {
         self.birth_suspend.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the exception loop's next `task_suspend`, for a new stop, fail before
+    /// calling the kernel (`KERN_FAILURE`). The task keeps running. Tests only (#191).
+    pub fn fail_next_exception_suspend(&self)
+    {
+        self.exception_suspend.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn fail_birth_suspend(&self) -> bool
@@ -1083,13 +1096,15 @@ pub(crate) fn run_exception_loop(
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
             let mut state = lock_shared(&shared);
-            // SAFETY: `task` is the send right the backend holds for as long as this
-            // loop runs.
-            let kr = unsafe { task_suspend(task) };
+            let kr = if faults.exception_suspend.swap(false, Ordering::SeqCst) {
+                KERN_FAILURE
+            } else {
+                // SAFETY: `task` is the send right the backend holds for as long as this
+                // loop runs.
+                unsafe { task_suspend(task) }
+            };
             if kr == KERN_SUCCESS {
                 state.suspends += 1;
-            } else {
-                error!("task_suspend failed while handling a Mach exception: {kr}");
             }
 
             let mut stops = vec![first];
@@ -1103,6 +1118,10 @@ pub(crate) fn run_exception_loop(
                 {
                     stops.push(hold_exception(&request, architecture));
                 }
+            }
+            if kr != KERN_SUCCESS {
+                abandon_unsuspended_stops(stops, kr, &state, &faults, &events);
+                continue;
             }
             if stops.len() > 1 {
                 debug!("{} threads stopped at once", stops.len());
@@ -1211,6 +1230,52 @@ pub(crate) fn run_exception_loop(
     // suspended threads are still held. Answer them, so those threads are not left
     // blocked in the kernel, and release their rights.
     release_held_exceptions(&mut lock_shared(&shared));
+}
+
+/// The `task_suspend` of a new stop failed (#191): the other threads may still run, so
+/// no stop of this batch may be published, nor may the backend await a Continue.
+///
+/// Every exception is answered and its thread right released, as the shutdown paths
+/// do for a task the backend no longer holds. Holding the replies instead would keep
+/// the threads blocked in the kernel with no stop to resume them from, and would block
+/// an external SIGKILL. A thread at a `brk` executes it again and raises a new
+/// exception, which the loop handles afresh. A client Unix signal is delivered as if
+/// the process were not traced, since it cannot be held. Stops deferred behind an
+/// earlier hold were already answered and suppressed; their logical stop is dropped
+/// (that signal is lost) rather than retried, so a task that cannot be suspended does
+/// not make the loop spin. The failure is
+/// queued as an `Err`, so the next `wait` returns it, unless the task is dead: the
+/// exit watcher then reports the terminal event.
+#[cfg(target_os = "macos")]
+fn abandon_unsuspended_stops(
+    stops: Vec<(HeldException, StopEvent)>,
+    kr: kern_return_t,
+    state: &ExceptionSharedState,
+    faults: &ReplyFaultInjector,
+    events: &mpsc::Sender<LoopEvent>,
+)
+{
+    let count = stops.len();
+    for (mut exception, _) in stops {
+        if let Err(err) = reply_to_held(&mut exception, faults) {
+            debug!("reply after a failed task_suspend: {err}");
+        }
+        deallocate_right(exception.thread);
+    }
+    if state.dead {
+        return;
+    }
+    let failure = BackendError::Os {
+        code: i64::from(kr),
+        message: format!(
+            "task_suspend failed with {kr} while handling a Mach exception; {count} stop(s) not reported, the target keeps \
+             running"
+        ),
+    };
+    error!("{failure}");
+    if let Err(err) = events.send(Err(failure)) {
+        warn!("Failed to queue a task_suspend failure from Mach loop: {err}");
+    }
 }
 
 /// Receive one message from `exception_port`: block until one arrives, or with

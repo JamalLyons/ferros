@@ -35,7 +35,6 @@ pub struct ProcessOutputLine
 #[allow(clippy::struct_excessive_bools)]
 pub struct App
 {
-    /// The debugger instance
     pub debugger: Box<dyn Debugger>,
     /// Process ID of the attached process (if any)
     pub pid: Option<u32>,
@@ -43,7 +42,6 @@ pub struct App
     pub was_launched: bool,
     /// Whether the application should exit
     pub should_quit: bool,
-    /// Current view mode
     pub view_mode: ViewMode,
     /// State for the registers table
     pub registers_state: TableState,
@@ -51,7 +49,6 @@ pub struct App
     pub threads_state: TableState,
     /// State for the memory regions table
     pub memory_regions_state: TableState,
-    /// Currently selected thread index
     pub selected_thread_index: usize,
     /// Error message to display (if any)
     pub error_message: Option<String>,
@@ -65,19 +62,14 @@ pub struct App
     pub output_scrollback: usize,
     /// Timestamp of last thread list refresh (to avoid refreshing too frequently)
     last_thread_refresh: std::time::Instant,
-    /// Whether the target is currently stopped.
     pub target_is_stopped: bool,
-    /// Last reported stop reason.
     pub last_stop_reason: StopReason,
     /// Recent stop/resume events for display.
     pub stop_event_log: VecDeque<String>,
     /// Command palette input buffer
     pub command_input: String,
-    /// Whether command palette is active
     pub command_palette_active: bool,
-    /// Command history
     pub command_history: VecDeque<String>,
-    /// Current command history index
     pub command_history_index: Option<usize>,
     /// Cached stack trace for the active thread
     pub cached_stack_trace: Option<Vec<StackFrame>>,
@@ -87,7 +79,6 @@ pub struct App
     pub stack_frames_state: TableState,
     /// State for the breakpoints table
     pub breakpoints_state: TableState,
-    /// Cached breakpoints list
     pub cached_breakpoints: Vec<BreakpointInfo>,
     /// Cache of breakpoint addresses to source locations (for UI indicators)
     pub breakpoint_locations: std::collections::HashMap<Address, Option<SourceLocation>>,
@@ -101,9 +92,7 @@ pub struct App
     pub source_selected_line: Option<usize>,
     /// Timeline log entries (chronological events)
     pub timeline_log: VecDeque<TimelineEntry>,
-    /// Current layout preset
     pub layout_preset: LayoutPreset,
-    /// Breakpoint editor state
     pub breakpoint_editor: Option<BreakpointEditorState>,
 }
 
@@ -766,7 +755,6 @@ impl App
         }
     }
 
-    /// Refresh the cached stack trace
     pub fn refresh_stack_trace(&mut self)
     {
         if self.debugger.is_attached()
@@ -782,7 +770,6 @@ impl App
         }
     }
 
-    /// Refresh the cached breakpoints list
     pub fn refresh_breakpoints(&mut self)
     {
         self.cached_breakpoints = self.debugger.breakpoints();
@@ -938,7 +925,6 @@ impl App
         }
     }
 
-    /// Navigate up in stack view
     fn navigate_stack_up(&mut self)
     {
         if let Some(ref frames) = self.cached_stack_trace {
@@ -954,7 +940,6 @@ impl App
         }
     }
 
-    /// Navigate down in stack view
     fn navigate_stack_down(&mut self)
     {
         if let Some(ref frames) = self.cached_stack_trace {
@@ -991,7 +976,6 @@ impl App
         None
     }
 
-    /// Toggle breakpoint at the given address
     fn toggle_breakpoint_at_address(&mut self, address: Address)
     {
         // Check if breakpoint already exists
@@ -1041,7 +1025,6 @@ impl App
         }
     }
 
-    /// Open breakpoint editor
     fn open_breakpoint_editor(&mut self, existing_id: Option<BreakpointId>)
     {
         if let Some(id) = existing_id {
@@ -1076,7 +1059,6 @@ impl App
         }
     }
 
-    /// Handle input in breakpoint editor
     fn handle_breakpoint_editor_input(&mut self, key_event: crossterm::event::KeyEvent) -> bool
     {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -1104,7 +1086,6 @@ impl App
         false
     }
 
-    /// Apply breakpoint editor changes
     fn apply_breakpoint_editor(&mut self)
     {
         if let Some(editor) = self.breakpoint_editor.take() {
@@ -1143,7 +1124,6 @@ impl App
         }
     }
 
-    /// Handle input in command palette
     fn handle_command_palette_input(&mut self, key_event: crossterm::event::KeyEvent) -> bool
     {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -1201,7 +1181,6 @@ impl App
         false
     }
 
-    /// Execute a command from the command palette
     #[allow(clippy::too_many_lines)]
     fn execute_command(&mut self)
     {
@@ -1322,7 +1301,6 @@ impl App
         self.command_input.clear();
     }
 
-    /// Cycle through layout presets
     fn cycle_layout_preset(&mut self)
     {
         self.layout_preset = match self.layout_preset {
@@ -1332,7 +1310,6 @@ impl App
         };
     }
 
-    /// Add an entry to the timeline log
     pub fn add_timeline_entry(&mut self, kind: TimelineEntryKind, message: String)
     {
         self.timeline_log.push_back(TimelineEntry {

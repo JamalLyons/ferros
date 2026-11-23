@@ -6,7 +6,7 @@ Terminal User Interface (TUI) for the Ferros debugger.
 
 `ferros-ui` is currently **parked and excluded from the Cargo workspace** (`exclude = ["crates/ferros-ui"]` in the root `Cargo.toml`).
 
-The initial implementation was written using `ratatui` against the retired `Debugger` trait. While the core debugging engine was refactored into the portable `Session` engine and platform `Backend` architecture, the interactive front end was parked so the core platform could be stabilized and covered by comprehensive tests. As a result, `ferros launch` and `ferros attach` currently execute in headless mode.
+The initial implementation was written using `ratatui` against the retired `Debugger` trait, which is no longer in `ferros-core`. The crate is excluded from the workspace and does not build against `Session`. `ferros launch` and `ferros attach` open the line-oriented REPL in `crates/ferros`, not this TUI.
 
 ## Planned Rebuild
 

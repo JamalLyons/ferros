@@ -51,11 +51,8 @@ pub enum DebuggerError
     /// - `task_for_pid()` returned `KERN_PROTECTION_FAILURE`
     /// - You need to run with `sudo` or grant debugging entitlements
     ///
-    /// On Linux, this means:
-    /// - `ptrace(PTRACE_ATTACH)` failed with EPERM
-    /// - You need to be root or the process owner
-    ///
-    /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger)
+    /// There is no Linux or Windows backend. See the
+    /// [macOS debugging entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger).
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 

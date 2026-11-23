@@ -74,7 +74,6 @@ fn format_memory_size(size_bytes: u64) -> String
     }
 }
 
-/// Draw the overview screen
 pub fn draw_overview(frame: &mut Frame, area: Rect, app: &App)
 {
     // Use boxed slice to avoid large stack array warning
@@ -88,7 +87,6 @@ pub fn draw_overview(frame: &mut Frame, area: Rect, app: &App)
     draw_status(frame, chunks[1], app);
 }
 
-/// Draw debugger information
 fn draw_debugger_info(frame: &mut Frame, area: Rect, app: &App)
 {
     let info_lines = vec![
@@ -146,7 +144,6 @@ fn draw_debugger_info(frame: &mut Frame, area: Rect, app: &App)
     frame.render_widget(info, area);
 }
 
-/// Draw status information
 fn draw_status(frame: &mut Frame, area: Rect, app: &App)
 {
     let mut lines = vec![Line::from(app.status_message())];
@@ -162,7 +159,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App)
     frame.render_widget(status, area);
 }
 
-/// Draw the registers view
 pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
 {
     let registers = match app.debugger.read_registers() {
@@ -269,7 +265,6 @@ pub fn draw_registers(frame: &mut Frame, area: Rect, app: &mut App)
     frame.render_stateful_widget(table, area, &mut app.registers_state);
 }
 
-/// Draw the threads view
 pub fn draw_threads(frame: &mut Frame, area: Rect, app: &mut App)
 {
     let threads = match app.debugger.threads() {
@@ -314,7 +309,6 @@ pub fn draw_threads(frame: &mut Frame, area: Rect, app: &mut App)
     frame.render_stateful_widget(table, area, &mut app.threads_state);
 }
 
-/// Draw the memory regions view
 pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
 {
     let regions = match app.debugger.get_memory_regions() {
@@ -369,7 +363,6 @@ pub fn draw_memory_regions(frame: &mut Frame, area: Rect, app: &mut App)
     frame.render_stateful_widget(table, area, &mut app.memory_regions_state);
 }
 
-/// Draw the process output view
 pub fn draw_output(frame: &mut Frame, area: Rect, app: &App)
 {
     let viewport_height = area.height.saturating_sub(2) as usize; // account for borders
@@ -420,7 +413,6 @@ fn format_process_output_line(entry: &ProcessOutputLine) -> Line<'_>
     ])
 }
 
-/// Draw the command palette
 pub fn draw_command_palette(frame: &mut Frame, area: Rect, app: &App)
 {
     let center_y = area.height / 2;
@@ -448,7 +440,6 @@ pub fn draw_command_palette(frame: &mut Frame, area: Rect, app: &App)
     frame.set_cursor_position((palette_area.x + 1 + cursor_offset, palette_area.y + 1));
 }
 
-/// Draw the breakpoint editor
 pub fn draw_breakpoint_editor(frame: &mut Frame, area: Rect, app: &App)
 {
     let center_y = area.height / 2;
@@ -642,7 +633,6 @@ fn draw_source_code(frame: &mut Frame, area: Rect, app: &mut App)
     }
 }
 
-/// Draw breakpoints list
 fn draw_breakpoints_list(frame: &mut Frame, area: Rect, app: &mut App)
 {
     let rows: Vec<Row> = app
@@ -720,7 +710,6 @@ pub fn draw_stack_view(frame: &mut Frame, area: Rect, app: &mut App)
     }
 }
 
-/// Draw the stack frames list
 fn draw_stack_frames(frame: &mut Frame, area: Rect, app: &mut App)
 {
     let frames = app.cached_stack_trace.as_deref().unwrap_or(&[]);
@@ -862,7 +851,6 @@ fn draw_frame_details(frame: &mut Frame, area: Rect, app: &App)
     }
 }
 
-/// Draw the timeline/log panel
 pub fn draw_timeline(frame: &mut Frame, area: Rect, app: &App)
 {
     let viewport_height = area.height.saturating_sub(2) as usize;
@@ -914,7 +902,6 @@ pub fn draw_timeline(frame: &mut Frame, area: Rect, app: &App)
     frame.render_widget(timeline, area);
 }
 
-/// Draw the help page
 pub fn draw_help(frame: &mut Frame, area: Rect, _app: &App)
 {
     let mut lines = Vec::new();

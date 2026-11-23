@@ -142,7 +142,6 @@ pub struct Ctx<'a>
 
 impl Ctx<'_>
 {
-    /// The session.
     pub fn session(&mut self) -> &mut Session
     {
         &mut self.debugger.session

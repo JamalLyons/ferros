@@ -8,7 +8,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, ViewMode};
 
-/// Draw the UI
 pub fn draw(frame: &mut Frame, app: &mut App)
 {
     // Use boxed slice to avoid large stack array warning
@@ -31,7 +30,6 @@ pub fn draw(frame: &mut Frame, app: &mut App)
     draw_footer(frame, chunks[2], app);
 }
 
-/// Draw the header bar
 fn draw_header(frame: &mut Frame, area: Rect, app: &App)
 {
     let title = if app.debugger.is_attached() {
@@ -51,7 +49,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App)
     frame.render_widget(header, area);
 }
 
-/// Draw the main content area
 fn draw_main_content(frame: &mut Frame, area: Rect, app: &mut App)
 {
     // Draw command palette overlay if active

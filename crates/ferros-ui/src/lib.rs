@@ -1,28 +1,10 @@
 //! # ferros-ui
 //!
-//! Terminal User Interface (TUI) for the Ferros debugger.
+//! Parked terminal UI for the Ferros debugger, built on `ratatui`.
 //!
-//! This crate provides an interactive terminal interface for debugging Rust programs,
-//! built on top of `ratatui`. It displays registers, memory, threads, and other
-//! debugger state in a user-friendly format.
-//!
-//! ## Usage
-//!
-//! ```rust,no_run
-//! use ferros_core::debugger::create_debugger;
-//! use ferros_core::types::ProcessId;
-//! use ferros_ui::Tui;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut debugger = create_debugger()?;
-//! let pid = ProcessId::from(12345);
-//! debugger.attach(pid)?;
-//!
-//! let mut tui = Tui::new()?;
-//! tui.run(debugger, Some(u32::from(pid)), false).await?;
-//! # Ok(())
-//! # }
-//! ```
+//! The crate is excluded from the workspace. It still names the removed
+//! `ferros_core::Debugger` trait, so it does not build against `Session`.
+//! `ferros launch` and `ferros attach` open the CLI REPL instead.
 
 pub mod app;
 pub mod event;
@@ -33,30 +15,14 @@ pub mod widgets;
 pub use app::App;
 pub use tui::Tui;
 
-/// Run the TUI with a debugger instance
+/// Create a [`Tui`] and run it with `debugger`.
 ///
-/// This is a convenience function that creates a TUI and runs it with the given debugger.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use ferros_core::debugger::create_debugger;
-/// use ferros_core::types::ProcessId;
-/// use ferros_ui::run_tui;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut debugger = create_debugger()?;
-/// let pid = ProcessId::from(12345);
-/// debugger.attach(pid)?;
-///
-/// run_tui(debugger, Some(u32::from(pid)), false).await?;
-/// # Ok(())
-/// # }
-/// ```
+/// `debugger` is the removed `Debugger` trait. This crate is parked and excluded
+/// from the workspace, so this function is not built by `cargo test`.
 ///
 /// # Errors
 ///
-/// Returns an error if the TUI fails to initialize or run (terminal errors, etc.)
+/// Returns an error if the terminal cannot be initialized or restored.
 pub async fn run_tui(debugger: Box<dyn ferros_core::Debugger>, pid: Option<u32>, was_launched: bool) -> std::io::Result<()>
 {
     let mut tui = Tui::new()?;

@@ -282,8 +282,10 @@ fn write_registers_to_port(architecture: Architecture, thread: thread_act_t, reg
 /// and detaches from an attached process unless the session asks to keep it stopped.
 /// In that case Ferros retains the task suspension and its installed exception ports
 /// until the target dies. When the debugger process exits, its Mach rights (including
-/// the exception port's receive right) are destroyed. XNU sends SIGKILL to the
-/// still-traced process as part of tracer exit.
+/// the exception port's receive right) are destroyed, and XNU sends SIGKILL to the
+/// still-traced process as part of tracer exit: a held target does not outlive a
+/// debugger, such as the CLI, that exits right after dropping its session. If the
+/// exit watcher fails before the target dies, the retained resources are not released.
 ///
 /// ## Thread Safety
 ///

@@ -61,8 +61,10 @@
 //! Dropping the session kills a process it launched. For an attached process, drop
 //! interrupts a running target and waits up to [`DROP_STOP_TIMEOUT`] for a stop.
 //! Once stopped, drop restores every trap before detaching. If the wait expires or
-//! trap restoration fails, the backend keeps the target stopped and traced.
-//! The platform determines what happens if the debugger process itself exits.
+//! trap restoration fails, the backend keeps the target traced and stopped (stopping
+//! it first if no stop arrived; a failure to stop is only logged). The hold lasts as
+//! long as the debugger process: the backend documents what its platform does to a
+//! still-traced target when the debugger exits (on macOS the kernel kills it).
 //! Call [`Session::kill`] or [`Session::detach`] to end a session deliberately and see errors.
 //! [`Session::ownership`] tells which rule applies.
 
@@ -165,7 +167,8 @@ pub enum ProcessOwnership
     /// Started by [`Session::launch`]: killed when the session is dropped.
     Launched,
     /// Taken over by [`Session::attach`]: released, still running, when the session is
-    /// dropped.
+    /// dropped after a stop with every trap restored. Otherwise the backend holds it
+    /// stopped and traced (see [`Backend::hold_attached_on_drop`]).
     Attached,
 }
 

@@ -58,11 +58,14 @@
 //!
 //! ## Ownership
 //!
-//! A process the session launched belongs to it: dropping the session kills it. A
-//! process the session attached to does not: dropping the session restores every trap
-//! and detaches, leaving it running (a running process is interrupted first, waiting at
-//! most [`DROP_STOP_TIMEOUT`]). Drop ignores failures; call [`Session::kill`] or
-//! [`Session::detach`] to end a session deliberately and see errors.
+//! Dropping the session kills a process it launched. For an attached process, drop
+//! interrupts a running target and waits up to [`DROP_STOP_TIMEOUT`] for a stop.
+//! Once stopped, drop restores every trap before detaching. If the wait expires or
+//! trap restoration fails, the backend keeps the target traced and stopped (stopping
+//! it first if no stop arrived; a failure to stop is only logged). The hold lasts as
+//! long as the debugger process: the backend documents what its platform does to a
+//! still-traced target when the debugger exits (on macOS the kernel kills it).
+//! Call [`Session::kill`] or [`Session::detach`] to end a session deliberately and see errors.
 //! [`Session::ownership`] tells which rule applies.
 
 #![forbid(unsafe_code)]
@@ -164,7 +167,8 @@ pub enum ProcessOwnership
     /// Started by [`Session::launch`]: killed when the session is dropped.
     Launched,
     /// Taken over by [`Session::attach`]: released, still running, when the session is
-    /// dropped.
+    /// dropped after a stop with every trap restored. Otherwise the backend holds it
+    /// stopped and traced (see [`Backend::hold_attached_on_drop`]).
     Attached,
 }
 
@@ -189,21 +193,17 @@ impl std::fmt::Debug for Session
 
 impl Drop for Session
 {
-    /// Apply the ownership rules: kill a launched process, release an attached one.
+    /// Kill a launched process or release an attached process once its traps are gone.
     ///
     /// - Launched: the original bytes of every inserted trap are restored while it is
     ///   stopped (harmless, and it keeps the target's memory honest for a backend that
     ///   outlives the call), then the process is killed with [`Backend::kill`], whether
     ///   it is stopped or running.
-    /// - Attached: the process is left running without traps. A running process is
-    ///   interrupted first and the stop awaited for at most [`DROP_STOP_TIMEOUT`]; once
-    ///   stopped, every trap is restored and [`Backend::detach`] releases it. If it
-    ///   exits meanwhile there is nothing left to do; if it never stops, `detach` is
-    ///   still attempted.
+    /// - Attached: interrupt a running process and wait up to [`DROP_STOP_TIMEOUT`].
+    ///   A stopped process is detached after every trap is restored. On timeout or
+    ///   restore failure, [`Backend::hold_attached_on_drop`] retains the stop and trace.
     ///
-    /// Failures are ignored and the drop never blocks for longer than the timeout. Call
-    /// [`Session::kill`] or [`Session::detach`] to end a session deliberately and see
-    /// errors.
+    /// Call [`Session::kill`] or [`Session::detach`] to end a session deliberately and see errors.
     fn drop(&mut self)
     {
         self.step_plan = None;
@@ -217,15 +217,26 @@ impl Drop for Session
             (Some(ProcessOwnership::Launched), SessionState::Running) => {
                 let _ = self.backend.kill();
             }
-            (Some(ProcessOwnership::Attached), SessionState::Running) => {
-                if self.stop_for_release() {
-                    let _ = self.restore_all_traps();
-                    let _ = self.backend.detach();
+            (Some(ProcessOwnership::Attached), SessionState::Running | SessionState::Stopped) => {
+                if self.state == SessionState::Running {
+                    self.stop_for_release();
                 }
-            }
-            (Some(ProcessOwnership::Attached), SessionState::Stopped) => {
-                let _ = self.restore_all_traps();
-                let _ = self.backend.detach();
+                match self.state {
+                    SessionState::Stopped => match self.restore_all_traps() {
+                        Ok(()) => {
+                            let _ = self.backend.detach();
+                        }
+                        Err(err) => {
+                            tracing::warn!("keeping attached target stopped after trap restoration failed: {err}");
+                            self.backend.hold_attached_on_drop();
+                        }
+                    },
+                    SessionState::Running => {
+                        tracing::warn!("keeping attached target stopped after waiting for a stop timed out");
+                        self.backend.hold_attached_on_drop();
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -243,43 +254,42 @@ impl Drop for Session
 pub const STEP_OVER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long dropping a session that is running an attached process waits for the
-/// interrupt to stop it before detaching anyway.
+/// interrupt to stop it.
 pub const DROP_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl Session
 {
     /// Bring a running attached process to a stop so it can be released (used by drop).
     ///
-    /// Returns `false` when the process is gone (a terminal event arrived), `true`
-    /// otherwise, including when no stop arrived within [`DROP_STOP_TIMEOUT`] (detach is
-    /// then still worth trying). Every pending event is drained, so the backend has
-    /// nothing queued when it is detached.
-    fn stop_for_release(&mut self) -> bool
+    /// Updates the state when a stop or exit is observed. Drain queued stops before
+    /// attempting detach. If the wait expires, the state remains Running.
+    fn stop_for_release(&mut self)
     {
         // An event drained by `resume` means the backend never resumed: it is stopped.
-        if let Some(event) = self.deferred.take() {
-            if event.is_terminal() {
-                return false;
-            }
+        let event = if let Some(event) = self.deferred.take() {
+            event
         } else {
             let _ = self.backend.interrupt();
             let deadline = Instant::now() + DROP_STOP_TIMEOUT;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match self.backend.wait(Some(remaining)) {
-                    Ok(Some(event)) if event.is_terminal() => return false,
-                    Ok(Some(_)) => break,
-                    Ok(None) | Err(_) if remaining.is_zero() => return true,
-                    Ok(None) | Err(_) => {}
+                    Ok(Some(event)) => break event,
+                    Ok(None) => return,
+                    Err(_) if remaining.is_zero() => return,
+                    Err(_) => {}
                 }
             }
+        };
+        if event.is_terminal() {
+            self.state = SessionState::Exited;
+            return;
         }
         self.state = SessionState::Stopped;
-        loop {
-            match self.backend.wait(Some(Duration::ZERO)) {
-                Ok(Some(event)) if event.is_terminal() => return false,
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => return true,
+        while let Ok(Some(event)) = self.backend.wait(Some(Duration::ZERO)) {
+            if event.is_terminal() {
+                self.state = SessionState::Exited;
+                return;
             }
         }
     }

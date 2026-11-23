@@ -69,6 +69,8 @@
 //! - [Apple Mach Kernel Programming](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/Mach/Mach.html)
 //! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -277,7 +279,13 @@ fn write_registers_to_port(architecture: Architecture, thread: thread_act_t, reg
 /// 4. `detach()` (the target keeps running) or `kill()`
 ///
 /// Dropping a backend that still has a process kills it if the backend launched it,
-/// and detaches from it otherwise.
+/// and detaches from an attached process unless the session asks to keep it stopped.
+/// In that case Ferros retains the task suspension and its installed exception ports
+/// until the target dies. When the debugger process exits, its Mach rights (including
+/// the exception port's receive right) are destroyed, and XNU sends SIGKILL to the
+/// still-traced process as part of tracer exit: a held target does not outlive a
+/// debugger, such as the CLI, that exits right after dropping its session. If the
+/// exit watcher fails before the target dies, the retained resources are not released.
 ///
 /// ## Thread Safety
 ///
@@ -315,6 +323,8 @@ pub struct MacOSBackend
     saved_exception_ports: Option<SavedExceptionPorts>,
     /// Test hook shared with the exception loop (see `fail_next_exception_reply`).
     reply_faults: ReplyFaultInjector,
+    /// One-shot integration test fault for the next engine memory write.
+    fail_memory_write: Arc<AtomicBool>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
     events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
@@ -364,7 +374,12 @@ impl MacOSBackend
     /// None at present; the `Result` leaves room for setup that can fail.
     pub fn new() -> Result<Self>
     {
-        Ok(Self {
+        Ok(Self::empty())
+    }
+
+    fn empty() -> Self
+    {
+        Self {
             task: 0,
             threads: Vec::new(),
             pid: ProcessId(0),
@@ -380,6 +395,7 @@ impl MacOSBackend
             exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
             saved_exception_ports: None,
             reply_faults: ReplyFaultInjector::default(),
+            fail_memory_write: Arc::default(),
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -387,7 +403,7 @@ impl MacOSBackend
             mapped_uuids: images::MappedUuidCache::default(),
             suspended_threads: Vec::new(),
             stepping_threads: Vec::new(),
-        })
+        }
     }
 
     /// Check if the debugger has permissions to attach to processes
@@ -481,6 +497,14 @@ impl MacOSBackend
     pub fn reply_fault_injector(&self) -> ReplyFaultInjector
     {
         self.reply_faults.clone()
+    }
+
+    /// Test hook: arm a failure before the next engine memory write changes any bytes.
+    #[doc(hidden)]
+    pub fn memory_write_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let fail = Arc::clone(&self.fail_memory_write);
+        move || fail.store(true, Ordering::Relaxed)
     }
 
     /// Obtain the Mach task port and thread list for `pid` and start the exception
@@ -1676,6 +1700,46 @@ impl Backend for MacOSBackend
         Ok(())
     }
 
+    fn hold_attached_on_drop(&mut self)
+    {
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            if shared.dead || crate::lifecycle::task_is_dead(self.task) {
+                return;
+            }
+            if shared.suspends == 0 {
+                // SAFETY: this backend still owns the target task right. A concurrent
+                // exception stop takes the same lock before acquiring its suspension.
+                let kr = unsafe { task_suspend(self.task) };
+                if kr == KERN_SUCCESS {
+                    shared.suspends += 1;
+                } else {
+                    tracing::error!(
+                        "could not suspend retained target {}: {}",
+                        self.pid.0,
+                        mach_error(kr, "task_suspend failed")
+                    );
+                }
+            }
+        }
+
+        // Keep the exception receive right and exit watcher alive. Normal backend Drop
+        // can clean up once the target dies. If that cannot be observed, retain the
+        // resources until debugger exit to avoid the ordinary detach path.
+        let retained = ManuallyDrop::new(std::mem::replace(self, Self::empty()));
+        if let Err(err) = thread::Builder::new().name("ferros-retained-target".into()).spawn(move || {
+            let waited = retained.exit_watcher.as_ref().map(|watcher| watcher.wait(Duration::MAX));
+            let dead = lock_shared(&retained.exception_state).dead || crate::lifecycle::task_is_dead(retained.task);
+            if dead {
+                drop(ManuallyDrop::into_inner(retained));
+            } else {
+                tracing::error!("could not wait for retained target {} to exit: {waited:?}", retained.pid.0);
+            }
+        }) {
+            tracing::error!("could not start cleanup for retained target: {err}");
+        }
+    }
+
     /// SIGKILL works at Mach and ptrace stops; release holds and await the sole reaper.
     fn kill(&mut self) -> BackendResult<()>
     {
@@ -2056,6 +2120,12 @@ impl Backend for MacOSBackend
     fn write_memory(&mut self, address: Address, data: &[u8]) -> BackendResult<()>
     {
         self.require_stopped("write_memory")?;
+        if self.fail_memory_write.swap(false, Ordering::Relaxed) {
+            return Err(BackendError::Os {
+                code: -1,
+                message: "injected memory write failure".into(),
+            });
+        }
         if let Some(word) = self.birth_engine_write(address, data) {
             return self.write_target_memory(address, &word).map_err(backend_error);
         }

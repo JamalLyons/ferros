@@ -1269,6 +1269,31 @@ fn dropping_an_attached_running_session_interrupts_restores_and_detaches()
 }
 
 #[test]
+fn dropping_an_attached_running_session_without_a_stop_holds_the_target()
+{
+    let mock = process();
+    let mut session = attached(&mock);
+    session.add_breakpoint(software(BP)).expect("add");
+    session.resume().expect("resume");
+    mock.fail_next(
+        MockCallKind::Interrupt,
+        BackendError::Os {
+            code: 1,
+            message: "interrupt failed".into(),
+        },
+    );
+    let _ = mock.take_calls();
+
+    drop(session);
+    assert!(matches!(
+        mock.take_calls().as_slice(),
+        [MockCall::Interrupt, MockCall::Wait(Some(_)), MockCall::HoldAttachedOnDrop]
+    ));
+    assert_eq!(mock.state(), MockState::Stopped);
+    assert_eq!(peek(&mock, BP), TRAP);
+}
+
+#[test]
 fn dropping_an_attached_running_session_drains_simultaneous_events_before_detaching()
 {
     let mock = process();

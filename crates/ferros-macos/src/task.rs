@@ -1128,13 +1128,32 @@ impl MacOSBackend
         if self.launched {
             self.child_cleanup.traced();
         }
-        wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+        let arrived = wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "ptrace attach SIGSTOP did not arrive within 5s".into(),
         })?;
         // Suppress and answer the attach signal while retaining the task suspend.
         // Holding this exception indefinitely would defer an external SIGKILL.
         let ports = lock_shared(&self.exception_state).soft_signals.clone();
+        if let Err(err) = arrived {
+            // The loop could not suspend the task for the private stop (#191) and holds
+            // it unanswered. Suppress and answer it, so the target runs on and the
+            // caller's cleanup can stop it with a handshake of its own.
+            for (port, _) in ports {
+                let _ = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0);
+            }
+            if let Some(events) = &self.events_tx {
+                exception::answer_held_exceptions(
+                    &mut lock_shared(&self.exception_state),
+                    &[],
+                    &self.reply_faults,
+                    events,
+                    self.task,
+                );
+            }
+            let _ = self.requeue_handshake_signals(true);
+            return Err(err);
+        }
         for (port, _) in ports {
             self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0)?;
         }
@@ -1293,10 +1312,12 @@ impl MacOSBackend
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
         self.release_suspends();
+        // A failed task suspend still holds the private SIGSTOP (#191): the fallback
+        // PT_DETACH of `detach_target` finds the tracee waiting in its exception.
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "detach SIGSTOP did not arrive within 5s".into(),
-        })?;
+        })??;
         if fail_handshake {
             return Err(BackendError::Os {
                 code: -1,

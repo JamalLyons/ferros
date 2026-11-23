@@ -285,6 +285,168 @@ fn failed_exception_suspend_is_reported_by_wait_not_as_a_stop()
     });
 }
 
+/// The error a failed exception-loop `task_suspend` makes `wait` return (#191).
+fn expect_suspend_failure<E: std::fmt::Display>(result: Result<Option<StopEvent>, E>, what: &str)
+{
+    match result {
+        Err(err) => assert!(
+            err.to_string().contains("task_suspend"),
+            "{what}: the error does not name the failed task_suspend: {err}"
+        ),
+        Ok(event) => panic!("{what}: expected the task_suspend failure from wait, got {event:?}"),
+    }
+}
+
+/// A signal sent while the backend holds the target stopped is deferred until resume
+/// (#79). A failed `task_suspend` for it after the resume must not lose it (#191): it is
+/// still reported, once the task can be suspended.
+#[test]
+fn deferred_signal_survives_a_failed_exception_suspend()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], backend);
+        let pid = d.pid().0;
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &pid.to_string()])
+                .status()
+                .expect("SIGUSR1")
+                .success()
+        );
+        let b = d.session_mut().backend_mut();
+        assert_eq!(
+            b.wait(Some(Duration::from_millis(300))).expect("wait while stopped"),
+            None,
+            "a signal sent while stopped was published before resume"
+        );
+        faults.fail_next_exception_suspend();
+        b.resume(&ResumeRequest::continue_all()).expect("resume");
+        expect_suspend_failure(b.wait(Some(STOP_TIMEOUT)), "the deferred signal's suspend");
+        match b.wait(Some(STOP_TIMEOUT)).expect("wait for the deferred signal") {
+            Some(StopEvent::Signal { signal: 30, .. }) => {}
+            other => panic!("the deferred SIGUSR1 was lost after the failed suspend, got {other:?}"),
+        }
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the reported signal stop does not hold the task suspended"
+        );
+        assert!(!harness::process_is_gone(pid), "the suppressed SIGUSR1 was delivered");
+    });
+}
+
+/// While the loop cannot suspend the task it holds the faulting thread's exception
+/// unanswered (#191). An external SIGKILL still ends the target, and `wait` reports it.
+#[test]
+fn external_kill_ends_a_target_whose_exception_suspend_keeps_failing()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], backend);
+        let pid = d.pid().0;
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        d.add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at tick_body");
+        faults.fail_exception_suspends(u32::MAX);
+        d.resume().expect("resume");
+        expect_suspend_failure(d.wait(Some(STOP_TIMEOUT)), "the breakpoint's suspend");
+        // Several retries fail meanwhile; none may publish a stop.
+        assert_eq!(
+            d.session_mut()
+                .backend_mut()
+                .wait(Some(Duration::from_millis(200)))
+                .expect("wait while the suspend keeps failing"),
+            None,
+            "a retried stop was published although its task_suspend failed"
+        );
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-9", &pid.to_string()])
+                .status()
+                .expect("SIGKILL")
+                .success()
+        );
+        assert!(
+            harness::wait_until_gone(pid, STOP_TIMEOUT),
+            "the held exception kept SIGKILL from ending the target"
+        );
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+    });
+}
+
+/// A failed `task_suspend` for attach's private SIGSTOP reaches the caller at once as
+/// that error (#191), not as a timeout of a SIGSTOP that never arrives, and the target
+/// is released running.
+#[test]
+fn failed_exception_suspend_during_attach_fails_attach_promptly()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        backend.reply_fault_injector().fail_next_exception_suspend();
+        let began = std::time::Instant::now();
+        let result = ferros_core::Backend::attach(&mut backend, pid);
+        let took = began.elapsed();
+        let err = result.expect_err("attach succeeded although its task_suspend failed");
+        assert!(err.to_string().contains("task_suspend"), "attach error: {err}");
+        assert!(took < Duration::from_secs(3), "attach took {took:?} to fail");
+        assert_runs(pid.0);
+    });
+}
+
+/// A failed `task_suspend` for detach's private SIGSTOP reaches the caller at once as
+/// that error (#191). The fallback `PT_DETACH` still releases the target running.
+#[test]
+fn failed_exception_suspend_during_detach_fails_detach_promptly()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        backend.reply_fault_injector().fail_next_exception_suspend();
+        let began = std::time::Instant::now();
+        let result = ferros_core::Backend::detach(&mut backend);
+        let took = began.elapsed();
+        let err = result.expect_err("detach reported success although its task_suspend failed");
+        assert!(err.to_string().contains("task_suspend"), "detach error: {err}");
+        assert!(took < Duration::from_secs(3), "detach took {took:?} to fail");
+        assert_runs(pid.0);
+    });
+}
+
+/// `pid` is alive, not stopped, and not traced, sampled over a short while.
+fn assert_runs(pid: u32)
+{
+    std::thread::sleep(Duration::from_millis(200));
+    let output = std::process::Command::new("/bin/ps")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .expect("ps");
+    let stat = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(!stat.is_empty(), "the target died");
+    assert!(!stat.starts_with('T'), "the target was left stopped: {stat}");
+    let counts = diagnostics::process_suspend_counts(ferros_core::ProcessId(pid)).expect("suspend counts");
+    assert_eq!(counts.task.expect("task suspend count"), 0, "the target was left suspended");
+}
+
 /// A process killed from outside while the session holds its breakpoint stop still
 /// dies before the client calls `wait`; the next `wait` reports it as killed.
 #[test]

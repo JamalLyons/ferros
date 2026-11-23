@@ -730,6 +730,108 @@ fn new_thread_created_during_step_stays_at_the_trap()
     });
 }
 
+/// A failed `task_suspend` for a completed single-step must not let the stepped
+/// thread run on (#191): `wait` reports the failure, then the step, with the thread on
+/// the instruction after the one it stepped.
+#[test]
+fn failed_exception_suspend_keeps_a_completed_step()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+        let insn = instruction_at(&mut d, tick);
+        assert_eq!(flow(tick.value(), insn), Flow::Next, "tick does not start straight-line");
+
+        faults.fail_next_exception_suspend();
+        backend(&mut d)
+            .resume(&ResumeRequest::step(thread))
+            .expect("resume with a step");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_secs(2))).expect("wait for the step"),
+            Some(StopEvent::SingleStep { thread }),
+            "the completed step was lost after the failed suspend"
+        );
+        assert_eq!(
+            pc_of(&mut d, thread).value(),
+            tick.value() + 4,
+            "the stepped thread ran past its step"
+        );
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+    });
+}
+
+/// A failed `task_suspend` for a birth step-off must not skip its bookkeeping (#191):
+/// the entry trap is armed again and the creator, frozen for the step, is let go, so it
+/// starts the second thread, which the trap then holds.
+#[test]
+fn failed_exception_suspend_keeps_a_birth_step_off()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], debugger);
+        let (creator, suspended, newborn) = stop_before_second_spawn(&mut d, &fixture);
+        faults.fail_next_exception_suspend();
+        backend(&mut d)
+            .resume(
+                &ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(creator, ThreadAction::Continue)
+                    .with_thread(newborn, ThreadAction::Continue),
+            )
+            .expect("continue creator and newborn");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        assert!(
+            !d.wait_for_stdout("second worker ran", BIRTH_QUIET),
+            "the second thread ran through the birth entry, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "a birth stop was delivered to the client"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        assert_suspended_still(&mut d, &suspended);
+        let known: Vec<_> = suspended
+            .iter()
+            .map(|(id, _)| *id)
+            .chain([creator, newborn])
+            .collect::<Vec<_>>();
+        let second_thread = backend(&mut d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| !known.contains(id))
+            .expect("the creator never started the second thread: it stayed frozen for the step-off");
+        let second_pc = pc_of(&mut d, second_thread);
+        assert_eq!(
+            raw_instruction_at(&d, second_pc),
+            BRK,
+            "the second thread is not held on a re-armed trap"
+        );
+    });
+}
+
 /// Releases a birth step-off hold if the test panics while the entry is restored.
 struct ReleaseHold<'a>(&'a ferros_macos::exception::ReplyFaultInjector);
 

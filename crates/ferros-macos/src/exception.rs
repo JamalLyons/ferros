@@ -27,9 +27,22 @@
 //! answering newly arriving signals without resuming user code. Only the exit
 //! watcher marks death and publishes terminal status.
 //!
-//! If that `task_suspend` fails, nothing of the batch is published and no Continue is
-//! awaited: the loop answers its exceptions and queues the failure as an `Err` for
-//! the next `wait` (#191).
+//! If that `task_suspend` fails (#191), nothing of the batch is published and no
+//! Continue is awaited, but nothing is dropped either: every record of the batch,
+//! including stops deferred behind an earlier hold, goes back to the front of the
+//! deferred queue in order, so a single-step completion, a birth step-off or a
+//! deferred signal is not lost. Each faulting thread is held with a `thread_suspend`
+//! of its own before its exception is answered (a client signal is suppressed first,
+//! as usual), so it cannot run on, and no unanswered reply holds back an external
+//! SIGKILL: XNU does not complete a SIGKILL while a thread waits for its exception
+//! reply. The failure is queued as an `Err` for the next `wait`, once per run of
+//! failures. After a short receive (10 ms), which also collects new exceptions, the
+//! loop retries the suspend; the first one that succeeds releases those thread
+//! suspends, the task suspension now holding the threads, and publishes the batch
+//! through the usual birth and handshake paths. A private attach/detach SIGSTOP is not
+//! retried: its exception stays held for `PT_DETACH`, and the handshake caller receives
+//! the failure at once. A handshake, a discard of deferred stops, shutdown and a dead
+//! task release the thread suspends too.
 //!
 //! ## Held signals and retained thread rights
 //!
@@ -144,8 +157,9 @@ pub(crate) struct ExceptionSharedState
     pub soft_signals: Vec<(thread_act_t, c_int)>,
     /// Selected signals queued for a fresh kernel pass, replied to once internally.
     pub requeued_signals: Vec<RequeuedSignal>,
-    /// An internal SIGSTOP handshake for attach/detach, never exposed as an event.
-    pub internal_stop: Option<mpsc::Sender<()>>,
+    /// An internal SIGSTOP handshake for attach/detach, never exposed as an event. It
+    /// receives `Ok` once the private stop is held, or the error that prevented it.
+    pub internal_stop: Option<mpsc::Sender<BackendResult<()>>>,
     /// Signals caught during a private attach/detach handshake. They are delivered
     /// internally after the private stop, never exposed as stale client stop events.
     pub handshake_signals: Option<Vec<RequeuedSignal>>,
@@ -206,8 +220,8 @@ pub struct ReplyFaultInjector
     birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
     birth_suspend: Arc<AtomicBool>,
-    /// Fail the exception loop's next `task_suspend` for a new stop. Tests only.
-    exception_suspend: Arc<AtomicBool>,
+    /// How many of the exception loop's next `task_suspend`s for a new stop fail. Tests only.
+    exception_suspend: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug)]
@@ -394,7 +408,22 @@ impl ReplyFaultInjector
     /// calling the kernel (`KERN_FAILURE`). The task keeps running. Tests only (#191).
     pub fn fail_next_exception_suspend(&self)
     {
-        self.exception_suspend.store(true, Ordering::SeqCst);
+        self.fail_exception_suspends(1);
+    }
+
+    /// Make the exception loop's next `count` `task_suspend`s for a new stop fail,
+    /// retries included; 0 ends the injection. Tests only (#191).
+    pub fn fail_exception_suspends(&self, count: u32)
+    {
+        self.exception_suspend.store(count, Ordering::SeqCst);
+    }
+
+    /// Consume one injected `task_suspend` failure.
+    fn take_exception_suspend_failure(&self) -> bool
+    {
+        self.exception_suspend
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
     }
 
     pub(crate) fn fail_birth_suspend(&self) -> bool
@@ -896,8 +925,40 @@ pub(crate) fn run_exception_loop(
 )
 {
     let mut deferred: std::collections::VecDeque<(HeldException, StopEvent)> = std::collections::VecDeque::new();
+    // Consecutive failed `task_suspend`s of the batch now held at the front of
+    // `deferred` (#191); 0 once a suspend succeeds.
+    let mut suspend_failures = 0u32;
+    // Threads of that batch held with a `thread_suspend` (and a right) of their own.
+    let mut frozen: Vec<thread_act_t> = Vec::new();
     loop {
         let pending = lock_shared(&shared).pending_exception;
+        if !frozen.is_empty() && lock_shared(&shared).handshake_signals.is_some() {
+            // A private handshake takes the deferred stops apart, and its SIGSTOP
+            // must not pick a thread that stays suspended.
+            thaw_threads(&mut frozen);
+        }
+        if suspend_failures > 0 && !pending {
+            // Give the kernel a moment before retrying, and take any exception raised
+            // meanwhile, so a task that cannot be suspended does not make the loop spin.
+            match receive_exception_with_timeout(exception_port, Some(SUSPEND_RETRY_MS)) {
+                Ok(buffer) => {
+                    if let Some(request) = decode_request(&buffer)
+                        && !reply_to_requeued_signal(&request, &mut lock_shared(&shared), pid, &events, &faults)
+                    {
+                        deferred.push_back(hold_exception(&request, architecture));
+                    }
+                }
+                Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
+                    debug!("Mach exception port closed, exiting handler loop");
+                    break;
+                }
+                Err(_) => {}
+            }
+            if deferred.is_empty() {
+                thaw_threads(&mut frozen);
+                suspend_failures = 0;
+            }
+        }
         if pending {
             match commands.try_recv() {
                 Ok(ExceptionLoopCommand::Continue {
@@ -906,6 +967,9 @@ pub(crate) fn run_exception_loop(
                     discard_deferred,
                 }) => {
                     if discard_deferred {
+                        // The task is still suspended: the backend resumes it only
+                        // after this command is acknowledged.
+                        thaw_threads(&mut frozen);
                         for (mut exception, _) in deferred.drain(..) {
                             let _ = reply_to_held(&mut exception, &faults);
                             deallocate_right(exception.thread);
@@ -1096,7 +1160,7 @@ pub(crate) fn run_exception_loop(
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
             let mut state = lock_shared(&shared);
-            let kr = if faults.exception_suspend.swap(false, Ordering::SeqCst) {
+            let kr = if faults.take_exception_suspend_failure() {
                 KERN_FAILURE
             } else {
                 // SAFETY: `task` is the send right the backend holds for as long as this
@@ -1120,9 +1184,27 @@ pub(crate) fn run_exception_loop(
                 }
             }
             if kr != KERN_SUCCESS {
-                abandon_unsuspended_stops(stops, kr, &state, &faults, &events);
+                suspend_failures += 1;
+                let held = hold_unsuspended_stops(
+                    stops,
+                    kr,
+                    suspend_failures,
+                    &mut state,
+                    task,
+                    pid,
+                    &faults,
+                    &events,
+                    &mut frozen,
+                );
+                if held.is_empty() {
+                    suspend_failures = 0;
+                }
+                deferred = held;
                 continue;
             }
+            suspend_failures = 0;
+            // The task suspension now holds the threads of an earlier failed batch.
+            thaw_threads(&mut frozen);
             if stops.len() > 1 {
                 debug!("{} threads stopped at once", stops.len());
             }
@@ -1207,7 +1289,7 @@ pub(crate) fn run_exception_loop(
                 }
                 state.held.push(exception);
                 if internal && let Some(ready) = state.internal_stop.take() {
-                    let _ = ready.send(());
+                    let _ = ready.send(Ok(()));
                     continue;
                 }
                 if state.dead {
@@ -1222,6 +1304,7 @@ pub(crate) fn run_exception_loop(
             }
         }
     }
+    thaw_threads(&mut frozen);
     for (mut exception, _) in deferred {
         let _ = reply_to_held(&mut exception, &faults);
         deallocate_right(exception.thread);
@@ -1232,49 +1315,137 @@ pub(crate) fn run_exception_loop(
     release_held_exceptions(&mut lock_shared(&shared));
 }
 
-/// The `task_suspend` of a new stop failed (#191): the other threads may still run, so
-/// no stop of this batch may be published, nor may the backend await a Continue.
-///
-/// Every exception is answered and its thread right released, as the shutdown paths
-/// do for a task the backend no longer holds. Holding the replies instead would keep
-/// the threads blocked in the kernel with no stop to resume them from, and would block
-/// an external SIGKILL. A thread at a `brk` executes it again and raises a new
-/// exception, which the loop handles afresh. A client Unix signal is delivered as if
-/// the process were not traced, since it cannot be held. Stops deferred behind an
-/// earlier hold were already answered and suppressed; their logical stop is dropped
-/// (that signal is lost) rather than retried, so a task that cannot be suspended does
-/// not make the loop spin. The failure is
-/// queued as an `Err`, so the next `wait` returns it, unless the task is dead: the
-/// exit watcher then reports the terminal event.
+/// How long the loop receives before it retries a failed `task_suspend` (#191).
 #[cfg(target_os = "macos")]
-fn abandon_unsuspended_stops(
+const SUSPEND_RETRY_MS: u32 = 10;
+
+/// The `task_suspend` of a new stop failed (#191): other threads may still run, so no
+/// stop of `stops` may be published, nor may the backend await a Continue. Returns the
+/// records to retry, in order, as the new deferred queue.
+///
+/// Nothing is dropped. Each unanswered exception's thread is held with a
+/// `thread_suspend` of its own, added to `frozen`, before its exception is answered
+/// (a client Unix signal is suppressed first, as for any stop): a completed
+/// single-step, a birth step-off or a newborn at its trap cannot run on, and no
+/// unanswered reply blocks an external SIGKILL. If that suspend fails, the exception
+/// stays unanswered instead. Records already answered (signals deferred behind an
+/// earlier hold, threads already in `frozen`) keep their only logical stop. The loop
+/// retries the suspend and publishes them once it succeeds; shutdown answers them
+/// like every deferred stop. During a private handshake, the private SIGSTOP stays
+/// held in [`ExceptionSharedState::held`] with its reply, as `PT_DETACH` needs, and
+/// its caller receives the failure at once instead of waiting for a stop that is not
+/// coming; competing signals are preserved for it as on the success path. The first
+/// failure of a run is queued as an `Err` for the next `wait`. A dead task's
+/// exceptions are answered at once: the exit watcher reports the terminal event.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn hold_unsuspended_stops(
     stops: Vec<(HeldException, StopEvent)>,
     kr: kern_return_t,
-    state: &ExceptionSharedState,
+    failures: u32,
+    state: &mut ExceptionSharedState,
+    task: mach_port_t,
+    pid: libc::pid_t,
     faults: &ReplyFaultInjector,
     events: &mpsc::Sender<LoopEvent>,
-)
+    frozen: &mut Vec<thread_act_t>,
+) -> std::collections::VecDeque<(HeldException, StopEvent)>
 {
-    let count = stops.len();
-    for (mut exception, _) in stops {
-        if let Err(err) = reply_to_held(&mut exception, faults) {
-            debug!("reply after a failed task_suspend: {err}");
-        }
-        deallocate_right(exception.thread);
-    }
-    if state.dead {
-        return;
-    }
-    let failure = BackendError::Os {
+    let failure = |count: usize| BackendError::Os {
         code: i64::from(kr),
         message: format!(
-            "task_suspend failed with {kr} while handling a Mach exception; {count} stop(s) not reported, the target keeps \
-             running"
+            "task_suspend failed with {kr} while handling a Mach exception; {count} stop(s) held unreported until the task \
+             can be suspended"
         ),
     };
-    error!("{failure}");
-    if let Err(err) = events.send(Err(failure)) {
-        warn!("Failed to queue a task_suspend failure from Mach loop: {err}");
+    let dead = state.dead || crate::lifecycle::task_is_dead(task);
+    let mut held = std::collections::VecDeque::new();
+    for (mut exception, event) in stops {
+        let internal = is_internal_stop(&event, state);
+        if dead {
+            let _ = reply_to_held(&mut exception, faults);
+            deallocate_right(exception.thread);
+            if internal && let Some(ready) = state.internal_stop.take() {
+                let _ = ready.send(Err(failure(1)));
+            }
+            continue;
+        }
+        if internal {
+            // As on the success path: the handshake caller suppresses it on failure.
+            state.soft_signals.push((exception.thread, libc::SIGSTOP));
+            state.held.push(exception);
+            let ready = state.internal_stop.take().expect("internal stop");
+            let err = failure(1);
+            error!("{err}");
+            let _ = ready.send(Err(err));
+            continue;
+        }
+        if state.handshake_signals.is_some() {
+            if let Err(err) = preserve_handshake_stop(exception, &event, state, pid, faults) {
+                let _ = events.send(Err(err));
+            }
+            continue;
+        }
+        if exception.header.is_some() {
+            if freeze_thread(exception.thread) {
+                frozen.push(exception.thread);
+                if let Err(err) = prepare_stop(&mut exception, pid, faults) {
+                    let _ = events.send(Err(err));
+                }
+            } else {
+                error!(
+                    "thread_suspend of thread {} failed after a failed task_suspend; its exception stays unanswered",
+                    exception.thread
+                );
+            }
+        }
+        held.push_back((exception, event));
+    }
+    if !held.is_empty() {
+        if failures == 1 {
+            let err = failure(held.len());
+            error!("{err}");
+            if let Err(err) = events.send(Err(err)) {
+                warn!("Failed to queue a task_suspend failure from Mach loop: {err}");
+            }
+        } else {
+            debug!("task_suspend retry {failures} failed with {kr}");
+        }
+    }
+    held
+}
+
+/// Hold `thread` with a `thread_suspend` of its own and retain an independent right to
+/// it, so its exception can be answered without letting it run (#191).
+#[cfg(target_os = "macos")]
+fn freeze_thread(thread: thread_act_t) -> bool
+{
+    // SAFETY: the exception record owns a send right to this thread, so the name is
+    // valid; this adds one user reference, released by `thaw_threads`.
+    let kr = unsafe { mach2::mach_port::mach_port_mod_refs(mach_task_self(), thread, mach2::port::MACH_PORT_RIGHT_SEND, 1) };
+    if kr != KERN_SUCCESS {
+        return false;
+    }
+    // SAFETY: a tracee thread right just retained; `thaw_threads` balances the suspend.
+    if unsafe { crate::ffi::thread_suspend(thread) } != KERN_SUCCESS {
+        deallocate_right(thread);
+        return false;
+    }
+    true
+}
+
+/// Balance every [`freeze_thread`] in `frozen` and release its right. A thread that has
+/// exited is ignored.
+#[cfg(target_os = "macos")]
+fn thaw_threads(frozen: &mut Vec<thread_act_t>)
+{
+    for thread in frozen.drain(..) {
+        // SAFETY: `freeze_thread` suspended this thread once and retained the right.
+        let kr = unsafe { crate::ffi::thread_resume(thread) };
+        if kr != KERN_SUCCESS {
+            debug!("thread_resume of a thread held after a failed task_suspend returned {kr}");
+        }
+        deallocate_right(thread);
     }
 }
 

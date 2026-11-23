@@ -5,7 +5,7 @@ use std::fs;
 
 use ferros_core::Address;
 use ferros_core::symbols::{ImageDescriptor, ImageMapping, SliceIdentity};
-use object::macho::{CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_MASK, CPU_TYPE_ARM64};
+use object::macho::{CPU_SUBTYPE_ARM64E, CPU_TYPE_ARM64};
 use object::read::macho::{FatArch, MachOFatFile32};
 use object::{Object, ObjectSegment};
 
@@ -22,11 +22,11 @@ fn maps_the_selected_arm64e_slice_of_dyld()
     let arch = fat
         .arches()
         .iter()
-        .find(|arch| arch.cputype() == CPU_TYPE_ARM64 && arch.cpusubtype() & !CPU_SUBTYPE_MASK == CPU_SUBTYPE_ARM64E)
+        .find(|arch| arch.cputype() == CPU_TYPE_ARM64 && arch.cpusubtype().id() == CPU_SUBTYPE_ARM64E)
         .expect("dyld has an arm64e slice");
     let file = object::File::parse(arch.data(bytes.as_slice()).expect("arm64e slice bytes")).expect("arm64e Mach-O");
     let uuid = file.mach_uuid().expect("read arm64e UUID").expect("arm64e UUID");
-    let selector = SliceIdentity::new(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64E, Some(uuid));
+    let selector = SliceIdentity::new(CPU_TYPE_ARM64.0, CPU_SUBTYPE_ARM64E.0, Some(uuid));
     let mapping = ImageMapping::parse_slice(&descriptor, &selector).expect("map the selected dyld slice");
     let text = file
         .segments()

@@ -60,13 +60,13 @@ fn has_dwarf(file: &object::File<'_>) -> bool
 }
 
 // Mach-O's <mach-o/stab.h> defines N_LIB alongside N_OSO.
-const N_LIB: u8 = 0x68;
+const N_LIB: macho::SymbolStab = macho::SymbolStab(0x68);
 
 fn has_debug_map(file: &object::File<'_>) -> bool
 {
     fn is_debug_map_entry(entry: &impl Nlist) -> bool
     {
-        entry.is_stab() && matches!(entry.n_type(), macho::N_OSO | N_LIB)
+        matches!(entry.stab(), Some(macho::N_OSO | N_LIB))
     }
 
     match file {
@@ -113,8 +113,8 @@ pub(crate) fn universal_slices(bytes: &[u8]) -> Option<object::Result<Vec<Univer
         arches
             .iter()
             .map(|arch| UniversalSlice {
-                cpu_type: arch.cputype(),
-                cpu_subtype: arch.cpusubtype(),
+                cpu_type: arch.cputype().0,
+                cpu_subtype: arch.cpusubtype().0,
                 architecture: arch.architecture(),
                 data: arch.data(bytes),
             })
@@ -397,7 +397,7 @@ mod tests
         bytes[16..20].copy_from_slice(&2_u32.to_le_bytes()); // Command count.
         bytes[20..24].copy_from_slice(&(2 * command_size).to_le_bytes());
         for field in [
-            macho::LC_SYMTAB,
+            macho::LC_SYMTAB.0,
             command_size,
             symbols_offset,
             1,
@@ -540,10 +540,10 @@ mod tests
     {
         for (bytes, expected) in [
             (image([1; 16], false), false),
-            (image_with_symbol(macho::N_SECT), false),
-            (image_with_symbol(macho::N_SO), false),
-            (image_with_symbol(macho::N_OSO), true),
-            (image_with_symbol(N_LIB), true),
+            (image_with_symbol(macho::N_SECT.0), false),
+            (image_with_symbol(macho::N_SO.0), false),
+            (image_with_symbol(macho::N_OSO.0), true),
+            (image_with_symbol(N_LIB.0), true),
         ] {
             assert_eq!(has_debug_map(&object::File::parse(bytes.as_slice()).unwrap()), expected);
         }
@@ -555,7 +555,7 @@ mod tests
         let workspace = Workspace::create(&std::env::temp_dir()).unwrap();
         let mut options = options(&workspace.0);
         options.dsymutil = Some(workspace.0.join("missing-dsymutil"));
-        let error = discover(&workspace.0.join("program"), &image_with_symbol(macho::N_OSO), &options).unwrap_err();
+        let error = discover(&workspace.0.join("program"), &image_with_symbol(macho::N_OSO.0), &options).unwrap_err();
         assert!(matches!(error, DebuggerError::NoDebugInfo { .. }));
         assert!(error.to_string().contains("split-debuginfo"));
         assert!(error.to_string().contains("dsymutil"));

@@ -353,8 +353,8 @@ impl SliceIdentity
             }
         }
         Ok(Self {
-            cpu_type: mach.cputype(endian),
-            cpu_subtype: mach.cpusubtype(endian),
+            cpu_type: mach.cputype(endian).0,
+            cpu_subtype: mach.cpusubtype(endian).0,
             uuid,
         })
     }

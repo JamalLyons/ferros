@@ -8,12 +8,11 @@
 //! above the stack it entered with: it has then landed where the exit goes.
 
 use super::Session;
-use super::images::same_build;
 use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
 use crate::symbols::symtab::SymtabLayout;
-use crate::types::{Address, ThreadId};
+use crate::types::{Address, BuildIdentity, ThreadId, same_build};
 
 /// Functions through which the unwinder transfers control to a landing pad:
 /// `unw_resume` and, on current macOS, the variant `_Unwind_RaiseException` and
@@ -66,7 +65,7 @@ pub(super) struct ExitImage
     /// Index into `SOURCES`.
     source: usize,
     load_address: u64,
-    uuid: Option<[u8; 16]>,
+    build_id: BuildIdentity,
     code: SymtabLayout,
     entries: Vec<Address>,
 }
@@ -278,7 +277,7 @@ impl Session
     }
 
     /// The process's exit images, read from their symbol tables in the target's memory.
-    /// Cached while the source and load address match and the UUID does not conflict (#170).
+    /// Cached while the source and load address match and the build can be the same (#170).
     fn exit_images(&mut self) -> Vec<ExitImage>
     {
         if let Err(error) = self.load_images() {
@@ -297,16 +296,16 @@ impl Session
                 continue;
             };
             let load_address = image.descriptor_load_address();
-            let uuid = image.uuid();
+            let build_id = image.build_id();
             if let Some(index) = previous.iter().position(|cached| {
-                cached.source == source && cached.load_address == load_address && same_build(cached.uuid, uuid)
+                cached.source == source && cached.load_address == load_address && same_build(cached.build_id, build_id)
             }) {
                 let mut cached = previous.swap_remove(index);
-                cached.uuid = cached.uuid.or(uuid);
+                cached.build_id = cached.build_id.or_later(build_id);
                 found.push(cached);
                 continue;
             }
-            match self.read_exit_image(source, load_address, uuid) {
+            match self.read_exit_image(source, load_address, build_id) {
                 Ok(image) => found.push(image),
                 Err(detail) => tracing::debug!("no exit hooks in {}: {detail}", exit.image),
             }
@@ -319,7 +318,7 @@ impl Session
         &mut self,
         source: usize,
         load_address: u64,
-        uuid: Option<[u8; 16]>,
+        build_id: BuildIdentity,
     ) -> std::result::Result<ExitImage, String>
     {
         let exit = &SOURCES[source];
@@ -339,7 +338,7 @@ impl Session
         Ok(ExitImage {
             source,
             load_address,
-            uuid,
+            build_id,
             code,
             entries,
         })

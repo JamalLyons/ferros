@@ -307,7 +307,7 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
             .with_image(LoadedImage {
                 path: executable,
                 load_address: Address::new(0x2_0000_0000),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -350,7 +350,7 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -407,7 +407,7 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -461,10 +461,10 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
         let executable = scratch.0.join("program");
         let dsym = scratch.0.join("program.dSYM");
         let load_address = Address::new(0x2_0000_0000);
-        let loaded = |uuid| LoadedImage {
+        let loaded = |uuid: Option<[u8; 16]>| LoadedImage {
             path: executable.clone(),
             load_address,
-            uuid,
+            build_id: uuid.map(ferros_core::BuildId::from).into(),
         };
         let header_and_uuid = |fixture: &Fixture| {
             let mut bytes = fs::read(fixture.path()).expect("read executable");
@@ -551,7 +551,7 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address,
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         let install = |fixture: &Fixture| {
@@ -601,7 +601,7 @@ fn session_refreshes_unloaded_and_relocated_images()
         let first = LoadedImage {
             path: fixture.path().to_path_buf(),
             load_address: Address::new(0x2_0000_0000),
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         };
         let second = LoadedImage {
             load_address: Address::new(0x3_0000_0000),
@@ -642,7 +642,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
         let image = LoadedImage {
             path: relative.clone(),
             load_address: Address::new(0x2_0000_0000),
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         };
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
         let address = ImageMapping::parse(&descriptor(&relative, image.load_address.value()))
@@ -685,7 +685,7 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
             .with_image(LoadedImage {
                 path: relative.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
@@ -897,7 +897,7 @@ fn cargo_built_fixture_contains_debug_map_stabs()
         let object_files = file
             .macho_symbol_table()
             .iter()
-            .filter(|entry| entry.is_stab() && entry.n_type() == object::macho::N_OSO)
+            .filter(|entry| entry.stab() == Some(object::macho::N_OSO))
             .count();
         assert!(object_files > 0, "fixture must have N_OSO stabs");
         println!("hello fixture N_OSO stabs: {object_files}");

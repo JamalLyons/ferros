@@ -304,7 +304,7 @@ impl MultiSiteImage
             .with_image(ferros_core::backend::LoadedImage {
                 path: path.clone(),
                 load_address: IMAGE_BASE,
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         (Self(path), mock)
     }
@@ -2352,7 +2352,7 @@ fn handler_stopped_with_long_jump() -> MockBackend
         .with_image(ferros_core::backend::LoadedImage {
             path: "/usr/lib/system/libsystem_platform.dylib".into(),
             load_address: LONG_JUMP_IMAGE,
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         })
 }
 
@@ -2832,10 +2832,10 @@ fn step_out_arms_the_replacement_exit_images_entry()
     image.extend(FIRST_ENTRY.to_le_bytes());
     image.extend(b"\0__longjmp\0");
 
-    let loaded = |uuid| LoadedImage {
+    let loaded = |uuid: Option<[u8; 16]>| LoadedImage {
         path: "/usr/lib/system/libsystem_platform.dylib".into(),
         load_address: Address::new(BASE),
-        uuid,
+        build_id: uuid.map(ferros_core::types::BuildId::from).into(),
     };
     let mock = returning_to_breakpoint()
         .with_region(Address::new(BASE), "r-x", image)
@@ -2930,4 +2930,122 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     );
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(mock.script_len(), 0);
+}
+
+/// Load address of the image in the build-identity tests below.
+const BUILD_IMAGE: u64 = 0x3_0000_0000;
+
+/// A mapped 64-bit Mach-O header with one `__TEXT` segment at file address `text`, so a
+/// runtime address in the image maps back to an offset from `text`.
+fn build_image_header(text: u64) -> Vec<u8>
+{
+    let u32s = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let u64s = |words: &[u64]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    let mut header = u32s(&[0xfeed_facf, 0x0100_000c, 0, 6, 1, 72, 0, 0]); // mach_header_64
+    header.extend(u32s(&[0x19, 72])); // LC_SEGMENT_64, with no sections
+    header.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+    header.extend(u64s(&[text, 0x1000, 0, 0x1000]));
+    header.extend(u32s(&[5, 5, 0, 0]));
+    header.resize(0x100, 0);
+    header
+}
+
+fn build_image(build_id: ferros_core::BuildIdentity) -> ferros_core::backend::LoadedImage
+{
+    ferros_core::backend::LoadedImage {
+        path: "/nonexistent/ferros-build-id-image".into(),
+        load_address: Address::new(BUILD_IMAGE),
+        build_id,
+    }
+}
+
+/// A session over an image whose mapped header puts `__TEXT` at `0x1000`, reported with
+/// `build_id`.
+fn build_id_session(build_id: ferros_core::BuildIdentity) -> (MockBackend, Session)
+{
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_region(Address::new(BUILD_IMAGE), "r-x", build_image_header(0x1000))
+        .with_image(build_image(build_id));
+    let mut session = Session::new(Box::new(mock.clone()));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    (mock, session)
+}
+
+/// The file address the session maps the image's first code byte past its header to.
+/// It follows the mapped header only when the session reads the image again.
+fn mapped_text(session: &mut Session) -> Option<u64>
+{
+    session
+        .file_address(Address::new(BUILD_IMAGE + 0x10))
+        .expect("file address")
+        .map(|(_, file)| file)
+}
+
+fn known(bytes: &[u8]) -> ferros_core::BuildIdentity
+{
+    ferros_core::BuildIdentity::Known(ferros_core::BuildId::new(bytes).expect("build id"))
+}
+
+/// A 20-byte id (an ELF GNU build-id) whose last byte changes is another build at the same
+/// path and address: the session reads its mapped header again, and refuses to map file
+/// addresses of the old build.
+#[test]
+fn a_twenty_byte_build_id_that_changes_its_last_byte_is_a_new_build()
+{
+    let first = [0x5A; 20];
+    let mut second = first;
+    second[19] ^= 1;
+    let (mock, mut session) = build_id_session(known(&first));
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    mock.set_images(vec![build_image(known(&second))]);
+    assert_eq!(mapped_text(&mut session), Some(0x8010), "the replaced build's header is read");
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&first)), 0x8010)
+            .expect("runtime address"),
+        None,
+        "file addresses of the old build do not apply"
+    );
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&second)), 0x8010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10))
+    );
+}
+
+/// An image whose format records no build id is never assumed to be the same build: with
+/// the id absent at both stops, the session reads the mapped header again.
+#[test]
+fn an_absent_build_id_at_both_stops_is_not_the_same_build()
+{
+    let (mock, mut session) = build_id_session(ferros_core::BuildIdentity::Absent);
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    mock.set_images(vec![build_image(ferros_core::BuildIdentity::Absent)]);
+    assert_eq!(mapped_text(&mut session), Some(0x8010), "the image is read again");
+}
+
+/// #170: an id the backend could not read at one stop and reads at the next is the same
+/// build, so the session keeps the mapping it read; the header is not read again.
+#[test]
+fn an_unknown_build_id_that_becomes_known_keeps_the_mapping()
+{
+    let id = [0xC3; 16];
+    let (mock, mut session) = build_id_session(ferros_core::BuildIdentity::Unknown);
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    mock.set_images(vec![build_image(known(&id))]);
+    assert_eq!(mapped_text(&mut session), Some(0x1010), "the mapping read earlier is kept");
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&id)), 0x1010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10))
+    );
 }

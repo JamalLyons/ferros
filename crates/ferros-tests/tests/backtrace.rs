@@ -26,7 +26,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// at the thread base shows up as garbage frames rather than a cut-off.
 const MAX_FRAMES: usize = 256;
 
-fn mapped_uuid(session: &mut Session, address: Address) -> [u8; 16]
+/// The build identity the backend should report: the mapped header's `LC_UUID`.
+fn mapped_uuid(session: &mut Session, address: Address) -> ferros_core::BuildIdentity
 {
     let header = session
         .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
@@ -34,9 +35,11 @@ fn mapped_uuid(session: &mut Session, address: Address) -> [u8; 16]
     let size = ImageMapping::header_size(&header).expect("load command size");
     let bytes = session.read_memory(address, size).expect("mapped load commands");
     let mach = MachHeader64::<Endianness>::parse(&*bytes, 0).expect("64-bit Mach-O");
-    mach.uuid(mach.endian().expect("Mach-O byte order"), &*bytes, 0)
+    let uuid = mach
+        .uuid(mach.endian().expect("Mach-O byte order"), &*bytes, 0)
         .expect("read LC_UUID")
-        .expect("mapped Mach-O has LC_UUID")
+        .expect("mapped Mach-O has LC_UUID");
+    ferros_core::BuildIdentity::Known(uuid.into())
 }
 
 /// Resume until a breakpoint at `address` stops the process.
@@ -286,7 +289,7 @@ fn dyld_is_a_listed_image_and_names_the_main_thread_base()
             .max_by_key(|image| image.load_address)
             .expect("an image below the base pc");
         assert_eq!(owner.load_address, dyld.load_address, "base {base:#?} in {images:#?}");
-        assert_eq!(dyld.uuid, Some(mapped_uuid(&mut d, dyld.load_address)), "{dyld:?}");
+        assert_eq!(dyld.build_id, mapped_uuid(&mut d, dyld.load_address), "{dyld:?}");
     });
 }
 
@@ -333,11 +336,8 @@ fn dyld_is_listed_at_the_launch_stop()
         let main = &images[0];
         let dyld = dylds[0];
         assert_eq!(
-            (main.uuid, dyld.uuid),
-            (
-                Some(mapped_uuid(&mut d, main.load_address)),
-                Some(mapped_uuid(&mut d, dyld.load_address))
-            ),
+            (main.build_id, dyld.build_id),
+            (mapped_uuid(&mut d, main.load_address), mapped_uuid(&mut d, dyld.load_address)),
             "the launch executable and dyld report their mapped UUIDs"
         );
     });
@@ -1076,7 +1076,7 @@ fn backtrace_through_a_static_shared_cache_function_names_it()
             frames.iter().all(|frame| frame.symbol.is_some()),
             "an unnamed frame: {frames:#?}"
         );
-        assert_eq!(image.uuid, Some(mapped_uuid(&mut d, image.load_address)), "{image:?}");
+        assert_eq!(image.build_id, mapped_uuid(&mut d, image.load_address), "{image:?}");
     });
 }
 

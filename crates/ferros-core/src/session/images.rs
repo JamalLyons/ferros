@@ -10,7 +10,7 @@ use crate::symbols::debuginfo::LoadInputs;
 use crate::symbols::image::SliceIdentity;
 use crate::symbols::symtab::{SymbolTable, SymtabLayout};
 use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
-use crate::types::Address;
+use crate::types::{Address, BuildId, BuildIdentity, same_build};
 
 /// The image's symbols could not be loaded (see [`SessionImage`]).
 ///
@@ -31,12 +31,13 @@ struct FailedLoad
 /// A loaded image and what the session learned about it while that same image stays
 /// mapped: its mapping, its symbols, and why they could not be loaded.
 ///
-/// The same image is the same path and load address with no conflicting Mach-O UUID
-/// ([`same_build`]). Only two known, different UUIDs mean a different build loaded where
-/// the previous one was; then the mapping, the symbol table, the DWARF id and the failure
-/// records are dropped and read again. An unknown UUID (`None`) on either side is no
-/// evidence of a change: a UUID read can fail at one stop and succeed at the next. The
-/// session also records the UUID from the mapped header when the backend omits it (#170).
+/// The same image is the same path and load address with build identities that can be
+/// the same build ([`same_build`]). Two known, different ids, or an id the image format
+/// does not record ([`BuildIdentity::Absent`]), mean the image may have been replaced;
+/// then the mapping, the symbol table, the DWARF id and the failure records are dropped
+/// and read again. An unknown id ([`BuildIdentity::Unknown`]) on either side is no
+/// evidence of a change: a read can fail at one stop and succeed at the next. The session
+/// also records the id from the mapped header when the backend could not read it (#170).
 ///
 /// Symbol loading keeps one of three outcomes: the loaded symbols; missing debug info
 /// (kept until the image is unloaded); or another failure, kept only while the files it
@@ -46,12 +47,12 @@ struct FailedLoad
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
-    /// Mach-O `LC_UUID` reported by the backend or read from the mapped header.
-    /// Set once a later report knows it.
-    uuid: Option<[u8; 16]>,
+    /// Build identity reported by the backend or read from the mapped header. An unknown
+    /// id is replaced once a later report knows it.
+    build_id: BuildIdentity,
     /// The layout read from the image's mapped header, or why it could not be read.
     /// Mapped memory does not change while this image stays loaded, so the result is kept
-    /// until the loader reports a different path, address or a conflicting UUID.
+    /// until the loader reports a different path, address or build ([`same_build`]).
     mapping: std::result::Result<ImageMapping, String>,
     /// CPU type, subtype and UUID of the mapped header, read with `mapping`: which slice
     /// of a universal file the symbols are loaded from (#169). `None` when the header
@@ -69,7 +70,7 @@ pub(super) struct SessionImage
     failed_load: Option<FailedLoad>,
     /// The image's symbol table layout as mapped in the target, read on the first frame
     /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
-    /// it holds until the loader reports a different path, address or a conflicting UUID.
+    /// it holds until the loader reports a different path, address or build ([`same_build`]).
     pub(super) symtab: Option<SessionSymtab>,
     /// The symbol request whose read of the symbol table layout last failed. The failure
     /// is not kept past that request.
@@ -105,14 +106,10 @@ impl SessionSymtab
     }
 }
 
-/// Whether two UUID reports for an image at the same path and load address can be the
-/// same build: only two known, different UUIDs say it was replaced.
-pub(super) fn same_build(known: Option<[u8; 16]>, reported: Option<[u8; 16]>) -> bool
+/// The 16-byte UUID a [`SliceIdentity`] selects a universal slice by, when `id` is one.
+fn slice_uuid(id: BuildIdentity) -> Option<[u8; 16]>
 {
-    match (known, reported) {
-        (Some(known), Some(reported)) => known == reported,
-        _ => true,
-    }
+    id.known().and_then(|id| id.as_bytes().try_into().ok())
 }
 
 impl SessionImage
@@ -127,9 +124,9 @@ impl SessionImage
         &self.descriptor.path
     }
 
-    pub(super) fn uuid(&self) -> Option<[u8; 16]>
+    pub(super) fn build_id(&self) -> BuildIdentity
     {
-        self.uuid
+        self.build_id
     }
 }
 
@@ -175,7 +172,7 @@ impl Session
     }
 
     /// Map a file virtual address within a particular loaded image to runtime memory.
-    /// `image` must still be loaded at the supplied load address, with no conflicting UUID
+    /// `image` must still be loaded at the supplied load address as the same build
     /// ([`same_build`]); otherwise, or when the address is outside the image's
     /// mapped segments, the result is `None`.
     ///
@@ -193,7 +190,7 @@ impl Session
         let Some(entry) = self.loaded_images.iter().find(|entry| {
             entry.descriptor.path == image.path
                 && entry.descriptor.load_address == image.load_address.value()
-                && same_build(entry.uuid, image.uuid)
+                && same_build(entry.build_id, image.build_id)
         }) else {
             return Ok(None);
         };
@@ -230,8 +227,8 @@ impl Session
     /// shared cache) stay unmapped, which is harmless here.
     ///
     /// A previous [`SessionImage`] is reused only when its path and load address are
-    /// unchanged and its UUID does not conflict ([`same_build`]). A conflicting UUID starts
-    /// a fresh image, and its DWARF cache id is then absent from the set passed to
+    /// unchanged and its build identity can be the same build ([`same_build`]). Otherwise a
+    /// fresh image starts, and its DWARF cache id is then absent from the set passed to
     /// [`SymbolCache::retain_ids`].
     pub(super) fn load_images(&mut self) -> Result<()>
     {
@@ -249,19 +246,24 @@ impl Session
             if let Some(index) = previous.iter().position(|entry| {
                 entry.descriptor.path == descriptor.path
                     && entry.descriptor.load_address == descriptor.load_address
-                    && same_build(entry.uuid, image.uuid)
+                    && same_build(entry.build_id, image.build_id)
             }) {
                 let mut kept = previous.swap_remove(index);
-                kept.uuid = kept.uuid.or(image.uuid);
+                kept.build_id = kept.build_id.or_later(image.build_id);
                 if let Some(slice) = &mut kept.slice {
-                    slice.uuid = slice.uuid.or(kept.uuid);
+                    slice.uuid = slice.uuid.or(slice_uuid(kept.build_id));
                 }
                 self.loaded_images.push(kept);
             } else {
-                let (mapping, slice) = self.map_loaded_image(descriptor.load_address, image.uuid);
+                let (mapping, slice) = self.map_loaded_image(descriptor.load_address, image.build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
-                    uuid: image.uuid.or_else(|| slice.as_ref().and_then(|slice| slice.uuid)),
+                    build_id: image.build_id.or_later(
+                        slice
+                            .as_ref()
+                            .and_then(|slice| slice.uuid)
+                            .map_or(BuildIdentity::Unknown, |uuid| BuildIdentity::Known(BuildId::from(uuid))),
+                    ),
                     mapping,
                     slice,
                     symbols: None,
@@ -280,11 +282,11 @@ impl Session
     /// Read the segment layout and the slice identity from the header mapped at
     /// `load_address`. Trap bytes are irrelevant: breakpoints are never planted in a
     /// Mach-O header. The header's `LC_UUID` is the identity's UUID; the loader-reported
-    /// `uuid` stands in only when the header has none.
+    /// `build_id` stands in only when the header has none.
     fn map_loaded_image(
         &mut self,
         load_address: u64,
-        uuid: Option<[u8; 16]>,
+        build_id: BuildIdentity,
     ) -> (std::result::Result<ImageMapping, String>, Option<SliceIdentity>)
     {
         let header = match self.read_mapped_header(load_address) {
@@ -292,7 +294,7 @@ impl Session
             Err(detail) => return (Err(detail), None),
         };
         let slice = SliceIdentity::from_header(&header).ok().map(|slice| SliceIdentity {
-            uuid: slice.uuid.or(uuid),
+            uuid: slice.uuid.or(slice_uuid(build_id)),
             ..slice
         });
         let mapping = ImageMapping::from_header(&header, load_address)

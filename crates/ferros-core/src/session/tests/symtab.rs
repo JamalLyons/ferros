@@ -1,7 +1,7 @@
 //! Frames named from a mapped image's symbol table, on the mock backend.
 
 use super::*;
-use crate::types::{StackFrame, SymbolSource};
+use crate::types::{BuildId, StackFrame, SymbolSource};
 
 /// A 64-bit Mach-O image for the mapped layout: `__TEXT` (vmaddr 0x1_0000_0000, file
 /// offset 0, 0x4000 bytes) with `__text` code at 0x1000..0x1100, `__LINKEDIT` at file
@@ -79,7 +79,7 @@ fn image_at(path: &str, address: u64) -> LoadedImage
     LoadedImage {
         path: format!("/nonexistent/{path}").into(),
         load_address: Address::new(address),
-        uuid: None,
+        build_id: crate::types::BuildIdentity::Unknown,
     }
 }
 
@@ -244,10 +244,10 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     const IMAGE: u64 = 0x10_0000;
     let (header, nlists, strings) = image();
     let path = "/nonexistent/ferros-symtab-replaced";
-    let listed = |uuid| LoadedImage {
+    let listed = |uuid: Option<[u8; 16]>| LoadedImage {
         path: path.into(),
         load_address: Address::new(IMAGE),
-        uuid,
+        build_id: uuid.map(BuildId::from).into(),
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
@@ -298,10 +298,10 @@ fn runtime_address_refuses_an_image_whose_known_uuid_differs()
     // a different build, so its file addresses do not apply. An unknown UUID on either
     // side is no evidence of a change.
     let (header, _, _) = image();
-    let listed = |uuid| LoadedImage {
+    let listed = |uuid: Option<[u8; 16]>| LoadedImage {
         path: "/nonexistent/ferros-uuid-image".into(),
         load_address: Address::new(0x10_0000),
-        uuid,
+        build_id: uuid.map(BuildId::from).into(),
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(0x10_1010))

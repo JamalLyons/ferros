@@ -62,7 +62,11 @@ fn main_executable_uuid_matches_its_file()
             .iter()
             .find(|image| image.path == fixture.path())
             .expect("the main executable image");
-        assert_eq!(main.uuid, Some(file_uuid(fixture.path())), "{main:?}");
+        assert_eq!(
+            main.build_id,
+            ferros_core::BuildIdentity::Known(file_uuid(fixture.path()).into()),
+            "{main:?}"
+        );
     });
 }
 
@@ -89,7 +93,7 @@ fn second_images_call_does_not_reread_known_headers()
              all {} images, so this would not show the cache working: {first:#?}",
             first.len()
         );
-        assert!(first.iter().any(|image| image.uuid.is_some()), "{first:#?}");
+        assert!(first.iter().any(|image| image.build_id.known().is_some()), "{first:#?}");
 
         let second = d.images().expect("images again");
         let warm_reads = mapped_uuid_header_reads();
@@ -240,7 +244,7 @@ fn measure_mapped_uuid_and_backtrace_cost()
             cached_backtrace_reads, 0,
             "a backtrace with an unchanged image list re-read mapped headers: {line}"
         );
-        assert!(cached.iter().any(|image| image.uuid.is_some()), "{cached:#?}");
+        assert!(cached.iter().any(|image| image.build_id.known().is_some()), "{cached:#?}");
         assert!(frames > 50, "{frames} frames");
     });
 }

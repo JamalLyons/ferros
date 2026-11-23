@@ -220,15 +220,17 @@ The `symbols` module provides symbol resolution, DWARF parsing, and type introsp
 
 **Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../crates/ferros-core/src/symbols/mod.rs)
 
-Debug information is discovered in this order: embedded DWARF, an adjacent
+On macOS, `ferros_macos::MachOFormat` (the session's `ObjectFormat`; `ferros-core` only
+consumes the DWARF bytes it returns) discovers debug information in this order: embedded DWARF, an adjacent
 `<executable>.dSYM` with matching UUID and architecture, a validated UUID/architecture
 cache entry, then `dsymutil`. Companion member names are not used as identity.
 Generated DWARF is validated before an atomic cache publication, with a 30-second
 per-tool deadline and cleanup on failure. The cache defaults to
 `$XDG_CACHE_HOME/ferros/debuginfo`, or `$HOME/.cache/ferros/debuginfo`, falling back to
-the temporary directory when neither variable is set. `DebugInfoOptions` configures
+the temporary directory when neither variable is set. `ferros_macos::DebugInfoOptions` configures
 these locations, tool selection (including disabling it), and the deadline through
-`SymbolCache::with_debug_info_options` or the Session builder of the same name.
+`MachOFormat::with_debug_info_options`, passed to `SymbolCache::new`, `Session::new` or
+`Session::with_object_format`.
 
 `Session::symbolicate` returns `DebuggerError::NoDebugInfo` for a mapped image without
 usable debug information, with `split-debuginfo` and `dsymutil` remedies. Stack traces

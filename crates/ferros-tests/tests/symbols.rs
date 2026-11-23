@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ferros_core::symbols::{BinaryImage, DebugInfoOptions, FunctionAddress, ImageDescriptor, SourceLookupError};
+use ferros_core::symbols::{BinaryImage, FunctionAddress, ImageDescriptor, SourceLookupError};
 use ferros_core::{Address, SymbolCache};
+use ferros_macos::{DebugInfoOptions, MachOFormat};
 use ferros_tests::{Fixture, fixture, scratch};
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 
@@ -84,7 +85,7 @@ fn load(fixture: &Fixture) -> Arc<BinaryImage>
         .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
         .expect("__TEXT segment");
     let scratch = Scratch::new();
-    let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+    let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
     cache
         .load_image(ImageDescriptor {
             path: fixture.path().to_path_buf(),
@@ -789,7 +790,7 @@ fn load_with_corrupt_dwarf(fixture: &Fixture, scratch: &Scratch, corrupt: impl F
         .segments()
         .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
         .expect("__TEXT segment");
-    let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+    let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
     cache
         .load_image(ImageDescriptor {
             path: executable,

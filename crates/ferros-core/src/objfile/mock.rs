@@ -9,7 +9,9 @@
 //!
 //! - **Header**, at the image's load address ([`MockObjectImage::header_bytes`]):
 //!   [`MockObjectFormat::MAGIC`], four bytes of zero, then the code range
-//!   `[code_start, code_end)`, the table address and the symbol count (40 bytes).
+//!   `[code_start, code_end)`, the table address, the symbol count, and the image's
+//!   mapping: the file address of its first byte and the size of its one segment, zero
+//!   when it has none (56 bytes).
 //! - **Table**, at the table address ([`MockObjectImage::table_bytes`]): per symbol its
 //!   address, the address of its name and the name's length (24 bytes each).
 //! - **Names**, at the address given to [`MockObjectImage::new`]
@@ -18,12 +20,29 @@
 //! A symbol names the pcs from its address to the next symbol's, within the code range.
 //! Unlisted images are searched for at [`MockObjectFormat::ALIGNMENT`]; a probe reads the
 //! [`MAGIC`](MockObjectFormat::MAGIC) word only, then the header.
+//!
+//! An image's file on disk, for [`ObjectFormat::open_image`], is a [`MockObjectFile`]:
+//! [`MockObjectFile::FILE_MAGIC`], four bytes of zero, the file address of the image's
+//! first byte, the size of its one segment and the number of entries; then each entry as
+//! its kind, address and length followed by that many bytes. An entry is a DWARF section
+//! (kind = its index in [`DWARF_SECTIONS`](super::DWARF_SECTIONS)), `eh_frame`,
+//! `eh_frame_hdr`, `debug_frame`, or an unwind hint for the function at its address. A
+//! file without `.debug_info` has no debug information. Files are always arm64 and
+//! little-endian, and their build id is never checked.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
-use super::{ImageProbe, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey, TargetMemory};
-use crate::types::Address;
+use gimli::{RunTimeEndian, SectionId};
+
+use super::{
+    DWARF_SECTIONS, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice, MappedImage,
+    MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
+};
+use crate::error::{DebuggerError, Result as EngineResult};
+use crate::types::{Address, Architecture, BuildIdentity};
 
 /// The made-up format of the [module documentation](self).
 #[derive(Debug, Clone, Copy, Default)]
@@ -34,7 +53,7 @@ impl MockObjectFormat
     /// First word of a header.
     pub const MAGIC: [u8; 4] = *b"FMK1";
     /// Bytes in a header.
-    pub const HEADER_SIZE: usize = 40;
+    pub const HEADER_SIZE: usize = 56;
     /// Bytes per table entry.
     pub const ENTRY_SIZE: usize = 24;
     /// Alignment of unlisted images.
@@ -95,6 +114,50 @@ impl ObjectFormat for MockObjectFormat
             Ok(_) => self.mapped_symbols(memory, at).map_or(ImageProbe::Nothing, ImageProbe::Image),
         }
     }
+
+    /// The header's one segment, of file address `word 4` and size `word 5`. The slice
+    /// names no part of a file, and its build id is unknown.
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+    {
+        let header = match memory.read(load_address, Self::HEADER_SIZE) {
+            Ok(header) => header,
+            Err(error) => {
+                return MappedImage {
+                    mapping: Err(format!("reading the mock header at {load_address}: {error}")),
+                    slice: None,
+                };
+            }
+        };
+        if header.get(..4) != Some(&Self::MAGIC[..]) {
+            return MappedImage {
+                mapping: Err(format!("no mock header at {load_address}")),
+                slice: None,
+            };
+        }
+        let mapping = segment_mapping(word(&header, 4), word(&header, 5), load_address.value())
+            .map_err(|error| format!("mock header at {load_address}: {error}"));
+        MappedImage {
+            mapping,
+            slice: Some(ImageSlice::new(Vec::new(), BuildIdentity::Unknown)),
+        }
+    }
+
+    fn open_image(&self, path: &Path, load_address: u64, _slice: Option<&ImageSlice>) -> EngineResult<ImageContents>
+    {
+        let bytes = std::fs::read(path)?;
+        MockObjectFile::parse(&bytes, path, load_address)
+    }
+}
+
+fn segment_mapping(file_base: u64, size: u64, load_address: u64) -> EngineResult<ImageMapping>
+{
+    let segment = ImageSegment {
+        address: file_base,
+        size,
+        file_offset: 0,
+        file_size: size,
+    };
+    ImageMapping::from_segments(&[segment], load_address)
 }
 
 /// A mock image's code range and where its table lies.
@@ -188,6 +251,7 @@ pub struct MockObjectImage
     table_at: u64,
     names_at: u64,
     symbols: Vec<(u64, String)>,
+    mapping: (u64, u64),
 }
 
 impl MockObjectImage
@@ -202,6 +266,7 @@ impl MockObjectImage
             table_at,
             names_at,
             symbols: Vec::new(),
+            mapping: (0, 0),
         }
     }
 
@@ -213,13 +278,29 @@ impl MockObjectImage
         self
     }
 
+    /// Give the image one segment of `size` bytes whose first byte, the header, is at the
+    /// file address `file_base`. Without one the image has no mapping.
+    #[must_use]
+    pub fn with_mapping(mut self, file_base: u64, size: u64) -> Self
+    {
+        self.mapping = (file_base, size);
+        self
+    }
+
     /// The header, to map at the image's load address.
     #[must_use]
     pub fn header_bytes(&self) -> Vec<u8>
     {
         let mut bytes = MockObjectFormat::MAGIC.to_vec();
         bytes.extend([0; 4]);
-        for value in [self.code.start, self.code.end, self.table_at, self.symbols.len() as u64] {
+        for value in [
+            self.code.start,
+            self.code.end,
+            self.table_at,
+            self.symbols.len() as u64,
+            self.mapping.0,
+            self.mapping.1,
+        ] {
             bytes.extend(value.to_le_bytes());
         }
         bytes
@@ -245,6 +326,215 @@ impl MockObjectImage
     pub fn name_bytes(&self) -> Vec<u8>
     {
         self.symbols.iter().flat_map(|(_, name)| name.bytes()).collect()
+    }
+}
+
+/// The file of one [`MockObjectFormat`] image (see the [module documentation](self)).
+#[derive(Debug, Clone, Default)]
+pub struct MockObjectFile
+{
+    file_base: u64,
+    size: u64,
+    entries: Vec<(u64, u64, Vec<u8>)>,
+}
+
+/// Entry kinds after the DWARF sections.
+const EH_FRAME: u64 = 0x100;
+const EH_FRAME_HDR: u64 = 0x101;
+const DEBUG_FRAME: u64 = 0x102;
+const HINT_CFI: u64 = 0x200;
+const HINT_LEAF: u64 = 0x201;
+const HINT_FRAME_RECORD: u64 = 0x202;
+
+impl MockObjectFile
+{
+    /// First word of a file.
+    pub const FILE_MAGIC: [u8; 4] = *b"FMKF";
+
+    /// A file whose image is one segment of `size` bytes, its first byte at the file
+    /// address `file_base`, with no sections yet.
+    #[must_use]
+    pub fn new(file_base: u64, size: u64) -> Self
+    {
+        Self {
+            file_base,
+            size,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Add the DWARF section `id` (one of [`DWARF_SECTIONS`]).
+    ///
+    /// # Panics
+    /// When `id` is not one of [`DWARF_SECTIONS`].
+    #[must_use]
+    pub fn with_dwarf(mut self, id: SectionId, data: &[u8]) -> Self
+    {
+        let kind = DWARF_SECTIONS
+            .iter()
+            .position(|&known| known == id)
+            .expect("a DWARF section the engine reads");
+        self.entries.push((kind as u64, 0, data.to_vec()));
+        self
+    }
+
+    /// Add `eh_frame` at the file address `address`.
+    #[must_use]
+    pub fn with_eh_frame(mut self, address: u64, data: &[u8]) -> Self
+    {
+        self.entries.push((EH_FRAME, address, data.to_vec()));
+        self
+    }
+
+    /// Add `eh_frame_hdr` at the file address `address`.
+    #[must_use]
+    pub fn with_eh_frame_hdr(mut self, address: u64, data: &[u8]) -> Self
+    {
+        self.entries.push((EH_FRAME_HDR, address, data.to_vec()));
+        self
+    }
+
+    /// Add `debug_frame` at the file address `address`.
+    #[must_use]
+    pub fn with_debug_frame(mut self, address: u64, data: &[u8]) -> Self
+    {
+        self.entries.push((DEBUG_FRAME, address, data.to_vec()));
+        self
+    }
+
+    /// Add the unwind hint `hint` for the function starting at the file address `start`;
+    /// it covers addresses up to the next hinted function.
+    #[must_use]
+    pub fn with_hint(mut self, start: u64, hint: UnwindHint) -> Self
+    {
+        let (kind, value) = match hint {
+            UnwindHint::Cfi { eh_frame_offset } => (HINT_CFI, eh_frame_offset as u64),
+            UnwindHint::Leaf { stack_size } => (HINT_LEAF, stack_size),
+            UnwindHint::FrameRecord => (HINT_FRAME_RECORD, 0),
+        };
+        self.entries.push((kind, start, value.to_le_bytes().to_vec()));
+        self
+    }
+
+    /// The file's bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8>
+    {
+        let mut bytes = Self::FILE_MAGIC.to_vec();
+        bytes.extend([0; 4]);
+        for value in [self.file_base, self.size, self.entries.len() as u64] {
+            bytes.extend(value.to_le_bytes());
+        }
+        for (kind, address, data) in &self.entries {
+            for value in [*kind, *address, data.len() as u64] {
+                bytes.extend(value.to_le_bytes());
+            }
+            bytes.extend(data);
+        }
+        bytes
+    }
+
+    fn parse(bytes: &[u8], path: &Path, load_address: u64) -> EngineResult<ImageContents>
+    {
+        let invalid = || DebuggerError::InvalidArgument(format!("{} is not a mock object file", path.display()));
+        if bytes.get(..4) != Some(&Self::FILE_MAGIC[..]) {
+            return Err(invalid());
+        }
+        let mut at = 8;
+        let mut next = || -> EngineResult<u64> {
+            let value = bytes
+                .get(at..at + 8)
+                .and_then(|word| word.try_into().ok())
+                .map(u64::from_le_bytes)
+                .ok_or_else(invalid)?;
+            at += 8;
+            Ok(value)
+        };
+        let (file_base, size, count) = (next()?, next()?, next()?);
+        let mapping = segment_mapping(file_base, size, load_address)?;
+        let mut dwarf = HashMap::new();
+        let (mut eh_frame, mut eh_frame_hdr, mut debug_frame) = (None, None, None);
+        let mut hints = Vec::new();
+        for _ in 0..count {
+            let mut next = || -> EngineResult<u64> {
+                let value = bytes
+                    .get(at..at + 8)
+                    .and_then(|word| word.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(invalid)?;
+                at += 8;
+                Ok(value)
+            };
+            let (kind, address, len) = (next()?, next()?, next()?);
+            let len = usize::try_from(len).map_err(|_| invalid())?;
+            let data: Arc<[u8]> = bytes.get(at..at + len).ok_or_else(invalid)?.into();
+            at += len;
+            let section = || SectionData {
+                address,
+                data: data.clone(),
+            };
+            let value = || data.get(..8).and_then(|word| word.try_into().ok()).map(u64::from_le_bytes);
+            match kind {
+                EH_FRAME => eh_frame = Some(section()),
+                EH_FRAME_HDR => eh_frame_hdr = Some(section()),
+                DEBUG_FRAME => debug_frame = Some(section()),
+                HINT_CFI | HINT_LEAF | HINT_FRAME_RECORD => {
+                    let value = value().ok_or_else(invalid)?;
+                    let hint = match kind {
+                        HINT_CFI => UnwindHint::Cfi {
+                            eh_frame_offset: usize::try_from(value).map_err(|_| invalid())?,
+                        },
+                        HINT_LEAF => UnwindHint::Leaf { stack_size: value },
+                        _ => UnwindHint::FrameRecord,
+                    };
+                    let start = mapping.relocate(address).ok_or_else(invalid)?;
+                    hints.push((start, hint));
+                }
+                kind => {
+                    let id = usize::try_from(kind)
+                        .ok()
+                        .and_then(|index| DWARF_SECTIONS.get(index))
+                        .ok_or_else(invalid)?;
+                    dwarf.insert(*id, data.clone());
+                }
+            }
+        }
+        if !dwarf.contains_key(&SectionId::DebugInfo) {
+            return Err(DebuggerError::NoDebugInfo {
+                path: path.to_path_buf(),
+                detail: "mock object file has no .debug_info".into(),
+            });
+        }
+        hints.sort_unstable_by_key(|&(start, _)| start);
+        Ok(ImageContents {
+            architecture: Architecture::Arm64,
+            endian: RunTimeEndian::Little,
+            mapping,
+            dwarf,
+            eh_frame,
+            eh_frame_hdr,
+            debug_frame,
+            unwind_hints: (!hints.is_empty()).then(|| Box::new(MockHints(hints)) as Box<dyn UnwindHints>),
+        })
+    }
+}
+
+/// A mock file's hints, `(runtime start, hint)` sorted by start.
+struct MockHints(Vec<(u64, UnwindHint)>);
+
+impl UnwindHints for MockHints
+{
+    fn lookup(&self, address: Address) -> Option<FunctionUnwind>
+    {
+        let index = self
+            .0
+            .partition_point(|&(start, _)| start <= address.value())
+            .checked_sub(1)?;
+        let (start, hint) = self.0[index];
+        Some(FunctionUnwind {
+            start: Address::new(start),
+            hint,
+        })
     }
 }
 

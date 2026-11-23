@@ -247,7 +247,6 @@ fn runtime_address_refuses_an_image_whose_known_uuid_differs()
     // Issue #121: an image at the same path and address with a different known UUID is
     // a different build, so its file addresses do not apply. An unknown UUID on either
     // side is no evidence of a change.
-    // The mapping is still read from a Mach-O header in core (`ImageMapping`).
     let listed = |uuid: Option<[u8; 16]>| LoadedImage {
         path: "/nonexistent/ferros-uuid-image".into(),
         load_address: Address::new(0x10_0000),

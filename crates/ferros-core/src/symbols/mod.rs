@@ -7,16 +7,17 @@
 //! ## Module Structure
 //!
 //! - **`cache`**: Symbol cache for binary images and address symbolication
-//! - **`compact_unwind`**: Lookup in Mach-O `__unwind_info` (used by `unwind`)
 //! - **`demangle`**: Symbol demangling utilities (Rust, C++)
 //! - **`extractor`**: DWARF type extraction and introspection
 //! - **`functions`**: Function index: function name to entry and post-prologue addresses
-//! - **`image`**: Binary image parsing and DWARF section loading
+//! - **`image`**: Binary images: DWARF sections, segment mapping and unwind information
+//!   read by the session's [`ObjectFormat`](crate::objfile::ObjectFormat)
 //! - **`lines`**: Line-table index: `file:line` to addresses, address to line and ranges
 //!
 //! ## DWARF Sections
 //!
-//! The module loads DWARF sections from binary images:
+//! The module reads these DWARF sections, which the object format finds in an image or
+//! its companion files:
 //!
 //! - **`.debug_info`**: Debugging information entries (DIEs)
 //! - **`.debug_line`**: Line number information
@@ -33,13 +34,12 @@
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
 pub mod cache;
-pub(crate) mod compact_unwind;
-pub mod debuginfo;
 pub mod demangle;
 pub mod extractor;
 pub mod functions;
 pub mod image;
 pub mod lines;
+pub(crate) mod load_inputs;
 pub mod unwind;
 
 // Shared type aliases
@@ -48,8 +48,7 @@ pub(crate) type OwnedDwarf = Dwarf<OwnedReader>;
 
 // Re-exports
 pub use cache::{SymbolCache, SymbolFrame, Symbolication};
-pub use debuginfo::DebugInfoOptions;
 pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use functions::FunctionAddress;
-pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping, SliceIdentity};
+pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping, ImageSegment};
 pub use lines::{AddressLine, LineAddresses, SkippedDebugInfo, SourceLookupError};

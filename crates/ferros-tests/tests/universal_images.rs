@@ -4,7 +4,8 @@
 use std::fs;
 
 use ferros_core::Address;
-use ferros_core::symbols::{ImageDescriptor, ImageMapping, SliceIdentity};
+use ferros_core::symbols::ImageDescriptor;
+use ferros_macos::macho::{SliceIdentity, slice_mapping};
 use object::macho::{CPU_SUBTYPE_ARM64E, CPU_TYPE_ARM64};
 use object::read::macho::{FatArch, MachOFatFile32};
 use object::{Object, ObjectSegment};
@@ -27,7 +28,7 @@ fn maps_the_selected_arm64e_slice_of_dyld()
     let file = object::File::parse(arch.data(bytes.as_slice()).expect("arm64e slice bytes")).expect("arm64e Mach-O");
     let uuid = file.mach_uuid().expect("read arm64e UUID").expect("arm64e UUID");
     let selector = SliceIdentity::new(CPU_TYPE_ARM64.0, CPU_SUBTYPE_ARM64E.0, Some(uuid));
-    let mapping = ImageMapping::parse_slice(&descriptor, &selector).expect("map the selected dyld slice");
+    let mapping = slice_mapping(&descriptor.path, descriptor.load_address, &selector).expect("map the selected dyld slice");
     let text = file
         .segments()
         .find(|segment| segment.name().expect("segment name") == Some("__TEXT"))

@@ -1,7 +1,8 @@
 //! Build identity of a loaded image, independent of the object-file format.
 //!
 //! Object formats record a build's identity in different ways: an ELF GNU build-id note is
-//! usually 20 bytes, a Mach-O UUID 16, a PE/COFF CodeView signature 16 plus an age. The
+//! usually 20 bytes, a 16-byte UUID is common too, a PE/COFF CodeView signature is 16
+//! plus an age. The
 //! engine only needs to compare them, so [`BuildId`] holds the bytes the backend reports
 //! and [`BuildIdentity`] says whether the backend has them.
 

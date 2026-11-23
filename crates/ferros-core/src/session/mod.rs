@@ -307,6 +307,7 @@ impl Session
     #[must_use]
     pub fn new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>) -> Self
     {
+        let symbols = SymbolCache::new(format.clone());
         Self {
             backend,
             format,
@@ -332,7 +333,7 @@ impl Session
             logical: Vec::new(),
             next_logical: 0,
             detach_intent: None,
-            symbols: SymbolCache::new(),
+            symbols,
             loaded_images: Vec::new(),
             symbol_request: 0,
         }

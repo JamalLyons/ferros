@@ -65,11 +65,9 @@ pub enum DebuggerError
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// No usable embedded or UUID-matched companion debug information was found.
-    #[error(
-        "No debug information for {path}: {detail}. Build with debug symbols and split-debuginfo = \"packed\", or \
-         install/run dsymutil to generate a matching dSYM"
-    )]
+    /// No usable debug information was found in the image or a companion file. `detail`
+    /// comes from the object format and says what was looked for and how to provide it.
+    #[error("No debug information for {path}: {detail}")]
     NoDebugInfo
     {
         /// Executable whose symbols were requested.
@@ -93,7 +91,7 @@ pub enum DebuggerError
     /// debug information, for example because its file could not be read while Cargo
     /// replaced it. `source` is the original failure. The session keeps the failure
     /// only while the files the load read are unchanged: later requests return it again
-    /// without reading them, and the first request after the image, its `.dSYM` or the
+    /// without reading them, and the first request after the image, its companion debug files or the
     /// debug cache changes on disk tries the load again.
     #[error("Cannot load symbols for {path}: {source}")]
     SymbolLoad

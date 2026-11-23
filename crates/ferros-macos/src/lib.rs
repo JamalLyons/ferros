@@ -206,7 +206,7 @@ pub mod terminal;
 pub mod threads;
 pub mod types;
 
-pub use macho::MachOFormat;
+pub use macho::{DebugInfoOptions, MachOFormat};
 pub use task::MacOSBackend;
 
 /// A [`ferros_core::Session`] with no process on a new [`MacOSBackend`], reading images

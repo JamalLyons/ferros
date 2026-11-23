@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::Session;
+use super::stack::BackendTarget;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
-use crate::objfile::{MappedSymbols, SymbolIndex, SymbolKey};
-use crate::symbols::debuginfo::LoadInputs;
-use crate::symbols::image::SliceIdentity;
-use crate::symbols::{DebugInfoOptions, ImageDescriptor, ImageId, ImageMapping, SymbolCache};
-use crate::types::{Address, BuildId, BuildIdentity, same_build};
+use crate::objfile::{ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey};
+use crate::symbols::load_inputs::LoadInputs;
+use crate::symbols::{ImageDescriptor, ImageId, ImageMapping, SymbolCache};
+use crate::types::{Address, BuildIdentity, same_build};
 
 /// The image's symbols could not be loaded (see [`SessionImage`]).
 ///
@@ -43,7 +43,7 @@ struct FailedLoad
 /// Symbol loading keeps one of three outcomes: the loaded symbols; missing debug info
 /// (kept until the image is unloaded); or another failure, kept only while the files it
 /// read are unchanged ([`FailedLoad`]). So a persistent failure, such as a corrupt image
-/// file or a malformed dSYM, costs one read and parse, not one per request, and a
+/// file or a malformed companion debug file, costs one read and parse, not one per request, and a
 /// transient one, such as a file Cargo is replacing, recovers once the file is back.
 pub(super) struct SessionImage
 {
@@ -55,17 +55,17 @@ pub(super) struct SessionImage
     /// Mapped memory does not change while this image stays loaded, so the result is kept
     /// until the loader reports a different path, address or build ([`same_build`]).
     mapping: std::result::Result<ImageMapping, String>,
-    /// CPU type, subtype and UUID of the mapped header, read with `mapping`: which slice
-    /// of a universal file the symbols are loaded from (#169). `None` when the header
-    /// could not be read.
-    slice: Option<SliceIdentity>,
+    /// Which slice and build of the image's file is mapped, read with `mapping` by the
+    /// session's [`ObjectFormat`]: the part of a file holding several images the symbols
+    /// are loaded from (#169). `None` when the header could not be read.
+    slice: Option<ImageSlice>,
     /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
-    /// images by canonical path, load address and the slice known at parse time (CPU
-    /// type, masked subtype and UUID; [`ImageId`]). Retention uses this id because a relative loader path may stop
+    /// images by canonical path, load address and the slice known at parse time
+    /// ([`ImageId`]). Retention uses this id because a relative loader path may stop
     /// resolving later (#99).
     symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
-    /// without repeatedly running dsymutil.
+    /// without repeatedly running the format's debug-info discovery.
     no_debug_info: Option<String>,
     /// Why the image's last symbol load failed for another reason, and what it read.
     failed_load: Option<FailedLoad>,
@@ -108,12 +108,6 @@ impl SessionSymtab
     }
 }
 
-/// The 16-byte UUID a [`SliceIdentity`] selects a universal slice by, when `id` is one.
-fn slice_uuid(id: BuildIdentity) -> Option<[u8; 16]>
-{
-    id.known().and_then(|id| id.as_bytes().try_into().ok())
-}
-
 impl SessionImage
 {
     pub(super) fn descriptor_load_address(&self) -> u64
@@ -134,13 +128,17 @@ impl SessionImage
 
 impl Session
 {
-    /// Configure companion discovery and clear any previous symbol-loading results.
-    /// The options persist across launches; live mappings refresh on the next lookup.
+    /// Read images as `format` from now on, clearing any previous mapping and
+    /// symbol-loading results. A platform crate configures how its format finds companion
+    /// debug information this way. The format persists across launches; live mappings
+    /// refresh on the next lookup.
     #[must_use]
-    pub fn with_debug_info_options(mut self, options: DebugInfoOptions) -> Self
+    pub fn with_object_format(mut self, format: Arc<dyn ObjectFormat>) -> Self
     {
-        self.symbols = SymbolCache::with_debug_info_options(options);
+        self.symbols = SymbolCache::new(format.clone());
+        self.format = format;
         self.loaded_images.clear();
+        self.exit_images.clear();
         self
     }
 
@@ -178,7 +176,7 @@ impl Session
     /// ([`same_build`]); otherwise, or when the address is outside the image's
     /// mapped segments, the result is `None`.
     ///
-    /// The layout comes from the Mach-O header the loader mapped, not from the file at
+    /// The layout comes from the image header the loader mapped, not from the file at
     /// `image.path`, so a file replaced or removed on disk does not change the result.
     ///
     /// # Errors
@@ -252,20 +250,15 @@ impl Session
             }) {
                 let mut kept = previous.swap_remove(index);
                 kept.build_id = kept.build_id.or_later(image.build_id);
-                if let Some(slice) = &mut kept.slice {
-                    slice.uuid = slice.uuid.or(slice_uuid(kept.build_id));
-                }
+                kept.slice = kept.slice.map(|slice| slice.or_later(kept.build_id));
                 self.loaded_images.push(kept);
             } else {
-                let (mapping, slice) = self.map_loaded_image(descriptor.load_address, image.build_id);
+                let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, image.build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
-                    build_id: image.build_id.or_later(
-                        slice
-                            .as_ref()
-                            .and_then(|slice| slice.uuid)
-                            .map_or(BuildIdentity::Unknown, |uuid| BuildIdentity::Known(BuildId::from(uuid))),
-                    ),
+                    build_id: image
+                        .build_id
+                        .or_later(slice.as_ref().map_or(BuildIdentity::Unknown, ImageSlice::build_id)),
                     mapping,
                     slice,
                     symbols: None,
@@ -281,41 +274,19 @@ impl Session
         Ok(())
     }
 
-    /// Read the segment layout and the slice identity from the header mapped at
-    /// `load_address`. Trap bytes are irrelevant: breakpoints are never planted in a
-    /// Mach-O header. The header's `LC_UUID` is the identity's UUID; the loader-reported
-    /// `build_id` stands in only when the header has none.
-    fn map_loaded_image(
-        &mut self,
-        load_address: u64,
-        build_id: BuildIdentity,
-    ) -> (std::result::Result<ImageMapping, String>, Option<SliceIdentity>)
+    /// Read the segment layout and the slice from the header mapped at `load_address`,
+    /// through the session's [`ObjectFormat`]. Trap bytes are irrelevant: breakpoints are
+    /// never planted in an image header. The header's build id is the slice's; the
+    /// loader-reported `build_id` stands in only when the header's is unknown.
+    fn map_loaded_image(&mut self, load_address: u64, build_id: BuildIdentity) -> MappedImage
     {
-        let header = match self.read_mapped_header(load_address) {
-            Ok(header) => header,
-            Err(detail) => return (Err(detail), None),
-        };
-        let slice = SliceIdentity::from_header(&header).ok().map(|slice| SliceIdentity {
-            uuid: slice.uuid.or(slice_uuid(build_id)),
-            ..slice
-        });
-        let mapping = ImageMapping::from_header(&header, load_address)
-            .map_err(|error| format!("header at {}: {error}", Address::new(load_address)));
-        (mapping, slice)
-    }
-
-    /// The Mach-O header and load commands mapped at `load_address`.
-    pub(super) fn read_mapped_header(&mut self, load_address: u64) -> std::result::Result<Vec<u8>, String>
-    {
-        let address = Address::new(load_address);
-        let header = self
-            .backend
-            .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
-            .map_err(|error| format!("reading the Mach-O header at {address}: {error}"))?;
-        let size = ImageMapping::header_size(&header).map_err(|error| format!("header at {address}: {error}"))?;
-        self.backend
-            .read_memory(address, size)
-            .map_err(|error| format!("reading {size} bytes of load commands at {address}: {error}"))
+        let MappedImage { mapping, slice } = self
+            .format
+            .map_image(&mut BackendTarget(self.backend.as_mut()), Address::new(load_address));
+        MappedImage {
+            mapping,
+            slice: slice.map(|slice| slice.or_later(build_id)),
+        }
     }
 
     /// Start a request that may load symbols. Within one request an image whose load

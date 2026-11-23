@@ -46,7 +46,6 @@ use std::path::{Path, PathBuf};
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::error::{DebuggerError, Result};
-use ferros_core::symbols::ImageMapping;
 use ferros_core::types::{Address, BuildId, BuildIdentity, ProcessId};
 use libc::mach_port_t;
 use mach2::kern_return::KERN_SUCCESS;
@@ -444,11 +443,11 @@ impl MappedUuidCache
 fn mapped_uuid(task: mach_port_t, address: Address) -> MappedUuidRead
 {
     note_mapped_uuid_header_read();
-    let header = match read_target(task, address, ImageMapping::MACH_HEADER_SIZE) {
+    let header = match read_target(task, address, crate::macho::MACH_HEADER_SIZE) {
         Ok(header) => header,
         Err(_) => return MappedUuidRead::Failed,
     };
-    let size = match ImageMapping::header_size(&header) {
+    let size = match crate::macho::header_size(&header) {
         Ok(size) => size,
         Err(_) => return MappedUuidRead::Failed,
     };

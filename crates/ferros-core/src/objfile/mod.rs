@@ -1,11 +1,12 @@
 //! # Object files without naming a format
 //!
-//! The engine asks container questions about the images mapped in a target: where an
-//! image's symbol table is, which addresses are its code, and whether memory that no
-//! loader lists holds an image. The answers depend on the object-file format (Mach-O, ELF,
-//! PE/COFF), which `ferros-core` does not know. [`ObjectFormat`] is the question set;
-//! each platform crate implements it for its own format (`ferros-macos` for Mach-O) and
-//! the session is given one ([`Session::new`](crate::Session::new)).
+//! The engine asks container questions about the images mapped in a target: how an
+//! image's file addresses map to runtime addresses, which build it is, where its symbol
+//! table is, which addresses are its code, whether memory that no loader lists holds an
+//! image, and what debug and unwind information its file on disk holds. The answers depend
+//! on the object-file format, which `ferros-core` does not know. [`ObjectFormat`] is the
+//! question set; each platform crate implements it for its own format and the session is
+//! given one ([`Session::new`](crate::Session::new)).
 //!
 //! The format never sees a [`Backend`](crate::Backend): it reads the target through
 //! [`TargetMemory`], which the session adapts over its backend. The session keeps the
@@ -28,11 +29,19 @@
 //! [`SymbolIndex`], and [`SymbolIndex::read_name`] reads one name. Each step reads only
 //! what it needs, so the session can keep what was read and retry only what failed.
 
+mod contents;
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use gimli::{RunTimeEndian, SectionId};
+
+pub use self::contents::{
+    DWARF_SECTIONS, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData, UnwindHint, UnwindHints,
+};
+pub use crate::symbols::image::{ImageMapping, ImageSegment};
 use crate::types::Address;
 
 /// Reads of the target's memory, for an [`ObjectFormat`].
@@ -86,6 +95,37 @@ pub trait ObjectFormat: Send + Sync
         let _ = (memory, at);
         ImageProbe::Nothing
     }
+
+    /// The segment layout and slice of the image whose header is mapped at
+    /// `load_address`, read from the target only.
+    ///
+    /// A header that cannot be read or parsed is a [`MappedImage`] whose `mapping` holds
+    /// the reason and whose `slice` is `None`. The session keeps the result while the
+    /// image stays loaded as the same build.
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage;
+
+    /// Read the file at `path`, mapped at `load_address`, for its debug and unwind
+    /// information. `slice` is the [`MappedImage::slice`] the session read from the
+    /// mapped header, with any build id the loader reported since; `None` when it is
+    /// unknown. A format whose files hold several images reads the one `slice` names, and
+    /// a file of another build than `slice` names is an error.
+    ///
+    /// # Errors
+    /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the image
+    /// has no usable debug information (the session keeps it while the image stays
+    /// loaded); any other error for a file that cannot be read, does not parse, or is
+    /// another build (the session retries once [`load_inputs`](Self::load_inputs)
+    /// change).
+    fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> crate::Result<ImageContents>;
+
+    /// The files [`open_image`](Self::open_image) reads for the image at `path`, `path`
+    /// included, in a stable order: companion debug files and any cache directory the
+    /// format consults. The session stamps them (size and timestamps) when a read fails
+    /// and reads again only once one of them changes. The default is `path` alone.
+    fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
+    {
+        vec![path.to_path_buf()]
+    }
 }
 
 /// What [`ObjectFormat::probe_unlisted_image`] found at one address.
@@ -127,7 +167,7 @@ pub trait MappedSymbols: Send + Sync
     fn load(&self, memory: &mut dyn TargetMemory) -> Result<Box<dyn SymbolIndex>, String>;
 
     /// The function name a raw symbol table name stands for. The default is the raw name;
-    /// a format that decorates names (Mach-O prefixes C-level names with `_`) removes the
+    /// a format that decorates names (some prefix C-level names with `_`) removes the
     /// decoration here.
     fn function_name<'a>(&self, raw: &'a str) -> &'a str
     {
@@ -155,7 +195,7 @@ pub trait SymbolIndex: Send + Sync
 }
 
 /// Identifies one symbol of a [`SymbolIndex`], for reading and caching its name. Its
-/// value means something only to the index that returned it (a Mach-O string table
-/// index, for example).
+/// value means something only to the index that returned it (a string table index, for
+/// example).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymbolKey(pub u64);

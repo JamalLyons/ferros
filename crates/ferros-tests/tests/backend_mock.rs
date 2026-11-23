@@ -238,14 +238,18 @@ fn session_carries_process_group_to_backend()
     }
 }
 
-/// A portable, synthetic arm64 Mach-O with two DWARF subprograms named `multi`.
-/// No compiler, fixture process, or platform API is needed to resolve multiple sites.
+/// A portable, synthetic arm64 image in the neutral `MockObjectFormat` with two DWARF
+/// subprograms named `multi`. No compiler, fixture process, or platform API is needed to
+/// resolve multiple sites.
 struct MultiSiteImage(std::path::PathBuf);
 
 impl MultiSiteImage
 {
     fn new() -> (Self, MockBackend)
     {
+        use ferros_core::objfile::SectionId;
+        use ferros_core::objfile::mock::MockObjectFile;
+
         let (mut image, path) = ferros_tests::scratch::create_file("ferros-mock-multi", "");
         // DWARF 4: a compile unit with children, then subprograms with inline name,
         // low_pc (address), high_pc (data4 offset). No statement table is referenced.
@@ -261,42 +265,17 @@ impl MultiSiteImage
         let length = u32::try_from(info.len() - 4).unwrap();
         info[..4].copy_from_slice(&length.to_le_bytes());
 
-        let sections =
-            vec![("__debug_info", info), ("__debug_abbrev", abbrev), ("__debug_line", vec![0])].into_boxed_slice();
-        let commands_size = 72 + 72 + 80 * sections.len();
-        let mut bytes = vec![0; 32 + commands_size];
-        let word = |bytes: &mut [u8], offset, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        let long = |bytes: &mut [u8], offset, value: u64| bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        word(&mut bytes, 0, 0xfeed_facf);
-        word(&mut bytes, 4, 0x0100_000c);
-        word(&mut bytes, 12, 2);
-        word(&mut bytes, 16, 2);
-        word(&mut bytes, 20, u32::try_from(commands_size).unwrap());
-        word(&mut bytes, 32, 0x19); // LC_SEGMENT_64: header and code mapping.
-        word(&mut bytes, 36, 72);
-        bytes[40..46].copy_from_slice(b"__TEXT");
-        long(&mut bytes, 56, IMAGE_BASE.value());
-        long(&mut bytes, 64, 0x2000);
-        long(&mut bytes, 80, 0x2000);
-        word(&mut bytes, 88, 5);
-        word(&mut bytes, 92, 5);
-        let dwarf = 104;
-        word(&mut bytes, dwarf, 0x19);
-        word(&mut bytes, dwarf + 4, u32::try_from(72 + 80 * sections.len()).unwrap());
-        bytes[dwarf + 8..dwarf + 15].copy_from_slice(b"__DWARF");
-        word(&mut bytes, dwarf + 64, u32::try_from(sections.len()).unwrap());
-        for (index, (name, data)) in sections.into_iter().enumerate() {
-            let section = dwarf + 72 + 80 * index;
-            bytes[section..section + name.len()].copy_from_slice(name.as_bytes());
-            bytes[section + 16..section + 23].copy_from_slice(b"__DWARF");
-            long(&mut bytes, section + 40, data.len() as u64);
-            let offset = u32::try_from(bytes.len()).unwrap();
-            word(&mut bytes, section + 48, offset);
-            bytes.extend(data);
-        }
-        bytes.resize(0x2000, 0x1F);
-        std::io::Write::write_all(&mut image, &bytes).expect("write synthetic image");
+        let file = MockObjectFile::new(IMAGE_BASE.value(), 0x2000)
+            .with_dwarf(SectionId::DebugInfo, &info)
+            .with_dwarf(SectionId::DebugAbbrev, &abbrev)
+            .with_dwarf(SectionId::DebugLine, &[0]);
+        std::io::Write::write_all(&mut image, &file.to_bytes()).expect("write synthetic image");
         drop(image);
+        // The mapped image: its header, then code (`0x1F` bytes) up to the segment's end.
+        let mut bytes = MockObjectImage::new(0..1, 0, 0)
+            .with_mapping(IMAGE_BASE.value(), 0x2000)
+            .header_bytes();
+        bytes.resize(0x2000, 0x1F);
         let mut registers = arm64_registers();
         registers.pc = IMAGE_BASE;
         let mock = MockBackend::new()
@@ -2879,17 +2858,11 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
 /// Load address of the image in the build-identity tests below.
 const BUILD_IMAGE: u64 = 0x3_0000_0000;
 
-/// A mapped 64-bit Mach-O header with one `__TEXT` segment at file address `text`, so a
-/// runtime address in the image maps back to an offset from `text`.
+/// A mapped image header in the neutral `MockObjectFormat` with one segment at file
+/// address `text`, so a runtime address in the image maps back to an offset from `text`.
 fn build_image_header(text: u64) -> Vec<u8>
 {
-    let u32s = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    let u64s = |words: &[u64]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    let mut header = u32s(&[0xfeed_facf, 0x0100_000c, 0, 6, 1, 72, 0, 0]); // mach_header_64
-    header.extend(u32s(&[0x19, 72])); // LC_SEGMENT_64, with no sections
-    header.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
-    header.extend(u64s(&[text, 0x1000, 0, 0x1000]));
-    header.extend(u32s(&[5, 5, 0, 0]));
+    let mut header = MockObjectImage::new(0..1, 0, 0).with_mapping(text, 0x1000).header_bytes();
     header.resize(0x100, 0);
     header
 }
@@ -2903,7 +2876,7 @@ fn build_image(build_id: ferros_core::BuildIdentity) -> ferros_core::backend::Lo
     }
 }
 
-/// A session over an image whose mapped header puts `__TEXT` at `0x1000`, reported with
+/// A session over an image whose mapped header puts its segment at `0x1000`, reported with
 /// `build_id`.
 fn build_id_session(build_id: ferros_core::BuildIdentity) -> (MockBackend, Session)
 {

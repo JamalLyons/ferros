@@ -11,27 +11,43 @@
 //!   header before it. Images in the dyld shared cache start on 4 KiB boundaries, finer
 //!   than the 16 KiB page, so that is the alignment searched; the session decides which
 //!   regions to search and caches what each probe found.
+//! - **Mapped images** ([`image`]): the segment layout of a mapped header (without
+//!   `__PAGEZERO`) and its [`SliceIdentity`] (CPU type, subtype and `LC_UUID`), which picks
+//!   the slice of a universal file to read (#169, #175).
+//! - **Image files** ([`image`], [`debuginfo`]): DWARF from the image, its `.dSYM`, a
+//!   UUID-keyed cache or `dsymutil` ([`DebugInfoOptions`]); `__eh_frame`,
+//!   `__eh_frame_hdr`, and `__unwind_info` (Apple compact unwind, [`compact_unwind`]) as
+//!   the engine's unwind hints.
 //!
 //! Mach-O prefixes C-level names with an underscore (`_main`, `__ZN...`), which is not
 //! part of the function's name; [`MappedSymbols::function_name`] removes it.
 
+pub(crate) mod compact_unwind;
+pub mod debuginfo;
+pub mod image;
 pub(crate) mod symtab;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ferros_core::objfile::{ImageProbe, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey, TargetMemory};
+use ferros_core::error::Result as EngineResult;
+use ferros_core::objfile::{
+    ImageContents, ImageProbe, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey, TargetMemory,
+};
 use ferros_core::types::Address;
 use object::Endianness;
 use object::macho::MachHeader64;
 use object::read::macho::MachHeader as _;
 
+pub use self::debuginfo::DebugInfoOptions;
+pub use self::image::{SliceIdentity, file_mapping, slice_mapping};
 use self::symtab::{SymbolTable, SymtabLayout};
 
 /// `MH_MAGIC_64`, the first word of a 64-bit Mach-O header.
 pub(crate) const MH_MAGIC_64: u32 = 0xfeed_facf;
 
 /// Size of a 64-bit Mach-O header, which precedes its load commands.
-const MACH_HEADER_SIZE: usize = 32;
+pub const MACH_HEADER_SIZE: usize = 32;
 
 /// Largest `sizeofcmds` read from a target.
 const MAX_LOAD_COMMANDS_SIZE: usize = 1 << 20;
@@ -44,17 +60,59 @@ const UNLISTED_IMAGE_ALIGNMENT: u64 = 0x1000;
 const MAX_SYMBOL_NAME: usize = 4096;
 
 /// The Mach-O [`ObjectFormat`]. See the [module documentation](self).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MachOFormat;
+#[derive(Debug, Clone, Default)]
+pub struct MachOFormat
+{
+    debug_info: DebugInfoOptions,
+}
 
 impl MachOFormat
 {
-    /// The format as a session holds it.
+    /// The format with the default [`DebugInfoOptions`].
+    #[must_use]
+    pub fn new() -> Self
+    {
+        Self::default()
+    }
+
+    /// The format with explicit companion debug-info discovery options.
+    #[must_use]
+    pub fn with_debug_info_options(debug_info: DebugInfoOptions) -> Self
+    {
+        Self { debug_info }
+    }
+
+    /// The format with the default options, as a session holds it.
     #[must_use]
     pub fn shared() -> Arc<dyn ObjectFormat>
     {
-        Arc::new(Self)
+        Arc::new(Self::default())
     }
+
+    /// This format as a session holds it.
+    #[must_use]
+    pub fn into_shared(self) -> Arc<dyn ObjectFormat>
+    {
+        Arc::new(self)
+    }
+}
+
+/// Bytes of the header and load commands, given the first [`MACH_HEADER_SIZE`] bytes of a
+/// 64-bit Mach-O header. The size is target-controlled: it is bounded before anyone
+/// allocates it.
+///
+/// # Errors
+/// A description of why `header` does not start a 64-bit Mach-O header, or why its load
+/// commands are too large.
+pub fn header_size(header: &[u8]) -> Result<usize, String>
+{
+    let mach = MachHeader64::<Endianness>::parse(header, 0).map_err(|error| format!("invalid image header: {error}"))?;
+    let endian = mach.endian().map_err(|error| format!("invalid image header: {error}"))?;
+    usize::try_from(mach.sizeofcmds(endian))
+        .ok()
+        .filter(|&commands| commands <= MAX_LOAD_COMMANDS_SIZE)
+        .map(|commands| commands + MACH_HEADER_SIZE)
+        .ok_or_else(|| "image load commands exceed the size limit".to_owned())
 }
 
 /// The Mach-O header and load commands mapped at `load_address`.
@@ -63,17 +121,7 @@ fn read_mapped_header(memory: &mut dyn TargetMemory, load_address: Address) -> R
     let header = memory
         .read(load_address, MACH_HEADER_SIZE)
         .map_err(|error| format!("reading the Mach-O header at {load_address}: {error}"))?;
-    let mach = MachHeader64::<Endianness>::parse(&*header, 0)
-        .map_err(|error| format!("header at {load_address}: invalid image header: {error}"))?;
-    let endian = mach
-        .endian()
-        .map_err(|error| format!("header at {load_address}: invalid image header: {error}"))?;
-    // The size is target-controlled: bound the read before anyone allocates it.
-    let size = usize::try_from(mach.sizeofcmds(endian))
-        .ok()
-        .filter(|&commands| commands <= MAX_LOAD_COMMANDS_SIZE)
-        .map(|commands| commands + MACH_HEADER_SIZE)
-        .ok_or_else(|| format!("header at {load_address}: image load commands exceed the size limit"))?;
+    let size = header_size(&header).map_err(|error| format!("header at {load_address}: {error}"))?;
     memory
         .read(load_address, size)
         .map_err(|error| format!("reading {size} bytes of load commands at {load_address}: {error}"))
@@ -120,6 +168,39 @@ impl ObjectFormat for MachOFormat
                 ImageProbe::Nothing
             }
         }
+    }
+
+    /// The segments of the mapped header without `__PAGEZERO`, and its CPU type,
+    /// subtype and `LC_UUID` as the slice. A header without `LC_UUID` leaves the build
+    /// identity unknown, never absent (#170).
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+    {
+        let header = match read_mapped_header(memory, load_address) {
+            Ok(header) => header,
+            Err(detail) => {
+                return MappedImage {
+                    mapping: Err(detail),
+                    slice: None,
+                };
+            }
+        };
+        let slice = SliceIdentity::from_header(&header).ok().map(|slice| slice.to_image_slice());
+        let mapping = image::mapping_from_header(&header, load_address.value())
+            .map_err(|error| format!("header at {load_address}: {error}"));
+        MappedImage { mapping, slice }
+    }
+
+    fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> EngineResult<ImageContents>
+    {
+        let target = slice.and_then(SliceIdentity::from_image_slice);
+        image::open(path, load_address, target.as_ref(), &self.debug_info)
+    }
+
+    /// The image, its `.dSYM` bundle's DWARF directory and members, and the debug cache
+    /// directory.
+    fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
+    {
+        debuginfo::load_inputs(path, &self.debug_info)
     }
 }
 

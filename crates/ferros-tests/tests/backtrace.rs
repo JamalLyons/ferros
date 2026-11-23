@@ -7,7 +7,6 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::symbols::ImageMapping;
 use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, Session, StackFrame, StopEvent, SymbolSource,
 };
@@ -30,9 +29,9 @@ const MAX_FRAMES: usize = 256;
 fn mapped_uuid(session: &mut Session, address: Address) -> ferros_core::BuildIdentity
 {
     let header = session
-        .read_memory(address, ImageMapping::MACH_HEADER_SIZE)
+        .read_memory(address, ferros_macos::macho::MACH_HEADER_SIZE)
         .expect("mapped Mach-O header");
-    let size = ImageMapping::header_size(&header).expect("load command size");
+    let size = ferros_macos::macho::header_size(&header).expect("load command size");
     let bytes = session.read_memory(address, size).expect("mapped load commands");
     let mach = MachHeader64::<Endianness>::parse(&*bytes, 0).expect("64-bit Mach-O");
     let uuid = mach

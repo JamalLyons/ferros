@@ -408,7 +408,6 @@ version = "0.0.0"
 dependencies = [
  "addr2line",
  "gimli",
- "object",
  "once_cell",
  "rustc-demangle",
  "thiserror 2.0.17",
@@ -420,6 +419,7 @@ name = "ferros-macos"
 version = "0.0.0"
 dependencies = [
  "ferros-core",
+ "gimli",
  "libc",
  "libproc",
  "mach2",

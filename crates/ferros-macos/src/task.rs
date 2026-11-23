@@ -2162,6 +2162,9 @@ impl Backend for MacOSBackend
     {
         self.require_stopped("threads")?;
         self.threads = threads::ThreadManager::refresh_thread_list(self.task, &self.threads).map_err(backend_error)?;
+        if self.reply_faults.sorted_threads.load(std::sync::atomic::Ordering::SeqCst) {
+            self.threads.sort_unstable();
+        }
         Ok(self.threads.iter().map(|&port| ThreadId::from(u64::from(port))).collect())
     }
 

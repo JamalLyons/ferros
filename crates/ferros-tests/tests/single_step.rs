@@ -1684,13 +1684,14 @@ fn kill_releases_a_held_new_thread()
     });
 }
 
-/// Release the publication hook even if an assertion unwinds.
+/// Disarm or release the publication hook even if an assertion unwinds, so a hook
+/// armed but not yet reached cannot pause a late exception during teardown (#183).
 struct ReleasePublication(ferros_macos::exception::ReplyFaultInjector);
 impl Drop for ReleasePublication
 {
     fn drop(&mut self)
     {
-        self.0.release_stop_publication();
+        self.0.cancel_stop_publication();
     }
 }
 
@@ -2212,6 +2213,13 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
         let fixture = fixture!("step_races");
         let debugger = MacOSBackend::new().expect("backend");
         let faults = debugger.reply_fault_injector();
+        // Session steps breakpoint sites in the order of its thread list. Mach does not
+        // promise `task_threads` order across stops (#183), so the backend reports the
+        // list sorted by port name, which is stable for a live thread.
+        faults.sort_thread_lists();
+        // The paused return is held across an interrupt, a wait and a resume; give that
+        // the same bound as every other wait here rather than the hook's default.
+        faults.set_stop_publication_deadline(STOP_TIMEOUT);
         let mut d = t.launch_with_backend(&fixture, &[control.path().to_str().expect("path")], debugger);
         let interrupted = Some(StopEvent::Interrupted { thread: None });
         d.resume().expect("start gated workers");
@@ -2220,11 +2228,8 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
         d.interrupt().expect("stop to enumerate workers");
         assert_eq!(d.wait(Some(STOP_TIMEOUT)).expect("startup interrupt"), interrupted);
 
-        // Session steps breakpoint sites in the order of its thread list, which
-        // `task_threads` reports and the backend keeps across refreshes. Choose the
-        // earlier worker as the peer because the handler will also be at a breakpoint.
-        // Mach does not promise that order; if it changed between stops, Session would
-        // step the handler first and the step-bit assertion below fails, naming it.
+        // Choose the earlier worker in that sorted list as the peer, because the handler
+        // will also be at a breakpoint and Session must step the peer first.
         let worker_ids = ["tid-0", "tid-1"].map(|file| control.read(file).parse::<u64>().expect("worker id"));
         let workers: Vec<_> = d
             .threads()
@@ -2298,8 +2303,7 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
         assert!(faults.stop_publication_is_paused());
         assert!(
             diagnostics::single_step_enabled(peer).expect("peer step bit"),
-            "Session did not step the peer first: the thread list order changed between stops, so this run does not \
-             exercise #176's ordering (threads now {:?})",
+            "Session did not step the peer first (threads now {:?})",
             d.threads().expect("threads")
         );
         faults.release_stop_publication();
@@ -2314,5 +2318,40 @@ fn handler_return_reissues_a_real_peer_breakpoint_step()
         );
         control.wait("done-0");
         control.wait("done-1");
+    });
+}
+
+/// Dropping the publication guard while the hook is armed but no exception has reached
+/// it disarms the hook (#183): the next real stop is published without pausing, so a
+/// test that unwinds early cannot leave a late exception paused during teardown.
+#[test]
+fn publication_guard_disarms_an_armed_hook()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+
+        // A pause would hold the stop far longer than the wait below allows.
+        faults.set_stop_publication_deadline(Duration::from_secs(60));
+        faults.pause_next_stop_publication();
+        assert!(faults.stop_publication_is_armed());
+        drop(ReleasePublication(faults.clone()));
+        assert!(!faults.stop_publication_is_armed(), "the guard left the hook armed");
+        // Should the step pause anyway, release it once the assertions below unwind.
+        let _release = ReleasePublication(faults.clone());
+
+        assert!(
+            matches!(step(&mut d, thread), StopEvent::SingleStep { thread: stepped } if stepped == thread),
+            "expected the step to be published"
+        );
+        assert!(!faults.stop_publication_is_paused(), "a disarmed hook paused the step");
     });
 }

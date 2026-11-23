@@ -7,8 +7,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use ferros_core::arch::Arm64;
 use ferros_core::backend::{Backend, BackendError, ResumeRequest};
-use ferros_core::{LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent};
+use ferros_core::{BreakpointLocation, LaunchSpec, ProcessId, ProcessOwnership, Session, SessionState, StopEvent};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::{fixture, harness, scratch};
 
@@ -505,6 +506,59 @@ fn attached_session_drop_releases_ownership_and_restores_ports()
             again.detach().expect("detach again");
             assert_eq!(diagnostics::exception_ports(pid).expect("ports after second detach"), before);
         }
+    });
+}
+
+#[test]
+fn attached_session_drop_keeps_the_target_when_trap_restore_fails()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut target = t.spawn(&fixture, &[]);
+        let pid = target.pid();
+        let backend = MacOSBackend::new().expect("backend");
+        let fail_write = backend.memory_write_fault_injector();
+        let mut session = Session::new(Box::new(backend));
+        session.attach(pid).expect("attach");
+        session
+            .set_breakpoint(BreakpointLocation::Line {
+                file: format!("{}.rs", fixture.name()),
+                line: fixture.marker_line("tick_body"),
+            })
+            .expect("set breakpoint");
+        session.resume().expect("resume");
+        let Some(StopEvent::Breakpoint { pc, .. }) = session.wait(Some(TIMEOUT)).expect("wait for breakpoint") else {
+            panic!("target did not stop at its breakpoint");
+        };
+        let ports = diagnostics::exception_ports(pid).expect("debugger exception ports");
+        let before = diagnostics::process_suspend_counts(pid)
+            .expect("suspend counts")
+            .task
+            .expect("task suspend count");
+        assert!(before > 0, "breakpoint stop must suspend the task");
+
+        fail_write();
+        drop(session);
+
+        assert_eq!(
+            target.try_wait().expect("check target status"),
+            None,
+            "target exited after drop"
+        );
+        let after = diagnostics::process_suspend_counts(pid)
+            .expect("target should still be alive")
+            .task
+            .expect("task suspend count after drop");
+        assert_eq!(after, before, "session drop released the task suspension");
+        let state = process_state(pid.0);
+        assert!(state.contains('X'), "target is no longer traced: {state}");
+        assert_eq!(diagnostics::exception_ports(pid).expect("ports after drop"), ports);
+        assert_eq!(
+            diagnostics::raw_memory(pid, pc, Arm64::TRAP_INSTRUCTION.len()).expect("read retained instruction"),
+            Arm64::TRAP_INSTRUCTION
+        );
+        drop(target); // Harness kills and reaps the retained fixture.
+        assert_reaped(pid.0);
     });
 }
 

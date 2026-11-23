@@ -137,6 +137,8 @@ pub enum MockCall
     Attach(ProcessId),
     /// [`Backend::detach`].
     Detach,
+    /// [`Backend::hold_attached_on_drop`].
+    HoldAttachedOnDrop,
     /// [`Backend::kill`].
     Kill,
     /// [`Backend::wait`] with its timeout.
@@ -189,6 +191,7 @@ impl MockCall
             Self::Launch(_) => MockCallKind::Launch,
             Self::Attach(_) => MockCallKind::Attach,
             Self::Detach => MockCallKind::Detach,
+            Self::HoldAttachedOnDrop => MockCallKind::HoldAttachedOnDrop,
             Self::Kill => MockCallKind::Kill,
             Self::Wait(_) => MockCallKind::Wait,
             Self::Resume(_) => MockCallKind::Resume,
@@ -214,6 +217,8 @@ pub enum MockCallKind
     Attach,
     /// [`Backend::detach`].
     Detach,
+    /// [`Backend::hold_attached_on_drop`].
+    HoldAttachedOnDrop,
     /// [`Backend::kill`].
     Kill,
     /// [`Backend::wait`].
@@ -910,6 +915,15 @@ impl Backend for MockBackend
         inner.require_stopped("detach")?;
         inner.end_process();
         Ok(())
+    }
+
+    fn hold_attached_on_drop(&mut self)
+    {
+        let mut inner = self.lock();
+        inner.calls.push(MockCall::HoldAttachedOnDrop);
+        if inner.state != MockState::NoProcess {
+            inner.state = MockState::Stopped;
+        }
     }
 
     fn kill(&mut self) -> BackendResult<()>

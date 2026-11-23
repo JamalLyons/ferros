@@ -90,6 +90,8 @@
 //! traps with [`Backend::write_memory`] (using [`crate::arch::Arch::trap_instruction`]),
 //! [`Backend::read_memory`] returns memory exactly as it is including those traps, and a
 //! trap stop is reported as [`StopEvent::Breakpoint`] with the raw, unadjusted pc.
+//! Before dropping an attached backend that could still have traps, the engine calls
+//! [`Backend::hold_attached_on_drop`] to preserve tracing and the target's stop.
 //!
 //! ## Out of scope
 //!
@@ -119,8 +121,7 @@ use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, Th
 /// Operating-system mechanism for controlling one target process.
 ///
 /// See the [module documentation](self) for the state machine, threading rules and the
-/// division of labour with the engine. Every method other than
-/// [`architecture`](Self::architecture) may also return [`BackendError::Os`] for an
+/// division of labour with the engine. Fallible methods may also return [`BackendError::Os`] for an
 /// unexpected operating-system failure, and every method that names a process, thread or
 /// address may return [`BackendError::NotFound`] if the target vanished underneath it.
 pub trait Backend: Send
@@ -186,6 +187,14 @@ pub trait Backend: Send
     ///   the backend is *NoProcess*. The target may still be traced or stopped, or
     ///   retain an exception handler that could not be restored.
     fn detach(&mut self) -> BackendResult<()>;
+
+    /// Keep the attached target stopped and traced when this backend is dropped.
+    ///
+    /// Called once, immediately before drop, with a stopped or running attached target.
+    /// Keep existing suspensions and stop the target if needed, even if no stop event was
+    /// observed. If stopping fails, preserve tracing and report the failure in the log.
+    /// The lifetime of the stop and trace after the debugger process exits is OS-specific.
+    fn hold_attached_on_drop(&mut self);
 
     /// Terminate and reap the target; the backend returns to *NoProcess*.
     ///
@@ -458,6 +467,8 @@ mod tests
             self.pid = None;
             Ok(())
         }
+
+        fn hold_attached_on_drop(&mut self) {}
 
         fn kill(&mut self) -> BackendResult<()>
         {

@@ -167,7 +167,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 └── ...
 ```
 
-`Session::new(backend: Box<dyn Backend>)` creates a session. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
+`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session (`ferros_macos::new_session()` on macOS). See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
 
 #### Platform Factory
 
@@ -487,7 +487,7 @@ pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
 
 3. Add integration tests for the platform in `crates/ferros-tests` that debug the fixture programs through `Session`.
 
-`Session`'s process-control policy (state machine, software breakpoints, stepping) already works with any `Backend`. Image format does not. Mach-O headers, `LC_UUID`, compact unwind, and the symbol-table reader still live in `ferros-core`, and `LoadedImage.uuid` is a 16-byte Mach-O UUID. [ADR 0001](adr/0001-object-file-boundary.md) (accepted 2026-11-22, tracked by [#193](https://github.com/JamalLyons/ferros/issues/193)) moves that Mach-O knowledge into `ferros-macos` behind a format-neutral trait in `ferros-core`. DWARF stays in core. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
+`Session`'s process-control policy (state machine, software breakpoints, stepping) works with any `Backend`, and its symbolication works with any `objfile::ObjectFormat`. Per [ADR 0001](adr/0001-object-file-boundary.md) ([#193](https://github.com/JamalLyons/ferros/issues/193)), the Mach-O implementor (headers, universal slices, symbol tables, compact unwind, dSYM discovery) is `ferros_macos::macho::MachOFormat`; `LoadedImage.build_id` holds up to 32 bytes, so an ELF build-id fits. DWARF stays in core. A new platform implements both `Backend` and `ObjectFormat`. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
 
 ---
 

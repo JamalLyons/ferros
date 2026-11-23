@@ -6,7 +6,10 @@
 #   2. crates/ferros-core/src must not contain `unsafe` code, and lib.rs must
 #      declare `#![forbid(unsafe_code)]`.
 #   3. crates/ferros-core/Cargo.toml must not name an OS crate.
-#   4. The CLI (crates/ferros/src) may name `ferros_macos` only in its factory
+#   4. crates/ferros-core/src must not contain Mach-O knowledge (comments
+#      included), and crates/ferros-core/Cargo.toml must not name an
+#      object-file parser crate (ADR 0001, #193).
+#   5. The CLI (crates/ferros/src) may name `ferros_macos` only in its factory
 #      module, platform.rs, and its manifest may not rename that dependency.
 #
 # Every offending line is printed as `file:line: rule: text` on stderr and the
@@ -66,7 +69,45 @@ awk '
     END { exit bad }
 ' crates/ferros-core/Cargo.toml >&2 || failed=1
 
-# Rule 4: the CLI names the macOS crate only in platform.rs.
+# Rule 4: Mach-O text in ferros-core sources, case-insensitive substrings plus
+# `LC_<NAME>` and `nlist` at the start of a word (so `unlisted` is allowed), and
+# `dSYM` with its case (`MappedSymbols` contains `dsym`).
+# shellcheck disable=SC2086
+awk '
+    {
+        lower = tolower($0)
+        n = split("mach-o macho mach_o mh_magic feedfacf feed_facf mach_uuid __linkedit __pagezero __unwind_info compact_unwind dsymutil n_oso", tokens, " ")
+        hit = ""
+        for (i = 1; i <= n; i++) if (index(lower, tokens[i])) { hit = tokens[i]; break }
+        if (hit == "" && index(lower, "compact unwind")) hit = "compact unwind"
+        if (hit == "" && index($0, "dSYM")) hit = "dSYM"
+        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9_])LC_[A-Z]/) hit = "LC_"
+        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9_])[Nn]list/) hit = "nlist"
+        if (hit != "") {
+            printf "%s:%d: Mach-O knowledge belongs in ferros-macos (%s): %s\n", FILENAME, FNR, hit, $0
+            bad = 1
+        }
+    }
+    END { exit bad }
+' $core_sources >&2 || failed=1
+
+awk '
+    /^[[:space:]]*#/ { next }
+    {
+        line = $0
+        while (match(line, /[A-Za-z0-9_-]+/)) {
+            word = substr(line, RSTART, RLENGTH)
+            if (word == "object" || word == "goblin" || word == "macho" || word == "mach_object") {
+                printf "%s:%d: ferros-core must not depend on an object-file parser: %s\n", FILENAME, FNR, $0
+                bad = 1
+            }
+            line = substr(line, RSTART + RLENGTH)
+        }
+    }
+    END { exit bad }
+' crates/ferros-core/Cargo.toml >&2 || failed=1
+
+# Rule 5: the CLI names the macOS crate only in platform.rs.
 cli_sources=$(find crates/ferros/src -type f -name '*.rs' ! -path 'crates/ferros/src/platform.rs' | sort)
 if [ -n "$cli_sources" ]; then
     # shellcheck disable=SC2086

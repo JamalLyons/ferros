@@ -1,7 +1,8 @@
 //! arm64 prologue and epilogue analysis for the stack unwinder.
 //!
-//! Compact unwind describes a function only once its frame is built (`MODE_FRAME`) or
-//! only before its epilogue releases the stack (`MODE_FRAMELESS`). Between those points
+//! A format's unwind hint describes a function only once its frame is built
+//! ([`UnwindHint::FrameRecord`](crate::objfile::UnwindHint::FrameRecord)) or only before
+//! its epilogue releases the stack ([`UnwindHint::Leaf`](crate::objfile::UnwindHint::Leaf)). Between those points
 //! the unwinder decodes the instructions around the pc of the innermost frame:
 //!
 //! - [`epilogue`]: from the pc forward to the `ret`, executing only the instructions that

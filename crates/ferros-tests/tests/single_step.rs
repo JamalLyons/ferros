@@ -841,6 +841,98 @@ fn interrupt_reports_a_step_held_by_a_failing_exception_suspend()
             backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
             Some(StopEvent::Interrupted { .. })
         ));
+        // The resume really let the target run: it calls `tick` again.
+        plant_trap(&mut d, tick);
+        let (again, _) = run_to_trap(&mut d, tick);
+        assert_eq!(again, thread, "another thread reached tick");
+    });
+}
+
+/// An interrupt that lands after the exception loop received a completed step but
+/// before its own `task_suspend` failed (#191) is reported as `Interrupted`, and the
+/// step stays held. A resume after that interrupt must not start while the step is
+/// held unpublished: it is refused (`StopPending`), and the next `wait` reports the
+/// step, with the task suspended. Otherwise the step would be published after the
+/// resume, for a resume it does not belong to.
+#[test]
+fn resume_after_an_interrupt_is_refused_while_a_step_is_held()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+        assert_eq!(flow(tick.value(), instruction_at(&mut d, tick)), Flow::Next);
+
+        // The loop receives the step and pauses before its task_suspend.
+        faults.pause_next_stop_publication();
+        backend(&mut d)
+            .resume(&ResumeRequest::step(thread))
+            .expect("resume with a step");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !faults.stop_publication_is_paused() {
+            assert!(Instant::now() < deadline, "the step was not received");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        backend(&mut d).interrupt().expect("interrupt");
+        faults.fail_exception_suspends(u32::MAX);
+        faults.release_stop_publication();
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+
+        let refused = backend(&mut d).resume(&ResumeRequest::continue_all());
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            refused,
+            Err(BackendError::StopPending),
+            "a resume started while a completed step was held unpublished"
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the held step"),
+            Some(StopEvent::SingleStep { thread }),
+            "the refused resume did not leave the held step to wait"
+        );
+        assert_eq!(pc_of(&mut d, thread).value(), tick.value() + 4, "the stepped thread ran on");
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the stop does not hold the task"
+        );
+        assert_eq!(
+            diagnostics::thread_suspend_count(thread).expect("thread suspend count"),
+            0,
+            "the thread held for the failed suspend was not released"
+        );
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("resume");
+        assert_eq!(
+            backend(&mut d)
+                .wait(Some(Duration::from_millis(300)))
+                .expect("wait after resume"),
+            None,
+            "a stale stop was published for the resume"
+        );
+        backend(&mut d).interrupt().expect("interrupt again");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        plant_trap(&mut d, tick);
+        let (again, _) = run_to_trap(&mut d, tick);
+        assert_eq!(again, thread, "another thread reached tick");
     });
 }
 

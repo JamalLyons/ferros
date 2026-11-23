@@ -185,8 +185,14 @@ pub(crate) struct ExceptionSharedState
     pub held_unsuspended: bool,
     /// An interrupt found [`Self::held_unsuspended`] set, took a task suspend of its own
     /// (counted in [`Self::suspends`]) and handed it to the loop, which publishes the
-    /// held batch with it as the stop. Cleared by the loop when it takes it over.
+    /// held batch with it as the stop. A resume refused for a held batch hands over one
+    /// of the suspends the backend already holds the same way. Cleared by the loop when
+    /// it takes it over.
     pub interrupt_suspend: bool,
+    /// Incremented each time attach or detach arms a private handshake. The loop stamps
+    /// every exception it receives with the value current at that moment, so only one
+    /// received after the handshake armed can be its private SIGSTOP (#191).
+    pub handshake_generation: u64,
 }
 
 impl ExceptionSharedState
@@ -194,6 +200,15 @@ impl ExceptionSharedState
     pub(crate) fn new() -> Self
     {
         Self::default()
+    }
+
+    /// Arm a private attach/detach handshake: `ready` receives the outcome of its
+    /// SIGSTOP. Exceptions received before this call are client exceptions.
+    pub(crate) fn arm_handshake(&mut self, ready: mpsc::Sender<BackendResult<()>>)
+    {
+        self.handshake_generation += 1;
+        self.internal_stop = Some(ready);
+        self.handshake_signals = Some(Vec::new());
     }
 
     /// Private handshake signals (or failed early suppressions) still need PT_THUPDATE.
@@ -242,6 +257,9 @@ pub struct ReplyFaultInjector
     exception_suspend: Arc<std::sync::atomic::AtomicU32>,
     /// How many of the next client-signal suppressions (`PT_THUPDATE(0)`) fail. Tests only.
     signal_suppression: Arc<std::sync::atomic::AtomicU32>,
+    /// 0 idle, 1 armed, 2 paused before a suspend retry, 3 released by a detach
+    /// handshake. Tests only (#191).
+    suspend_retry_hold: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -454,6 +472,65 @@ impl ReplyFaultInjector
         self.signal_suppression.store(count, Ordering::SeqCst);
     }
 
+    /// Pause the exception loop before its next retried `task_suspend` of a batch held
+    /// behind a failed one, until a detach handshake has sent its private SIGSTOP; the
+    /// detach then waits until the loop holds the shared lock for that suspend, before it
+    /// balances the backend's suspends. Tests only (#191).
+    pub fn hold_next_suspend_retry_for_detach(&self)
+    {
+        self.suspend_retry_hold.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether the exception loop is paused by [`Self::hold_next_suspend_retry_for_detach`].
+    #[must_use]
+    pub fn suspend_retry_is_held(&self) -> bool
+    {
+        self.suspend_retry_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// If `retry` and a test armed the hold, pause until a detach releases it (or five
+    /// seconds pass).
+    fn pause_suspend_retry(&self, retry: bool)
+    {
+        if !retry
+            || self
+                .suspend_retry_hold
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.suspend_retry_hold.load(Ordering::SeqCst) == 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The loop holds the shared lock for the retry the hold paused.
+    fn suspend_retry_locked(&self)
+    {
+        let _ = self
+            .suspend_retry_hold
+            .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Detach has sent its private SIGSTOP: release a paused suspend retry and wait
+    /// (bounded) until the loop holds the shared lock for it.
+    pub(crate) fn release_suspend_retry_for_detach(&self)
+    {
+        if self
+            .suspend_retry_hold
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.suspend_retry_hold.load(Ordering::SeqCst) == 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Consume one injected signal-suppression failure.
     fn take_signal_suppression_failure(&self) -> bool
     {
@@ -573,6 +650,8 @@ pub(crate) struct HeldException
     /// The message's thread send right, retained until its logical stop is released.
     thread: mach_port_t,
     soft_signal: bool,
+    /// [`ExceptionSharedState::handshake_generation`] when the loop received it.
+    handshake: u64,
 }
 
 /// A requeued signal owns a thread right even if it remains masked while
@@ -968,12 +1047,13 @@ pub(crate) fn run_exception_loop(
     // Threads of that batch held with a `thread_suspend` (and a right) of their own.
     let mut frozen: Vec<thread_act_t> = Vec::new();
     loop {
-        let (pending, handshake, handed_over) = {
+        let (pending, handshake, handed_over, keeps_records) = {
             let state = lock_shared(&shared);
             (
                 state.pending_exception,
                 state.handshake_signals.is_some(),
                 state.interrupt_suspend,
+                !state.held.is_empty(),
             )
         };
         if !frozen.is_empty() && handshake {
@@ -1022,10 +1102,13 @@ pub(crate) fn run_exception_loop(
             // An interrupt that took the task suspend for the held batch needs no wait.
             match receive_exception_with_timeout(exception_port, Some(if handed_over { 0 } else { SUSPEND_RETRY_MS })) {
                 Ok(buffer) => {
-                    if let Some(request) = decode_request(&buffer)
-                        && !reply_to_requeued_signal(&request, &mut lock_shared(&shared), pid, &events, &faults)
-                    {
-                        deferred.push_back(hold_exception(&request, architecture));
+                    if let Some(request) = decode_request(&buffer) {
+                        let mut state = lock_shared(&shared);
+                        if !reply_to_requeued_signal(&request, &mut state, pid, &events, &faults) {
+                            let generation = state.handshake_generation;
+                            drop(state);
+                            deferred.push_back(hold_exception(&request, architecture, generation));
+                        }
                     }
                 }
                 Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
@@ -1046,7 +1129,14 @@ pub(crate) fn run_exception_loop(
         let mut first = if popped {
             deferred.pop_front().expect("deferred request")
         } else {
-            let buffer = match receive_exception_with_timeout(exception_port, pending.then_some(10)) {
+            // While it keeps records, shutdown joins the loop: bound the receive, so the
+            // join does not depend on the wake alone.
+            let timeout = if pending {
+                Some(10)
+            } else {
+                keeps_records.then_some(KEPT_RECORDS_POLL_MS)
+            };
+            let buffer = match receive_exception_with_timeout(exception_port, timeout) {
                 Ok(buffer) => buffer,
                 Err(kr) if kr == MACH_RCV_PORT_DIED || kr == MACH_RCV_INVALID_NAME => {
                     debug!("Mach exception port closed, exiting handler loop");
@@ -1057,10 +1147,14 @@ pub(crate) fn run_exception_loop(
             let Some(request) = decode_request(&buffer) else {
                 continue;
             };
-            if reply_to_requeued_signal(&request, &mut lock_shared(&shared), pid, &events, &faults) {
-                continue;
-            }
-            hold_exception(&request, architecture)
+            let generation = {
+                let mut state = lock_shared(&shared);
+                if reply_to_requeued_signal(&request, &mut state, pid, &events, &faults) {
+                    continue;
+                }
+                state.handshake_generation
+            };
+            hold_exception(&request, architecture, generation)
         };
         let mut injected_batch = Vec::new();
         // Only a step that starts a new stop outside a ptrace handshake: those paths
@@ -1076,7 +1170,7 @@ pub(crate) fn run_exception_loop(
                 assert_eq!(unsafe { crate::ffi::thread_resume(peer) }, KERN_SUCCESS);
                 let buffer = receive_request_for_hook(exception_port).expect("signal batched with real step");
                 let request = decode_request(&buffer).expect("real signal request");
-                let racing = hold_exception(&request, architecture);
+                let racing = hold_exception(&request, architecture, current_generation(&shared));
                 assert!(
                     matches!(racing.1, StopEvent::Signal { thread, signal: libc::SIGUSR1 }
                     if thread.raw() == u64::from(peer)),
@@ -1107,7 +1201,7 @@ pub(crate) fn run_exception_loop(
                 assert_eq!(unsafe { crate::ffi::__pthread_kill(other, libc::SIGUSR1) }, 0);
                 let buffer = receive_request_for_hook(exception_port).expect("racing signal exception");
                 let request = decode_request(&buffer).expect("racing exception request");
-                let mut racing = hold_exception(&request, architecture);
+                let mut racing = hold_exception(&request, architecture, current_generation(&shared));
                 for port in ports {
                     deallocate_right(port);
                 }
@@ -1121,7 +1215,7 @@ pub(crate) fn run_exception_loop(
                 } else {
                     let buffer = receive_request_for_hook(exception_port).expect("fresh private stop");
                     let request = decode_request(&buffer).expect("private exception request");
-                    first = hold_exception(&request, architecture);
+                    first = hold_exception(&request, architecture, current_generation(&shared));
                     injected_batch.push(racing);
                 }
             }
@@ -1205,11 +1299,30 @@ pub(crate) fn run_exception_loop(
             // resume already suspended them. Production resumes do not arm the hold.
             let step_off = lock_shared(&shared).birth.is_step_off(&first.1);
             faults.pause_for_birth_step_off(step_off);
+            faults.pause_suspend_retry(popped && suspend_failures > 0);
 
             // Stop every thread, collect every message of this stop, mark the exceptions
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
             let mut state = lock_shared(&shared);
+            faults.suspend_retry_locked();
+            if state.handshake_signals.is_some() && !is_internal_stop(&first.0, &first.1, &state) {
+                // A handshake armed since the check above (#191): its teardown has
+                // balanced, or will balance, every suspend the backend counts, an
+                // interrupt's handed-over one included, and its private SIGSTOP may not
+                // have been raised yet. A fresh task suspend for a client stop would keep
+                // it from ever arriving. Preserve the stop for the handshake as above, and
+                // release the threads held for a failed suspend, which the kernel may have
+                // chosen to take that SIGSTOP.
+                state.interrupt_suspend = false;
+                thaw_threads(&mut frozen);
+                for (exception, event) in std::iter::once(first).chain(injected_batch) {
+                    if let Err(err) = preserve_handshake_stop(exception, &event, &mut state, pid, &faults) {
+                        let _ = events.send(Err(err));
+                    }
+                }
+                continue;
+            }
             // An interrupt that found a held batch took the task suspend for it, already
             // counted in `suspends` (#191): publish the batch with it as the stop.
             // A handshake's teardown has already balanced that suspend with the others
@@ -1237,7 +1350,7 @@ pub(crate) fn run_exception_loop(
                 if let Some(request) = decode_request(&buffer)
                     && !reply_to_requeued_signal(&request, &mut state, pid, &events, &faults)
                 {
-                    stops.push(hold_exception(&request, architecture));
+                    stops.push(hold_exception(&request, architecture, state.handshake_generation));
                 }
             }
             if kr != KERN_SUCCESS {
@@ -1389,6 +1502,11 @@ pub(crate) fn run_exception_loop(
 /// How long the loop receives before it retries a failed `task_suspend` (#191).
 #[cfg(target_os = "macos")]
 const SUSPEND_RETRY_MS: u32 = 10;
+
+/// How long the loop receives, with no stop pending, while it keeps records for
+/// threads a resume left suspended, before it checks its commands again.
+#[cfg(target_os = "macos")]
+const KEPT_RECORDS_POLL_MS: u32 = 100;
 
 /// The loop no longer holds a batch behind a failed `task_suspend` (#191), and has
 /// published none of it. An interrupt that took the task suspend for that batch gets
@@ -1872,7 +1990,15 @@ fn suspend_newborn(
 /// kernel until the reply), then releases the task right the message carried. The thread
 /// right is kept until the logical stop record is released.
 #[cfg(target_os = "macos")]
-fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architecture) -> (HeldException, StopEvent)
+///
+/// `handshake` is [`ExceptionSharedState::handshake_generation`], read after the
+/// receive: a handshake armed before then can be waiting for this exception, while every
+/// record received earlier is a client record.
+fn hold_exception(
+    request: &MachExceptionRaiseRequest,
+    architecture: Architecture,
+    handshake: u64,
+) -> (HeldException, StopEvent)
 {
     let thread_port = request.thread.name as thread_act_t;
     let code = request.code;
@@ -1898,6 +2024,7 @@ fn hold_exception(request: &MachExceptionRaiseRequest, architecture: Architectur
             header: Some(request.Head),
             thread: thread_port,
             soft_signal: exception_type == EXC_SOFTWARE as exception_type_t && codes[0] == EXC_SOFT_SIGNAL,
+            handshake,
         },
         event,
     )
@@ -1983,15 +2110,24 @@ fn held_quietly(state: &ExceptionSharedState) -> bool
         && !state.interrupt_suspend
 }
 
+/// The current [`ExceptionSharedState::handshake_generation`].
+fn current_generation(shared: &Mutex<ExceptionSharedState>) -> u64
+{
+    lock_shared(shared).handshake_generation
+}
+
 /// Whether `exception` is the private attach/detach SIGSTOP a handshake waits for.
 ///
 /// Only a fresh kernel exception, whose reply is still outstanding, can be: `PT_DETACH`
 /// needs the tracee waiting in it. A SIGSTOP record already answered (a client signal
 /// suppressed during a stop, or held across a failed `task_suspend`, #191) is a client
-/// signal, even while a handshake is waiting.
+/// signal, even while a handshake is waiting. So is one received before the handshake
+/// armed, even if its suppression failed and its reply is still outstanding: only an
+/// exception stamped with the current handshake generation can be the private stop.
 fn is_internal_stop(exception: &HeldException, event: &StopEvent, state: &ExceptionSharedState) -> bool
 {
     exception.header.is_some()
+        && exception.handshake == state.handshake_generation
         && matches!(
             event,
             StopEvent::Signal {
@@ -2051,6 +2187,7 @@ fn reply_to_requeued_signal(
         header: Some(request.Head),
         thread: request.thread.name,
         soft_signal: true,
+        handshake: state.handshake_generation,
     };
     // The fresh pass through issignal_locked evaluates this signal's own
     // properties rather than those cached before the original exception.
@@ -2210,6 +2347,7 @@ mod tests
                 header: None,
                 thread,
                 soft_signal: false,
+                handshake: 0,
             },
             &StopEvent::Signal {
                 thread: ThreadId::from(u64::from(thread)),
@@ -2221,6 +2359,52 @@ mod tests
         )
         .expect("release hardware exception");
         assert!(state.handshake_signals.as_ref().unwrap().is_empty());
+    }
+
+    /// A client SIGSTOP received before a detach handshake armed, whose reply is still
+    /// outstanding (its suppression failed across failed `task_suspend`s, #191), is not
+    /// that handshake's private stop; one received after it armed is.
+    #[test]
+    fn only_a_sigstop_received_after_the_handshake_armed_is_private()
+    {
+        // SAFETY: mach_thread_self returns an owned send right for this live thread.
+        let thread = unsafe { mach2::mach_init::mach_thread_self() };
+        let sigstop = StopEvent::Signal {
+            thread: ThreadId::from(u64::from(thread)),
+            signal: libc::SIGSTOP,
+        };
+        let header = mach_msg_header_t {
+            msgh_bits: 0,
+            msgh_size: 0,
+            msgh_remote_port: MACH_PORT_NULL,
+            msgh_local_port: MACH_PORT_NULL,
+            msgh_voucher_port: MACH_PORT_NULL,
+            msgh_id: MACH_EXCEPTION_RAISE_ID,
+        };
+        let mut state = ExceptionSharedState::new();
+        let client = HeldException {
+            header: Some(header),
+            thread,
+            soft_signal: true,
+            handshake: state.handshake_generation,
+        };
+        let (ready, _wait) = mpsc::channel();
+        state.arm_handshake(ready);
+        let private = HeldException {
+            header: Some(header),
+            thread,
+            soft_signal: true,
+            handshake: state.handshake_generation,
+        };
+        assert!(
+            !is_internal_stop(&client, &sigstop, &state),
+            "a client SIGSTOP satisfied the handshake"
+        );
+        assert!(
+            is_internal_stop(&private, &sigstop, &state),
+            "the private SIGSTOP was not recognised"
+        );
+        deallocate_right(thread);
     }
 
     #[test]

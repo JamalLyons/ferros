@@ -1123,11 +1123,7 @@ impl MacOSBackend
     fn start_tracing(&mut self) -> BackendResult<()>
     {
         let (ready, wait) = mpsc::channel();
-        {
-            let mut shared = lock_shared(&self.exception_state);
-            shared.internal_stop = Some(ready);
-            shared.handshake_signals = Some(Vec::new());
-        }
+        lock_shared(&self.exception_state).arm_handshake(ready);
         self.ptrace(ffi::ptrace_requests::PT_ATTACHEXC, 0, 0)?;
         self.traced = true;
         if self.launched {
@@ -1269,8 +1265,7 @@ impl MacOSBackend
             if shared.dead {
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
-            shared.internal_stop = Some(ready);
-            shared.handshake_signals = Some(Vec::new());
+            shared.arm_handshake(ready);
             shared.pending_exception
         };
         if pending {
@@ -1317,6 +1312,7 @@ impl MacOSBackend
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
         self.release_suspends();
+        self.reply_faults.release_suspend_retry_for_detach();
         // A failed task suspend still holds the private SIGSTOP (#191): the fallback
         // PT_DETACH of `detach_target` finds the tracee waiting in its exception.
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
@@ -1557,6 +1553,44 @@ impl MacOSBackend
             self.state = BackendState::Stopped;
         }
         event
+    }
+
+    /// Publish a batch the exception loop holds behind a failed `task_suspend` (#191),
+    /// for a resume that must be refused because of it; returns that refusal.
+    ///
+    /// The target is stopped, so the backend already holds the task suspended (an
+    /// interrupt whose `Interrupted` raced the batch, or the stop before it). One of
+    /// those suspends is handed to the loop as an interrupt's would be
+    /// ([`ExceptionSharedState::interrupt_suspend`]): the loop publishes the held batch
+    /// with it as the stop, without a `task_suspend` of its own. The first event it
+    /// publishes is peeked for the next `wait`. A suspend is taken here only if the
+    /// backend holds none; its failure is returned instead of the refusal.
+    fn publish_held_batch(&mut self) -> BackendError
+    {
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            if shared.held_unsuspended && !shared.interrupt_suspend {
+                if shared.suspends == 0 {
+                    // SAFETY: `self.task` is the send right this backend holds.
+                    let kr = unsafe { task_suspend(self.task) };
+                    if kr != KERN_SUCCESS {
+                        return mach_error(kr, "task_suspend failed");
+                    }
+                    shared.suspends += 1;
+                }
+                shared.interrupt_suspend = true;
+            }
+        }
+        exception::wake_loop(self.exception_port);
+        if self.peeked.is_none()
+            && let Some(event) = self
+                .events_rx
+                .as_ref()
+                .and_then(|rx| rx.recv_timeout(EXCEPTION_REPLY_TIMEOUT).ok())
+        {
+            self.peeked = Some(event);
+        }
+        BackendError::StopPending
     }
 
     /// Take a queued event (or queued failure) without blocking.
@@ -1838,6 +1872,12 @@ impl Backend for MacOSBackend
     /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
     /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
     /// exception, returns [`BackendError::Unsupported`]; so does `Step` on x86-64.
+    ///
+    /// A stop the exception loop received but could not publish because its own
+    /// `task_suspend` failed (#191) is a pending stop too: the resume is refused with
+    /// [`BackendError::StopPending`] after that stop is published (see
+    /// [`publish_held_batch`](Self::publish_held_batch)), so the next `wait` returns it
+    /// rather than reporting it after this resume, which it does not belong to.
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         use tracing::info;
@@ -1860,6 +1900,10 @@ impl Backend for MacOSBackend
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
                 return Err(BackendError::StopPending);
+            }
+            if shared.held_unsuspended || shared.interrupt_suspend {
+                drop(shared);
+                return Err(self.publish_held_batch());
             }
             shared.preparing_resume = true;
             (
@@ -1903,6 +1947,11 @@ impl Backend for MacOSBackend
                 drop(shared);
                 restore(self, count);
                 return Err(BackendError::StopPending);
+            }
+            if shared.held_unsuspended {
+                drop(shared);
+                restore(self, count);
+                return Err(self.publish_held_batch());
             }
             if pending || held {
                 // A selectively suspended thread retains its logical signal decision

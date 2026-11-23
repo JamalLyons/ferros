@@ -496,6 +496,61 @@ fn held_client_sigstop_does_not_satisfy_a_detach_handshake()
     });
 }
 
+/// A detach that arms its handshake after the exception loop checked for one, but before
+/// it took the lock for its suspend retry, still completes (#191): the loop sees the
+/// handshake under that lock, takes no task suspend for the held client batch (the
+/// interrupt's suspend handed to it is the detach's to balance), preserves the client
+/// SIGSTOP for the handshake and releases the thread held for the failed suspend, so the
+/// private SIGSTOP arrives. The hook pauses the loop's retry until the detach has sent
+/// that SIGSTOP and balanced its suspends.
+///
+/// The kernel usually queues the private SIGSTOP's exception before the retry runs, so
+/// this does not reproduce the hang of a fresh suspend taken before that exception
+/// arrives; it covers the path the loop takes for it.
+#[test]
+fn detach_during_a_suspend_retry_still_receives_its_private_stop()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+        faults.fail_exception_suspends(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-STOP", &pid.0.to_string()])
+                .status()
+                .expect("SIGSTOP")
+                .success()
+        );
+        expect_suspend_failure(
+            ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)),
+            "the client SIGSTOP's suspend",
+        );
+        faults.hold_next_suspend_retry_for_detach();
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while !faults.suspend_retry_is_held() {
+            assert!(std::time::Instant::now() < deadline, "the loop did not retry its suspend");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The interrupt hands its suspend to the paused retry; then suspends succeed.
+        ferros_core::Backend::interrupt(&mut backend).expect("interrupt");
+        faults.fail_exception_suspends(0);
+        // The backend is still running: dropping it detaches through the handshake.
+        let began = std::time::Instant::now();
+        drop(backend);
+        let took = began.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "detach took {took:?}: its private SIGSTOP was held back by a fresh suspend"
+        );
+        assert_runs(pid.0);
+    });
+}
+
 /// A failing suppression of a client signal held across failed `task_suspend`s (#191)
 /// is retried with the suspend, but its thread is held with one `thread_suspend` only,
 /// and each failure is reported once, not on every retry. Once both succeed, the signal

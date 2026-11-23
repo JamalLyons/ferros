@@ -44,6 +44,17 @@
 //! the failure at once. A handshake, a discard of deferred stops, shutdown and a dead
 //! task release the thread suspends too.
 //!
+//! While such a batch is held, [`ExceptionSharedState::held_unsuspended`] is set. An
+//! interrupt then takes the task suspend and hands it to the loop
+//! ([`ExceptionSharedState::interrupt_suspend`]) instead of queueing `Interrupted`: the
+//! loop publishes the held batch with that suspend as the stop, so a held step or
+//! breakpoint cannot be published after a later resume it does not belong to. A thread
+//! is held at most once per batch, and a failed signal suppression is retried with the
+//! suspend but reported once. Only a fresh exception, whose reply is outstanding, can
+//! be a handshake's private SIGSTOP: an answered client SIGSTOP of the batch is a
+//! client signal. Shutdown joins the loop whenever it holds records, and the loop takes
+//! commands in every state, so it answers what is queued before its port is destroyed.
+//!
 //! ## Held signals and retained thread rights
 //!
 //! Client Unix signals are suppressed with `PT_THUPDATE(0)` and answered while
@@ -169,6 +180,13 @@ pub(crate) struct ExceptionSharedState
     pub watcher_error: Option<BackendError>,
     /// Traps that hold threads created while the default resume action is `Suspend`.
     pub(crate) birth: crate::birth::BirthPolicy,
+    /// The loop holds a batch it could not publish because its `task_suspend` failed,
+    /// and retries that suspend (#191). Set and cleared by the loop only.
+    pub held_unsuspended: bool,
+    /// An interrupt found [`Self::held_unsuspended`] set, took a task suspend of its own
+    /// (counted in [`Self::suspends`]) and handed it to the loop, which publishes the
+    /// held batch with it as the stop. Cleared by the loop when it takes it over.
+    pub interrupt_suspend: bool,
 }
 
 impl ExceptionSharedState
@@ -222,6 +240,8 @@ pub struct ReplyFaultInjector
     birth_suspend: Arc<AtomicBool>,
     /// How many of the exception loop's next `task_suspend`s for a new stop fail. Tests only.
     exception_suspend: Arc<std::sync::atomic::AtomicU32>,
+    /// How many of the next client-signal suppressions (`PT_THUPDATE(0)`) fail. Tests only.
+    signal_suppression: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug)]
@@ -422,6 +442,22 @@ impl ReplyFaultInjector
     fn take_exception_suspend_failure(&self) -> bool
     {
         self.exception_suspend
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+    }
+
+    /// Make the next `count` suppressions of a client signal before its exception
+    /// reply (`PT_THUPDATE(0)`) fail without calling the kernel, leaving the exception
+    /// unanswered; 0 ends the injection. Tests only (#191).
+    pub fn fail_signal_suppressions(&self, count: u32)
+    {
+        self.signal_suppression.store(count, Ordering::SeqCst);
+    }
+
+    /// Consume one injected signal-suppression failure.
+    fn take_signal_suppression_failure(&self) -> bool
+    {
+        self.signal_suppression
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok()
     }
@@ -904,8 +940,9 @@ pub(crate) fn release_held_exceptions(state: &mut ExceptionSharedState)
 /// resume. While stopped, keep answering newly arriving exceptions so they cannot
 /// block external SIGKILL. Private ptrace handshake signals retain their reply.
 ///
-/// Continue releases records of runnable threads and answers their remaining replies;
-/// Shutdown answers all held replies, drains queued messages and exits. Destroying
+/// Commands are taken on every pass. Continue releases records of runnable threads and
+/// answers their remaining replies; Shutdown answers all held replies, drains queued
+/// messages and exits. Destroying
 /// the receive port also exits the loop and releases retained thread rights.
 ///
 /// See:
@@ -931,16 +968,59 @@ pub(crate) fn run_exception_loop(
     // Threads of that batch held with a `thread_suspend` (and a right) of their own.
     let mut frozen: Vec<thread_act_t> = Vec::new();
     loop {
-        let pending = lock_shared(&shared).pending_exception;
-        if !frozen.is_empty() && lock_shared(&shared).handshake_signals.is_some() {
+        let (pending, handshake, handed_over) = {
+            let state = lock_shared(&shared);
+            (
+                state.pending_exception,
+                state.handshake_signals.is_some(),
+                state.interrupt_suspend,
+            )
+        };
+        if !frozen.is_empty() && handshake {
             // A private handshake takes the deferred stops apart, and its SIGSTOP
             // must not pick a thread that stays suspended.
             thaw_threads(&mut frozen);
         }
+        // Commands are taken in every state, not only while a stop is pending: a
+        // shutdown must also reach a loop that retries a failed suspend or keeps
+        // records, so it answers what is queued before the port is destroyed (#191).
+        // A Continue is only ever sent for a pending stop.
+        match commands.try_recv() {
+            Ok(ExceptionLoopCommand::Continue {
+                ack,
+                keep,
+                discard_deferred,
+            }) => {
+                let mut state = lock_shared(&shared);
+                if discard_deferred {
+                    // The task is still suspended: the backend resumes it only
+                    // after this command is acknowledged.
+                    thaw_threads(&mut frozen);
+                    for (mut exception, _) in deferred.drain(..) {
+                        let _ = reply_to_held(&mut exception, &faults);
+                        deallocate_right(exception.thread);
+                    }
+                    suspend_failures = 0;
+                    end_unsuspended_hold(&mut state, &events);
+                }
+                answer_held_exceptions(&mut state, &keep, &faults, &events, task);
+                state.pending_exception = false;
+                faults.pending_stop.store(false, Ordering::SeqCst);
+                let _ = ack.send(());
+                continue;
+            }
+            Ok(ExceptionLoopCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
+                release_held_exceptions(&mut lock_shared(&shared));
+                reply_to_queued_exceptions(exception_port);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
         if suspend_failures > 0 && !pending {
             // Give the kernel a moment before retrying, and take any exception raised
             // meanwhile, so a task that cannot be suspended does not make the loop spin.
-            match receive_exception_with_timeout(exception_port, Some(SUSPEND_RETRY_MS)) {
+            // An interrupt that took the task suspend for the held batch needs no wait.
+            match receive_exception_with_timeout(exception_port, Some(if handed_over { 0 } else { SUSPEND_RETRY_MS })) {
                 Ok(buffer) => {
                     if let Some(request) = decode_request(&buffer)
                         && !reply_to_requeued_signal(&request, &mut lock_shared(&shared), pid, &events, &faults)
@@ -957,37 +1037,7 @@ pub(crate) fn run_exception_loop(
             if deferred.is_empty() {
                 thaw_threads(&mut frozen);
                 suspend_failures = 0;
-            }
-        }
-        if pending {
-            match commands.try_recv() {
-                Ok(ExceptionLoopCommand::Continue {
-                    ack,
-                    keep,
-                    discard_deferred,
-                }) => {
-                    if discard_deferred {
-                        // The task is still suspended: the backend resumes it only
-                        // after this command is acknowledged.
-                        thaw_threads(&mut frozen);
-                        for (mut exception, _) in deferred.drain(..) {
-                            let _ = reply_to_held(&mut exception, &faults);
-                            deallocate_right(exception.thread);
-                        }
-                    }
-                    let mut state = lock_shared(&shared);
-                    answer_held_exceptions(&mut state, &keep, &faults, &events, task);
-                    state.pending_exception = false;
-                    faults.pending_stop.store(false, Ordering::SeqCst);
-                    let _ = ack.send(());
-                    continue;
-                }
-                Ok(ExceptionLoopCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {
-                    release_held_exceptions(&mut lock_shared(&shared));
-                    reply_to_queued_exceptions(exception_port);
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
+                end_unsuspended_hold(&mut lock_shared(&shared), &events);
             }
         }
         // A deferred stop that must wait again goes back to the front, keeping the
@@ -1039,7 +1089,7 @@ pub(crate) fn run_exception_loop(
             }
         }
 
-        if is_internal_stop(&first.1, &lock_shared(&shared)) {
+        if is_internal_stop(&first.0, &first.1, &lock_shared(&shared)) {
             let race = faults.private_stop_race.swap(0, Ordering::SeqCst);
             if race != 0 {
                 // Consume the first private stop, then arrange a fresh private
@@ -1078,7 +1128,7 @@ pub(crate) fn run_exception_loop(
         }
         {
             let mut state = lock_shared(&shared);
-            if state.handshake_signals.is_some() && !is_internal_stop(&first.1, &state) {
+            if state.handshake_signals.is_some() && !is_internal_stop(&first.0, &first.1, &state) {
                 // Do not suspend the task for a stop that won the race against our
                 // SIGSTOP: doing so prevents that private stop from ever arriving.
                 if let Err(err) = preserve_handshake_stop(first.0, &first.1, &mut state, pid, &faults) {
@@ -1109,7 +1159,7 @@ pub(crate) fn run_exception_loop(
             // stop queued after its drain. Once a resume is preparing, a new stop is
             // still published and refused (G8): its decision cannot be taken yet.
             let mut state = lock_shared(&shared);
-            if held_quietly(&state) && first.0.soft_signal && !is_internal_stop(&first.1, &state) {
+            if held_quietly(&state) && first.0.soft_signal && !is_internal_stop(&first.0, &first.1, &state) {
                 let (mut exception, event) = first;
                 if let Err(err) = prepare_stop(&mut exception, pid, &faults) {
                     let _ = events.send(Err(err));
@@ -1140,7 +1190,7 @@ pub(crate) fn run_exception_loop(
                 BirthConsume::Publish => {}
             }
             if (state.suspends > 0 || state.preparing_resume)
-                && !is_internal_stop(&event, &state)
+                && !is_internal_stop(&exception, &event, &state)
                 && let Err(err) = prepare_stop(&mut exception, pid, &faults)
             {
                 let _ = events.send(Err(err));
@@ -1160,14 +1210,21 @@ pub(crate) fn run_exception_loop(
             // as held and queue the events in one step under the lock, so a concurrent
             // resume or interrupt sees either none or all of this stop.
             let mut state = lock_shared(&shared);
-            let kr = if faults.take_exception_suspend_failure() {
+            // An interrupt that found a held batch took the task suspend for it, already
+            // counted in `suspends` (#191): publish the batch with it as the stop.
+            // A handshake's teardown has already balanced that suspend with the others
+            // (`release_suspends`), so its private SIGSTOP takes a suspend of its own.
+            let handover = std::mem::take(&mut state.interrupt_suspend) && state.handshake_signals.is_none();
+            let kr = if handover {
+                KERN_SUCCESS
+            } else if faults.take_exception_suspend_failure() {
                 KERN_FAILURE
             } else {
                 // SAFETY: `task` is the send right the backend holds for as long as this
                 // loop runs.
                 unsafe { task_suspend(task) }
             };
-            if kr == KERN_SUCCESS {
+            if kr == KERN_SUCCESS && !handover {
                 state.suspends += 1;
             }
 
@@ -1199,10 +1256,12 @@ pub(crate) fn run_exception_loop(
                 if held.is_empty() {
                     suspend_failures = 0;
                 }
+                state.held_unsuspended = !held.is_empty();
                 deferred = held;
                 continue;
             }
             suspend_failures = 0;
+            state.held_unsuspended = false;
             // The task suspension now holds the threads of an earlier failed batch.
             thaw_threads(&mut frozen);
             if stops.len() > 1 {
@@ -1228,6 +1287,12 @@ pub(crate) fn run_exception_loop(
                     state.held.extend(stuck);
                     state.pending_exception = true;
                     faults.pending_stop.store(true, Ordering::SeqCst);
+                    let _ = events.send(Ok(StopEvent::Interrupted { thread: None }));
+                    continue;
+                }
+                if handover {
+                    // Nothing of the held batch is a client stop: the interrupt's
+                    // suspend stays, and its stop is reported as for any interrupt.
                     let _ = events.send(Ok(StopEvent::Interrupted { thread: None }));
                     continue;
                 }
@@ -1267,7 +1332,7 @@ pub(crate) fn run_exception_loop(
             state.pending_exception = true;
             faults.pending_stop.store(true, Ordering::SeqCst);
             for (mut exception, event) in client {
-                let internal = is_internal_stop(&event, &state);
+                let internal = is_internal_stop(&exception, &event, &state);
                 if state.handshake_signals.is_some() && !internal {
                     if let Err(err) = preserve_handshake_stop(exception, &event, &mut state, pid, &faults) {
                         let _ = events.send(Err(err));
@@ -1309,6 +1374,12 @@ pub(crate) fn run_exception_loop(
         let _ = reply_to_held(&mut exception, &faults);
         deallocate_right(exception.thread);
     }
+    {
+        // The backend balances an interrupt's suspend with the others on teardown.
+        let mut state = lock_shared(&shared);
+        state.held_unsuspended = false;
+        state.interrupt_suspend = false;
+    }
     // The port was destroyed while the loop was blocked receiving: exceptions kept for
     // suspended threads are still held. Answer them, so those threads are not left
     // blocked in the kernel, and release their rights.
@@ -1318,6 +1389,18 @@ pub(crate) fn run_exception_loop(
 /// How long the loop receives before it retries a failed `task_suspend` (#191).
 #[cfg(target_os = "macos")]
 const SUSPEND_RETRY_MS: u32 = 10;
+
+/// The loop no longer holds a batch behind a failed `task_suspend` (#191), and has
+/// published none of it. An interrupt that took the task suspend for that batch gets
+/// its own stop instead, as `interrupt` would have reported it.
+#[cfg(target_os = "macos")]
+fn end_unsuspended_hold(state: &mut ExceptionSharedState, events: &mpsc::Sender<LoopEvent>)
+{
+    state.held_unsuspended = false;
+    if std::mem::take(&mut state.interrupt_suspend) && state.handshake_signals.is_none() {
+        let _ = events.send(Ok(StopEvent::Interrupted { thread: None }));
+    }
+}
 
 /// The `task_suspend` of a new stop failed (#191): other threads may still run, so no
 /// stop of `stops` may be published, nor may the backend await a Continue. Returns the
@@ -1361,7 +1444,7 @@ fn hold_unsuspended_stops(
     let dead = state.dead || crate::lifecycle::task_is_dead(task);
     let mut held = std::collections::VecDeque::new();
     for (mut exception, event) in stops {
-        let internal = is_internal_stop(&event, state);
+        let internal = is_internal_stop(&exception, &event, state);
         if dead {
             let _ = reply_to_held(&mut exception, faults);
             deallocate_right(exception.thread);
@@ -1387,16 +1470,23 @@ fn hold_unsuspended_stops(
             continue;
         }
         if exception.header.is_some() {
-            if freeze_thread(exception.thread) {
+            // A thread is frozen once per held batch: a retry finds it in `frozen`
+            // with its exception still unanswered only if the suppression failed,
+            // and then only tries that again, without reporting it again.
+            let first = !frozen.contains(&exception.thread);
+            if first && freeze_thread(exception.thread) {
                 frozen.push(exception.thread);
-                if let Err(err) = prepare_stop(&mut exception, pid, faults) {
-                    let _ = events.send(Err(err));
-                }
-            } else {
+            } else if first {
                 error!(
                     "thread_suspend of thread {} failed after a failed task_suspend; its exception stays unanswered",
                     exception.thread
                 );
+            }
+            if frozen.contains(&exception.thread)
+                && let Err(err) = prepare_stop(&mut exception, pid, faults)
+                && first
+            {
+                let _ = events.send(Err(err));
             }
         }
         held.push_back((exception, event));
@@ -1824,6 +1914,12 @@ fn prepare_stop(exception: &mut HeldException, pid: libc::pid_t, faults: &ReplyF
         return Ok(());
     }
     if exception.soft_signal {
+        if faults.take_signal_suppression_failure() {
+            return Err(BackendError::Os {
+                code: i64::from(libc::ESRCH),
+                message: "suppress signal before exception reply: injected failure".into(),
+            });
+        }
         // SAFETY: this is our tracee and the exception retains the thread right.
         let result = unsafe {
             crate::ffi::ptrace(
@@ -1875,20 +1971,35 @@ fn preserve_handshake_stop(
 
 /// Whether the backend holds the task suspended while stopped, outside a resume and a
 /// private handshake, with no stop of the loop's own awaiting Continue.
+///
+/// An interrupt's suspend handed over for a held batch (#191) does not count: that
+/// suspend is the batch's, whose stop the loop is about to publish.
 fn held_quietly(state: &ExceptionSharedState) -> bool
 {
-    state.suspends > 0 && !state.preparing_resume && !state.pending_exception && state.handshake_signals.is_none()
+    state.suspends > 0
+        && !state.preparing_resume
+        && !state.pending_exception
+        && state.handshake_signals.is_none()
+        && !state.interrupt_suspend
 }
 
-fn is_internal_stop(event: &StopEvent, state: &ExceptionSharedState) -> bool
+/// Whether `exception` is the private attach/detach SIGSTOP a handshake waits for.
+///
+/// Only a fresh kernel exception, whose reply is still outstanding, can be: `PT_DETACH`
+/// needs the tracee waiting in it. A SIGSTOP record already answered (a client signal
+/// suppressed during a stop, or held across a failed `task_suspend`, #191) is a client
+/// signal, even while a handshake is waiting.
+fn is_internal_stop(exception: &HeldException, event: &StopEvent, state: &ExceptionSharedState) -> bool
 {
-    matches!(
-        event,
-        StopEvent::Signal {
-            signal: libc::SIGSTOP,
-            ..
-        }
-    ) && state.internal_stop.is_some()
+    exception.header.is_some()
+        && matches!(
+            event,
+            StopEvent::Signal {
+                signal: libc::SIGSTOP,
+                ..
+            }
+        )
+        && state.internal_stop.is_some()
 }
 
 /// Answer a requeued client signal without exposing another signal stop.

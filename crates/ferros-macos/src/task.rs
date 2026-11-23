@@ -695,10 +695,15 @@ impl MacOSBackend
             drop(saved);
         }
 
-        // If the loop holds exceptions it is waiting for a command: let it reply, answer
-        // the exceptions still queued on the port and exit before the port is destroyed.
-        // Otherwise it is blocked receiving, and destroying the port is what wakes it.
-        let holds_exception = lock_shared(&self.exception_state).pending_exception;
+        // If the loop holds exceptions (a pending stop, kept records, or a batch held
+        // behind a failed task_suspend, #191) let it reply, answer the exceptions still
+        // queued on the port and exit before the port is destroyed: a message destroyed
+        // with the port is an unhandled exception. Otherwise it is blocked receiving,
+        // and destroying the port is what wakes it.
+        let holds_exception = {
+            let shared = lock_shared(&self.exception_state);
+            shared.pending_exception || !shared.held.is_empty() || shared.held_unsuspended || shared.interrupt_suspend
+        };
         if let Some(tx) = self.exception_commands.take()
             && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
         {
@@ -1999,6 +2004,11 @@ impl Backend for MacOSBackend
     }
 
     /// Stop a running target with `task_suspend()` and queue `Interrupted`.
+    ///
+    /// While the exception loop holds a batch whose own `task_suspend` failed (#191),
+    /// the interrupt's suspend is handed to the loop instead, which publishes that held
+    /// batch as the stop: a completed step or a breakpoint reported after a resume
+    /// would otherwise belong to a resume it did not come from.
     fn interrupt(&mut self) -> BackendResult<()>
     {
         match self.state {
@@ -2010,7 +2020,8 @@ impl Backend for MacOSBackend
                     // An exception stop is already queued for `wait`, or a signal was
                     // deferred because an earlier interrupt holds the task: the interrupt
                     // lost the race and is consumed, as the contract requires.
-                    if shared.pending_exception {
+                    // So is one already handed to a held batch.
+                    if shared.pending_exception || shared.interrupt_suspend {
                         return Ok(());
                     }
                     let kr = unsafe { task_suspend(self.task) };
@@ -2018,6 +2029,12 @@ impl Backend for MacOSBackend
                         return Err(mach_error(kr, "task_suspend failed"));
                     }
                     shared.suspends += 1;
+                    if shared.held_unsuspended {
+                        shared.interrupt_suspend = true;
+                        drop(shared);
+                        exception::wake_loop(self.exception_port);
+                        return Ok(());
+                    }
                     if let Some(tx) = &self.events_tx {
                         let _ = tx.send(Ok(StopEvent::Interrupted { thread: None }));
                     }

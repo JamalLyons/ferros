@@ -245,8 +245,8 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
 /// A failed `task_suspend` in the exception loop is not published as a stop (#191):
 /// other threads could still be running while the engine reads memory or writes
 /// traps. The next `wait` returns the failure, the session stays running, and the
-/// thread, whose exception was answered, raises its breakpoint again, which is then
-/// reported with the task really suspended.
+/// held breakpoint stop is reported once a retried suspend succeeds, with the task
+/// really suspended.
 #[test]
 fn failed_exception_suspend_is_reported_by_wait_not_as_a_stop()
 {
@@ -273,8 +273,8 @@ fn failed_exception_suspend_is_reported_by_wait_not_as_a_stop()
             SessionState::Running,
             "a stop without a task suspension was reported as stopped"
         );
-        // The answered thread runs into the trap again at once, so by now the loop may
-        // already hold that new stop, with the task really suspended: checked below.
+        // The loop retries the suspend within milliseconds, so by now it may already
+        // have published the held stop, with the task really suspended: checked below.
         expect_breakpoint(&mut d, address, "the breakpoint stop after the failed suspend");
         assert_eq!(d.state(), SessionState::Stopped);
         let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
@@ -339,8 +339,9 @@ fn deferred_signal_survives_a_failed_exception_suspend()
     });
 }
 
-/// While the loop cannot suspend the task it holds the faulting thread's exception
-/// unanswered (#191). An external SIGKILL still ends the target, and `wait` reports it.
+/// While the loop cannot suspend the task it holds the faulting thread with a
+/// `thread_suspend` of its own and answers its exception (#191), so no unanswered reply
+/// holds back an external SIGKILL: it still ends the target, and `wait` reports it.
 #[test]
 fn external_kill_ends_a_target_whose_exception_suspend_keeps_failing()
 {
@@ -429,10 +430,10 @@ fn failed_exception_suspend_during_detach_fails_detach_promptly()
     });
 }
 
-/// `pid` is alive, not stopped, and not traced, sampled over a short while.
-fn assert_runs(pid: u32)
+/// The `ps` state of `pid` (for example `S`, `R`, `T`, or `SX` while traced), empty if
+/// it does not exist.
+fn process_state(pid: u32) -> String
 {
-    std::thread::sleep(Duration::from_millis(200));
     let output = std::process::Command::new("/bin/ps")
         .arg("-o")
         .arg("stat=")
@@ -440,11 +441,124 @@ fn assert_runs(pid: u32)
         .arg(pid.to_string())
         .output()
         .expect("ps");
-    let stat = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// `pid` is alive, not stopped, not traced, and neither its task nor any of its
+/// threads is left suspended, sampled after a short while.
+fn assert_runs(pid: u32)
+{
+    std::thread::sleep(Duration::from_millis(200));
+    let stat = process_state(pid);
     assert!(!stat.is_empty(), "the target died");
     assert!(!stat.starts_with('T'), "the target was left stopped: {stat}");
+    assert!(!stat.contains('X'), "the target was left traced: {stat}");
     let counts = diagnostics::process_suspend_counts(ferros_core::ProcessId(pid)).expect("suspend counts");
     assert_eq!(counts.task.expect("task suspend count"), 0, "the target was left suspended");
+    for (index, thread) in counts.threads.expect("thread suspend counts").into_iter().enumerate() {
+        let thread = thread.expect("thread suspend count");
+        assert_eq!(thread.suspend_count, 0, "thread {index} was left suspended: {thread:?}");
+    }
+}
+
+/// A client SIGSTOP held across failed `task_suspend`s (#191) is already answered, so it
+/// is not the private SIGSTOP a detach handshake waits for. Dropping the backend
+/// detaches through that handshake: the real private stop must satisfy it, so
+/// `PT_DETACH` finds the tracee in its exception and the target is released untraced
+/// and running. The injected failures last through the handshake.
+#[test]
+fn held_client_sigstop_does_not_satisfy_a_detach_handshake()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+        faults.fail_exception_suspends(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-STOP", &pid.0.to_string()])
+                .status()
+                .expect("SIGSTOP")
+                .success()
+        );
+        expect_suspend_failure(
+            ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)),
+            "the client SIGSTOP's suspend",
+        );
+        // The backend is still running: dropping it detaches from a running target.
+        drop(backend);
+        faults.fail_exception_suspends(0);
+        assert_runs(pid.0);
+    });
+}
+
+/// A failing suppression of a client signal held across failed `task_suspend`s (#191)
+/// is retried with the suspend, but its thread is held with one `thread_suspend` only,
+/// and each failure is reported once, not on every retry. Once both succeed, the signal
+/// is reported as a stop.
+#[test]
+fn failing_signal_suppression_holds_its_thread_once()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], backend);
+        let pid = d.pid().0;
+        let b = d.session_mut().backend_mut();
+        b.resume(&ResumeRequest::continue_all()).expect("resume");
+        faults.fail_exception_suspends(u32::MAX);
+        faults.fail_signal_suppressions(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &pid.to_string()])
+                .status()
+                .expect("SIGUSR1")
+                .success()
+        );
+        match b.wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("suppress"), "first error: {err}"),
+            Ok(event) => panic!("expected the suppression failure from wait, got {event:?}"),
+        }
+        expect_suspend_failure(b.wait(Some(STOP_TIMEOUT)), "the signal's suspend");
+        // Many retries fail meanwhile; none may report again or hold the thread again.
+        let quiet = b.wait(Some(Duration::from_millis(300)));
+        assert!(
+            matches!(quiet, Ok(None)),
+            "a retry reported its failure again or published a stop: {quiet:?}"
+        );
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        let threads = counts.threads.expect("thread suspend counts");
+        let held: Vec<i32> = threads
+            .into_iter()
+            .map(|thread| thread.expect("thread suspend count").suspend_count)
+            .collect();
+        assert!(
+            held.iter().all(|&count| count <= 1) && held.contains(&1),
+            "the signalled thread is not held exactly once: {held:?}"
+        );
+        faults.fail_signal_suppressions(0);
+        faults.fail_exception_suspends(0);
+        let b = d.session_mut().backend_mut();
+        match b.wait(Some(STOP_TIMEOUT)).expect("wait for the signal") {
+            Some(StopEvent::Signal { signal: 30, .. }) => {}
+            other => panic!("the held SIGUSR1 was not reported, got {other:?}"),
+        }
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the stop does not hold the task"
+        );
+        for thread in counts.threads.expect("thread suspend counts") {
+            assert_eq!(thread.expect("thread suspend count").suspend_count, 0, "a thread stayed held");
+        }
+        assert!(!harness::process_is_gone(pid), "the suppressed SIGUSR1 was delivered");
+    });
 }
 
 /// A process killed from outside while the session holds its breakpoint stop still

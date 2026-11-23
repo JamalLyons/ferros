@@ -552,6 +552,9 @@ impl Session
     {
         loop {
             let event = self.backend.wait(timeout)?;
+            if event.is_some() {
+                self.stop_generation = self.stop_generation.wrapping_add(1);
+            }
             match (&event, self.stale_step) {
                 (Some(StopEvent::SingleStep { thread }), Some(stale)) if *thread == stale => {
                     self.stale_step = None;

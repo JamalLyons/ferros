@@ -10,12 +10,13 @@
 use std::sync::Arc;
 
 use super::Session;
+use super::images::same_image;
 use super::stack::BackendTarget;
 use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
 use crate::objfile::MappedSymbols;
-use crate::types::{Address, BuildIdentity, ThreadId, same_build};
+use crate::types::{Address, BuildIdentity, ThreadId};
 
 /// Functions through which the unwinder transfers control to a landing pad:
 /// `unw_resume` and, on current macOS, the variant `_Unwind_RaiseException` and
@@ -69,6 +70,8 @@ pub(super) struct ExitImage
     source: usize,
     load_address: u64,
     build_id: BuildIdentity,
+    /// Stop generation it was read at (see [`same_image`]).
+    generation: u64,
     /// The image's code, which an exit is stepped through until it leaves.
     code: Arc<dyn MappedSymbols>,
     entries: Vec<Address>,
@@ -302,7 +305,9 @@ impl Session
             let load_address = image.descriptor_load_address();
             let build_id = image.build_id();
             if let Some(index) = previous.iter().position(|cached| {
-                cached.source == source && cached.load_address == load_address && same_build(cached.build_id, build_id)
+                cached.source == source
+                    && cached.load_address == load_address
+                    && same_image(cached.build_id, cached.generation, build_id, self.stop_generation)
             }) {
                 let mut cached = previous.swap_remove(index);
                 cached.build_id = cached.build_id.or_later(build_id);
@@ -343,6 +348,7 @@ impl Session
             source,
             load_address,
             build_id,
+            generation: self.stop_generation,
             code,
             entries,
         })

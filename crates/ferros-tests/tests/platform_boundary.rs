@@ -37,6 +37,28 @@ const MACH_O_TEXT: &[&str] = &[
     "compact_unwind",
     "dsymutil",
     "n_oso",
+    "mh_execute",
+    "mh_dylib",
+    "cpu_type_",
+    "cpu_subtype_",
+    "cafebabe",
+    "cafe_babe",
+    "feedface",
+    "feed_face",
+    "cffaedfe",
+    "cefaedfe",
+    "bebafeca",
+    "fat_arch",
+    "fat_header",
+    "segment_command",
+    "dyld_info",
+    "uuidcommand",
+    "uuid_command",
+    "unwind_arm64_mode",
+    "s_attr_",
+    "\"__text\"",
+    "\"__data\"",
+    "__text,",
 ];
 
 /// Mach-O text matched with its case, where a case-insensitive match would flag neutral
@@ -44,8 +66,10 @@ const MACH_O_TEXT: &[&str] = &[
 const MACH_O_CASED: &[&str] = &["dSYM"];
 
 /// Mach-O words that are only Mach-O as a whole word start: `LC_*` load commands and the
-/// `nlist` symbol entry. A plain substring would flag words such as `unlisted`.
-const MACH_O_WORD_STARTS: &[&str] = &["LC_", "nlist", "Nlist"];
+/// `nlist` symbol entry. A plain substring would flag words such as `unlisted`. An
+/// underscore does not end a word, so `struct_nlist` is not caught, but `_nlist` is
+/// (see [`starts_word`]).
+const MACH_O_WORD_STARTS: &[&str] = &["LC_", "lc_", "nlist", "Nlist", "NLIST"];
 
 /// Crates that parse object-file containers. `ferros-core` takes DWARF and CFI as bytes
 /// from its `ObjectFormat`, so it never needs one.
@@ -123,8 +147,8 @@ fn starts_word(line: &str, token: &str) -> bool
     line.match_indices(token).any(|(at, _)| {
         let before = line[..at].chars().next_back();
         let after = line[at + token.len()..].chars().next();
-        let boundary = !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-        let named = !token.ends_with('_') || after.is_some_and(|c| c.is_ascii_uppercase());
+        let boundary = !before.is_some_and(|c| c.is_ascii_alphanumeric());
+        let named = !token.ends_with('_') || after.is_some_and(|c| c.is_ascii_alphabetic());
         boundary && named
     })
 }
@@ -184,14 +208,32 @@ const MACH_O_LINES_FORBIDDEN: &[&str] = &[
     "/// the .dSYM bundle",
     "// run dsymutil",
     "N_OSO entries",
+    "const MH_EXECUTE: u32 = 2;",
+    "let arm = CPU_TYPE_ARM64;",
+    "const FAT_MAGIC: u32 = 0xcafebabe;",
+    "0xCAFE_BABE",
+    "const MH_MAGIC: u32 = 0xfeedface;",
+    "b\"\\xcf\\xfa\\xed\\xfe\" // cffaedfe",
+    "struct FatArch; // fat_arch",
+    "segment_command_64",
+    "UuidCommand",
+    "UNWIND_ARM64_MODE_FRAME",
+    "S_ATTR_PURE_INSTRUCTIONS",
+    "section(\"__TEXT\")",
+    "let s = \"__TEXT,__text\";",
+    "NLIST_64",
+    "lc_uuid",
+    "LC_segment",
 ];
 const MACH_O_LINES_ALLOWED: &[&str] = &[
     "/// An unlisted image",
     "fn unlisted_image_alignment()",
     "let calc_offset = 1;",
-    "SECTION_LC_x",
     "/// The DWARF unwind table",
     "use crate::objfile::MappedSymbols;",
+    "let text_section = 1;",
+    "/// the text segment",
+    "fn calc_uuid()",
 ];
 
 #[test]

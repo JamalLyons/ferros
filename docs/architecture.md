@@ -174,7 +174,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 The CLI factory is `crates/ferros/src/platform.rs`:
 
 ```rust
-pub fn create_backend() -> ferros_core::Result<Box<dyn ferros_core::Backend>>
+pub fn create_session() -> ferros_core::Result<ferros_core::Session>
 ```
 
 It is the only CLI module that names a platform crate and the only `cfg(target_os)` switch outside platform and test crates.
@@ -403,7 +403,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
 2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
-3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
+3. **Create session**: `create_session()` pairs the platform backend with its object format (`Session::new`)
 4. **Launch process**: `session.launch()` spawns process in suspended state
 5. **Run commands**: the REPL drives the session (`continue`, `break`, `registers`, ...) until `quit` or the end of input
 6. **End**: a launched process is killed with `session.kill()`; an attached one is released with `session.detach()`
@@ -412,7 +412,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros attach <pid>`
 2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
-3. **Create backend**: `create_backend()` supplies the platform mechanism
+3. **Create session**: `create_session()` supplies the platform mechanism and object format
 4. **Attach to process**: `session.attach(pid)` asks the backend to stop the process. On macOS that takes a Mach task port. There is no Linux backend.
 5. **Run commands & detach**: the REPL drives the session; at `quit` or the end of input `session.detach()` releases the process, which keeps running
 
@@ -466,20 +466,20 @@ The rules are enforced by `just check-boundary` ([`scripts/check-boundary.sh`](.
 
 ### How to Add a Platform
 
-1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
+1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type and `ferros_core::objfile::ObjectFormat` for its object-file format. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
 2. Add the crate as a target-specific dependency of `crates/ferros` and add one arm to the factory:
 
 ```rust
-pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
+pub fn create_session() -> ferros_core::Result<Session>
 {
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(ferros_macos::MacOSBackend::new()?))
+        ferros_macos::new_session()
     }
 
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(ferros_linux::LinuxBackend::new()?))
+        Ok(Session::new(Box::new(ferros_linux::LinuxBackend::new()?), ferros_linux::ElfFormat::shared()))
     }
     // ...
 }

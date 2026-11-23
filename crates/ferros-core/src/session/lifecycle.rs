@@ -26,6 +26,7 @@ impl Session
         // Earlier images may sit at other addresses; retain discovery options, not mappings.
         self.symbols.retain_images(&[]);
         self.loaded_images.clear();
+        self.stop_generation = self.stop_generation.wrapping_add(1);
         self.pid = Some(pid);
         self.state = SessionState::Stopped;
         self.ownership = None;

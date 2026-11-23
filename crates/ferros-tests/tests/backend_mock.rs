@@ -2934,17 +2934,40 @@ fn a_twenty_byte_build_id_that_changes_its_last_byte_is_a_new_build()
     );
 }
 
-/// An image whose format records no build id is never assumed to be the same build: with
-/// the id absent at both stops, the session reads the mapped header again.
+/// An image whose format records no build id is never assumed to be the same build
+/// across stops: with the id absent at both stops, the session reads the mapped header
+/// again after the process ran. Within one stop the image is reused, and
+/// `runtime_address` accepts the image it was handed (#193).
 #[test]
 fn an_absent_build_id_at_both_stops_is_not_the_same_build()
 {
-    let (mock, mut session) = build_id_session(ferros_core::BuildIdentity::Absent);
+    let absent = ferros_core::BuildIdentity::Absent;
+    let (mock, mut session) = build_id_session(absent);
     assert_eq!(mapped_text(&mut session), Some(0x1010));
+    assert_eq!(
+        session
+            .runtime_address(&build_image(absent), 0x1010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10)),
+        "within one stop the image is the one just read"
+    );
 
+    // Same stop: memory changes under the session are not re-read.
     mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
-    mock.set_images(vec![build_image(ferros_core::BuildIdentity::Absent)]);
-    assert_eq!(mapped_text(&mut session), Some(0x8010), "the image is read again");
+    assert_eq!(mapped_text(&mut session), Some(0x1010), "the image is reused within a stop");
+
+    mock.script(MockStop::new(StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: Address::new(BUILD_IMAGE + 0x10),
+    }));
+    session.resume().expect("resume");
+    session.wait(None).expect("wait");
+    mock.set_images(vec![build_image(absent)]);
+    assert_eq!(
+        mapped_text(&mut session),
+        Some(0x8010),
+        "after a stop the image is read again"
+    );
 }
 
 /// #170: an id the backend could not read at one stop and reads at the next is the same

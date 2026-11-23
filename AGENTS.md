@@ -35,7 +35,7 @@ Read these before changing engine behavior. One line each; the module docs carry
 | `session::location` | `crates/ferros-core/src/session/location.rs` | Resolves a `BreakpointLocation` to sites in the main executable. |
 | `session::stack` | `crates/ferros-core/src/session/stack.rs` | Stack traces and symbolication. Asks the `ObjectFormat` for symbol tables and unlisted images. |
 | `ObjectFormat` | `crates/ferros-core/src/objfile/` | Format-neutral image/object-file trait (ADR 0001): mapped layout, build identity, symbol tables, DWARF/CFI bytes, unwind hints. `mock.rs` is `MockObjectFormat` (`test-util`). `ferros_macos::macho::MachOFormat` is the Mach-O implementor; `ferros_macos::new_session` pairs it with `MacOSBackend`. |
-| `session::images` | `crates/ferros-core/src/session/images.rs` | Loads `Backend::images` into the symbol cache. `same_build` treats two missing UUIDs as the same image and two different UUIDs as a new one. |
+| `session::images` | `crates/ferros-core/src/session/images.rs` | Loads `Backend::images` into the symbol cache. It reuses an image while `types::same_build` holds: two different known build ids are a new build, `BuildIdentity::Unknown` is no evidence, and `Absent` never matches. |
 | `session::exits` | `crates/ferros-core/src/session/exits.rs` | Non-local exits (panic landing pads and `longjmp`) so step-out sees a frame leave. |
 | Stop channel | `Session::wait` → `StopEvent` in `crates/ferros-core/src/backend/types.rs` | The event a backend actually returns. |
 | `DebuggerEvent` | `crates/ferros-core/src/events.rs` | Not published by any backend. Only the parked `ferros-ui` refers to it. |

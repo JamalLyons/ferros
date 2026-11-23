@@ -76,13 +76,13 @@ awk '
 awk '
     {
         lower = tolower($0)
-        n = split("mach-o macho mach_o mh_magic feedfacf feed_facf mach_uuid __linkedit __pagezero __unwind_info compact_unwind dsymutil n_oso", tokens, " ")
+        n = split("mach-o macho mach_o mh_magic feedfacf feed_facf mach_uuid __linkedit __pagezero __unwind_info compact_unwind dsymutil n_oso mh_execute mh_dylib cpu_type_ cpu_subtype_ cafebabe cafe_babe feedface feed_face cffaedfe cefaedfe bebafeca fat_arch fat_header segment_command dyld_info uuidcommand uuid_command unwind_arm64_mode s_attr_ \"__text\" \"__data\" __text,", tokens, " ")
         hit = ""
         for (i = 1; i <= n; i++) if (index(lower, tokens[i])) { hit = tokens[i]; break }
         if (hit == "" && index(lower, "compact unwind")) hit = "compact unwind"
         if (hit == "" && index($0, "dSYM")) hit = "dSYM"
-        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9_])LC_[A-Z]/) hit = "LC_"
-        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9_])[Nn]list/) hit = "nlist"
+        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9])[Ll][Cc]_[A-Za-z]/) hit = "LC_"
+        if (hit == "" && $0 ~ /(^|[^A-Za-z0-9])(nlist|Nlist|NLIST)/) hit = "nlist"
         if (hit != "") {
             printf "%s:%d: Mach-O knowledge belongs in ferros-macos (%s): %s\n", FILENAME, FNR, hit, $0
             bad = 1

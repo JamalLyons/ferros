@@ -51,6 +51,9 @@ pub(super) struct SessionImage
     /// Build identity reported by the backend or read from the mapped header. An unknown
     /// id is replaced once a later report knows it.
     build_id: BuildIdentity,
+    /// The session's stop generation when this image was read. An image with an
+    /// [`BuildIdentity::Absent`] id is kept only within that stop ([`Self::same_image`]).
+    generation: u64,
     /// The layout read from the image's mapped header, or why it could not be read.
     /// Mapped memory does not change while this image stays loaded, so the result is kept
     /// until the loader reports a different path, address or build ([`same_build`]).
@@ -106,6 +109,18 @@ impl SessionSymtab
             names: HashMap::new(),
         }
     }
+}
+
+/// Whether a cached image read at stop `generation` with id `cached` is the image now
+/// reported with id `reported` at the same path and load address, at stop `current`.
+///
+/// Two ids that can be the same build ([`same_build`]) are. An id the format does not record
+/// ([`BuildIdentity::Absent`]) is no evidence across stops, but within one stop the
+/// process has not run and cannot have replaced the image, so it is reused then: an
+/// `Absent` image costs one read per stop, not one per request.
+pub(super) fn same_image(cached: BuildIdentity, generation: u64, reported: BuildIdentity, current: u64) -> bool
+{
+    same_build(cached, reported) || (generation == current && cached == reported)
 }
 
 impl SessionImage
@@ -190,7 +205,7 @@ impl Session
         let Some(entry) = self.loaded_images.iter().find(|entry| {
             entry.descriptor.path == image.path
                 && entry.descriptor.load_address == image.load_address.value()
-                && same_build(entry.build_id, image.build_id)
+                && same_image(entry.build_id, entry.generation, image.build_id, self.stop_generation)
         }) else {
             return Ok(None);
         };
@@ -246,7 +261,7 @@ impl Session
             if let Some(index) = previous.iter().position(|entry| {
                 entry.descriptor.path == descriptor.path
                     && entry.descriptor.load_address == descriptor.load_address
-                    && same_build(entry.build_id, image.build_id)
+                    && same_image(entry.build_id, entry.generation, image.build_id, self.stop_generation)
             }) {
                 let mut kept = previous.swap_remove(index);
                 kept.build_id = kept.build_id.or_later(image.build_id);
@@ -256,6 +271,7 @@ impl Session
                 let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, image.build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
+                    generation: self.stop_generation,
                     build_id: image
                         .build_id
                         .or_later(slice.as_ref().map_or(BuildIdentity::Unknown, ImageSlice::build_id)),

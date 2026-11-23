@@ -363,7 +363,9 @@ struct UnlistedImages
     regions: Option<Vec<MemoryRegion>>,
 }
 
-/// Steps searched back for an unlisted image's header (16 MiB of code at 4 KiB).
+/// Steps searched back for an unlisted image's header, each one the format's
+/// [`unlisted_image_alignment`](crate::objfile::ObjectFormat::unlisted_image_alignment)
+/// (16 MiB of code at 4 KiB).
 const MAX_HEADER_SEARCH_STEPS: usize = 4096;
 
 /// [`TargetMemory`] over a backend, for the session's

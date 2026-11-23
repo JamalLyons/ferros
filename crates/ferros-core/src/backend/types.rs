@@ -403,6 +403,6 @@ pub struct LoadedImage
     /// The session compares it with [`same_build`](crate::types::same_build): two known,
     /// different ids mean another build was loaded at the same path and address;
     /// [`BuildIdentity::Unknown`] is no evidence either way; [`BuildIdentity::Absent`]
-    /// never matches, so such an image is read again at every stop.
+    /// is no evidence across stops, so such an image is read again once per stop.
     pub build_id: BuildIdentity,
 }

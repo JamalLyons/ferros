@@ -359,6 +359,14 @@ control and real kernel exception messages:
   known peer's Mach suspend count immediately before detach sends its real private
   SIGSTOP. The count must already be zero there, and the child must exit normally.
 
+- `single_step::handler_return_reissues_a_real_peer_breakpoint_step` (#176) asks the
+  backend for thread lists sorted by port name (`ReplyFaultInjector::sort_thread_lists`),
+  so the peer Session steps first does not depend on `task_threads` order (#183). It
+  sets the publication hook's deadline to the test's stop timeout.
+- `single_step::publication_guard_disarms_an_armed_hook` (#183) drops the
+  `ReleasePublication` guard while the hook is armed but not yet paused; the next real
+  step must be published without a pause.
+
 The four Session mock tests for late abandoned steps, pending events alongside step
 completion, and delivery/drop of carried signals remain as fast, isolated complements;
 these orderings now also have native coverage above. The completion-winning interrupt

@@ -105,7 +105,7 @@
 //! - [thread_set_state(3) man page](https://developer.apple.com/documentation/kernel/1418827-thread_set_state/)
 
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use ferros_core::backend::{BackendError, BackendResult, StopEvent};
@@ -226,6 +226,9 @@ pub(crate) fn lock_shared(shared: &Mutex<ExceptionSharedState>) -> std::sync::Mu
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How long a paused stop publication waits for release unless a test sets a deadline.
+pub const DEFAULT_STOP_PUBLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Fault injection for tests: makes the exception loop report the next reply as failed.
 ///
 /// Obtained from [`MacOSBackend::reply_fault_injector`](crate::MacOSBackend::reply_fault_injector);
@@ -239,7 +242,14 @@ pub struct ReplyFaultInjector
     restore: Arc<AtomicBool>,
     private_stop_race: Arc<AtomicI32>,
     pending_stop: Arc<AtomicBool>,
+    /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     stop_publication: Arc<AtomicU8>,
+    /// How long a paused publication waits for release before the loop panics, in
+    /// milliseconds; 0 means [`DEFAULT_STOP_PUBLICATION_DEADLINE`]. Tests only.
+    stop_publication_deadline: Arc<AtomicU64>,
+    /// Report `threads` sorted by thread port name, so a test can rely on the order
+    /// Session steps breakpoint sites in. Tests only (#183).
+    pub(crate) sorted_threads: Arc<AtomicBool>,
     publish_during_resume: Arc<AtomicBool>,
     step_batch_signal: Arc<std::sync::atomic::AtomicU32>,
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
@@ -376,6 +386,51 @@ impl ReplyFaultInjector
         let _ = self
             .stop_publication
             .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Disarm the hook if no exception has reached it yet, or release the paused one.
+    /// A test's drop guard calls this so an unwind leaves no armed hook to pause a
+    /// late exception during teardown. Tests only (#183).
+    pub fn cancel_stop_publication(&self)
+    {
+        if self
+            .stop_publication
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.release_stop_publication();
+        }
+    }
+
+    /// Whether the hook is armed and waiting for an exception to pause. Tests only.
+    #[must_use]
+    pub fn stop_publication_is_armed(&self) -> bool
+    {
+        self.stop_publication.load(Ordering::SeqCst) == 1
+    }
+
+    /// How long a paused publication may wait for release before the exception loop
+    /// panics. Defaults to [`DEFAULT_STOP_PUBLICATION_DEADLINE`]. Tests only (#183).
+    pub fn set_stop_publication_deadline(&self, deadline: std::time::Duration)
+    {
+        let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.stop_publication_deadline.store(millis, Ordering::SeqCst);
+    }
+
+    fn stop_publication_deadline(&self) -> std::time::Duration
+    {
+        match self.stop_publication_deadline.load(Ordering::SeqCst) {
+            0 => DEFAULT_STOP_PUBLICATION_DEADLINE,
+            millis => std::time::Duration::from_millis(millis),
+        }
+    }
+
+    /// Make the backend report `threads` sorted by thread port name, so Session steps
+    /// breakpoint sites in a known order instead of `task_threads` order, which Mach
+    /// does not promise across stops. Tests only (#183).
+    pub fn sort_thread_lists(&self)
+    {
+        self.sorted_threads.store(true, Ordering::SeqCst);
     }
 
     /// Collect a real SIGUSR1 on `thread` alongside the next real SingleStep.
@@ -1237,7 +1292,7 @@ pub(crate) fn run_exception_loop(
                 .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + faults.stop_publication_deadline();
             while faults.stop_publication.load(Ordering::SeqCst) == 2 {
                 assert!(std::time::Instant::now() < deadline, "paused stop was not released");
                 std::thread::sleep(std::time::Duration::from_millis(1));

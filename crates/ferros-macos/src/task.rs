@@ -719,10 +719,15 @@ impl MacOSBackend
             drop(saved);
         }
 
-        // If the loop holds exceptions it is waiting for a command: let it reply, answer
-        // the exceptions still queued on the port and exit before the port is destroyed.
-        // Otherwise it is blocked receiving, and destroying the port is what wakes it.
-        let holds_exception = lock_shared(&self.exception_state).pending_exception;
+        // If the loop holds exceptions (a pending stop, kept records, or a batch held
+        // behind a failed task_suspend, #191) let it reply, answer the exceptions still
+        // queued on the port and exit before the port is destroyed: a message destroyed
+        // with the port is an unhandled exception. Otherwise it is blocked receiving,
+        // and destroying the port is what wakes it.
+        let holds_exception = {
+            let shared = lock_shared(&self.exception_state);
+            shared.pending_exception || !shared.held.is_empty() || shared.held_unsuspended || shared.interrupt_suspend
+        };
         if let Some(tx) = self.exception_commands.take()
             && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
         {
@@ -1142,23 +1147,38 @@ impl MacOSBackend
     fn start_tracing(&mut self) -> BackendResult<()>
     {
         let (ready, wait) = mpsc::channel();
-        {
-            let mut shared = lock_shared(&self.exception_state);
-            shared.internal_stop = Some(ready);
-            shared.handshake_signals = Some(Vec::new());
-        }
+        lock_shared(&self.exception_state).arm_handshake(ready);
         self.ptrace(ffi::ptrace_requests::PT_ATTACHEXC, 0, 0)?;
         self.traced = true;
         if self.launched {
             self.child_cleanup.traced();
         }
-        wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
+        let arrived = wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "ptrace attach SIGSTOP did not arrive within 5s".into(),
         })?;
         // Suppress and answer the attach signal while retaining the task suspend.
         // Holding this exception indefinitely would defer an external SIGKILL.
         let ports = lock_shared(&self.exception_state).soft_signals.clone();
+        if let Err(err) = arrived {
+            // The loop could not suspend the task for the private stop (#191) and holds
+            // it unanswered. Suppress and answer it, so the target runs on and the
+            // caller's cleanup can stop it with a handshake of its own.
+            for (port, _) in ports {
+                let _ = self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0);
+            }
+            if let Some(events) = &self.events_tx {
+                exception::answer_held_exceptions(
+                    &mut lock_shared(&self.exception_state),
+                    &[],
+                    &self.reply_faults,
+                    events,
+                    self.task,
+                );
+            }
+            let _ = self.requeue_handshake_signals(true);
+            return Err(err);
+        }
         for (port, _) in ports {
             self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, 0)?;
         }
@@ -1269,8 +1289,7 @@ impl MacOSBackend
             if shared.dead {
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
-            shared.internal_stop = Some(ready);
-            shared.handshake_signals = Some(Vec::new());
+            shared.arm_handshake(ready);
             shared.pending_exception
         };
         if pending {
@@ -1317,10 +1336,13 @@ impl MacOSBackend
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
         self.release_suspends();
+        self.reply_faults.release_suspend_retry_for_detach();
+        // A failed task suspend still holds the private SIGSTOP (#191): the fallback
+        // PT_DETACH of `detach_target` finds the tracee waiting in its exception.
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
             code: -1,
             message: "detach SIGSTOP did not arrive within 5s".into(),
-        })?;
+        })??;
         if fail_handshake {
             return Err(BackendError::Os {
                 code: -1,
@@ -1555,6 +1577,44 @@ impl MacOSBackend
             self.state = BackendState::Stopped;
         }
         event
+    }
+
+    /// Publish a batch the exception loop holds behind a failed `task_suspend` (#191),
+    /// for a resume that must be refused because of it; returns that refusal.
+    ///
+    /// The target is stopped, so the backend already holds the task suspended (an
+    /// interrupt whose `Interrupted` raced the batch, or the stop before it). One of
+    /// those suspends is handed to the loop as an interrupt's would be
+    /// ([`ExceptionSharedState::interrupt_suspend`]): the loop publishes the held batch
+    /// with it as the stop, without a `task_suspend` of its own. The first event it
+    /// publishes is peeked for the next `wait`. A suspend is taken here only if the
+    /// backend holds none; its failure is returned instead of the refusal.
+    fn publish_held_batch(&mut self) -> BackendError
+    {
+        {
+            let mut shared = lock_shared(&self.exception_state);
+            if shared.held_unsuspended && !shared.interrupt_suspend {
+                if shared.suspends == 0 {
+                    // SAFETY: `self.task` is the send right this backend holds.
+                    let kr = unsafe { task_suspend(self.task) };
+                    if kr != KERN_SUCCESS {
+                        return mach_error(kr, "task_suspend failed");
+                    }
+                    shared.suspends += 1;
+                }
+                shared.interrupt_suspend = true;
+            }
+        }
+        exception::wake_loop(self.exception_port);
+        if self.peeked.is_none()
+            && let Some(event) = self
+                .events_rx
+                .as_ref()
+                .and_then(|rx| rx.recv_timeout(EXCEPTION_REPLY_TIMEOUT).ok())
+        {
+            self.peeked = Some(event);
+        }
+        BackendError::StopPending
     }
 
     /// Take a queued event (or queued failure) without blocking.
@@ -1876,6 +1936,12 @@ impl Backend for MacOSBackend
     /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
     /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
     /// exception, returns [`BackendError::Unsupported`]; so does `Step` on x86-64.
+    ///
+    /// A stop the exception loop received but could not publish because its own
+    /// `task_suspend` failed (#191) is a pending stop too: the resume is refused with
+    /// [`BackendError::StopPending`] after that stop is published (see
+    /// [`publish_held_batch`](Self::publish_held_batch)), so the next `wait` returns it
+    /// rather than reporting it after this resume, which it does not belong to.
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         use tracing::info;
@@ -1898,6 +1964,10 @@ impl Backend for MacOSBackend
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
                 return Err(BackendError::StopPending);
+            }
+            if shared.held_unsuspended || shared.interrupt_suspend {
+                drop(shared);
+                return Err(self.publish_held_batch());
             }
             shared.preparing_resume = true;
             (
@@ -1941,6 +2011,11 @@ impl Backend for MacOSBackend
                 drop(shared);
                 restore(self, count);
                 return Err(BackendError::StopPending);
+            }
+            if shared.held_unsuspended {
+                drop(shared);
+                restore(self, count);
+                return Err(self.publish_held_batch());
             }
             if pending || held {
                 // A selectively suspended thread retains its logical signal decision
@@ -2042,6 +2117,11 @@ impl Backend for MacOSBackend
     }
 
     /// Stop a running target with `task_suspend()` and queue `Interrupted`.
+    ///
+    /// While the exception loop holds a batch whose own `task_suspend` failed (#191),
+    /// the interrupt's suspend is handed to the loop instead, which publishes that held
+    /// batch as the stop: a completed step or a breakpoint reported after a resume
+    /// would otherwise belong to a resume it did not come from.
     fn interrupt(&mut self) -> BackendResult<()>
     {
         match self.state {
@@ -2053,7 +2133,8 @@ impl Backend for MacOSBackend
                     // An exception stop is already queued for `wait`, or a signal was
                     // deferred because an earlier interrupt holds the task: the interrupt
                     // lost the race and is consumed, as the contract requires.
-                    if shared.pending_exception {
+                    // So is one already handed to a held batch.
+                    if shared.pending_exception || shared.interrupt_suspend {
                         return Ok(());
                     }
                     let kr = unsafe { task_suspend(self.task) };
@@ -2061,6 +2142,12 @@ impl Backend for MacOSBackend
                         return Err(mach_error(kr, "task_suspend failed"));
                     }
                     shared.suspends += 1;
+                    if shared.held_unsuspended {
+                        shared.interrupt_suspend = true;
+                        drop(shared);
+                        exception::wake_loop(self.exception_port);
+                        return Ok(());
+                    }
                     if let Some(tx) = &self.events_tx {
                         let _ = tx.send(Ok(StopEvent::Interrupted { thread: None }));
                     }

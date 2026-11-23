@@ -730,6 +730,272 @@ fn new_thread_created_during_step_stays_at_the_trap()
     });
 }
 
+/// A failed `task_suspend` for a completed single-step must not let the stepped
+/// thread run on (#191): `wait` reports the failure, then the step, with the thread on
+/// the instruction after the one it stepped.
+#[test]
+fn failed_exception_suspend_keeps_a_completed_step()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+        let insn = instruction_at(&mut d, tick);
+        assert_eq!(flow(tick.value(), insn), Flow::Next, "tick does not start straight-line");
+
+        faults.fail_next_exception_suspend();
+        backend(&mut d)
+            .resume(&ResumeRequest::step(thread))
+            .expect("resume with a step");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_secs(2))).expect("wait for the step"),
+            Some(StopEvent::SingleStep { thread }),
+            "the completed step was lost after the failed suspend"
+        );
+        assert_eq!(
+            pc_of(&mut d, thread).value(),
+            tick.value() + 4,
+            "the stepped thread ran past its step"
+        );
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+    });
+}
+
+/// An interrupt while a failed `task_suspend` holds a completed step (#191) reports
+/// that step as its stop, with the task really suspended, not a separate `Interrupted`
+/// that lets the held step be published after the next resume, for a resume it does
+/// not belong to.
+#[test]
+fn interrupt_reports_a_step_held_by_a_failing_exception_suspend()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+        assert_eq!(flow(tick.value(), instruction_at(&mut d, tick)), Flow::Next);
+
+        faults.fail_exception_suspends(u32::MAX);
+        backend(&mut d)
+            .resume(&ResumeRequest::step(thread))
+            .expect("resume with a step");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        // Retries keep failing: the step stays held, unpublished.
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(100))).expect("wait"),
+            None,
+            "a stop was published although its task_suspend keeps failing"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        let stop = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt");
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            stop,
+            Some(StopEvent::SingleStep { thread }),
+            "the interrupt did not report the held step"
+        );
+        assert_eq!(pc_of(&mut d, thread).value(), tick.value() + 4, "the stepped thread ran on");
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the stop does not hold the task"
+        );
+        assert_eq!(
+            diagnostics::thread_suspend_count(thread).expect("thread suspend count"),
+            0,
+            "the thread held for the failed suspend was not released"
+        );
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+
+        // No stale step from before the interrupt reaches the next resume.
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("resume");
+        assert_eq!(
+            backend(&mut d)
+                .wait(Some(Duration::from_millis(300)))
+                .expect("wait after resume"),
+            None,
+            "a stale stop was published for the resume after the interrupt"
+        );
+        backend(&mut d).interrupt().expect("interrupt again");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        // The resume really let the target run: it calls `tick` again.
+        plant_trap(&mut d, tick);
+        let (again, _) = run_to_trap(&mut d, tick);
+        assert_eq!(again, thread, "another thread reached tick");
+    });
+}
+
+/// An interrupt that lands after the exception loop received a completed step but
+/// before its own `task_suspend` failed (#191) is reported as `Interrupted`, and the
+/// step stays held. A resume after that interrupt must not start while the step is
+/// held unpublished: it is refused (`StopPending`), and the next `wait` reports the
+/// step, with the task suspended. Otherwise the step would be published after the
+/// resume, for a resume it does not belong to.
+#[test]
+fn resume_after_an_interrupt_is_refused_while_a_step_is_held()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
+        let tick = function_address(&mut d, &fixture, "tick");
+        let original = plant_trap(&mut d, tick);
+        let (thread, _) = run_to_trap(&mut d, tick);
+        backend(&mut d)
+            .write_memory(tick, &original)
+            .expect("restore the original bytes");
+        assert_eq!(flow(tick.value(), instruction_at(&mut d, tick)), Flow::Next);
+
+        // The loop receives the step and pauses before its task_suspend.
+        faults.pause_next_stop_publication();
+        backend(&mut d)
+            .resume(&ResumeRequest::step(thread))
+            .expect("resume with a step");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while !faults.stop_publication_is_paused() {
+            assert!(Instant::now() < deadline, "the step was not received");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        backend(&mut d).interrupt().expect("interrupt");
+        faults.fail_exception_suspends(u32::MAX);
+        faults.release_stop_publication();
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+
+        let refused = backend(&mut d).resume(&ResumeRequest::continue_all());
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            refused,
+            Err(BackendError::StopPending),
+            "a resume started while a completed step was held unpublished"
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the held step"),
+            Some(StopEvent::SingleStep { thread }),
+            "the refused resume did not leave the held step to wait"
+        );
+        assert_eq!(pc_of(&mut d, thread).value(), tick.value() + 4, "the stepped thread ran on");
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the stop does not hold the task"
+        );
+        assert_eq!(
+            diagnostics::thread_suspend_count(thread).expect("thread suspend count"),
+            0,
+            "the thread held for the failed suspend was not released"
+        );
+        assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
+
+        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("resume");
+        assert_eq!(
+            backend(&mut d)
+                .wait(Some(Duration::from_millis(300)))
+                .expect("wait after resume"),
+            None,
+            "a stale stop was published for the resume"
+        );
+        backend(&mut d).interrupt().expect("interrupt again");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        plant_trap(&mut d, tick);
+        let (again, _) = run_to_trap(&mut d, tick);
+        assert_eq!(again, thread, "another thread reached tick");
+    });
+}
+
+/// A failed `task_suspend` for a birth step-off must not skip its bookkeeping (#191):
+/// the entry trap is armed again and the creator, frozen for the step, is let go, so it
+/// starts the second thread, which the trap then holds.
+#[test]
+fn failed_exception_suspend_keeps_a_birth_step_off()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], debugger);
+        let (creator, suspended, newborn) = stop_before_second_spawn(&mut d, &fixture);
+        faults.fail_next_exception_suspend();
+        backend(&mut d)
+            .resume(
+                &ResumeRequest::all(ThreadAction::Suspend)
+                    .with_thread(creator, ThreadAction::Continue)
+                    .with_thread(newborn, ThreadAction::Continue),
+            )
+            .expect("continue creator and newborn");
+        match backend(&mut d).wait(Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(err.to_string().contains("task_suspend"), "wait error: {err}"),
+            Ok(event) => panic!("expected the task_suspend failure from wait, got {event:?}"),
+        }
+        assert!(
+            !d.wait_for_stdout("second worker ran", BIRTH_QUIET),
+            "the second thread ran through the birth entry, stdout: {}",
+            d.stdout()
+        );
+        assert_eq!(
+            backend(&mut d).wait(Some(Duration::from_millis(50))).expect("wait"),
+            None,
+            "a birth stop was delivered to the client"
+        );
+        backend(&mut d).interrupt().expect("interrupt");
+        assert!(matches!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        assert_suspended_still(&mut d, &suspended);
+        let known: Vec<_> = suspended
+            .iter()
+            .map(|(id, _)| *id)
+            .chain([creator, newborn])
+            .collect::<Vec<_>>();
+        let second_thread = backend(&mut d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| !known.contains(id))
+            .expect("the creator never started the second thread: it stayed frozen for the step-off");
+        let second_pc = pc_of(&mut d, second_thread);
+        assert_eq!(
+            raw_instruction_at(&d, second_pc),
+            BRK,
+            "the second thread is not held on a re-armed trap"
+        );
+    });
+}
+
 /// Releases a birth step-off hold if the test panics while the entry is restored.
 struct ReleaseHold<'a>(&'a ferros_macos::exception::ReplyFaultInjector);
 

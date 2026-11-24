@@ -10,7 +10,7 @@
 ![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/ferros_rs)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
-<img src="https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/trunk/assets/ferros-logo.png" alt="Ferros Logo" width="300" style="border-radius: 50%;">
+<img src="https://raw.githubusercontent.com/JamalLyons/ferros/refs/heads/trunk/assets/Ferros_Logo_v3.png" alt="Ferros Logo" width="300" style="border-radius: 50%;">
 
 **Ferros** (from *ferrum* — Latin for iron) is a next-generation debugger designed specifically for the Rust programming language.
 

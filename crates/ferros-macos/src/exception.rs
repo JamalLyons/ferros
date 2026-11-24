@@ -36,13 +36,46 @@
 //! as usual), so it cannot run on, and no unanswered reply holds back an external
 //! SIGKILL: XNU does not complete a SIGKILL while a thread waits for its exception
 //! reply. The failure is queued as an `Err` for the next `wait`, once per run of
-//! failures. After a short receive (10 ms), which also collects new exceptions, the
-//! loop retries the suspend; the first one that succeeds releases those thread
-//! suspends, the task suspension now holding the threads, and publishes the batch
-//! through the usual birth and handshake paths. A private attach/detach SIGSTOP is not
-//! retried: its exception stays held for `PT_DETACH`, and the handshake caller receives
-//! the failure at once. A handshake, a discard of deferred stops, shutdown and a dead
-//! task release the thread suspends too.
+//! failures. After a receive, which also collects new exceptions, the loop retries the
+//! suspend; the first one that succeeds releases those thread suspends, the task
+//! suspension now holding the threads, and publishes the batch through the usual birth
+//! and handshake paths. A private attach/detach SIGSTOP is not retried: its exception
+//! stays held for `PT_DETACH`, and the handshake caller receives the failure at once. A
+//! handshake, a discard of deferred stops, shutdown and a dead task release the thread
+//! suspends too.
+//!
+//! The retries back off (#198): the first receive lasts 10 ms (`SUSPEND_RETRY_MS`) and
+//! each further consecutive failure doubles it, up to 500 ms (`SUSPEND_RETRY_MAX_MS`).
+//! Once the failures have lasted [`SUSPEND_RETRY_BUDGET`] (5 s), the loop gives up: it
+//! queues one last `Err` for `wait` saying the task cannot be suspended and the session
+//! is unrecoverable, and calls `task_suspend` for client stops no more. The frozen
+//! threads stay held, their exceptions answered, so an external SIGKILL still ends the
+//! target; a new exception is held the same way, without another report. The loop
+//! keeps servicing its port and commands every 500 ms, so detach, kill, a discard of
+//! deferred stops, shutdown and task death release everything as before. An interrupt,
+//! or a resume refused for the held batch, still hands a task suspend of its own over
+//! and the loop publishes the batch with it: that is a real successful suspend, after
+//! which the hold ends and a later failure starts a fresh budget. A detach handshake's
+//! private SIGSTOP still gets a `task_suspend` of its own, so a detach can complete its
+//! handshake if the task can be suspended again.
+//!
+//! A thread whose own `thread_suspend` fails is the limit of that hold (#198): its
+//! exception stays unanswered, since answering it would let the thread run past a stop
+//! that is not published, and XNU does not complete a SIGKILL until it is answered. The
+//! loop tries that freeze again on each retry pass (and after the give-up), and the
+//! first that succeeds answers the exception, so a SIGKILL sent meanwhile then takes
+//! effect; detach, kill, shutdown and a dead task answer it too. A client signal is
+//! answered only once it is also suppressed (`PT_THUPDATE`): if the freeze succeeds but
+//! the suppression fails, its exception stays unanswered too, and so does a SIGKILL,
+//! until a later pass suppresses it or teardown answers it.
+//!
+//! The backoff deadline of the next attempt does not move when a message arrives: an
+//! exception raised during the wait is held at once, its thread frozen and its exception
+//! answered as above, without a `task_suspend`, and the next attempt still waits for
+//! the deadline. A wake (a command, shutdown, a handshake or an interrupt's handover)
+//! ends the wait as before; a handover is published at once, and a handshake retries
+//! after 10 ms. A failed `task_suspend` for a handshake's private SIGSTOP counts
+//! against no retry budget: the handshake has taken the held batch apart.
 //!
 //! While such a batch is held, [`ExceptionSharedState::held_unsuspended`] is set. An
 //! interrupt then takes the task suspend and hands it to the loop
@@ -270,6 +303,30 @@ pub struct ReplyFaultInjector
     /// 0 idle, 1 armed, 2 paused before a suspend retry, 3 released by a detach
     /// handshake. Tests only (#191).
     suspend_retry_hold: Arc<AtomicU8>,
+    /// The retry budget of a failed exception `task_suspend` in milliseconds; 0 means
+    /// [`SUSPEND_RETRY_BUDGET`]. Tests only (#198).
+    suspend_retry_budget: Arc<AtomicU64>,
+    /// How many `task_suspend`s the exception loop has attempted for a new stop,
+    /// injected failures included. Counted always, read by tests only (#198).
+    exception_suspend_attempts: Arc<std::sync::atomic::AtomicU32>,
+    /// How many of the next [`freeze_thread`]s fail without calling the kernel. Tests only (#198).
+    thread_freeze: Arc<std::sync::atomic::AtomicU32>,
+    /// 0 idle, 1 armed, 2 paused before a suspend retry, 3 released by a detach that
+    /// armed its handshake, 4 the loop holds the shared lock for that retry. Tests only (#198).
+    detach_stop_hold: Arc<AtomicU8>,
+    /// Receives whether the handshake still awaited its private stop when the detach
+    /// held by [`Self::send_next_detach_stop_after_suspend_retry`] sent it. Tests only (#198).
+    detach_stop_probe: Arc<Mutex<Option<mpsc::Sender<bool>>>>,
+    /// Every exception `task_suspend` for a new stop and every client-signal suppression
+    /// fail until the next detach arms its handshake. Tests only (#198).
+    fail_until_detach: Arc<AtomicBool>,
+    /// Queue a real exception on the port at the next teardown. Tests only (#198, F6).
+    teardown_exception: Arc<AtomicBool>,
+    /// Set once that exception is queued on the port, unanswered. Tests only (#198).
+    teardown_exception_queued: Arc<AtomicBool>,
+    /// 0 idle, 1 requested by a teardown, 2 parked at the top of a loop pass, 3 released.
+    /// Tests only (#198).
+    loop_park: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -511,9 +568,53 @@ impl ReplyFaultInjector
         self.exception_suspend.store(count, Ordering::SeqCst);
     }
 
+    /// How long the exception loop retries a failed `task_suspend` before it gives up;
+    /// defaults to [`SUSPEND_RETRY_BUDGET`]. Tests only (#198).
+    pub fn set_suspend_retry_budget(&self, budget: std::time::Duration)
+    {
+        let millis = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.suspend_retry_budget.store(millis, Ordering::SeqCst);
+    }
+
+    fn suspend_retry_budget(&self) -> std::time::Duration
+    {
+        match self.suspend_retry_budget.load(Ordering::SeqCst) {
+            0 => SUSPEND_RETRY_BUDGET,
+            millis => std::time::Duration::from_millis(millis),
+        }
+    }
+
+    /// How many `task_suspend`s the exception loop has attempted for a new stop so far,
+    /// failed and injected ones included; an interrupt's handed-over suspend is not one.
+    /// The loop counts them always; only tests read the count (#198).
+    #[must_use]
+    pub fn exception_suspend_attempts(&self) -> u32
+    {
+        self.exception_suspend_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Make the next `count` `thread_suspend`s that hold a faulting thread after a
+    /// failed `task_suspend` fail without calling the kernel, leaving that thread's
+    /// exception unanswered; 0 ends the injection. Tests only (#198).
+    pub fn fail_thread_freezes(&self, count: u32)
+    {
+        self.thread_freeze.store(count, Ordering::SeqCst);
+    }
+
+    /// Consume one injected thread-freeze failure.
+    fn take_thread_freeze_failure(&self) -> bool
+    {
+        self.thread_freeze
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+    }
+
     /// Consume one injected `task_suspend` failure.
     fn take_exception_suspend_failure(&self) -> bool
     {
+        if self.fail_until_detach.load(Ordering::SeqCst) {
+            return true;
+        }
         self.exception_suspend
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok()
@@ -543,10 +644,94 @@ impl ReplyFaultInjector
         self.suspend_retry_hold.load(Ordering::SeqCst) == 2
     }
 
-    /// If `retry` and a test armed the hold, pause until a detach releases it (or five
+    /// Pause the exception loop before its next retried `task_suspend` of a batch held
+    /// behind a failed one, and make the next detach send its private SIGSTOP late (#198,
+    /// G1 and G3): only after it has armed its handshake and balanced the backend's
+    /// suspends, then released the loop and waited until the loop has finished that
+    /// retry under the shared lock. So the handshake arms after the loop checked for one
+    /// at the top of its pass, and the private SIGSTOP's exception cannot arrive before
+    /// the retry's suspend. The receiver gets whether the handshake still awaited its
+    /// private stop when the detach sent it: `false` means an exception received earlier
+    /// satisfied it. Tests only.
+    pub fn send_next_detach_stop_after_suspend_retry(&self) -> mpsc::Receiver<bool>
+    {
+        let (probe, result) = mpsc::channel();
+        *self.detach_stop_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+        self.detach_stop_hold.store(1, Ordering::SeqCst);
+        result
+    }
+
+    /// Whether the exception loop is paused by
+    /// [`Self::send_next_detach_stop_after_suspend_retry`].
+    #[must_use]
+    pub fn detach_stop_hold_is_paused(&self) -> bool
+    {
+        self.detach_stop_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Whether this detach defers its private SIGSTOP for
+    /// [`Self::send_next_detach_stop_after_suspend_retry`]: only while the loop is paused
+    /// by it. A hook the loop never reached is disarmed, so it cannot pause a later retry.
+    pub(crate) fn defer_detach_stop(&self) -> bool
+    {
+        if self
+            .detach_stop_hold
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return false;
+        }
+        self.detach_stop_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Release the retry paused by [`Self::send_next_detach_stop_after_suspend_retry`] and
+    /// wait (bounded) until the loop holds the shared lock for it. The detach then takes
+    /// that lock, so it sends its private SIGSTOP after the loop's pass.
+    pub(crate) fn release_suspend_retry_before_detach_stop(&self)
+    {
+        if self
+            .detach_stop_hold
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.detach_stop_hold.load(Ordering::SeqCst) == 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.detach_stop_hold.store(0, Ordering::SeqCst);
+    }
+
+    /// Detach sends its private SIGSTOP now, under the shared lock: report to an armed
+    /// probe whether the handshake still awaits its private stop.
+    pub(crate) fn report_detach_stop_awaited(&self, awaited: bool)
+    {
+        let probe = self.detach_stop_probe.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(probe) = probe {
+            let _ = probe.send(awaited);
+        }
+    }
+
+    /// If `retry` and a test armed a hold, pause until a detach releases it (or five
     /// seconds pass).
     fn pause_suspend_retry(&self, retry: bool)
     {
+        if retry
+            && self
+                .detach_stop_hold
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.detach_stop_hold.load(Ordering::SeqCst) == 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // No detach released it in time: disarm, so a late detach does not wait.
+            let _ = self
+                .detach_stop_hold
+                .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
         if !retry
             || self
                 .suspend_retry_hold
@@ -567,6 +752,9 @@ impl ReplyFaultInjector
         let _ = self
             .suspend_retry_hold
             .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self
+            .detach_stop_hold
+            .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Detach has sent its private SIGSTOP: release a paused suspend retry and wait
@@ -586,9 +774,99 @@ impl ReplyFaultInjector
         }
     }
 
+    /// Make every exception-loop `task_suspend` for a new stop and every suppression of
+    /// a client signal before its exception reply (`PT_THUPDATE(0)`) fail without calling
+    /// the kernel, as [`Self::fail_exception_suspends`] and
+    /// [`Self::fail_signal_suppressions`] do, until the next detach arms its private
+    /// handshake; from then on both succeed. A client signal then stays held with its
+    /// reply outstanding until the handshake begins. Tests only (#198).
+    pub fn fail_suspends_and_suppressions_until_detach(&self)
+    {
+        self.fail_until_detach.store(true, Ordering::SeqCst);
+    }
+
+    /// Detach arms its handshake: end [`Self::fail_suspends_and_suppressions_until_detach`].
+    /// Called under the shared lock, so nothing the loop does after the arming fails.
+    pub(crate) fn detach_handshake_armed(&self)
+    {
+        self.fail_until_detach.store(false, Ordering::SeqCst);
+    }
+
+    /// At the next teardown of the exception handler, before the target's exception
+    /// ports are restored, park the exception loop, make a running target thread raise a
+    /// real single-step `EXC_BREAKPOINT`, and wait until it waits in that exception, its
+    /// message queued on the port and unreceived; then shut the loop down (#198, F6). The
+    /// loop must answer it before the port is destroyed: a destroyed exception message
+    /// is an unhandled exception, and the kernel turns this one into a SIGTRAP that kills
+    /// the released target. Needs a target thread that runs without waiting in the kernel,
+    /// such as `hot_loop`'s. Tests only.
+    pub fn queue_exception_before_next_teardown(&self)
+    {
+        self.teardown_exception.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::queue_exception_before_next_teardown`] queued its exception.
+    #[must_use]
+    pub fn exception_was_queued_before_teardown(&self) -> bool
+    {
+        self.teardown_exception_queued.load(Ordering::SeqCst)
+    }
+
+    /// The exception loop's pass starts here: park while a teardown hook asks for it
+    /// (bounded, five seconds).
+    fn park_loop_for_teardown(&self)
+    {
+        if self
+            .loop_park
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.loop_park.load(Ordering::SeqCst) == 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.loop_park.store(0, Ordering::SeqCst);
+    }
+
+    /// The teardown half of [`Self::queue_exception_before_next_teardown`]: park the loop
+    /// running on `exception_port`, then queue the exception from a running thread of
+    /// `task`. Returns whether the loop is parked, for [`Self::unpark_loop`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn queue_teardown_exception(&self, task: mach_port_t, exception_port: mach_port_t) -> bool
+    {
+        if task == MACH_PORT_NULL || !self.teardown_exception.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.loop_park.store(1, Ordering::SeqCst);
+        wake_loop(exception_port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.loop_park.load(Ordering::SeqCst) != 2 {
+            if std::time::Instant::now() >= deadline {
+                self.loop_park.store(0, Ordering::SeqCst);
+                error!("teardown hook: the exception loop did not park");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let queued = queue_single_step_exception(task, exception_port);
+        self.teardown_exception_queued.store(queued, Ordering::SeqCst);
+        true
+    }
+
+    /// End the park of [`Self::queue_teardown_exception`].
+    pub(crate) fn unpark_loop(&self)
+    {
+        let _ = self.loop_park.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     /// Consume one injected signal-suppression failure.
     fn take_signal_suppression_failure(&self) -> bool
     {
+        if self.fail_until_detach.load(Ordering::SeqCst) {
+            return true;
+        }
         self.signal_suppression
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok()
@@ -618,6 +896,146 @@ impl ReplyFaultInjector
     {
         self.reply.swap(false, Ordering::SeqCst)
     }
+}
+
+/// How long [`queue_single_step_exception`] waits for one thread's exception message.
+#[cfg(target_os = "macos")]
+const TEARDOWN_TRAP_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How many threads [`queue_single_step_exception`] tries before it gives up.
+#[cfg(target_os = "macos")]
+const TEARDOWN_TRAP_TRIES: usize = 8;
+
+/// Messages queued on `port`, from `mach_port_get_attributes(MACH_PORT_RECEIVE_STATUS)`.
+#[cfg(target_os = "macos")]
+fn queued_messages(port: mach_port_t) -> std::result::Result<u32, kern_return_t>
+{
+    // `mach_port_status_t`: ten natural_t words; `mps_msgcount` is the fifth.
+    const MACH_PORT_RECEIVE_STATUS: c_int = 2;
+    const MACH_PORT_RECEIVE_STATUS_COUNT: mach_msg_type_number_t = 10;
+    const MPS_MSGCOUNT: usize = 4;
+    let mut status = [0_u32; MACH_PORT_RECEIVE_STATUS_COUNT as usize];
+    let mut count = MACH_PORT_RECEIVE_STATUS_COUNT;
+    // SAFETY: `status` holds MACH_PORT_RECEIVE_STATUS_COUNT writable words and outlives
+    // the call; `port` is a receive right this process holds.
+    let kr = unsafe {
+        crate::ffi::mach_port_get_attributes(
+            mach_task_self(),
+            port,
+            MACH_PORT_RECEIVE_STATUS,
+            status.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return Err(kr);
+    }
+    if (count as usize) <= MPS_MSGCOUNT {
+        return Err(KERN_FAILURE);
+    }
+    Ok(status[MPS_MSGCOUNT])
+}
+
+/// Set or clear the single-step bit of a running `thread` under a balanced
+/// `thread_suspend`.
+#[cfg(target_os = "macos")]
+fn set_single_step_while_suspended(thread: thread_act_t, enabled: bool) -> bool
+{
+    // SAFETY: the caller holds a right to this tracee thread; the suspend is balanced
+    // at once, after the single-step bit is written.
+    unsafe {
+        if crate::ffi::thread_suspend(thread) != KERN_SUCCESS {
+            return false;
+        }
+        let set = crate::registers::set_single_step(thread, enabled).is_ok();
+        crate::ffi::thread_resume(thread);
+        set
+    }
+}
+
+/// The test hook of [`ReplyFaultInjector::queue_exception_before_next_teardown`], with
+/// the loop parked: make a running thread of `task` raise a single-step
+/// `EXC_BREAKPOINT` and confirm that its message is queued, unreceived, on
+/// `exception_port`. A thread that does not trap in time has its bit cleared and the
+/// next running one is tried, from a fresh thread list. Returns whether a message was
+/// queued; each failed step is logged.
+#[cfg(target_os = "macos")]
+fn queue_single_step_exception(task: mach_port_t, exception_port: mach_port_t) -> bool
+{
+    // The parked loop receives nothing, and nothing else sends to the port meanwhile:
+    // only a message queued after this baseline is the exception.
+    let baseline = match queued_messages(exception_port) {
+        Ok(count) => count,
+        Err(kr) => {
+            error!("teardown hook: cannot read the exception port's queue: {kr}");
+            return false;
+        }
+    };
+    let waiting = |thread: thread_act_t| crate::diagnostics::thread_is_waiting(ThreadId::from(u64::from(thread)));
+    let mut tried: Vec<thread_act_t> = Vec::new();
+    for attempt in 1..=TEARDOWN_TRAP_TRIES {
+        let Ok(threads) = crate::threads::ThreadManager::refresh_thread_list(task, &[]) else {
+            error!("teardown hook: cannot list the target's threads (attempt {attempt})");
+            return false;
+        };
+        let candidate = threads
+            .iter()
+            .copied()
+            .find(|thread| !tried.contains(thread) && matches!(waiting(*thread), Ok(false)));
+        let queued = candidate.is_some_and(|thread| {
+            tried.push(thread);
+            if !set_single_step_while_suspended(thread, true) {
+                warn!("teardown hook: cannot set the single-step bit of thread {thread} (attempt {attempt})");
+                return false;
+            }
+            let deadline = std::time::Instant::now() + TEARDOWN_TRAP_WAIT;
+            loop {
+                match queued_messages(exception_port) {
+                    Ok(count) if count > baseline => return true,
+                    Ok(_) => {}
+                    Err(kr) => {
+                        error!("teardown hook: cannot read the exception port's queue: {kr}");
+                        // Clear the bit, so the thread cannot trap after the teardown.
+                        let _ = set_single_step_while_suspended(thread, false);
+                        return false;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // It never trapped: clear the bit, so it cannot trap after the teardown,
+            // unless its message arrived meanwhile.
+            let cleared = set_single_step_while_suspended(thread, false);
+            let late = queued_messages(exception_port).is_ok_and(|count| count > baseline);
+            if !late {
+                warn!(
+                    "teardown hook: thread {thread} queued no exception within {TEARDOWN_TRAP_WAIT:?} (attempt {attempt}, \
+                     bit cleared: {cleared})"
+                );
+            }
+            late
+        });
+        if candidate.is_none() {
+            warn!(
+                "teardown hook: no running target thread left to try among {} (attempt {attempt})",
+                threads.len()
+            );
+        }
+        for thread in threads {
+            deallocate_right(thread);
+        }
+        if queued {
+            return true;
+        }
+        if candidate.is_none() {
+            // Wait for a thread to run again before the next list.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    error!("teardown hook: no thread queued an exception in {TEARDOWN_TRAP_TRIES} attempts");
+    false
 }
 
 /// MIG id of `mach_exception_raise`, the request the kernel sends for
@@ -1097,11 +1515,13 @@ pub(crate) fn run_exception_loop(
 {
     let mut deferred: std::collections::VecDeque<(HeldException, StopEvent)> = std::collections::VecDeque::new();
     // Consecutive failed `task_suspend`s of the batch now held at the front of
-    // `deferred` (#191); 0 once a suspend succeeds.
-    let mut suspend_failures = 0u32;
+    // `deferred` (#191), the backoff between them and whether the loop gave up (#198);
+    // reset once a suspend succeeds or the batch is released.
+    let mut retry = SuspendRetry::default();
     // Threads of that batch held with a `thread_suspend` (and a right) of their own.
     let mut frozen: Vec<thread_act_t> = Vec::new();
     loop {
+        faults.park_loop_for_teardown();
         let (pending, handshake, handed_over, keeps_records) = {
             let state = lock_shared(&shared);
             (
@@ -1135,7 +1555,7 @@ pub(crate) fn run_exception_loop(
                         let _ = reply_to_held(&mut exception, &faults);
                         deallocate_right(exception.thread);
                     }
-                    suspend_failures = 0;
+                    retry = SuspendRetry::default();
                     end_unsuspended_hold(&mut state, &events);
                 }
                 answer_held_exceptions(&mut state, &keep, &faults, &events, task);
@@ -1151,11 +1571,29 @@ pub(crate) fn run_exception_loop(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        if suspend_failures > 0 && !pending {
-            // Give the kernel a moment before retrying, and take any exception raised
-            // meanwhile, so a task that cannot be suspended does not make the loop spin.
-            // An interrupt that took the task suspend for the held batch needs no wait.
-            match receive_exception_with_timeout(exception_port, Some(if handed_over { 0 } else { SUSPEND_RETRY_MS })) {
+        // A pass before the backoff deadline (#198): an exception arrived during the wait.
+        // It is held at once, its thread frozen and its exception answered, so it does
+        // not hold back an external SIGKILL, but no `task_suspend` is attempted for it.
+        let mut early = false;
+        if retry.failures > 0 && !pending {
+            // Give the kernel a moment before retrying, backing off while the failures
+            // go on, and take any exception raised meanwhile, so a task that cannot be
+            // suspended does not make the loop spin. The deadline of the next attempt
+            // does not move when a message arrives: an exception is held without an
+            // attempt, and a wake only ends the receive, so the loop takes its command
+            // and waits out the rest. An interrupt that took the task suspend for the
+            // held batch needs no wait, and a private handshake, which takes the held
+            // batch apart, no backed-off one. After giving up, the loop only services
+            // its port and commands at the longest delay.
+            let timeout = if handed_over {
+                0
+            } else if handshake {
+                SUSPEND_RETRY_MS
+            } else {
+                retry.remaining_ms()
+            };
+            let mut arrived = false;
+            match receive_exception_with_timeout(exception_port, Some(timeout)) {
                 Ok(buffer) => {
                     if let Some(request) = decode_request(&buffer) {
                         let mut state = lock_shared(&shared);
@@ -1163,6 +1601,7 @@ pub(crate) fn run_exception_loop(
                             let generation = state.handshake_generation;
                             drop(state);
                             deferred.push_back(hold_exception(&request, architecture, generation));
+                            arrived = true;
                         }
                     }
                 }
@@ -1174,8 +1613,14 @@ pub(crate) fn run_exception_loop(
             }
             if deferred.is_empty() {
                 thaw_threads(&mut frozen);
-                suspend_failures = 0;
+                retry = SuspendRetry::default();
                 end_unsuspended_hold(&mut lock_shared(&shared), &events);
+            } else if !handed_over && !handshake && !retry.due() {
+                if !arrived {
+                    // A wake or nothing: take the command, then wait out the rest.
+                    continue;
+                }
+                early = true;
             }
         }
         // A deferred stop that must wait again goes back to the front, keeping the
@@ -1354,7 +1799,7 @@ pub(crate) fn run_exception_loop(
             // resume already suspended them. Production resumes do not arm the hold.
             let step_off = lock_shared(&shared).birth.is_step_off(&first.1);
             faults.pause_for_birth_step_off(step_off);
-            faults.pause_suspend_retry(popped && suspend_failures > 0);
+            faults.pause_suspend_retry(popped && retry.failures > 0 && !retry.gave_up && !early);
 
             // Stop every thread, collect every message of this stop, mark the exceptions
             // as held and queue the events in one step under the lock, so a concurrent
@@ -1383,14 +1828,25 @@ pub(crate) fn run_exception_loop(
             // A handshake's teardown has already balanced that suspend with the others
             // (`release_suspends`), so its private SIGSTOP takes a suspend of its own.
             let handover = std::mem::take(&mut state.interrupt_suspend) && state.handshake_signals.is_none();
+            // After the give-up (#198) no more `task_suspend`s are taken for client
+            // stops: what arrives is held like the batch, its thread frozen and its
+            // exception answered. The same holds before the backoff deadline. A private
+            // handshake's SIGSTOP still gets one, so a detach can complete its handshake
+            // if the task can be suspended again.
+            let skipped = (retry.gave_up || early) && state.handshake_signals.is_none();
             let kr = if handover {
                 KERN_SUCCESS
-            } else if faults.take_exception_suspend_failure() {
-                KERN_FAILURE
+            } else if skipped {
+                retry.last_kr
             } else {
-                // SAFETY: `task` is the send right the backend holds for as long as this
-                // loop runs.
-                unsafe { task_suspend(task) }
+                faults.exception_suspend_attempts.fetch_add(1, Ordering::SeqCst);
+                if faults.take_exception_suspend_failure() {
+                    KERN_FAILURE
+                } else {
+                    // SAFETY: `task` is the send right the backend holds for as long as
+                    // this loop runs.
+                    unsafe { task_suspend(task) }
+                }
             };
             if kr == KERN_SUCCESS && !handover {
                 state.suspends += 1;
@@ -1409,11 +1865,19 @@ pub(crate) fn run_exception_loop(
                 }
             }
             if kr != KERN_SUCCESS {
-                suspend_failures += 1;
+                // A handshake takes the held batch apart: a failed suspend for its
+                // private SIGSTOP is reported to the handshake caller, and does not count
+                // against the old batch's retry budget.
+                let counted = !skipped && state.handshake_signals.is_none();
+                if counted {
+                    retry.failed(kr);
+                }
+                // A pass that attempted no counted suspend (after the give-up, before the
+                // backoff deadline, or for a handshake) passes 0: it reports nothing again.
                 let held = hold_unsuspended_stops(
                     stops,
                     kr,
-                    suspend_failures,
+                    if counted { retry.failures } else { 0 },
                     &mut state,
                     task,
                     pid,
@@ -1422,13 +1886,35 @@ pub(crate) fn run_exception_loop(
                     &mut frozen,
                 );
                 if held.is_empty() {
-                    suspend_failures = 0;
+                    retry = SuspendRetry::default();
+                } else if !early {
+                    // The next attempt (or, after the give-up, the next pass) is due one
+                    // backoff delay from now, however many messages arrive meanwhile.
+                    retry.schedule();
+                }
+                if !held.is_empty() && counted && !retry.gave_up && retry.exhausted(faults.suspend_retry_budget()) {
+                    retry.gave_up = true;
+                    let err = BackendError::Os {
+                        code: i64::from(kr),
+                        message: format!(
+                            "task_suspend kept failing with {kr} for {:?} ({} attempts) while handling a Mach exception; \
+                             the task cannot be suspended and the session is unrecoverable: {} stop(s) stay held, detach \
+                             or kill the target",
+                            retry.elapsed(),
+                            retry.failures,
+                            held.len()
+                        ),
+                    };
+                    error!("{err}");
+                    if let Err(err) = events.send(Err(err)) {
+                        warn!("Failed to queue the task_suspend give-up from Mach loop: {err}");
+                    }
                 }
                 state.held_unsuspended = !held.is_empty();
                 deferred = held;
                 continue;
             }
-            suspend_failures = 0;
+            retry = SuspendRetry::default();
             state.held_unsuspended = false;
             // The task suspension now holds the threads of an earlier failed batch.
             thaw_threads(&mut frozen);
@@ -1554,9 +2040,93 @@ pub(crate) fn run_exception_loop(
     release_held_exceptions(&mut lock_shared(&shared));
 }
 
-/// How long the loop receives before it retries a failed `task_suspend` (#191).
+/// How long the loop receives before it retries a failed `task_suspend` the first
+/// time (#191). Each further consecutive failure doubles it, up to
+/// [`SUSPEND_RETRY_MAX_MS`] (#198).
 #[cfg(target_os = "macos")]
 const SUSPEND_RETRY_MS: u32 = 10;
+
+/// The longest delay between two retries of a failed `task_suspend`, and how long the
+/// loop receives between passes once it has given up (#198).
+#[cfg(target_os = "macos")]
+const SUSPEND_RETRY_MAX_MS: u32 = 500;
+
+/// How long consecutive `task_suspend` failures may last before the loop gives up
+/// retrying and reports the session unrecoverable (#198). A test can shorten it with
+/// [`ReplyFaultInjector::set_suspend_retry_budget`].
+pub const SUSPEND_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The retry state of a batch held behind failed `task_suspend`s (#191, #198).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct SuspendRetry
+{
+    /// Consecutive failed attempts; 0 while no batch is held.
+    failures: u32,
+    /// When the first of them failed.
+    since: Option<std::time::Instant>,
+    /// The last failure's code, reported for a batch held after the give-up.
+    last_kr: kern_return_t,
+    /// When the next attempt is due; messages that arrive earlier do not advance it.
+    next_at: Option<std::time::Instant>,
+    /// The failures outlasted the budget: the loop no longer calls `task_suspend`.
+    gave_up: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl SuspendRetry
+{
+    fn failed(&mut self, kr: kern_return_t)
+    {
+        self.failures = self.failures.saturating_add(1);
+        self.since.get_or_insert_with(std::time::Instant::now);
+        self.last_kr = kr;
+    }
+
+    /// The delay before the next retry: [`SUSPEND_RETRY_MS`] doubled per failure after
+    /// the first, at most [`SUSPEND_RETRY_MAX_MS`], which is also the pace after the
+    /// give-up.
+    fn delay_ms(&self) -> u32
+    {
+        if self.gave_up {
+            return SUSPEND_RETRY_MAX_MS;
+        }
+        // Six doublings already pass the ceiling; the bound keeps the shift in range.
+        let doublings = self.failures.saturating_sub(1).min(6);
+        (SUSPEND_RETRY_MS << doublings).min(SUSPEND_RETRY_MAX_MS)
+    }
+
+    /// Set the next attempt one [`Self::delay_ms`] from now.
+    fn schedule(&mut self)
+    {
+        self.next_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(u64::from(self.delay_ms())));
+    }
+
+    /// Whether the next attempt is due.
+    fn due(&self) -> bool
+    {
+        self.next_at.is_none_or(|next| std::time::Instant::now() >= next)
+    }
+
+    /// Milliseconds until the next attempt is due, rounded up; 0 once it is.
+    fn remaining_ms(&self) -> u32
+    {
+        self.next_at.map_or(0, |next| {
+            let left = next.saturating_duration_since(std::time::Instant::now());
+            u32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(SUSPEND_RETRY_MAX_MS)
+        })
+    }
+
+    fn elapsed(&self) -> std::time::Duration
+    {
+        self.since.map_or(std::time::Duration::ZERO, |since| since.elapsed())
+    }
+
+    fn exhausted(&self, budget: std::time::Duration) -> bool
+    {
+        self.elapsed() >= budget
+    }
+}
 
 /// How long the loop receives, with no stop pending, while it keeps records for
 /// threads a resume left suspended, before it checks its commands again.
@@ -1584,14 +2154,22 @@ fn end_unsuspended_hold(state: &mut ExceptionSharedState, events: &mpsc::Sender<
 /// (a client Unix signal is suppressed first, as for any stop): a completed
 /// single-step, a birth step-off or a newborn at its trap cannot run on, and no
 /// unanswered reply blocks an external SIGKILL. If that suspend fails, the exception
-/// stays unanswered instead. Records already answered (signals deferred behind an
+/// stays unanswered instead, and an external SIGKILL does not complete while it is:
+/// answering it would let the thread run past a stop nobody sees, so the freeze is
+/// tried again on the next pass (#198), and one that succeeds answers the exception.
+/// A client signal whose freeze succeeds but whose suppression fails stays unanswered
+/// too, SIGKILL included, until a later pass suppresses it (and so answers it) or
+/// teardown answers it.
+/// Records already answered (signals deferred behind an
 /// earlier hold, threads already in `frozen`) keep their only logical stop. The loop
 /// retries the suspend and publishes them once it succeeds; shutdown answers them
 /// like every deferred stop. During a private handshake, the private SIGSTOP stays
 /// held in [`ExceptionSharedState::held`] with its reply, as `PT_DETACH` needs, and
 /// its caller receives the failure at once instead of waiting for a stop that is not
 /// coming; competing signals are preserved for it as on the success path. The first
-/// failure of a run is queued as an `Err` for the next `wait`. A dead task's
+/// failure of a run (`failures == 1`) is queued as an `Err` for the next `wait`; a pass
+/// that attempted no counted suspend (after the give-up, before the backoff deadline,
+/// or for a handshake) passes 0 and reports nothing. A dead task's
 /// exceptions are answered at once: the exit watcher reports the terminal event.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
@@ -1647,11 +2225,16 @@ fn hold_unsuspended_stops(
             // with its exception still unanswered only if the suppression failed,
             // and then only tries that again, without reporting it again.
             let first = !frozen.contains(&exception.thread);
-            if first && freeze_thread(exception.thread) {
+            if first && !faults.take_thread_freeze_failure() && freeze_thread(exception.thread) {
                 frozen.push(exception.thread);
-            } else if first {
+            } else if first && failures == 1 {
                 error!(
                     "thread_suspend of thread {} failed after a failed task_suspend; its exception stays unanswered",
+                    exception.thread
+                );
+            } else if first {
+                debug!(
+                    "thread_suspend of thread {} failed again; retried on the next pass",
                     exception.thread
                 );
             }
@@ -1671,7 +2254,7 @@ fn hold_unsuspended_stops(
             if let Err(err) = events.send(Err(err)) {
                 warn!("Failed to queue a task_suspend failure from Mach loop: {err}");
             }
-        } else {
+        } else if failures > 0 {
             debug!("task_suspend retry {failures} failed with {kr}");
         }
     }

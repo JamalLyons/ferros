@@ -284,8 +284,10 @@ fn write_registers_to_port(architecture: Architecture, thread: thread_act_t, reg
 /// until the target dies. When the debugger process exits, its Mach rights (including
 /// the exception port's receive right) are destroyed, and XNU sends SIGKILL to the
 /// still-traced process as part of tracer exit: a held target does not outlive a
-/// debugger, such as the CLI, that exits right after dropping its session. If the
-/// exit watcher fails before the target dies, the retained resources are not released.
+/// debugger, such as the CLI, that exits right after dropping its session
+/// (`held_target_when_the_debugger_process_exits` in `ferros-tests/tests/lifecycle.rs`
+/// observes the SIGKILL). If the exit watcher fails before the target dies, the
+/// retained resources are not released.
 ///
 /// ## Thread Safety
 ///
@@ -325,6 +327,11 @@ pub struct MacOSBackend
     reply_faults: ReplyFaultInjector,
     /// One-shot integration test fault for the next engine memory write.
     fail_memory_write: Arc<AtomicBool>,
+    /// One-shot integration test fault: the next interrupt of a running target neither
+    /// suspends it nor queues `Interrupted`.
+    drop_next_interrupt: Arc<AtomicBool>,
+    /// One-shot integration test fault: the `task_suspend` in `hold_attached_on_drop` fails.
+    fail_hold_suspend: Arc<AtomicBool>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
     events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
@@ -397,6 +404,8 @@ impl MacOSBackend
             saved_exception_ports: None,
             reply_faults: ReplyFaultInjector::default(),
             fail_memory_write: Arc::default(),
+            drop_next_interrupt: Arc::default(),
+            fail_hold_suspend: Arc::default(),
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -505,6 +514,27 @@ impl MacOSBackend
     pub fn memory_write_fault_injector(&self) -> impl FnOnce() + use<>
     {
         let fail = Arc::clone(&self.fail_memory_write);
+        move || fail.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next [`Backend::interrupt`] of a running target return `Ok`
+    /// without suspending it or queueing `Interrupted`, as if the stop never arrived.
+    ///
+    /// A session dropped after arming it times out waiting for the stop, so
+    /// `hold_attached_on_drop` runs with no suspension recorded. Tests only.
+    #[doc(hidden)]
+    pub fn interrupt_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let drop_interrupt = Arc::clone(&self.drop_next_interrupt);
+        move || drop_interrupt.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next `task_suspend` taken by `hold_attached_on_drop` fail with
+    /// an injected `KERN_FAILURE` without suspending the task. Tests only.
+    #[doc(hidden)]
+    pub fn hold_suspend_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let fail = Arc::clone(&self.fail_hold_suspend);
         move || fail.store(true, Ordering::Relaxed)
     }
 
@@ -712,6 +742,9 @@ impl MacOSBackend
     /// threads can continue once the task is resumed. Queued stop events are discarded.
     fn stop_exception_handler(&mut self, restore: bool) -> BackendResult<()>
     {
+        // Test hook (#198): a real exception queued on the port just before teardown.
+        let parked =
+            self.exception_thread.is_some() && self.reply_faults.queue_teardown_exception(self.task, self.exception_port);
         let mut restored = Ok(());
         if let Some(saved) = self.saved_exception_ports.take() {
             if restore && self.task != MACH_PORT_NULL {
@@ -733,6 +766,9 @@ impl MacOSBackend
             && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
         {
             exception::wake_loop(self.exception_port);
+        }
+        if parked {
+            self.reply_faults.unpark_loop();
         }
         if holds_exception && let Some(handle) = self.exception_thread.take() {
             let _ = handle.join();
@@ -1291,6 +1327,7 @@ impl MacOSBackend
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
             shared.arm_handshake(ready);
+            self.reply_faults.detach_handshake_armed();
             shared.pending_exception
         };
         if pending {
@@ -1322,22 +1359,20 @@ impl MacOSBackend
             );
         }
         while self.try_next_event().is_some() {}
-        {
-            let shared = lock_shared(&self.exception_state);
-            if shared.dead {
-                return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
-            }
-            self.reply_faults.sample_detach_suspend_count();
-            // SAFETY: the shared lock excludes the watcher's reaping of this pid.
-            if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
-                return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
-            }
-            *private_stop_sent = true;
+        // Test hook (#198): send the private SIGSTOP only after a paused suspend retry of
+        // the loop has run, so its exception cannot arrive before that retry's suspend.
+        let defer_stop = self.reply_faults.defer_detach_stop();
+        if !defer_stop {
+            self.send_private_stop(private_stop_sent)?;
         }
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
         self.release_suspends();
         self.reply_faults.release_suspend_retry_for_detach();
+        if defer_stop {
+            self.reply_faults.release_suspend_retry_before_detach_stop();
+            self.send_private_stop(private_stop_sent)?;
+        }
         // A failed task suspend still holds the private SIGSTOP (#191): the fallback
         // PT_DETACH of `detach_target` finds the tracee waiting in its exception.
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
@@ -1353,6 +1388,23 @@ impl MacOSBackend
         // PT_DETACH needs the tracee waiting in its signal exception (EBUSY otherwise),
         // so it comes before the reply.
         self.detach_trace()
+    }
+
+    /// Raise detach's private SIGSTOP, unless the process has exited.
+    fn send_private_stop(&self, private_stop_sent: &mut bool) -> BackendResult<()>
+    {
+        let shared = lock_shared(&self.exception_state);
+        if shared.dead {
+            return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
+        }
+        self.reply_faults.sample_detach_suspend_count();
+        self.reply_faults.report_detach_stop_awaited(shared.internal_stop.is_some());
+        // SAFETY: the shared lock excludes the watcher's reaping of this pid.
+        if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
+            return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
+        }
+        *private_stop_sent = true;
+        Ok(())
     }
 
     /// End tracing and account for the kernel resume, including fallback cleanup.
@@ -1769,9 +1821,13 @@ impl Backend for MacOSBackend
                 return;
             }
             if shared.suspends == 0 {
-                // SAFETY: this backend still owns the target task right. A concurrent
-                // exception stop takes the same lock before acquiring its suspension.
-                let kr = unsafe { task_suspend(self.task) };
+                let kr = if self.fail_hold_suspend.swap(false, Ordering::Relaxed) {
+                    mach2::kern_return::KERN_FAILURE
+                } else {
+                    // SAFETY: this backend still owns the target task right. A concurrent
+                    // exception stop takes the same lock before acquiring its suspension.
+                    unsafe { task_suspend(self.task) }
+                };
                 if kr == KERN_SUCCESS {
                     shared.suspends += 1;
                 } else {
@@ -2136,6 +2192,9 @@ impl Backend for MacOSBackend
                     // lost the race and is consumed, as the contract requires.
                     // So is one already handed to a held batch.
                     if shared.pending_exception || shared.interrupt_suspend {
+                        return Ok(());
+                    }
+                    if self.drop_next_interrupt.swap(false, Ordering::Relaxed) {
                         return Ok(());
                     }
                     let kr = unsafe { task_suspend(self.task) };

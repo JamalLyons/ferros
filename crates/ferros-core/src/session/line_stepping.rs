@@ -385,7 +385,7 @@ impl Session
     }
 
     /// Whether `event` is a breakpoint stop left over from a private trap this session
-    /// already removed (a return trap or a libunwind resume hook): an interrupt can stop
+    /// already removed (a return trap or an unwinder resume hook): an interrupt can stop
     /// the thread just as it reaches the trap, so the trap's exception is delivered
     /// later, when no trap is at that address any more (none in the table and no trap
     /// instruction of any form in memory, see

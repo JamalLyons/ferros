@@ -247,25 +247,15 @@ pub trait Backend: Send
 
     /// Resume the target as described by `request`; the backend becomes *Running*.
     ///
-    /// On macOS arm64, a thread created while the default action is `Suspend` does not
-    /// execute application code until a later resume allows it to run. The backend holds
-    /// it at the first instruction of `libsystem_pthread`'s `_thread_start` or
-    /// `_start_wqthread` and that instruction runs when the thread is next allowed to.
-    /// If dyld has not published that library yet, the resume breakpoints the
-    /// executable entry and arms the pthread entries there, before that
-    /// instruction runs. A failure to install either trap fails a resume that
-    /// would otherwise let a thread continue. While a held thread executes the
-    /// restored entry, every other thread stays suspended, including when that
-    /// thread is single-stepped. A software breakpoint at either pthread
-    /// instruction is reported, and the newborn stays suspended. These traps are
-    /// the backend's own: `read_memory` shows the instructions under them, and a
-    /// software breakpoint written there survives their removal. A thread the
-    /// request lets `Continue` is never held, even when it re-enters
-    /// `_start_wqthread` as a reused workqueue thread.
-    /// `ThreadAction::Step` as the default action, and a thread created at any
-    /// other address, are outside this guarantee. On a macOS target that is not
-    /// arm64, a resume with the default `Suspend` that lets any thread run fails with
-    /// `BackendError::Unsupported`, because new threads could not be held.
+    /// A thread created while the default action is `Suspend` should not execute
+    /// application code until a later resume allows it to run. A backend that holds new
+    /// threads does so with traps of its own on the platform's thread entry points:
+    /// `read_memory` shows the instructions under them, and a software breakpoint
+    /// written there survives their removal. A software breakpoint at such an entry is
+    /// reported, and the newborn stays suspended. A backend that cannot hold new threads
+    /// fails a resume with the default `Suspend` that lets any thread run with
+    /// `BackendError::Unsupported`. The macOS backend's entries, and the cases outside
+    /// its guarantee, are documented on `ferros_macos::task`.
     ///
     /// # Preconditions
     ///

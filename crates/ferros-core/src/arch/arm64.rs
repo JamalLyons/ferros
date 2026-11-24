@@ -64,6 +64,14 @@ impl Arm64
     {
         self.addressable_bits
     }
+
+    /// Whether `instruction` is a register-indirect call: `blr`, or the pointer
+    /// authenticating `blraa`, `blraaz`, `blrab`, `blrabz`.
+    #[must_use]
+    pub const fn is_indirect_call(instruction: u32) -> bool
+    {
+        instruction & 0xffff_fc1f == 0xd63f_0000 || instruction & 0xfeff_f800 == 0xd63f_0800
+    }
 }
 
 impl Default for Arm64
@@ -186,6 +194,19 @@ mod tests
         let mut regs = Registers::new().with_arch(Architecture::Arm64);
         regs.general = vec![0; 31];
         regs
+    }
+
+    #[test]
+    fn indirect_calls_are_recognized()
+    {
+        // blr x8, blraa x8, x9, blraaz x8, blrab x8, x9, blrabz x8.
+        for call in [0xd63f_0100, 0xd73f_0909, 0xd63f_091f, 0xd73f_0d09, 0xd63f_0d1f] {
+            assert!(Arm64::is_indirect_call(call), "{call:#x}");
+        }
+        // bl, br x8, ret.
+        for other in [0x9400_0010, 0xd61f_0100, 0xd65f_03c0] {
+            assert!(!Arm64::is_indirect_call(other), "{other:#x}");
+        }
     }
 
     #[test]

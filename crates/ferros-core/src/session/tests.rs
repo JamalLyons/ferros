@@ -807,7 +807,7 @@ fn stack_trace_ignores_unsupported_image_listing()
         MockCallKind::Images,
         BackendError::Os {
             code: 4,
-            message: "dyld".into(),
+            message: "image list".into(),
         },
     );
     assert!(matches!(

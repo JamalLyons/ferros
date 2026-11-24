@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use ferros_core::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use ferros_core::backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent};
 use ferros_core::objfile::mock::{MockObjectFormat, MockObjectImage};
+use ferros_core::runtime::ExitSource;
+use ferros_core::runtime::mock::MockRuntime;
 use ferros_core::types::{Address, ProcessId, ThreadId};
 use ferros_core::{BreakpointLocation, LogicalBreakpointId, Session, SessionState, arch};
 
@@ -2253,20 +2255,40 @@ fn zero_timeout_wait_reports_a_dying_targets_refused_handler_continue_later()
     assert_eq!(session.last_stop(), Some(&exited));
 }
 
-/// Where `libsystem_platform.dylib` is mapped in `handler_stopped_with_long_jump`: its
-/// file addresses are its runtime ones (no slide).
+/// The file name of the exit image the tests' runtime names: not a macOS library, so a
+/// trap there comes from the runtime the session was given, not from the engine.
+const EXIT_IMAGE: &str = "libexits.so.1";
+/// The entry symbol of `EXIT_IMAGE` the tests' runtime traps.
+const EXIT_ENTRY: &str = "jump_leaf";
+
+/// A runtime whose one exit source is `EXIT_IMAGE`'s `EXIT_ENTRY`.
+fn exit_runtime() -> std::sync::Arc<dyn ferros_core::runtime::TargetRuntime>
+{
+    MockRuntime::new()
+        .with_exit_source(ExitSource::named(EXIT_IMAGE, &[EXIT_ENTRY]))
+        .into_shared()
+}
+
+/// A session on `mock` with the neutral format and `exit_runtime`.
+fn exit_session(mock: &MockBackend) -> Session
+{
+    Session::new(Box::new(mock.clone()), MockObjectFormat::shared()).with_runtime(exit_runtime())
+}
+
+/// Where `EXIT_IMAGE` is mapped in `handler_stopped_with_long_jump`: its file addresses
+/// are its runtime ones (no slide).
 const LONG_JUMP_IMAGE: Address = Address::new(0x2_0000_0000);
-/// `__longjmp` in that image, where the session traps a stopped handler's exit.
+/// `EXIT_ENTRY` in that image, where the session traps a stopped handler's exit.
 const LONG_JUMP: Address = Address::new(0x2_0000_1000);
 
-/// A mapped `libsystem_platform.dylib` with one symbol, `__longjmp` at `LONG_JUMP`, in
-/// the neutral `MockObjectFormat`: its header at the load address, code at
-/// 0x1000..0x1100, its table at 0x4000 and names at 0x5000.
+/// A mapped `EXIT_IMAGE` with one symbol, `EXIT_ENTRY` at `LONG_JUMP`, in the neutral
+/// `MockObjectFormat`: its header at the load address, code at 0x1000..0x1100, its table
+/// at 0x4000 and names at 0x5000.
 fn long_jump_image() -> Vec<u8>
 {
     let base = LONG_JUMP_IMAGE.value();
     let image = MockObjectImage::new(LONG_JUMP.value()..LONG_JUMP.value() + 0x100, base + 0x4000, base + 0x5000)
-        .with_symbol(LONG_JUMP.value(), "__longjmp");
+        .with_symbol(LONG_JUMP.value(), EXIT_ENTRY);
     let mut bytes = image.header_bytes();
     bytes.resize(0x1000, 0);
     bytes.extend(std::iter::repeat_n(0x1F, 0x3000));
@@ -2277,14 +2299,14 @@ fn long_jump_image() -> Vec<u8>
     bytes
 }
 
-/// `handler_stopped_process` with `libsystem_platform.dylib` loaded, so the continue
-/// that lets a stopped handler run on traps `__longjmp` for its thread.
+/// `handler_stopped_process` with `EXIT_IMAGE` loaded, so the continue that lets a
+/// stopped handler run on traps `EXIT_ENTRY` for its thread (with `exit_session`).
 fn handler_stopped_with_long_jump() -> MockBackend
 {
     handler_stopped_process()
         .with_region(LONG_JUMP_IMAGE, "r-x", long_jump_image())
         .with_image(ferros_core::backend::LoadedImage {
-            path: "/usr/lib/system/libsystem_platform.dylib".into(),
+            path: format!("/usr/lib/{EXIT_IMAGE}").into(),
             load_address: LONG_JUMP_IMAGE,
             build_id: ferros_core::types::BuildIdentity::Unknown,
         })
@@ -2468,7 +2490,7 @@ fn handler_continue_reports_a_real_trap_stop_that_refuses_it()
     }
 }
 
-/// `HANDLER` at `__longjmp`'s exit trap, inside its handler's frame.
+/// `HANDLER` at `EXIT_ENTRY`'s exit trap, inside its handler's frame.
 fn handler_at_long_jump(registers: &ferros_core::Registers) -> MockStop
 {
     let mut at_entry = registers.clone();
@@ -2481,16 +2503,16 @@ fn handler_at_long_jump(registers: &ferros_core::Registers) -> MockStop
     .set_registers(HANDLER, at_entry)
 }
 
-/// #165: a stopped handler, let run on, hits the `__longjmp` exit trap armed for its
+/// #165: a stopped handler, let run on, hits the `EXIT_ENTRY` exit trap armed for its
 /// continue, together with another thread's breakpoint stop at a private trap that is
 /// gone. That stop is dropped and the exit followed: the handler is stepped out of
-/// `__longjmp` to a landing still inside its own frame, so the rendezvous is kept and the
+/// `EXIT_ENTRY` to a landing still inside its own frame, so the rendezvous is kept and the
 /// user's continue reissued.
 #[test]
 fn handler_exit_drops_a_stale_trap_stop_reported_with_it()
 {
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    let mut session = exit_session(&mock);
     session
         .launch(&LaunchSpec::new("scripted-stale-handler-exit"))
         .expect("launch");
@@ -2537,7 +2559,7 @@ fn handler_exit_reports_a_real_trap_stop_reported_with_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_with_long_jump();
-        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+        let mut session = exit_session(&mock);
         session
             .launch(&LaunchSpec::new("scripted-real-handler-exit"))
             .expect("launch");
@@ -2559,7 +2581,7 @@ fn handler_exit_reports_a_real_trap_stop_reported_with_it()
     }
 }
 
-/// #165: following a stopped handler's exit steps it out of `__longjmp`; another
+/// #165: following a stopped handler's exit steps it out of `EXIT_ENTRY`; another
 /// thread's breakpoint stop at a private trap that is gone arrives just before that
 /// step, so the backend refuses it. The stop is dropped and the step issued again; the
 /// exit lands inside the handler's frame and the user's continue is reissued.
@@ -2567,7 +2589,7 @@ fn handler_exit_reports_a_real_trap_stop_reported_with_it()
 fn handler_exit_step_drops_a_stale_trap_stop_that_refuses_it()
 {
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    let mut session = exit_session(&mock);
     session.launch(&LaunchSpec::new("scripted-stale-exit-step")).expect("launch");
     let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2606,7 +2628,7 @@ fn handler_exit_step_reports_a_real_trap_stop_that_refuses_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_with_long_jump();
-        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+        let mut session = exit_session(&mock);
         session.launch(&LaunchSpec::new("scripted-real-exit-step")).expect("launch");
         let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2747,7 +2769,7 @@ fn step_out_arms_the_replacement_exit_images_entry()
     const SECOND_ENTRY: u64 = BASE + 0x408;
     const TABLE: u64 = BASE + 0x1000;
     let symbols =
-        MockObjectImage::new(FIRST_ENTRY..FIRST_ENTRY + 16, TABLE, TABLE + 0x100).with_symbol(FIRST_ENTRY, "__longjmp");
+        MockObjectImage::new(FIRST_ENTRY..FIRST_ENTRY + 16, TABLE, TABLE + 0x100).with_symbol(FIRST_ENTRY, EXIT_ENTRY);
     let mut image = symbols.header_bytes();
     image.resize(0x1000, 0);
     image.extend(symbols.table_bytes());
@@ -2755,14 +2777,14 @@ fn step_out_arms_the_replacement_exit_images_entry()
     image.extend(symbols.name_bytes());
 
     let loaded = |uuid: Option<[u8; 16]>| LoadedImage {
-        path: "/usr/lib/system/libsystem_platform.dylib".into(),
+        path: format!("/usr/lib/{EXIT_IMAGE}").into(),
         load_address: Address::new(BASE),
         build_id: uuid.map(ferros_core::types::BuildId::from).into(),
     };
     let mock = returning_to_breakpoint()
         .with_region(Address::new(BASE), "r-x", image)
         .with_image(loaded(Some([1; 16])));
-    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    let mut session = exit_session(&mock);
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
     step_out_to_breakpoint(&mock, &mut session);
@@ -2800,7 +2822,7 @@ fn step_out_arms_the_replacement_exit_images_entry()
 }
 
 /// #177: a stopped handler's thread sits on a breakpoint of its own, so the user's
-/// continue steps it over that breakpoint with the `__longjmp` exit trap armed. The exit
+/// continue steps it over that breakpoint with the `EXIT_ENTRY` exit trap armed. The exit
 /// trap is reported instead of that step's completion, which abandons the step: its
 /// thread is named by `stale_step`. Following the exit single-steps that same thread, and
 /// the session must take that fresh `SingleStep` as the exit step's completion instead of
@@ -2811,7 +2833,7 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     use ferros_core::BreakpointRequest;
 
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    let mut session = exit_session(&mock);
     session.launch(&LaunchSpec::new("scripted-exit-fresh-step")).expect("launch");
     let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2823,7 +2845,7 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
         .expect("breakpoint at the handler's stop");
 
     // The handler's step is cut short by its hit of the exit trap, so that step is
-    // abandoned; the followed exit steps the handler out of `__longjmp` to a landing
+    // abandoned; the followed exit steps the handler out of `EXIT_ENTRY` to a landing
     // inside its own frame, and the continue is reissued.
     mock.script(handler_at_long_jump(&registers).expect_resume(ResumeRequest::step(HANDLER)));
     let mut landed = registers.clone();
@@ -3036,4 +3058,126 @@ fn a_frame_is_named_through_the_injected_object_format()
         let frames = session.stack_trace(1).expect("stack trace");
         assert_eq!(frames[0].symbol, None, "{frames:?}");
     }
+}
+
+/// #201: the non-local exit entries come from the session's runtime, not from the engine.
+/// A step out with `exit_runtime` traps `EXIT_ENTRY` in `EXIT_IMAGE`, a library no macOS
+/// process has; the same session without a runtime traps nothing there, and one given a
+/// runtime naming another image does not trap it either.
+#[test]
+fn step_out_traps_the_exit_entries_the_runtime_names()
+{
+    use ferros_core::backend::LoadedImage;
+
+    const BASE: u64 = 0x2_0000_0000;
+    const ENTRY: u64 = BASE + 0x400;
+    const TABLE: u64 = BASE + 0x1000;
+    let symbols = MockObjectImage::new(ENTRY..ENTRY + 16, TABLE, TABLE + 0x100).with_symbol(ENTRY, EXIT_ENTRY);
+    let mut image = symbols.header_bytes();
+    image.resize(0x1000, 0);
+    image.extend(symbols.table_bytes());
+    image.resize(0x1100, 0);
+    image.extend(symbols.name_bytes());
+    let mock = || {
+        returning_to_breakpoint()
+            .with_region(Address::new(BASE), "r-x", image.clone())
+            .with_image(LoadedImage {
+                path: format!("/usr/lib/{EXIT_IMAGE}").into(),
+                load_address: Address::new(BASE),
+                build_id: ferros_core::BuildIdentity::Unknown,
+            })
+    };
+    let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
+    let stepped_out = |runtime: Option<std::sync::Arc<dyn ferros_core::runtime::TargetRuntime>>| {
+        let mock = mock();
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+        if let Some(runtime) = runtime {
+            session = session.with_runtime(runtime);
+        }
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        step_out_to_breakpoint(&mock, &mut session);
+        mock.peek_memory(Address::new(ENTRY), 4).expect("entry bytes")
+    };
+
+    assert_eq!(stepped_out(Some(exit_runtime())), trap, "the runtime's exit entry is trapped");
+    assert_ne!(stepped_out(None), trap, "no runtime, no exit trap");
+    let elsewhere = MockRuntime::new()
+        .with_exit_source(ExitSource::named("libother.so", &[EXIT_ENTRY]))
+        .into_shared();
+    assert_ne!(stepped_out(Some(elsewhere)), trap, "another image's entry is not this one");
+}
+
+/// #201: a signal trampoline is recognized by the session's runtime. The handler's frame
+/// record returns into `MockRuntime`'s trampoline, whose saved state (at its `fp + 16`)
+/// holds the interrupted frame; a trace through the session restores it. Without the
+/// runtime the trace follows the trampoline's frame record instead and misses it.
+#[test]
+fn a_backtrace_restores_the_frame_the_runtimes_signal_trampoline_interrupted()
+{
+    const CODE: u64 = 0x4000_0000;
+    const TRAMPOLINE: u64 = 0x5000_0000;
+    const STACK_BASE: u64 = 0x1000;
+    const HANDLER_FP: u64 = 0x1000;
+    const TRAMPOLINE_FP: u64 = 0x1100;
+    const CONTEXT: u64 = TRAMPOLINE_FP + MockRuntime::CONTEXT_OFFSET;
+    const INTERRUPTED_SP: u64 = 0x2000;
+    const INTERRUPTED_FP: u64 = 0x2100;
+    const INTERRUPTED_PC: u64 = CODE + 0x100;
+
+    let mut stack = vec![0u8; 0x2000];
+    let mut put = |at: u64, value: u64| {
+        let offset = usize::try_from(at - STACK_BASE).expect("offset");
+        stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    // The handler's frame record returns into the trampoline.
+    put(HANDLER_FP, TRAMPOLINE_FP);
+    put(HANDLER_FP + 8, TRAMPOLINE + 0x44);
+    // The trampoline's record holds the interrupted fp and a stale link register.
+    put(TRAMPOLINE_FP, INTERRUPTED_FP);
+    put(TRAMPOLINE_FP + 8, CODE + 0xaa0);
+    for index in 0..MockRuntime::GENERAL_WORDS {
+        put(CONTEXT + 8 * index, 0x100 + index);
+    }
+    put(CONTEXT + MockRuntime::FP, INTERRUPTED_FP);
+    put(CONTEXT + MockRuntime::LR, CODE + 0xaa0);
+    put(CONTEXT + MockRuntime::SP, INTERRUPTED_SP);
+    put(CONTEXT + MockRuntime::PC, INTERRUPTED_PC);
+    // The interrupted frame's record ends the chain at its caller.
+    put(INTERRUPTED_FP, 0);
+    put(INTERRUPTED_FP + 8, CODE + 0x200);
+
+    let mut registers = arm64_registers();
+    registers.pc = Address::new(CODE);
+    registers.sp = Address::new(0xf00);
+    registers.fp = Address::new(HANDLER_FP);
+    registers.general[29] = HANDLER_FP;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(Address::new(CODE), "r-x", vec![0x1F; 0x1000])
+        .with_region(Address::new(TRAMPOLINE), "r-x", vec![0x1F; 0x100])
+        .with_region(Address::new(0), "rw-", vec![0; 0x1000])
+        .with_region(Address::new(STACK_BASE), "rw-", stack);
+    let pcs = |runtime: Option<std::sync::Arc<dyn ferros_core::runtime::TargetRuntime>>| {
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+        if let Some(runtime) = runtime {
+            session = session.with_runtime(runtime);
+        }
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        let frames = session.stack_trace(16).expect("stack trace");
+        frames.iter().map(|frame| frame.pc.value()).collect::<Vec<_>>()
+    };
+
+    let runtime = MockRuntime::new()
+        .with_signal_trampoline(TRAMPOLINE..TRAMPOLINE + 0x100)
+        .into_shared();
+    assert_eq!(
+        pcs(Some(runtime)),
+        [CODE, TRAMPOLINE + 0x44, INTERRUPTED_PC, CODE + 0x200],
+        "the interrupted frame is restored"
+    );
+    // Without the runtime the trampoline's record is followed: its stale link register
+    // stands in for the interrupted frame, which is never reported.
+    let unaware = pcs(None);
+    assert_eq!(unaware, [CODE, TRAMPOLINE + 0x44, CODE + 0xaa0, CODE + 0x200]);
+    assert!(!unaware.contains(&INTERRUPTED_PC), "{unaware:x?}");
 }

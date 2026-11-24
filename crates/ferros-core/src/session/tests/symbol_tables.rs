@@ -159,7 +159,7 @@ fn header_search_runs_once_per_region_in_a_trace()
 #[test]
 fn a_listed_image_is_named_without_a_header_search()
 {
-    // Issue #121: dyld is now a listed image, so its code (the base of a main-thread
+    // Issue #121: the dynamic loader is now a listed image, so its code (the base of a main-thread
     // trace) is named from its own symbol table. The pc's region is executable, where a
     // search would probe each 4 KiB page below the pc for a header's magic word; for a
     // listed image no such probe is read.
@@ -170,7 +170,7 @@ fn a_listed_image_is_named_without_a_header_search()
         .with_region(Address::new(IMAGE), "r-x", header)
         .with_region(Address::new(IMAGE + 0x4000), "r--", table)
         .with_region(Address::new(IMAGE + 0x5000), "r--", names)
-        .with_image(image_at("dyld", IMAGE));
+        .with_image(image_at("loader", IMAGE));
     let mut session = launched(&mock);
     let frames = session.stack_trace(4).expect("stack trace");
     assert_eq!(symbol(&frames[0]), Some(("foo", SymbolSource::SymbolTable)));
@@ -223,7 +223,7 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
     mock.set_images(vec![listed(Some([1; 16]))]);
     assert_eq!(name(&mut session), named("foo"));
 
-    // An unknown UUID again (a failed read of dyld's UUID array) changes nothing either.
+    // An unknown UUID again (a failed read of the loader's image list) changes nothing either.
     mock.set_images(vec![listed(None)]);
     assert_eq!(name(&mut session), named("foo"));
 

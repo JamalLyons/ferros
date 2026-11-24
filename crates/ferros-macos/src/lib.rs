@@ -18,7 +18,8 @@
 //! session.launch(&LaunchSpec::new("/bin/echo").arg("hello"))?;
 //! let regs = session.read_registers()?;
 //! println!("stopped at entry, pc = {}", regs.pc);
-//! session.detach()?; // the process keeps running
+//! // The process keeps running after detach.
+//! session.detach()?;
 //! # Ok(())
 //! # }
 //! # #[cfg(not(target_os = "macos"))]

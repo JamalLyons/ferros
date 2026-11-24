@@ -448,6 +448,7 @@ dependencies = [
  "portable-pty",
  "rustc-demangle",
  "serde_json",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -284,8 +284,10 @@ fn write_registers_to_port(architecture: Architecture, thread: thread_act_t, reg
 /// until the target dies. When the debugger process exits, its Mach rights (including
 /// the exception port's receive right) are destroyed, and XNU sends SIGKILL to the
 /// still-traced process as part of tracer exit: a held target does not outlive a
-/// debugger, such as the CLI, that exits right after dropping its session. If the
-/// exit watcher fails before the target dies, the retained resources are not released.
+/// debugger, such as the CLI, that exits right after dropping its session
+/// (`held_target_when_the_debugger_process_exits` in `ferros-tests/tests/lifecycle.rs`
+/// observes the SIGKILL). If the exit watcher fails before the target dies, the
+/// retained resources are not released.
 ///
 /// ## Thread Safety
 ///
@@ -325,6 +327,11 @@ pub struct MacOSBackend
     reply_faults: ReplyFaultInjector,
     /// One-shot integration test fault for the next engine memory write.
     fail_memory_write: Arc<AtomicBool>,
+    /// One-shot integration test fault: the next interrupt of a running target neither
+    /// suspends it nor queues `Interrupted`.
+    drop_next_interrupt: Arc<AtomicBool>,
+    /// One-shot integration test fault: the `task_suspend` in `hold_attached_on_drop` fails.
+    fail_hold_suspend: Arc<AtomicBool>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
     events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
@@ -397,6 +404,8 @@ impl MacOSBackend
             saved_exception_ports: None,
             reply_faults: ReplyFaultInjector::default(),
             fail_memory_write: Arc::default(),
+            drop_next_interrupt: Arc::default(),
+            fail_hold_suspend: Arc::default(),
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -505,6 +514,27 @@ impl MacOSBackend
     pub fn memory_write_fault_injector(&self) -> impl FnOnce() + use<>
     {
         let fail = Arc::clone(&self.fail_memory_write);
+        move || fail.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next [`Backend::interrupt`] of a running target return `Ok`
+    /// without suspending it or queueing `Interrupted`, as if the stop never arrived.
+    ///
+    /// A session dropped after arming it times out waiting for the stop, so
+    /// `hold_attached_on_drop` runs with no suspension recorded. Tests only.
+    #[doc(hidden)]
+    pub fn interrupt_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let drop_interrupt = Arc::clone(&self.drop_next_interrupt);
+        move || drop_interrupt.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next `task_suspend` taken by `hold_attached_on_drop` fail with
+    /// an injected `KERN_FAILURE` without suspending the task. Tests only.
+    #[doc(hidden)]
+    pub fn hold_suspend_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let fail = Arc::clone(&self.fail_hold_suspend);
         move || fail.store(true, Ordering::Relaxed)
     }
 
@@ -1769,9 +1799,13 @@ impl Backend for MacOSBackend
                 return;
             }
             if shared.suspends == 0 {
-                // SAFETY: this backend still owns the target task right. A concurrent
-                // exception stop takes the same lock before acquiring its suspension.
-                let kr = unsafe { task_suspend(self.task) };
+                let kr = if self.fail_hold_suspend.swap(false, Ordering::Relaxed) {
+                    mach2::kern_return::KERN_FAILURE
+                } else {
+                    // SAFETY: this backend still owns the target task right. A concurrent
+                    // exception stop takes the same lock before acquiring its suspension.
+                    unsafe { task_suspend(self.task) }
+                };
                 if kr == KERN_SUCCESS {
                     shared.suspends += 1;
                 } else {
@@ -2136,6 +2170,9 @@ impl Backend for MacOSBackend
                     // lost the race and is consumed, as the contract requires.
                     // So is one already handed to a held batch.
                     if shared.pending_exception || shared.interrupt_suspend {
+                        return Ok(());
+                    }
+                    if self.drop_next_interrupt.swap(false, Ordering::Relaxed) {
                         return Ok(());
                     }
                     let kr = unsafe { task_suspend(self.task) };

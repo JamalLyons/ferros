@@ -1210,8 +1210,10 @@ fn exception_queued_just_before_detach_teardown_is_answered()
 {
     let _serial = serial();
     harness::run(|t| {
-        let mut target = t.spawn(&fixture!("hot_loop"), &["4"]);
+        let mut target = t.spawn(&fixture!("hot_loop"), &[&HOT_THREADS.to_string()]);
         let pid = target.pid();
+        // The hook needs a thread that runs: attach only once every thread spins.
+        wait_for_threads(pid, HOT_THREADS);
         let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
         let faults = backend.reply_fault_injector();
         ferros_core::Backend::attach(&mut backend, pid).expect("attach");
@@ -1229,5 +1231,110 @@ fn exception_queued_just_before_detach_teardown_is_answered()
             "the released target ended ({status:?}): the exception queued before teardown was destroyed unhandled"
         );
         assert_runs(pid.0);
+    });
+}
+
+/// Spinning threads of the `hot_loop` targets below, main included.
+const HOT_THREADS: usize = 4;
+
+/// Wait (bounded) until the process `pid` has `count` threads.
+fn wait_for_threads(pid: ferros_core::ProcessId, count: usize)
+{
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    loop {
+        let threads = diagnostics::thread_count(pid).unwrap_or(0);
+        if threads >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the target has {threads} threads, not {count}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Threads of the backoff test's `hot_loop`: one for the first held signal, the others
+/// raise one each during the measured window.
+const BACKOFF_THREADS: usize = 8;
+
+/// How long the backoff test lets a held batch fail before it measures: past the
+/// doublings (10 + 20 + ... + 320 ms), so the delay has reached its 500 ms ceiling.
+const BACKOFF_SETTLE: Duration = Duration::from_millis(1300);
+
+/// The window the backoff test measures, at the 500 ms ceiling.
+const BACKOFF_WINDOW: Duration = Duration::from_millis(1000);
+
+/// The most `task_suspend` attempts allowed within [`BACKOFF_WINDOW`]: two delays fit,
+/// plus one for the window's edges.
+const BACKOFF_WINDOW_ATTEMPTS: u32 = 3;
+
+/// Exceptions that arrive while a batch is held behind failing `task_suspend`s do not
+/// cut the backoff short (#198): the next attempt stays due one delay after the last.
+/// Each thread of `hot_loop` gets a thread-directed SIGUSR1 in turn, a fresh exception
+/// every ~140 ms, while the delay is 500 ms. Retrying at each arrival would make an
+/// attempt per signal. Each signal's thread is still held at once, its own
+/// `thread_suspend` holding it and its exception answered, so an external SIGKILL ends
+/// the target.
+#[test]
+fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("hot_loop");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[&BACKOFF_THREADS.to_string()], backend);
+        let pid = d.pid();
+        d.resume().expect("resume");
+        wait_for_threads(pid, BACKOFF_THREADS);
+        faults.fail_exception_suspends(u32::MAX);
+        diagnostics::send_sigusr1_to_thread(pid, 0).expect("SIGUSR1 to the first thread");
+        expect_suspend_failure(d.wait(Some(STOP_TIMEOUT)), "the first signal's suspend");
+        std::thread::sleep(BACKOFF_SETTLE);
+
+        let before = faults.exception_suspend_attempts();
+        let began = std::time::Instant::now();
+        let spacing = BACKOFF_WINDOW / u32::try_from(BACKOFF_THREADS).expect("thread count");
+        for index in 1..BACKOFF_THREADS {
+            diagnostics::send_sigusr1_to_thread(pid, index).expect("SIGUSR1 to a spinning thread");
+            std::thread::sleep(spacing);
+        }
+        let attempts = faults.exception_suspend_attempts() - before;
+        let took = began.elapsed();
+        assert!(
+            attempts <= BACKOFF_WINDOW_ATTEMPTS,
+            "{attempts} task_suspend attempts in {took:?} with a 500 ms backoff: arriving exceptions advanced the retry"
+        );
+        let quiet = d.session_mut().backend_mut().wait(Some(Duration::ZERO));
+        assert!(matches!(quiet, Ok(None)), "a held signal was reported: {quiet:?}");
+
+        // Every thread raised its signal and is held by its own suspend, the task not.
+        let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
+        assert_eq!(counts.task.expect("task suspend count"), 0, "the task was suspended");
+        let held: Vec<i32> = counts
+            .threads
+            .expect("thread suspend counts")
+            .into_iter()
+            .map(|thread| thread.expect("thread suspend count").suspend_count)
+            .collect();
+        assert_eq!(held, [1; BACKOFF_THREADS], "a signalled thread is not held exactly once");
+
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-9", &pid.0.to_string()])
+                .status()
+                .expect("SIGKILL")
+                .success()
+        );
+        assert!(
+            harness::wait_until_gone(pid.0, STOP_TIMEOUT),
+            "a signal held during the backoff kept SIGKILL from ending the target"
+        );
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
     });
 }

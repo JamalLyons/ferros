@@ -172,6 +172,22 @@ unsafe extern "C" {
     ///
     /// See: [mach_port_get_refs](https://developer.apple.com/documentation/kernel/1578745-mach_port_get_refs)
     pub fn mach_port_get_refs(task: mach_port_t, name: mach_port_t, right: u32, refs: *mut u32) -> kern_return_t;
+
+    /// Read one attribute `flavor` (a `MACH_PORT_*` attribute flavor) of the port `name`
+    /// denotes in `task`'s IPC space into `info`, `*count` natural_t words long; on
+    /// return `*count` holds the words written. With `MACH_PORT_RECEIVE_STATUS` it fills
+    /// a `mach_port_status_t`, whose `mps_msgcount` is the number of queued messages.
+    ///
+    /// ## Documentation
+    ///
+    /// See: [mach_port_get_attributes](https://developer.apple.com/documentation/kernel/1578766-mach_port_get_attributes)
+    pub fn mach_port_get_attributes(
+        task: mach_port_t,
+        name: mach_port_t,
+        flavor: c_int,
+        info: *mut natural_t,
+        count: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
 }
 
 // Thread State Functions

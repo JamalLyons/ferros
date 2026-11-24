@@ -460,6 +460,64 @@ pub fn send_sigusr1(thread: ferros_core::ThreadId) -> std::io::Result<()>
     }
 }
 
+/// How many threads the process `pid` has, from `proc_pidinfo(PROC_PIDTASKINFO)`, which
+/// needs no task port; `None` if it cannot be read. Tests only.
+#[doc(hidden)]
+#[must_use]
+pub fn thread_count(pid: ProcessId) -> Option<usize>
+{
+    // SAFETY: zero is a valid bit pattern for this plain C struct.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as c_int;
+    // SAFETY: `info` is writable for `size` bytes and outlives the call.
+    let written = unsafe { libc::proc_pidinfo(pid.0 as c_int, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then(|| usize::try_from(info.pti_threadnum).unwrap_or(0))
+}
+
+/// Send SIGUSR1 to the `index`th thread (in Mach's task thread order, main first) of
+/// the process `pid`, which the debugger need not hold a right to. Returns how many
+/// threads the process had. Tests only.
+///
+/// # Errors
+/// Returns the Mach error if the task port or thread list cannot be read, an
+/// `InvalidArgument` error if there is no such thread, or the `__pthread_kill` error.
+#[doc(hidden)]
+pub fn send_sigusr1_to_thread(pid: ProcessId, index: usize) -> Result<usize>
+{
+    let mut task = MACH_PORT_NULL;
+    // SAFETY: `task` is writable; the acquired send right is released below.
+    let kr = unsafe { ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task) };
+    if kr != KERN_SUCCESS {
+        return Err(DebuggerError::from(MachError::from(kr)));
+    }
+    let result = crate::threads::ThreadManager::refresh_thread_list(task, &[]).and_then(|threads| {
+        let sent = match threads.get(index) {
+            // SAFETY: refresh_thread_list retained this tracee thread right; the syscall
+            // takes no pointers.
+            Some(&port) if unsafe { ffi::__pthread_kill(port, libc::SIGUSR1) } == 0 => Ok(threads.len()),
+            Some(_) => Err(DebuggerError::Io(std::io::Error::last_os_error())),
+            None => Err(DebuggerError::InvalidArgument(format!(
+                "process {} has {} threads, not {}",
+                pid.0,
+                threads.len(),
+                index + 1
+            ))),
+        };
+        for port in threads {
+            // SAFETY: refresh_thread_list returned one owned send right per entry.
+            unsafe {
+                let _ = ffi::mach_port_deallocate(mach_task_self(), port);
+            }
+        }
+        sent
+    });
+    // SAFETY: release the task_for_pid send right exactly once.
+    unsafe {
+        let _ = ffi::mach_port_deallocate(mach_task_self(), task);
+    }
+    result
+}
+
 /// Read a byte on the stepping fixture's blocking socket. Tests break on the
 /// SVC in the exported function so the syscall is the first instruction of the step.
 #[cfg(target_arch = "aarch64")]

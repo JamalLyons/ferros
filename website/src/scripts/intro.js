@@ -18,7 +18,7 @@ export function initCinematicIntro(onComplete) {
     logoContainer.id = 'intro-logo-container';
     logoContainer.className = 'absolute inset-0 flex items-center justify-center opacity-0';
     const logo = document.createElement('img');
-    logo.src = '/ferros-logo.png';
+    logo.src = '/Ferros_Logo_v3.png';
     logo.className = 'w-32 h-32 rounded-full object-cover border-2 border-[#d3752b]';
     logoContainer.appendChild(logo);
     introOverlay.appendChild(logoContainer);

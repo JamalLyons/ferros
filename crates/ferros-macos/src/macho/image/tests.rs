@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ferros_core::error::{DebuggerError, Result};
-use ferros_core::objfile::{ImageContents, SectionId};
+use ferros_core::objfile::{FunctionUnwind, ImageContents, SectionId, UnwindHint};
 use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
 use ferros_core::types::{Address, Architecture};
 use gimli::write::{Address as WriteAddress, AttributeValue, DwarfUnit, EndianVec, LineProgram, LineString, Sections};
@@ -526,4 +526,120 @@ fn a_slice_identity_round_trips_through_the_engine_slice()
         Some([3; 16]),
         "a UUID the loader reports later selects the slice"
     );
+}
+
+/// Set the link-time address of section `index` of a [`slice_with_sections`] image.
+fn set_section_address(bytes: &mut [u8], index: usize, address: u64)
+{
+    let section = 128 + 72 + 80 * index;
+    bytes[section + 32..section + 40].copy_from_slice(&address.to_le_bytes());
+}
+
+/// An image with `__unwind_info` (the compact unwind test table), `__eh_frame` and
+/// `__eh_frame_hdr` hands the engine those sections and the table's hints, relative to
+/// the load address.
+#[test]
+fn open_reads_unwind_info_and_eh_frame_sections()
+{
+    let unwind_info = crate::macho::compact_unwind::tests::section();
+    // The table's DWARF-mode entry for 0x2000 names an FDE at 0x158: room for it.
+    let eh_frame: Vec<u8> = (0..0x180_u32).map(|i| i as u8).collect();
+    let eh_frame_hdr = [1_u8, 0x1b, 0x03, 0x3b, 9, 8, 7, 6];
+    let sections = [
+        ("__debug_info", &[0][..]),
+        ("__debug_abbrev", &[0][..]),
+        ("__debug_line", &[0][..]),
+        ("__unwind_info", &unwind_info[..]),
+        ("__eh_frame", &eh_frame[..]),
+        ("__eh_frame_hdr", &eh_frame_hdr[..]),
+    ];
+    let mut bytes = slice_with_sections(ARM64, 0, [1; 16], 0x1_0000_0000, &sections);
+    set_section_address(&mut bytes, 4, 0x1_0000_3000);
+    set_section_address(&mut bytes, 5, 0x1_0000_3400);
+    let path = write("unwind-sections", &bytes);
+    let image = parse(&path, None);
+    let _ = fs::remove_file(&path);
+    let image = image.expect("image with unwind sections");
+
+    let eh = image.eh_frame.as_ref().expect("__eh_frame");
+    assert_eq!(eh.address, 0x1_0000_3000);
+    assert_eq!(&*eh.data, &eh_frame[..]);
+    let hdr = image.eh_frame_hdr.as_ref().expect("__eh_frame_hdr");
+    assert_eq!(hdr.address, 0x1_0000_3400);
+    assert_eq!(&*hdr.data, &eh_frame_hdr[..]);
+
+    let hints = image.unwind_hints.as_deref().expect("__unwind_info hints");
+    let hint = |offset: u64| hints.lookup(Address::new(0x5_0000_0000 + offset));
+    assert_eq!(
+        hint(0x1004),
+        Some(FunctionUnwind {
+            start: Address::new(0x5_0000_1000),
+            hint: UnwindHint::FrameRecord,
+        })
+    );
+    // 0x0200_1000: frameless, ((encoding >> 12) & 0xfff) * 16 bytes of stack.
+    assert_eq!(
+        hint(0x1044),
+        Some(FunctionUnwind {
+            start: Address::new(0x5_0000_1040),
+            hint: UnwindHint::Leaf {
+                stack_size: u64::from((0x0200_1000_u32 >> 12) & 0xFFF) * 16,
+            },
+        })
+    );
+    // 0x0300_0158: DWARF mode, FDE at 0x158 in __eh_frame.
+    let cfi = hint(0x2abc).expect("DWARF-mode entry");
+    assert_eq!(cfi.start, Address::new(0x5_0000_2000));
+    assert_eq!(cfi.hint, UnwindHint::Cfi { eh_frame_offset: 0x158 });
+    let UnwindHint::Cfi { eh_frame_offset } = cfi.hint else {
+        unreachable!()
+    };
+    assert!(eh_frame_offset < eh.data.len(), "the FDE offset lies inside __eh_frame");
+    // Outside the table: before its first function, at its sentinel, below the header.
+    assert_eq!(hint(0x0fff), None);
+    assert_eq!(hint(0x3000), None);
+    assert_eq!(hints.lookup(Address::new(0x4_ffff_ffff)), None);
+}
+
+/// An entry with encoding 0 in the image's `__unwind_info` is no hint.
+#[test]
+fn open_gives_no_hint_for_an_entry_with_encoding_zero()
+{
+    let mut unwind_info = crate::macho::compact_unwind::tests::section();
+    // The regular page's only entry (0x2000) is the table's last word.
+    let last = unwind_info.len() - 4;
+    unwind_info[last..].copy_from_slice(&0_u32.to_le_bytes());
+    let sections = [
+        ("__debug_info", &[0][..]),
+        ("__debug_abbrev", &[0][..]),
+        ("__debug_line", &[0][..]),
+        ("__unwind_info", &unwind_info[..]),
+    ];
+    let path = write(
+        "unwind-zero",
+        &slice_with_sections(ARM64, 0, [1; 16], 0x1_0000_0000, &sections),
+    );
+    let image = parse(&path, None);
+    let _ = fs::remove_file(&path);
+    let image = image.expect("image with unwind info");
+    let hints = image.unwind_hints.as_deref().expect("__unwind_info hints");
+    assert_eq!(hints.lookup(Address::new(0x5_0000_2abc)), None);
+    assert_eq!(
+        hints.lookup(Address::new(0x5_0000_1004)).map(|entry| entry.hint),
+        Some(UnwindHint::FrameRecord),
+        "the other entries still give hints"
+    );
+}
+
+/// Without `__unwind_info`, `__eh_frame` or `__eh_frame_hdr` the image has none of them.
+#[test]
+fn open_without_unwind_sections_has_no_hints_or_eh_frame()
+{
+    let path = write("no-unwind", &slice(ARM64, 0, [1; 16], 0x1_0000_0000));
+    let image = parse(&path, None);
+    let _ = fs::remove_file(&path);
+    let image = image.expect("image without unwind sections");
+    assert!(image.unwind_hints.is_none());
+    assert!(image.eh_frame.is_none());
+    assert!(image.eh_frame_hdr.is_none());
 }

@@ -217,7 +217,7 @@ impl Arm64Mode
 }
 
 #[cfg(test)]
-mod tests
+pub(crate) mod tests
 {
     use super::*;
 
@@ -233,7 +233,7 @@ mod tests
 
     /// One compressed page for functions at 0x1000 and 0x1040 (common encodings 0 and the
     /// page's own encoding), one regular page for 0x2000, and a sentinel at 0x3000.
-    fn section() -> Vec<u8>
+    pub(crate) fn section() -> Vec<u8>
     {
         let mut s = Vec::new();
         // Header: version, common encodings (offset 28, count 1), personalities (0, 0),

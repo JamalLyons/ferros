@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use ferros_core::backend::{ProcessGroup, StdioSpec};
 use ferros_core::{LaunchSpec, ProcessId};
-use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
+use ferros_utils::{LogFormat, LogLevel, info, log_directory, start_file_logging};
 
 use crate::platform::create_session;
 use crate::repl::jobs::JobControl;
@@ -102,12 +102,15 @@ impl Script
     }
 }
 
-fn log_directory() -> PathBuf
+fn main() -> ExitCode
 {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), |home| PathBuf::from(home).join(".ferros"))
+    // The logging session owns the log worker. It lives until `main` returns, so the
+    // records written just before exit reach the file.
+    let mut logging = None;
+    run(&mut logging)
 }
 
-fn main() -> ExitCode
+fn run(logging: &mut Option<ferros_utils::LoggingSession>) -> ExitCode
 {
     let cli = Cli::parse();
 
@@ -153,8 +156,9 @@ fn main() -> ExitCode
     };
 
     // Logs go to a file so the session output stays deterministic (no timestamps, no colour).
-    if let Err(error) = init_logging_to_file(level, format) {
-        eprintln!("warning: logging is disabled: {error}");
+    match start_file_logging(level, format) {
+        Ok(session) => *logging = Some(session),
+        Err(error) => eprintln!("warning: logging is disabled: {error}"),
     }
 
     let lines = match script.lines() {

@@ -821,3 +821,257 @@ fn resume_with_signal_from_breakpoint_then_passes_pending_signal()
         );
     });
 }
+
+/// The retry budget the give-up tests set, instead of the 5 s production default (#198).
+const SHORT_RETRY_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The most `task_suspend` attempts a backed-off retry may make within
+/// [`SHORT_RETRY_BUDGET`]: delays of 10, 20, 40, ... ms capped at 500 ms make about 9,
+/// where fixed 10 ms retries would make about 150.
+const BACKED_OFF_ATTEMPTS: u32 = 20;
+
+/// Wait for the one error a give-up queues (#198).
+fn expect_give_up<E: std::fmt::Display>(result: Result<Option<StopEvent>, E>)
+{
+    match result {
+        Err(err) => {
+            let text = err.to_string();
+            assert!(
+                text.contains("task_suspend") && text.contains("unrecoverable"),
+                "the give-up error does not say the task cannot be suspended: {text}"
+            );
+        }
+        Ok(event) => panic!("expected the task_suspend give-up from wait, got {event:?}"),
+    }
+}
+
+/// Every thread of `pid` is held with exactly one `thread_suspend` and the task is not
+/// suspended: the hold of a batch behind failed `task_suspend`s (#191).
+fn assert_thread_held(pid: ferros_core::ProcessId)
+{
+    let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
+    assert_eq!(counts.task.expect("task suspend count"), 0, "the task was suspended");
+    let held: Vec<i32> = counts
+        .threads
+        .expect("thread suspend counts")
+        .into_iter()
+        .map(|thread| thread.expect("thread suspend count").suspend_count)
+        .collect();
+    assert_eq!(held, [1], "the faulting thread is not held exactly once");
+}
+
+/// Launch `loop_counter` with progress output and a failing exception `task_suspend`
+/// held at `tick_body` until the loop gives up (#198): checks that the retries back off
+/// and that exactly one give-up error arrives. Returns the debuggee and the breakpoint.
+fn give_up_at_a_breakpoint(t: &harness::TestContext) -> (Debuggee, ferros_macos::exception::ReplyFaultInjector, Address)
+{
+    let fixture = fixture!("loop_counter");
+    let backend = MacOSBackend::new().expect("MacOSBackend::new");
+    let faults = backend.reply_fault_injector();
+    faults.set_suspend_retry_budget(SHORT_RETRY_BUDGET);
+    let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP, "--progress"], backend);
+    let address = marker_address(&mut d, &fixture, "tick_body");
+    d.add_breakpoint(BreakpointRequest::Software { address })
+        .expect("add_breakpoint at tick_body");
+    faults.fail_exception_suspends(u32::MAX);
+    let began = std::time::Instant::now();
+    d.resume().expect("resume");
+    expect_suspend_failure(d.wait(Some(STOP_TIMEOUT)), "the breakpoint's suspend");
+    expect_give_up(d.wait(Some(STOP_TIMEOUT)));
+    let took = began.elapsed();
+    let attempts = faults.exception_suspend_attempts();
+    assert!(
+        took >= SHORT_RETRY_BUDGET && took < SHORT_RETRY_BUDGET + Duration::from_secs(2),
+        "the loop gave up after {took:?}, not after its {SHORT_RETRY_BUDGET:?} budget"
+    );
+    assert!(
+        (2..=BACKED_OFF_ATTEMPTS).contains(&attempts),
+        "{attempts} task_suspend attempts in {took:?}: the retries did not back off"
+    );
+    (d, faults, address)
+}
+
+/// A `task_suspend` that keeps failing is retried with an exponential backoff, and
+/// after the retry budget the loop gives up (#198): `wait` returns one error saying the
+/// session is unrecoverable, then stays quiet, and the loop calls `task_suspend` no
+/// more. The faulting thread stays held by its own `thread_suspend` and runs no user
+/// code, and its exception is answered, so an external SIGKILL still ends the target.
+#[test]
+fn failing_exception_suspend_backs_off_then_gives_up_once()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let (mut d, faults, _) = give_up_at_a_breakpoint(t);
+        let pid = d.pid();
+        let attempts = faults.exception_suspend_attempts();
+        let output = d.stdout().len();
+        let quiet = d.session_mut().backend_mut().wait(Some(Duration::from_secs(1)));
+        assert!(matches!(quiet, Ok(None)), "wait reported again after the give-up: {quiet:?}");
+        assert_eq!(
+            faults.exception_suspend_attempts(),
+            attempts,
+            "the loop kept calling task_suspend after it gave up"
+        );
+        assert_eq!(d.stdout().len(), output, "the held target ran user code");
+        assert_thread_held(pid);
+        assert_eq!(d.state(), SessionState::Running, "the give-up was reported as a stop");
+
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-9", &pid.0.to_string()])
+                .status()
+                .expect("SIGKILL")
+                .success()
+        );
+        assert!(
+            harness::wait_until_gone(pid.0, STOP_TIMEOUT),
+            "the held thread kept SIGKILL from ending the target after the give-up"
+        );
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+    });
+}
+
+/// After the loop gave up on `task_suspend` (#198), an interrupt still takes a task
+/// suspend of its own and hands it to the loop, which publishes the held breakpoint stop
+/// with it: a real suspend, so the stop holds the task and the session can kill it.
+#[test]
+fn interrupt_after_a_suspend_give_up_publishes_the_held_stop()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let (mut d, faults, address) = give_up_at_a_breakpoint(t);
+        let attempts = faults.exception_suspend_attempts();
+        interrupt(&mut d);
+        expect_breakpoint(&mut d, address, "the held breakpoint stop after the give-up");
+        assert_eq!(d.state(), SessionState::Stopped);
+        assert_eq!(
+            faults.exception_suspend_attempts(),
+            attempts,
+            "the loop called task_suspend again instead of taking the interrupt's"
+        );
+        let counts = diagnostics::process_suspend_counts(d.pid()).expect("suspend counts");
+        assert!(
+            counts.task.expect("task suspend count") > 0,
+            "the published stop does not hold the task suspended"
+        );
+        for thread in counts.threads.expect("thread suspend counts") {
+            assert_eq!(thread.expect("thread suspend count").suspend_count, 0, "a thread stayed held");
+        }
+        faults.fail_exception_suspends(0);
+        assert_eq!(d.kill().expect("kill"), StopEvent::Killed { signal: 9 });
+    });
+}
+
+/// A failing `thread_suspend` of a thread whose exception is held behind a failed
+/// `task_suspend` (#198) leaves that exception unanswered, and the thread waits in the
+/// kernel instead of running. XNU does not complete a SIGKILL while a thread waits for its
+/// exception reply, so an external `kill -9` does not end the target then: this is the
+/// documented limit of the hold. The loop retries the freeze on each pass, and the first
+/// that succeeds answers the exception, so the pending SIGKILL then takes effect.
+#[test]
+fn failed_thread_freeze_leaves_the_exception_unanswered_until_a_retry_holds_it()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP, "--progress"], backend);
+        let pid = d.pid();
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        d.add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at tick_body");
+        faults.fail_exception_suspends(u32::MAX);
+        faults.fail_thread_freezes(u32::MAX);
+        d.resume().expect("resume");
+        expect_suspend_failure(d.wait(Some(STOP_TIMEOUT)), "the breakpoint's suspend");
+        let output = d.stdout().len();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(d.stdout().len(), output, "the unanswered thread ran user code");
+        let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
+        assert_eq!(counts.task.expect("task suspend count"), 0, "the task was suspended");
+        let threads: Vec<_> = counts
+            .threads
+            .expect("thread suspend counts")
+            .into_iter()
+            .map(|thread| thread.expect("thread suspend count"))
+            .collect();
+        assert!(
+            threads.len() == 1 && threads[0].suspend_count == 0,
+            "the thread was held although its freeze failed: {threads:?}"
+        );
+
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-9", &pid.0.to_string()])
+                .status()
+                .expect("SIGKILL")
+                .success()
+        );
+        assert!(
+            !harness::wait_until_gone(pid.0, Duration::from_secs(1)),
+            "SIGKILL ended a target whose exception is unanswered: the documented limit no longer holds"
+        );
+        faults.fail_thread_freezes(0);
+        assert!(
+            harness::wait_until_gone(pid.0, STOP_TIMEOUT),
+            "a retried freeze did not answer the exception, so SIGKILL never took effect"
+        );
+        faults.fail_exception_suspends(0);
+        assert_eq!(
+            d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
+            Some(StopEvent::Killed { signal: 9 })
+        );
+    });
+}
+
+/// After the loop gave up on `task_suspend` for a held client SIGSTOP (#198), a detach
+/// still completes its handshake once the task can be suspended again: the loop takes a
+/// real `task_suspend` for the private SIGSTOP instead of failing it with the give-up,
+/// so the handshake completes promptly and the target is released untraced and running.
+#[test]
+fn detach_after_a_suspend_give_up_completes_its_handshake()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        faults.set_suspend_retry_budget(SHORT_RETRY_BUDGET);
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+        faults.fail_exception_suspends(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-STOP", &pid.0.to_string()])
+                .status()
+                .expect("SIGSTOP")
+                .success()
+        );
+        expect_suspend_failure(
+            ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)),
+            "the client SIGSTOP's suspend",
+        );
+        expect_give_up(ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)));
+        assert_thread_held(pid);
+        let attempts = faults.exception_suspend_attempts();
+        faults.fail_exception_suspends(0);
+        // The backend is still running: dropping it detaches through the handshake.
+        let began = std::time::Instant::now();
+        drop(backend);
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(3), "detach took {took:?}");
+        // Without a suspend of its own the private SIGSTOP fails with the give-up, and
+        // only the fallback `PT_DETACH` releases the target.
+        assert!(
+            faults.exception_suspend_attempts() > attempts,
+            "the detach handshake's private SIGSTOP took no task_suspend after the give-up"
+        );
+        assert_runs(pid.0);
+    });
+}

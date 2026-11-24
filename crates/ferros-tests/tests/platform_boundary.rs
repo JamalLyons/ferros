@@ -190,6 +190,18 @@ fn mach_o_marker(line: &str) -> Option<&'static str>
         .or_else(|| MACH_O_WORD_STARTS.iter().copied().find(|token| starts_word(line, token)))
 }
 
+/// The Mach-O marker of `line` from the substring lists only, without the word rules
+/// (`LC_`, `nlist`) that also match ordinary words on other platforms.
+fn mach_o_parser_marker(line: &str) -> Option<&'static str>
+{
+    let lower = line.to_ascii_lowercase();
+    MACH_O_TEXT
+        .iter()
+        .copied()
+        .find(|token| lower.contains(token))
+        .or_else(|| MACH_O_CASED.iter().copied().find(|token| line.contains(token)))
+}
+
 /// The macOS runtime marker a source line contains, if any (comments included).
 fn macos_runtime_marker(line: &str) -> Option<&'static str>
 {
@@ -205,14 +217,13 @@ fn parser_marker(line: &str, markers: &[&'static str]) -> Option<&'static str>
     })
 }
 
-/// Platform backends use the `ferros-<platform>` package naming convention.
+/// Platform backend crates, today's and the planned ones. A new platform crate is added
+/// here; a new portable `ferros-*` crate is not a platform crate.
+const PLATFORM_CRATES: &[&str] = &["ferros-macos", "ferros-linux", "ferros-windows"];
+
 fn is_platform_crate(name: &str) -> bool
 {
-    name.starts_with("ferros-")
-        && !matches!(
-            name,
-            "ferros-core" | "ferros-mir" | "ferros-protocol" | "ferros-tests" | "ferros-ui" | "ferros-utils"
-        )
+    PLATFORM_CRATES.contains(&name)
 }
 
 fn packages(metadata: &Value) -> &[Value]
@@ -249,7 +260,8 @@ fn check_platform_edges(metadata: &Value) -> Vec<DependencyViolation<'_>>
             let name = package_name(dependency);
             let platform = is_platform_crate(name);
             let rule = match owner_name {
-                "ferros-core" if platform || OS_DEPENDENCIES.contains(&name) => "ferros-core must not depend on OS crates",
+                "ferros-core" if platform => "ferros-core must not depend on a platform crate",
+                "ferros-core" if OS_DEPENDENCIES.contains(&name) => "ferros-core must not depend on OS crates",
                 "ferros-core" if FORMAT_DEPENDENCIES.contains(&name) => {
                     "ferros-core must not depend on an object-file parser"
                 }
@@ -326,13 +338,20 @@ fn source_violation<'a>(
         }
         _ => {}
     }
-    if owner != "ferros-macos" {
+    if owner == "ferros-core" {
         if let Some(marker) = mach_o_marker(line) {
             return Some(("Mach-O knowledge belongs in ferros-macos", marker));
         }
         if let Some(marker) = macos_runtime_marker(line) {
             return Some(("macOS runtime knowledge belongs in ferros-macos", marker));
         }
+    } else if owner != "ferros-macos"
+        && let Some(marker) = mach_o_parser_marker(line)
+    {
+        // Another platform crate may name its own signal frame, locale variables and
+        // libc symbols, which share words with the macOS runtime and `LC_` rules; only
+        // Mach-O parsing is reserved to ferros-macos there.
+        return Some(("Mach-O parsing belongs in ferros-macos", marker));
     }
     if owner != "ferros-linux"
         && let Some(marker) = parser_marker(line, ELF_MARKERS)
@@ -406,7 +425,7 @@ fn workspace_boundary()
 {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent().and_then(Path::parent).expect("workspace root");
-    let output = Command::new(env!("CARGO"))
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| env!("CARGO").into()))
         .arg("metadata")
         .args(["--format-version", "1", "--no-deps"])
         .current_dir(root)
@@ -696,6 +715,53 @@ fn object_format_parsing_stays_with_its_platform()
             );
         }
     }
+}
+
+#[test]
+fn other_platforms_may_use_words_the_macos_rules_reserve_in_core()
+{
+    const LINES: &[&str] = &[
+        "let regs = &frame.uc_mcontext;",
+        "struct rt_sigframe;",
+        "cmd.env(\"LC_ALL\", \"C\");",
+        "extern \"C\" { fn nlist(); }",
+    ];
+    let cli_platform_names = BTreeSet::new();
+    let path = Path::new("signal.rs");
+    for line in LINES {
+        assert_eq!(
+            source_violation("ferros-linux", path, line, &cli_platform_names),
+            None,
+            "ferros-linux: {line}"
+        );
+        assert!(
+            source_violation("ferros-core", path, line, &cli_platform_names).is_some(),
+            "ferros-core: {line}"
+        );
+    }
+}
+
+#[test]
+fn portable_crates_are_not_platform_crates()
+{
+    let metadata = serde_json::json!({
+        "packages": [{
+            "name": "ferros-core",
+            "manifest_path": "crates/ferros-core/Cargo.toml",
+            "dependencies": [{ "name": "ferros-dwarf", "rename": null, "optional": false, "target": null, "kind": null }]
+        }]
+    });
+    assert!(check_platform_edges(&metadata).is_empty());
+    let metadata = serde_json::json!({
+        "packages": [{
+            "name": "ferros-core",
+            "manifest_path": "crates/ferros-core/Cargo.toml",
+            "dependencies": [{ "name": "ferros-linux", "rename": null, "optional": false, "target": null, "kind": null }]
+        }]
+    });
+    let violations = check_platform_edges(&metadata);
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].rule, "ferros-core must not depend on a platform crate");
 }
 
 #[test]

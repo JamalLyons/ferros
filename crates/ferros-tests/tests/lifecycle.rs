@@ -721,6 +721,11 @@ fn process_state(pid: u32) -> String
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+/// How long a released `--progress` fixture may print nothing before
+/// [`Grandchild::ran_to_completion`] treats it as stuck. One tick takes about 10 ms
+/// unloaded and about 110 ms under a background scheduling clamp.
+const RELEASE_STALL: Duration = Duration::from_secs(10);
+
 /// Removes captured output even if spawning or PID discovery panics.
 struct ReleaseOutput(std::path::PathBuf);
 
@@ -809,11 +814,20 @@ impl Grandchild
         snapshot
     }
 
-    /// Whether the fixture (and so the shell) exited by itself within `timeout`, with
-    /// status 0.
-    fn ran_to_completion(&mut self, timeout: Duration) -> Option<std::process::ExitStatus>
+    /// The fixture's exit status once it (and so the shell) exits by itself, or `None`
+    /// if its `--progress` output stops growing for `stall` or it is still running after
+    /// `cap`.
+    ///
+    /// A stalled fixture is the failure these tests look for: one left stopped prints
+    /// nothing more. A plain deadline is not enough (#206): under a background scheduling
+    /// clamp, `loop_counter`'s 10 ms sleeps take 100 ms or more, so a released process
+    /// that runs normally can still miss a deadline sized for an unloaded machine.
+    fn ran_to_completion(&mut self, stall: Duration, cap: Duration) -> Option<std::process::ExitStatus>
     {
-        let deadline = Instant::now() + timeout;
+        let output_len = || fs::metadata(&self.output_path.0).map_or(0, |meta| meta.len());
+        let start = Instant::now();
+        let mut last_len = output_len();
+        let mut last_progress = start;
         loop {
             if let Some(status) = self
                 .shell
@@ -822,7 +836,13 @@ impl Grandchild
             {
                 return Some(status);
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            let len = output_len();
+            if len != last_len {
+                last_len = len;
+                last_progress = now;
+            }
+            if now.duration_since(last_progress) >= stall || now.duration_since(start) >= cap {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -858,7 +878,7 @@ impl Drop for Grandchild
 fn released_processes_run_to_completion()
 {
     const SHORT_LOOP: &str = "100";
-    const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+    const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
     /// How the attached process is released.
     const CASES: &[&str] = &[
         "detach after inspecting",
@@ -869,7 +889,7 @@ fn released_processes_run_to_completion()
         "detach with held signal",
     ];
 
-    harness::run_with_timeout(Duration::from_secs(120), |t| {
+    harness::run_with_timeout(Duration::from_secs(420), |t| {
         for &case in CASES {
             let mut target = Grandchild::spawn(&[SHORT_LOOP, "--progress"]);
             let pid = ProcessId::from(target.pid);
@@ -921,7 +941,7 @@ fn released_processes_run_to_completion()
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let status = target.ran_to_completion(EXIT_TIMEOUT).unwrap_or_else(|| {
+            let status = target.ran_to_completion(RELEASE_STALL, EXIT_TIMEOUT).unwrap_or_else(|| {
                 panic!(
                     "{case}: no completion after {:?}; {}",
                     released.elapsed(),
@@ -955,7 +975,7 @@ fn released_processes_run_to_completion()
 #[test]
 fn detach_continues_a_private_stop_that_lands_after_its_wait()
 {
-    harness::run_with_timeout(Duration::from_secs(60), |_| {
+    harness::run_with_timeout(Duration::from_secs(90), |_| {
         let mut target = Grandchild::spawn(&["100", "--progress"]);
         let mut backend = MacOSBackend::new().expect("backend");
         backend.attach(ProcessId::from(target.pid)).expect("attach");
@@ -971,7 +991,7 @@ fn detach_continues_a_private_stop_that_lands_after_its_wait()
             std::thread::sleep(Duration::from_millis(50));
         }
         let status = target
-            .ran_to_completion(Duration::from_secs(15))
+            .ran_to_completion(RELEASE_STALL, Duration::from_secs(60))
             .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
         assert!(status.success(), "the released process exited with {status}");
     });
@@ -982,7 +1002,7 @@ fn detach_continues_a_private_stop_that_lands_after_its_wait()
 #[test]
 fn detach_reports_a_private_stop_it_never_saw()
 {
-    harness::run_with_timeout(Duration::from_secs(60), |_| {
+    harness::run_with_timeout(Duration::from_secs(180), |_| {
         // Long enough to outlive the whole bounded wait.
         let mut target = Grandchild::spawn(&["600", "--progress"]);
         let mut backend = MacOSBackend::new().expect("backend");
@@ -994,8 +1014,9 @@ fn detach_reports_a_private_stop_it_never_saw()
             "{error:?}"
         );
         // The stop did land, so the late SIGCONT still released the process.
+        // Throttled, 600 ticks take over a minute (#206).
         let status = target
-            .ran_to_completion(Duration::from_secs(30))
+            .ran_to_completion(RELEASE_STALL, Duration::from_secs(150))
             .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
         assert!(status.success(), "the released process exited with {status}");
     });

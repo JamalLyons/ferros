@@ -300,6 +300,22 @@ pub struct ReplyFaultInjector
     exception_suspend_attempts: Arc<std::sync::atomic::AtomicU32>,
     /// How many of the next [`freeze_thread`]s fail without calling the kernel. Tests only (#198).
     thread_freeze: Arc<std::sync::atomic::AtomicU32>,
+    /// 0 idle, 1 armed, 2 paused before a suspend retry, 3 released by a detach that
+    /// armed its handshake, 4 the loop holds the shared lock for that retry. Tests only (#198).
+    detach_stop_hold: Arc<AtomicU8>,
+    /// Receives whether the handshake still awaited its private stop when the detach
+    /// held by [`Self::send_next_detach_stop_after_suspend_retry`] sent it. Tests only (#198).
+    detach_stop_probe: Arc<Mutex<Option<mpsc::Sender<bool>>>>,
+    /// Every exception `task_suspend` for a new stop and every client-signal suppression
+    /// fail until the next detach arms its handshake. Tests only (#198).
+    fail_until_detach: Arc<AtomicBool>,
+    /// Queue a real exception on the port at the next teardown. Tests only (#198, F6).
+    teardown_exception: Arc<AtomicBool>,
+    /// Set once that exception is queued on the port, unanswered. Tests only (#198).
+    teardown_exception_queued: Arc<AtomicBool>,
+    /// 0 idle, 1 requested by a teardown, 2 parked at the top of a loop pass, 3 released.
+    /// Tests only (#198).
+    loop_park: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -585,6 +601,9 @@ impl ReplyFaultInjector
     /// Consume one injected `task_suspend` failure.
     fn take_exception_suspend_failure(&self) -> bool
     {
+        if self.fail_until_detach.load(Ordering::SeqCst) {
+            return true;
+        }
         self.exception_suspend
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok()
@@ -614,10 +633,94 @@ impl ReplyFaultInjector
         self.suspend_retry_hold.load(Ordering::SeqCst) == 2
     }
 
-    /// If `retry` and a test armed the hold, pause until a detach releases it (or five
+    /// Pause the exception loop before its next retried `task_suspend` of a batch held
+    /// behind a failed one, and make the next detach send its private SIGSTOP late (#198,
+    /// G1 and G3): only after it has armed its handshake and balanced the backend's
+    /// suspends, then released the loop and waited until the loop has finished that
+    /// retry under the shared lock. So the handshake arms after the loop checked for one
+    /// at the top of its pass, and the private SIGSTOP's exception cannot arrive before
+    /// the retry's suspend. The receiver gets whether the handshake still awaited its
+    /// private stop when the detach sent it: `false` means an exception received earlier
+    /// satisfied it. Tests only.
+    pub fn send_next_detach_stop_after_suspend_retry(&self) -> mpsc::Receiver<bool>
+    {
+        let (probe, result) = mpsc::channel();
+        *self.detach_stop_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+        self.detach_stop_hold.store(1, Ordering::SeqCst);
+        result
+    }
+
+    /// Whether the exception loop is paused by
+    /// [`Self::send_next_detach_stop_after_suspend_retry`].
+    #[must_use]
+    pub fn detach_stop_hold_is_paused(&self) -> bool
+    {
+        self.detach_stop_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Whether this detach defers its private SIGSTOP for
+    /// [`Self::send_next_detach_stop_after_suspend_retry`]: only while the loop is paused
+    /// by it. A hook the loop never reached is disarmed, so it cannot pause a later retry.
+    pub(crate) fn defer_detach_stop(&self) -> bool
+    {
+        if self
+            .detach_stop_hold
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return false;
+        }
+        self.detach_stop_hold.load(Ordering::SeqCst) == 2
+    }
+
+    /// Release the retry paused by [`Self::send_next_detach_stop_after_suspend_retry`] and
+    /// wait (bounded) until the loop holds the shared lock for it. The detach then takes
+    /// that lock, so it sends its private SIGSTOP after the loop's pass.
+    pub(crate) fn release_suspend_retry_before_detach_stop(&self)
+    {
+        if self
+            .detach_stop_hold
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.detach_stop_hold.load(Ordering::SeqCst) == 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.detach_stop_hold.store(0, Ordering::SeqCst);
+    }
+
+    /// Detach sends its private SIGSTOP now, under the shared lock: report to an armed
+    /// probe whether the handshake still awaits its private stop.
+    pub(crate) fn report_detach_stop_awaited(&self, awaited: bool)
+    {
+        let probe = self.detach_stop_probe.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(probe) = probe {
+            let _ = probe.send(awaited);
+        }
+    }
+
+    /// If `retry` and a test armed a hold, pause until a detach releases it (or five
     /// seconds pass).
     fn pause_suspend_retry(&self, retry: bool)
     {
+        if retry
+            && self
+                .detach_stop_hold
+                .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.detach_stop_hold.load(Ordering::SeqCst) == 2 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // No detach released it in time: disarm, so a late detach does not wait.
+            let _ = self
+                .detach_stop_hold
+                .compare_exchange(2, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
         if !retry
             || self
                 .suspend_retry_hold
@@ -638,6 +741,9 @@ impl ReplyFaultInjector
         let _ = self
             .suspend_retry_hold
             .compare_exchange(3, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self
+            .detach_stop_hold
+            .compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Detach has sent its private SIGSTOP: release a paused suspend retry and wait
@@ -657,9 +763,126 @@ impl ReplyFaultInjector
         }
     }
 
+    /// Make every exception-loop `task_suspend` for a new stop and every suppression of
+    /// a client signal before its exception reply (`PT_THUPDATE(0)`) fail without calling
+    /// the kernel, as [`Self::fail_exception_suspends`] and
+    /// [`Self::fail_signal_suppressions`] do, until the next detach arms its private
+    /// handshake; from then on both succeed. A client signal then stays held with its
+    /// reply outstanding until the handshake begins. Tests only (#198).
+    pub fn fail_suspends_and_suppressions_until_detach(&self)
+    {
+        self.fail_until_detach.store(true, Ordering::SeqCst);
+    }
+
+    /// Detach arms its handshake: end [`Self::fail_suspends_and_suppressions_until_detach`].
+    /// Called under the shared lock, so nothing the loop does after the arming fails.
+    pub(crate) fn detach_handshake_armed(&self)
+    {
+        self.fail_until_detach.store(false, Ordering::SeqCst);
+    }
+
+    /// At the next teardown of the exception handler, before the target's exception
+    /// ports are restored, park the exception loop, make a running target thread raise a
+    /// real single-step `EXC_BREAKPOINT`, and wait until it waits in that exception, its
+    /// message queued on the port and unreceived; then shut the loop down (#198, F6). The
+    /// loop must answer it before the port is destroyed: a destroyed exception message
+    /// is an unhandled exception, and the kernel turns this one into a SIGTRAP that kills
+    /// the released target. Needs a target thread that runs without waiting in the kernel,
+    /// such as `hot_loop`'s. Tests only.
+    pub fn queue_exception_before_next_teardown(&self)
+    {
+        self.teardown_exception.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::queue_exception_before_next_teardown`] queued its exception.
+    #[must_use]
+    pub fn exception_was_queued_before_teardown(&self) -> bool
+    {
+        self.teardown_exception_queued.load(Ordering::SeqCst)
+    }
+
+    /// The exception loop's pass starts here: park while a teardown hook asks for it
+    /// (bounded, five seconds).
+    fn park_loop_for_teardown(&self)
+    {
+        if self
+            .loop_park
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.loop_park.load(Ordering::SeqCst) == 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.loop_park.store(0, Ordering::SeqCst);
+    }
+
+    /// The teardown half of [`Self::queue_exception_before_next_teardown`]: park the loop
+    /// running on `exception_port`, then queue the exception from a running thread of
+    /// `task`. Returns whether the loop is parked, for [`Self::unpark_loop`].
+    #[cfg(target_os = "macos")]
+    pub(crate) fn queue_teardown_exception(&self, task: mach_port_t, exception_port: mach_port_t) -> bool
+    {
+        if task == MACH_PORT_NULL || !self.teardown_exception.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.loop_park.store(1, Ordering::SeqCst);
+        wake_loop(exception_port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.loop_park.load(Ordering::SeqCst) != 2 {
+            if std::time::Instant::now() >= deadline {
+                self.loop_park.store(0, Ordering::SeqCst);
+                error!("teardown hook: the exception loop did not park");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Ok(threads) = crate::threads::ThreadManager::refresh_thread_list(task, &[]) else {
+            error!("teardown hook: cannot list the target's threads");
+            return true;
+        };
+        let waiting =
+            |thread: thread_act_t| crate::diagnostics::thread_is_waiting(ThreadId::from(u64::from(thread))).unwrap_or(true);
+        if let Some(&thread) = threads.iter().find(|&&thread| !waiting(thread)) {
+            // SAFETY: refresh_thread_list retained this tracee thread right; the suspend
+            // is balanced at once, after the single-step bit is set.
+            let set = unsafe {
+                crate::ffi::thread_suspend(thread) == KERN_SUCCESS && {
+                    let set = crate::registers::set_single_step(thread, true).is_ok();
+                    crate::ffi::thread_resume(thread);
+                    set
+                }
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while set && !waiting(thread) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The thread waits in its exception; give the message a moment to queue.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.teardown_exception_queued.store(set && waiting(thread), Ordering::SeqCst);
+        } else {
+            error!("teardown hook: no running target thread");
+        }
+        for thread in threads {
+            deallocate_right(thread);
+        }
+        true
+    }
+
+    /// End the park of [`Self::queue_teardown_exception`].
+    pub(crate) fn unpark_loop(&self)
+    {
+        let _ = self.loop_park.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     /// Consume one injected signal-suppression failure.
     fn take_signal_suppression_failure(&self) -> bool
     {
+        if self.fail_until_detach.load(Ordering::SeqCst) {
+            return true;
+        }
         self.signal_suppression
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
             .is_ok()
@@ -1174,6 +1397,7 @@ pub(crate) fn run_exception_loop(
     // Threads of that batch held with a `thread_suspend` (and a right) of their own.
     let mut frozen: Vec<thread_act_t> = Vec::new();
     loop {
+        faults.park_loop_for_teardown();
         let (pending, handshake, handed_over, keeps_records) = {
             let state = lock_shared(&shared);
             (

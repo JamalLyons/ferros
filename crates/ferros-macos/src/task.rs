@@ -742,6 +742,9 @@ impl MacOSBackend
     /// threads can continue once the task is resumed. Queued stop events are discarded.
     fn stop_exception_handler(&mut self, restore: bool) -> BackendResult<()>
     {
+        // Test hook (#198): a real exception queued on the port just before teardown.
+        let parked =
+            self.exception_thread.is_some() && self.reply_faults.queue_teardown_exception(self.task, self.exception_port);
         let mut restored = Ok(());
         if let Some(saved) = self.saved_exception_ports.take() {
             if restore && self.task != MACH_PORT_NULL {
@@ -763,6 +766,9 @@ impl MacOSBackend
             && tx.send(ExceptionLoopCommand::Shutdown).is_ok()
         {
             exception::wake_loop(self.exception_port);
+        }
+        if parked {
+            self.reply_faults.unpark_loop();
         }
         if holds_exception && let Some(handle) = self.exception_thread.take() {
             let _ = handle.join();
@@ -1321,6 +1327,7 @@ impl MacOSBackend
                 return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
             }
             shared.arm_handshake(ready);
+            self.reply_faults.detach_handshake_armed();
             shared.pending_exception
         };
         if pending {
@@ -1352,22 +1359,20 @@ impl MacOSBackend
             );
         }
         while self.try_next_event().is_some() {}
-        {
-            let shared = lock_shared(&self.exception_state);
-            if shared.dead {
-                return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
-            }
-            self.reply_faults.sample_detach_suspend_count();
-            // SAFETY: the shared lock excludes the watcher's reaping of this pid.
-            if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
-                return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
-            }
-            *private_stop_sent = true;
+        // Test hook (#198): send the private SIGSTOP only after a paused suspend retry of
+        // the loop has run, so its exception cannot arrive before that retry's suspend.
+        let defer_stop = self.reply_faults.defer_detach_stop();
+        if !defer_stop {
+            self.send_private_stop(private_stop_sent)?;
         }
         // Backend state can still be Running while the exception loop already owns
         // a pending stop. Release physical holds regardless of the last delivered event.
         self.release_suspends();
         self.reply_faults.release_suspend_retry_for_detach();
+        if defer_stop {
+            self.reply_faults.release_suspend_retry_before_detach_stop();
+            self.send_private_stop(private_stop_sent)?;
+        }
         // A failed task suspend still holds the private SIGSTOP (#191): the fallback
         // PT_DETACH of `detach_target` finds the tracee waiting in its exception.
         wait.recv_timeout(EXCEPTION_REPLY_TIMEOUT).map_err(|_| BackendError::Os {
@@ -1383,6 +1388,23 @@ impl MacOSBackend
         // PT_DETACH needs the tracee waiting in its signal exception (EBUSY otherwise),
         // so it comes before the reply.
         self.detach_trace()
+    }
+
+    /// Raise detach's private SIGSTOP, unless the process has exited.
+    fn send_private_stop(&self, private_stop_sent: &mut bool) -> BackendResult<()>
+    {
+        let shared = lock_shared(&self.exception_state);
+        if shared.dead {
+            return Err(BackendError::NotFound(format!("process {} has exited", self.pid.0)));
+        }
+        self.reply_faults.sample_detach_suspend_count();
+        self.reply_faults.report_detach_stop_awaited(shared.internal_stop.is_some());
+        // SAFETY: the shared lock excludes the watcher's reaping of this pid.
+        if unsafe { libc::kill(self.pid.0 as libc::pid_t, libc::SIGSTOP) } != 0 {
+            return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
+        }
+        *private_stop_sent = true;
+        Ok(())
     }
 
     /// End tracing and account for the kernel resume, including fallback cleanup.

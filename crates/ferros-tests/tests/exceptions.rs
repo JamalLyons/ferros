@@ -1075,3 +1075,159 @@ fn detach_after_a_suspend_give_up_completes_its_handshake()
         assert_runs(pid.0);
     });
 }
+
+/// Wait (bounded) until the exception loop is paused by
+/// `send_next_detach_stop_after_suspend_retry`.
+fn wait_for_detach_stop_hold(faults: &ferros_macos::exception::ReplyFaultInjector)
+{
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    while !faults.detach_stop_hold_is_paused() {
+        assert!(std::time::Instant::now() < deadline, "the loop did not retry its suspend");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A detach that arms its handshake after the exception loop checked for one, but before
+/// it took the lock for its suspend retry of a held client batch, still completes
+/// (#198, G1): the loop sees the handshake under that lock and takes no fresh task
+/// suspend, so the private SIGSTOP can arrive. Here the detach sends that SIGSTOP only
+/// once the loop has finished the retry, so its exception cannot be queued before a
+/// suspend the retry takes. A fresh suspend would hold the task, the thread could not
+/// take the SIGSTOP, and the detach would time out after 5 s.
+#[test]
+fn detach_armed_before_a_suspend_retry_takes_no_fresh_suspend()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+        faults.fail_exception_suspends(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-STOP", &pid.0.to_string()])
+                .status()
+                .expect("SIGSTOP")
+                .success()
+        );
+        expect_suspend_failure(
+            ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)),
+            "the client SIGSTOP's suspend",
+        );
+        let awaited = faults.send_next_detach_stop_after_suspend_retry();
+        wait_for_detach_stop_hold(&faults);
+        // From the paused retry on, suspends succeed: without the recheck under the lock,
+        // that retry takes a real one for the held client SIGSTOP.
+        faults.fail_exception_suspends(0);
+        let attempts = faults.exception_suspend_attempts();
+        // The backend is still running: dropping it detaches through the handshake.
+        let began = std::time::Instant::now();
+        drop(backend);
+        let took = began.elapsed();
+        assert_eq!(
+            awaited.try_recv(),
+            Ok(true),
+            "the detach did not send its private SIGSTOP late, or the handshake was already satisfied"
+        );
+        assert_eq!(
+            faults.exception_suspend_attempts(),
+            attempts + 1,
+            "the held client batch took a task_suspend during the handshake, or the private SIGSTOP none"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "detach took {took:?}: its private SIGSTOP was held back by a fresh suspend"
+        );
+        assert_runs(pid.0);
+    });
+}
+
+/// A client SIGSTOP whose suppression failed while its `task_suspend` failed keeps its
+/// reply outstanding (#191), but it was received before the detach armed its handshake,
+/// so it is not that handshake's private stop (#198, G3). The detach sends its own
+/// SIGSTOP only after the loop has processed the held SIGSTOP under the handshake: the
+/// handshake must still be waiting then, receive its real private stop, and release the
+/// target untraced and running. Taking the client SIGSTOP for the private one would
+/// satisfy the handshake before the detach raised its own, and the detach's real SIGSTOP
+/// would then land after `PT_DETACH`.
+#[test]
+fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+        // Suspends and suppressions fail until the detach arms its handshake, so the
+        // client SIGSTOP is held with its reply outstanding until then.
+        faults.fail_suspends_and_suppressions_until_detach();
+        faults.fail_thread_freezes(u32::MAX);
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-STOP", &pid.0.to_string()])
+                .status()
+                .expect("SIGSTOP")
+                .success()
+        );
+        match ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)) {
+            Err(err) => assert!(
+                err.to_string().contains("task_suspend") || err.to_string().contains("suppress"),
+                "first error: {err}"
+            ),
+            Ok(event) => panic!("expected the suspend or suppression failure from wait, got {event:?}"),
+        }
+        let awaited = faults.send_next_detach_stop_after_suspend_retry();
+        wait_for_detach_stop_hold(&faults);
+        faults.fail_thread_freezes(0);
+        let began = std::time::Instant::now();
+        drop(backend);
+        let took = began.elapsed();
+        assert_eq!(
+            awaited.try_recv(),
+            Ok(true),
+            "the held client SIGSTOP satisfied the detach handshake before its private SIGSTOP was sent"
+        );
+        assert!(took < Duration::from_secs(3), "detach took {took:?}");
+        assert_runs(pid.0);
+    });
+}
+
+/// An exception raised just before the exception handler is torn down waits queued on
+/// the exception port (#198, F6). The detach joins the loop, which holds the private
+/// stop's record, and the loop answers what is queued before the port is destroyed. A
+/// destroyed exception message is an unhandled exception: the kernel would turn this
+/// single-step trap into a SIGTRAP and kill the released target. The hook parks the loop,
+/// makes a running thread of `hot_loop` take a real single-step exception, then lets the
+/// teardown go on.
+#[test]
+fn exception_queued_just_before_detach_teardown_is_answered()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let mut target = t.spawn(&fixture!("hot_loop"), &["4"]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+        let faults = backend.reply_fault_injector();
+        ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+        faults.queue_exception_before_next_teardown();
+        ferros_core::Backend::detach(&mut backend).expect("detach");
+        assert!(
+            faults.exception_was_queued_before_teardown(),
+            "the hook did not queue a real exception before teardown"
+        );
+        drop(backend);
+        std::thread::sleep(Duration::from_millis(200));
+        let status = target.try_wait().expect("target status");
+        assert!(
+            status.is_none(),
+            "the released target ended ({status:?}): the exception queued before teardown was destroyed unhandled"
+        );
+        assert_runs(pid.0);
+    });
+}

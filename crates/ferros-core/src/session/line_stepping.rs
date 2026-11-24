@@ -63,6 +63,9 @@ impl Session
     ///   there (reported as `SingleStep`, possibly at code without a source line).
     /// - Inlined callees are stepped over, never entered.
     ///
+    /// A step that passes validation discards the selected thread's held signal, even
+    /// when a queued stop defers the step. Peers keep their held signals.
+    ///
     /// # Errors
     ///
     /// As for [`step_instruction`](Self::step_instruction), plus errors reading debug
@@ -107,7 +110,7 @@ impl Session
     {
         self.require_stopped()?;
         let thread = self.selected_or_error()?;
-        self.remember_last_signal();
+        self.carry_last_signal();
         self.interrupt_requested = false;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             // The session is stopped, so a queued single-step completion of this thread
@@ -117,6 +120,7 @@ impl Session
             // (`run_line_to`, `step_instruction`). Anything else is reported first.
             let stale_step = event == (StopEvent::SingleStep { thread });
             if !stale_step && !self.stale_trap(None, &event)? {
+                self.suppress_thread_signal(thread);
                 self.deferred = Some(event);
                 self.state = SessionState::Running;
                 self.last_stop = None;
@@ -191,6 +195,7 @@ impl Session
 
     fn run_line_to(&mut self, plan: &mut LinePlan, address: Address, sp: Address) -> Result<()>
     {
+        self.suppress_thread_signal(plan.thread);
         let arm_exits = plan.exits.is_none();
         loop {
             // Stops can still be queued here (#148): `start_line_step` drains only one event

@@ -101,7 +101,7 @@ impl Session
             .map(|entry| StepSite { thread, entry }))
     }
 
-    /// A signal is delivered or suppressed only when its thread starts running.
+    /// A successful resume consumes held signals for the threads it starts.
     fn resume_backend(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         self.backend.resume(request)?;
@@ -393,12 +393,10 @@ impl Session
     }
 
     /// Start the next step of an internal step-over `plan`. If a stop arrived first, the
-    /// backend runs nothing: the plan is given up as in `abandon` (no step was started, so
-    /// no completion can follow) and that stop is returned, unless it is one
-    /// `pending_event` drops (see `refusal`): the step is then started again, after
-    /// draining the rest (#158). When no stop comes in time (the target died), `None` as
-    /// for a started step, with the plan given up the same way: a later `wait` takes the
-    /// terminal event (#155).
+    /// backend runs nothing. A reportable stop ends the plan and is returned. When
+    /// `pending_event` drops the stop (see `refusal`), retry after draining the queue
+    /// (#158). If the target died and no stop comes in time, drop the plan and return
+    /// `None`. A later `wait` takes the terminal event (#155).
     fn continue_plan(&mut self, plan: StepPlan) -> Result<Option<StopEvent>>
     {
         // A refused start discards its copy of the plan. A retry still needs that
@@ -427,8 +425,9 @@ impl Session
     /// dropped as for `resume`.
     /// At an enabled software breakpoint its original instruction is executed and the
     /// trap is restored before the stop is returned. Completion is reported as
-    /// [`StopEvent::SingleStep`]; other events are reported normally. A held signal
-    /// of this thread is discarded; signals of suspended threads remain held.
+    /// [`StopEvent::SingleStep`]. Other events are reported normally. Once the call
+    /// validates the stopped state and thread, it discards that thread's held signal
+    /// even if the step is deferred or fails to start. Peers keep their held signals.
     ///
     /// # Errors
     ///
@@ -443,7 +442,7 @@ impl Session
         if !self.threads.contains(&thread) {
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
-        self.remember_last_signal();
+        self.suppress_thread_signal(thread);
         self.interrupt_requested = false;
         // An instruction step reports a handler's return like any other stop.
         self.handler_return = None;

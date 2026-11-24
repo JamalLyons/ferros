@@ -128,6 +128,8 @@ pub struct Session
     threads: Vec<ThreadId>,
     selected: Option<ThreadId>,
     last_stop: Option<StopEvent>,
+    /// Whether the last reported signal has been carried or discarded.
+    last_signal_taken: bool,
     /// A stop event drained from the backend by `resume`, returned by the next `wait`.
     deferred: Option<StopEvent>,
     step_plan: Option<stepping::StepPlan>,
@@ -145,8 +147,8 @@ pub struct Session
     /// Thread of an internal step that was abandoned because another event arrived
     /// first: its `SingleStep`, if still queued in the backend, is dropped, not reported.
     stale_step: Option<ThreadId>,
-    /// Signals a `resume_with_signal` meant to pass on the final continue of a step-over
-    /// sequence that another event cut short; the next `resume_with_signal` passes them.
+    /// Latest held signals carried over from reported stops. They remain available
+    /// until their threads resume, a user request suppresses them, or their threads exit.
     carried_signals: Vec<(ThreadId, i32)>,
     /// A failure to put back what a resume the backend refused had changed, kept until the
     /// refused stop is taken (see `Session::refusal`).
@@ -327,6 +329,7 @@ impl Session
             threads: Vec::new(),
             selected: None,
             last_stop: None,
+            last_signal_taken: false,
             deferred: None,
             step_plan: None,
             line_plan: None,
@@ -453,13 +456,25 @@ impl Session
     fn sync_threads(&mut self, preferred: Option<ThreadId>)
     {
         match self.backend.threads() {
-            Ok(threads) => self.threads = threads,
+            Ok(threads) => self.update_threads(threads),
             Err(error) => {
                 tracing::debug!("could not list threads after a stop: {error}");
                 self.threads = preferred.into_iter().collect();
             }
         }
         self.fix_selection(preferred);
+    }
+
+    /// Only a successful thread listing can establish that a held signal's thread exited.
+    fn update_threads(&mut self, threads: Vec<ThreadId>)
+    {
+        self.carried_signals.retain(|(thread, _)| threads.contains(thread));
+        if let Some(StopEvent::Signal { thread, .. }) = self.last_stop
+            && !threads.contains(&thread)
+        {
+            self.last_signal_taken = true;
+        }
+        self.threads = threads;
     }
 
     fn fix_selection(&mut self, preferred: Option<ThreadId>)
@@ -488,6 +503,7 @@ impl Session
         self.deferred_error = None;
         self.stale_step = None;
         self.carried_signals.clear();
+        self.last_signal_taken = false;
         self.refusal_cleanup = None;
         self.detach_intent = None;
         self.breakpoints.drain();
@@ -510,7 +526,8 @@ impl Session
     pub fn threads(&mut self) -> Result<Vec<ThreadId>>
     {
         self.require_stopped()?;
-        self.threads = self.backend.threads()?;
+        let threads = self.backend.threads()?;
+        self.update_threads(threads);
         self.fix_selection(None);
         Ok(self.threads.clone())
     }

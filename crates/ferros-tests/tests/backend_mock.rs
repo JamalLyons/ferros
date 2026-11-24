@@ -1234,16 +1234,15 @@ fn refused_step_over_keeps_a_stopped_handlers_rendezvous()
     assert_eq!(mock.script_len(), 0);
 }
 
-/// #150 review: an instruction step that fails to start ran nothing, so the stepping
-/// thread's carried signal is still held and the next `resume_with_signal` passes it.
+/// A validated instruction step discards its thread's carried signal even if the
+/// backend fails to start the step. A suspended peer's signal remains held.
 #[test]
-fn failed_step_instruction_keeps_the_threads_carried_signal()
+fn failed_step_instruction_drops_only_the_stepping_threads_signal()
 {
-    let mock = MockBackend::new().with_thread(THREAD, arm64_registers()).with_region(
-        Address::new(0x1_0000_0000),
-        "r-x",
-        vec![0x1F; 64],
-    );
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers())
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
     let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let signal = StopEvent::Signal {
@@ -1254,10 +1253,14 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
     session.resume().expect("run to the signal");
     assert_eq!(session.wait(None).expect("wait"), Some(signal));
     // The signal is carried: a late stop refuses the resume that would pass it.
-    let late = StopEvent::Interrupted { thread: Some(THREAD) };
+    let late = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 6,
+    };
     mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
     session.resume_with_signal().expect("a stop raced the resume");
     assert_eq!(session.wait(None).expect("wait"), Some(late));
+    let _ = mock.take_calls();
 
     mock.fail_next(
         MockCallKind::Resume,
@@ -1266,13 +1269,19 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
             message: "step failed".into(),
         },
     );
-    assert!(session.step_instruction(THREAD).is_err());
+    assert!(matches!(
+        session.step_instruction(THREAD),
+        Err(ferros_core::DebuggerError::Backend(BackendError::Os { code: 5, .. }))
+    ));
     assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
 
-    let _ = mock.take_calls();
     mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
-    session.resume_with_signal().expect("pass the carried signal");
-    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all().with_signal(THREAD, 30)]);
+    session.resume_with_signal().expect("pass the suspended peer's signal");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+    );
 }
 
 /// The thread whose signal handler stops in the `handler_stopped_*` tests.
@@ -3263,20 +3272,18 @@ fn invalid_second_resume_keeps_held_signals_during_a_deferred_stop()
 }
 
 #[test]
-fn failed_plain_resume_keeps_held_signals()
+fn failed_plain_resume_drops_held_signals()
 {
     let (mock, mut session, second) = defer_simultaneous_signal_stops();
-    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    assert_eq!(session.wait(None).expect("wait"), Some(second.clone()));
     mock.fail_next(MockCallKind::Resume, BackendError::Unsupported("resume failed".into()));
     assert!(session.resume().is_err());
+    assert_eq!(session.last_stop(), Some(&second));
     assert_eq!(mock.state(), MockState::Stopped);
     assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
 
-    session.resume_with_signal().expect("deliver both held signals");
-    let both = ResumeRequest::continue_all()
-        .with_signal(THREAD, 5)
-        .with_signal(SIGNAL_THREAD, 6);
-    assert_eq!(resumes(&mock), vec![both]);
+    session.resume_with_signal().expect("continue after suppression");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
 }
 
 #[test]
@@ -3370,4 +3377,130 @@ fn deferred_plain_resume_suppresses_signals_when_the_handler_continue_runs()
 
     session.resume_with_signal().expect("continue after suppression");
     assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+/// Stop on the first signal, leaving the second queued in the backend.
+fn queued_signal_stops() -> (MockBackend, Session, StopEvent)
+{
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers());
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let first = StopEvent::Signal {
+        thread: THREAD,
+        signal: 5,
+    };
+    let second = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 6,
+    };
+    mock.script_simultaneous(vec![MockStop::new(first.clone()), MockStop::new(second.clone())]);
+    session.resume().expect("run to both signal stops");
+    assert_eq!(session.wait(None).expect("wait"), Some(first));
+    let _ = mock.take_calls();
+    (mock, session, second)
+}
+
+#[test]
+fn deferred_plain_resume_drops_the_reported_signal()
+{
+    let (mock, mut session, second) = queued_signal_stops();
+    session.resume().expect("defer for the second signal");
+    assert!(resumes(&mock).is_empty(), "the deferred resume ran nothing");
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+    session.resume_with_signal().expect("deliver the second signal");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+    );
+}
+
+#[test]
+fn plain_resume_drops_the_suspended_peers_signal_before_step_over()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at the first thread's pc");
+    let interrupted = StopEvent::Interrupted { thread: Some(THREAD) };
+    mock.script(
+        MockStop::new(interrupted.clone())
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    session.resume().expect("start the step-over");
+    assert_eq!(session.wait(None).expect("wait"), Some(interrupted));
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
+
+    session.resume_with_signal().expect("continue after suppression");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+#[test]
+fn deferred_steps_drop_the_selected_threads_signal()
+{
+    let steps: [fn(&mut Session) -> ferros_core::Result<()>; 4] = [
+        |session| session.step_instruction(THREAD),
+        Session::step_over,
+        Session::step_into,
+        Session::step_out,
+    ];
+    for step in steps {
+        let (mock, mut session, second) = queued_signal_stops();
+        step(&mut session).expect("defer the step for the second signal");
+        assert!(resumes(&mock).is_empty(), "the deferred step ran nothing");
+        assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+        session.resume_with_signal().expect("deliver the peer's signal");
+        assert_eq!(
+            resumes(&mock),
+            vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+        );
+    }
+}
+
+#[test]
+fn forwarding_discards_the_signal_of_a_departed_thread()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at the first thread's pc");
+    let stop = StopEvent::Interrupted { thread: Some(THREAD) };
+    mock.script(
+        MockStop::new(stop.clone())
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .remove_thread(SIGNAL_THREAD),
+    );
+    session.resume_with_signal().expect("start the first thread's handler");
+    assert_eq!(session.wait(None).expect("wait"), Some(stop));
+    let _ = mock.take_calls();
+
+    session.resume_with_signal().expect("continue the surviving thread");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+#[test]
+fn thread_listing_failure_keeps_held_signals()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    mock.fail_next(
+        MockCallKind::Threads,
+        BackendError::Unsupported("thread listing failed".into()),
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+    session.resume_with_signal().expect("deliver both held signals");
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all()
+                .with_signal(THREAD, 5)
+                .with_signal(SIGNAL_THREAD, 6)
+        ]
+    );
 }

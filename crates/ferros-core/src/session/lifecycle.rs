@@ -6,7 +6,7 @@ use super::{ProcessOwnership, SIGKILL, Session, SessionState};
 use crate::arch;
 use crate::backend::{BackendError, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 use crate::error::{DebuggerError, Result};
-use crate::types::ProcessId;
+use crate::types::{ProcessId, ThreadId};
 
 #[derive(Clone, Copy)]
 pub(super) enum SignalPolicy
@@ -141,9 +141,9 @@ impl Session
     /// private trap that an interrupt raced, and the thread has not executed the
     /// instruction there yet.
     ///
-    /// A signal held by the backend after a [`StopEvent::Signal`] stop is discarded
-    /// when its thread resumes. Use [`resume_with_signal`](Self::resume_with_signal)
-    /// to pass it on.
+    /// Once the stopped-state check passes, all held signals are discarded, even if
+    /// another stop defers the resume or the backend cannot start it. Use
+    /// [`resume_with_signal`](Self::resume_with_signal) to pass held signals on.
     ///
     /// Every thread whose pc is at an enabled software breakpoint is stepped over,
     /// one at a time in thread-list order, before continuing all threads. This also
@@ -189,11 +189,10 @@ impl Session
     /// leaves by `longjmp` or `siglongjmp` for the frame it interrupted or an outer one,
     /// the thread's next arrival at the breakpoint is a hit.
     ///
-    /// If an earlier `resume_with_signal` passed a signal to a thread that never ran
-    /// because another stop cut its step-over sequence short, or was reported first
-    /// without resuming, or a resume failed before that thread ran, the signal is still
-    /// held and is passed now, together with the last stop's. A thread is passed one
-    /// signal, the latest.
+    /// The latest held signal for each thread is delivered once, when a backend resume
+    /// lets that thread run. A thread that stays suspended keeps its signal. Deferred
+    /// or failed starts keep signals for the threads that did not run, so a later
+    /// forwarding resume can deliver them.
     ///
     /// # Errors
     ///
@@ -206,7 +205,13 @@ impl Session
     fn resume_request(&mut self, signal_policy: SignalPolicy) -> Result<()>
     {
         self.require_stopped()?;
-        self.remember_last_signal();
+        match signal_policy {
+            SignalPolicy::Forward => self.carry_last_signal(),
+            SignalPolicy::Suppress => {
+                self.last_signal_taken = true;
+                self.carried_signals.clear();
+            }
+        }
         let request = self.prepare_signals(ResumeRequest::continue_all(), signal_policy);
         self.interrupt_requested = false;
         self.deferred = self.continue_after_drain(&request, signal_policy)?;
@@ -215,14 +220,24 @@ impl Session
         self.drive_step_overs()
     }
 
-    /// Keep the latest signal for this thread if the request clears `last_stop` before
-    /// the thread gets to run.
-    pub(super) fn remember_last_signal(&mut self)
+    /// Transfer the last reported signal into the held list once, leaving the stop
+    /// available for inspection even if the signal is later discarded.
+    pub(super) fn carry_last_signal(&mut self)
     {
-        if let Some(StopEvent::Signal { thread, signal }) = self.last_stop {
+        if !self.last_signal_taken
+            && let Some(StopEvent::Signal { thread, signal }) = self.last_stop
+        {
             self.carried_signals.retain(|(carried, _)| *carried != thread);
             self.carried_signals.push((thread, signal));
+            self.last_signal_taken = true;
         }
+    }
+
+    /// Commit a validated step's signal suppression, preserving held signals for peers.
+    pub(super) fn suppress_thread_signal(&mut self, thread: ThreadId)
+    {
+        self.carry_last_signal();
+        self.carried_signals.retain(|(carried, _)| *carried != thread);
     }
 
     /// Add held signals to a forwarding resume for the threads it allows to run.
@@ -428,8 +443,9 @@ impl Session
             other => other,
         };
         self.state = SessionState::Stopped;
-        self.sync_threads(event.thread());
         self.last_stop = Some(event.clone());
+        self.last_signal_taken = false;
+        self.sync_threads(event.thread());
         event
     }
 }

@@ -293,3 +293,72 @@ fn eh_frame_hdr_table_is_searched_by_runtime_address_from_the_slid_header()
     assert_eq!(pcs, [pc_in_b, CALLER_OF_B], "the header table must find B's FDE");
     assert_eq!(frames[1].sp, Address::new(STACK_POINTER + 32), "caller sp is B's CFA");
 }
+
+/// Through `Session::stack_trace`, an image whose file has `eh_frame` but no DWARF at all
+/// still unwinds: the frame pointer is zero and the link register points at no caller,
+/// so only the FDE finds it. `Session::symbolicate` still reports the missing debug
+/// information. The image's mapped code is `nop`s, so no prologue or epilogue is
+/// recognized from the instructions either.
+#[test]
+fn session_unwinds_through_eh_frame_of_an_image_without_dwarf()
+{
+    use ferros_core::Session;
+    use ferros_core::backend::mock::MockBackend;
+    use ferros_core::backend::{LaunchSpec, LoadedImage};
+    use ferros_core::objfile::mock::MockObjectImage;
+    use ferros_core::types::BuildIdentity;
+
+    // The caller is mapped executable memory outside the image, so the trace ends there.
+    const CALLER: u64 = 0x3_0000_0000;
+    let pc = FUNCTION_A + SLIDE + 0x10;
+
+    let mut eh_frame = cie();
+    eh_frame.extend(fde(24, FUNCTION_B, 32));
+    eh_frame.extend(fde(48, FUNCTION_A, 16));
+    eh_frame.extend(terminator());
+    let file = MockObjectFile::new(FILE_BASE, TEXT_SIZE)
+        .with_eh_frame(FILE_BASE + EH_FRAME_OFFSET, &eh_frame)
+        .to_bytes();
+    let (mut image, path) = scratch::create_file("ferros-eh-frame-without-dwarf", ".mock");
+    std::io::Write::write_all(&mut image, &file).expect("write synthetic image");
+    drop(image);
+    let path = TempImage(path);
+
+    let mut mapped = MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(FILE_BASE, TEXT_SIZE)
+        .header_bytes();
+    mapped.resize(usize::try_from(TEXT_SIZE).expect("size"), 0);
+    for word in mapped[0x1000..].as_chunks_mut::<4>().0 {
+        word.copy_from_slice(&0xD503_201F_u32.to_le_bytes()); // nop
+    }
+    let mut stack = vec![0_u8; 32];
+    stack[8..16].copy_from_slice(&CALLER.to_le_bytes());
+
+    let arch = arch::for_architecture(Architecture::Arm64).expect("arm64");
+    let mut regs: Registers = arm64_registers();
+    regs.pc = Address::new(pc);
+    regs.sp = Address::new(STACK_POINTER);
+    arch.set_fp(&mut regs, Address::ZERO);
+    arch.set_link_register(&mut regs, Address::new(pc)).expect("lr");
+    let mock = MockBackend::new()
+        .with_thread(ThreadId::from(1), regs)
+        .with_region(Address::new(LOAD_ADDRESS), "r-x", mapped)
+        .with_region(Address::new(CALLER), "r-x", vec![0x1F; 16])
+        .with_region(Address::new(STACK_POINTER), "rw-", stack)
+        .with_image(LoadedImage {
+            path: path.0.clone(),
+            load_address: Address::new(LOAD_ADDRESS),
+            build_id: BuildIdentity::Unknown,
+        });
+    let mut session = Session::new(Box::new(mock), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("mock launch");
+
+    let error = session.symbolicate(Address::new(pc)).expect_err("no DWARF");
+    assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+    let frames = session.stack_trace(8).expect("stack trace");
+    let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+    assert_eq!(pcs, [pc, CALLER], "A's FDE finds the caller: {frames:#?}");
+    assert_eq!(frames[1].sp, Address::new(STACK_POINTER + 16), "caller sp is A's CFA");
+    let error = session.symbolicate(Address::new(pc)).expect_err("still no DWARF");
+    assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+}

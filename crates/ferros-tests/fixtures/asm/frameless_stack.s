@@ -11,6 +11,13 @@
 // `frameless_caller` (compact unwind `UNWIND_ARM64_MODE_FRAME`) calls it and is run by
 // dyld as an initializer through `__mod_init_func`, so the fixture calls the leaf
 // without any `unsafe` Rust.
+//
+// `unwind_only_callee` saves the link register and the frame pointer in the reverse of
+// the frame-record order, so the linker cannot encode it compactly and gives it
+// `UNWIND_ARM64_MODE_DWARF`: only its `__eh_frame` FDE describes its caller. At the
+// `nop` the frame pointer is zero and the link register points at
+// the callee itself, so neither finds the caller `unwind_only_caller`. dyld runs
+// `unwind_only_caller` as a second initializer.
 
 	.text
 	.globl	_frameless_spill
@@ -41,8 +48,41 @@ _frameless_caller:
 	ret
 	.cfi_endproc
 
+	.globl	_unwind_only_callee
+	.p2align	2
+_unwind_only_callee:
+	.cfi_startproc
+	stp	x30, x29, [sp, #-16]!
+	.cfi_def_cfa_offset 16
+	.cfi_offset w30, -16
+	.cfi_offset w29, -8
+	mov	x29, xzr
+	adr	x30, _unwind_only_callee
+	nop
+	ldp	x30, x29, [sp], #16
+	.cfi_def_cfa_offset 0
+	.cfi_restore w30
+	.cfi_restore w29
+	ret
+	.cfi_endproc
+
+	.globl	_unwind_only_caller
+	.p2align	2
+_unwind_only_caller:
+	.cfi_startproc
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	.cfi_def_cfa w29, 16
+	.cfi_offset w30, -8
+	.cfi_offset w29, -16
+	bl	_unwind_only_callee
+	ldp	x29, x30, [sp], #16
+	ret
+	.cfi_endproc
+
 	.section	__DATA,__mod_init_func,mod_init_funcs
 	.p2align	3
 	.quad	_frameless_caller
+	.quad	_unwind_only_caller
 
 	.subsections_via_symbols

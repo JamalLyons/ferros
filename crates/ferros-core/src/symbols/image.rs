@@ -41,7 +41,7 @@ use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
-use crate::objfile::{ImageContents, ImageSlice, SectionData, UnwindHints};
+use crate::objfile::{DebugSections, ImageContents, ImageSlice, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
 
 /// Describes a binary image mapped in the debuggee's address space.
@@ -300,12 +300,13 @@ pub struct BinaryImage
     architecture: Architecture,
     endian: RunTimeEndian,
     mapping: ImageMapping,
-    debug_sections: HashMap<SectionId, Arc<[u8]>>,
     eh_frame: Option<SectionData>,
     eh_frame_hdr: Option<SectionData>,
-    debug_frame: Option<SectionData>,
     /// The format's own per-function unwind table, consulted before the CFI.
     unwind_hints: Option<Box<dyn UnwindHints>>,
+    /// The image's source debug information, or why there is none. The executable half
+    /// above is usable for unwinding either way.
+    debug: Result<DebugSections>,
     dwarf_cache: OnceCell<OwnedDwarf>,
     /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
@@ -331,11 +332,10 @@ impl BinaryImage
             architecture: contents.architecture,
             endian: contents.endian,
             mapping: contents.mapping,
-            debug_sections: contents.dwarf,
             eh_frame: contents.eh_frame,
             eh_frame_hdr: contents.eh_frame_hdr,
-            debug_frame: contents.debug_frame,
             unwind_hints: contents.unwind_hints,
+            debug: contents.debug,
             dwarf_cache: OnceCell::new(),
             context_cache: OnceCell::new(),
             type_cache: RwLock::new(HashMap::new()),
@@ -396,7 +396,27 @@ impl BinaryImage
 
     pub(crate) fn debug_frame_section(&self) -> Option<(u64, &[u8])>
     {
-        self.debug_frame.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
+        let debug_frame = self.debug.as_ref().ok()?.debug_frame.as_ref()?;
+        Some((debug_frame.address, debug_frame.data.as_ref()))
+    }
+
+    /// Whether the image has source debug information. Without it the image still
+    /// unwinds from its own unwind tables, but names no function and maps no line.
+    #[must_use]
+    pub fn has_debug_info(&self) -> bool
+    {
+        self.debug.is_ok()
+    }
+
+    /// Why the image has no source debug information, or `None` when it has some.
+    pub(crate) fn debug_error(&self) -> Option<&DebuggerError>
+    {
+        self.debug.as_ref().err()
+    }
+
+    fn debug_sections(&self) -> Result<&DebugSections>
+    {
+        self.debug.as_ref().map_err(DebuggerError::duplicate)
     }
 
     pub(crate) fn unwind_hints(&self) -> Option<&dyn UnwindHints>
@@ -568,18 +588,23 @@ impl BinaryImage
         &self.function_index
     }
 
+    /// The image's DWARF, loaded on first use.
+    ///
+    /// # Errors
+    /// Why the image has no source debug information, or why its DWARF does not load.
     pub(super) fn dwarf(&self) -> Result<&OwnedDwarf>
     {
+        let sections = self.debug_sections()?;
         self.dwarf_cache.get_or_try_init(|| {
-            Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))
+            Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF: {err}")))
         })
     }
 
-    fn section_reader(&self, id: SectionId) -> OwnedReader
+    fn section_reader(&self, sections: &DebugSections, id: SectionId) -> OwnedReader
     {
-        let data = self
-            .debug_sections
+        let data = sections
+            .dwarf
             .get(&id)
             .cloned()
             .unwrap_or_else(|| Arc::<[u8]>::from(Vec::new()));
@@ -588,8 +613,9 @@ impl BinaryImage
 
     fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
     {
+        let sections = self.debug_sections()?;
         self.context_cache.get_or_try_init(|| {
-            let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))
+            let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF for addr2line: {err}")))?;
             Context::from_dwarf(dwarf)
                 .map(Mutex::new)

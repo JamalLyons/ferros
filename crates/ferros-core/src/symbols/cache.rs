@@ -191,25 +191,49 @@ impl SymbolCache
 
     /// [`load_image`](Self::load_image), reading the slice `slice` names when it is
     /// known (#169).
+    ///
+    /// An image whose file has no usable debug information is kept for unwinding
+    /// ([`load_executable`](Self::load_executable)) and its debug error returned. A later
+    /// call reads the image again, so a companion debug file that appeared since is found.
     pub(crate) fn load_mapped_image(
         &mut self,
         descriptor: ImageDescriptor,
         slice: Option<&ImageSlice>,
     ) -> Result<Arc<BinaryImage>>
     {
-        let canonical = if descriptor.path.is_absolute() {
-            descriptor.path.clone()
-        } else {
-            descriptor.path.canonicalize().map_err(|err| {
-                DebuggerError::InvalidArgument(format!("unable to canonicalize {}: {err}", descriptor.path.display()))
-            })?
-        };
+        let id = Self::image_id(&descriptor, slice)?;
+        if self.images.get(&id).is_some_and(|image| !image.has_debug_info()) {
+            self.images.remove(&id);
+        }
+        let image = self.load_executable(descriptor, slice)?;
+        match image.debug_error() {
+            None => Ok(image),
+            Some(error) => Err(error.duplicate()),
+        }
+    }
 
-        let id = ImageId::with_slice(&canonical, descriptor.load_address, slice);
+    /// Load and cache the image `descriptor` names (the slice `slice` names when it is
+    /// known), whether or not its source debug information could be read.
+    ///
+    /// The returned image always has the file's layout and unwind tables;
+    /// [`BinaryImage::has_debug_info`] says whether it also has source debug information,
+    /// and the image keeps why not. A cached image is returned as it is: the caller drops
+    /// it with [`forget`](Self::forget) to read the image again.
+    ///
+    /// # Errors
+    /// An error of [`ObjectFormat::open_image`]: the file cannot be read, does not parse,
+    /// is another build, or the format cannot tell which part of it is mapped.
+    pub(crate) fn load_executable(
+        &mut self,
+        descriptor: ImageDescriptor,
+        slice: Option<&ImageSlice>,
+    ) -> Result<Arc<BinaryImage>>
+    {
+        let id = Self::image_id(&descriptor, slice)?;
         if let Some(existing) = self.images.get(&id) {
             return Ok(existing.clone());
         }
-
+        let canonical = Self::canonical(&descriptor)?;
         let contents = self.format.open_image(&canonical, descriptor.load_address, slice)?;
         let image = Arc::new(BinaryImage::from_contents(
             ImageDescriptor {
@@ -222,6 +246,32 @@ impl SymbolCache
         debug_assert_eq!(image.id(), id);
         self.images.insert(id, image.clone());
         Ok(image)
+    }
+
+    /// Drop the cached image `id`, so the next load reads it again.
+    pub(crate) fn forget(&mut self, id: ImageId)
+    {
+        self.images.remove(&id);
+    }
+
+    fn canonical(descriptor: &ImageDescriptor) -> Result<std::path::PathBuf>
+    {
+        if descriptor.path.is_absolute() {
+            Ok(descriptor.path.clone())
+        } else {
+            descriptor.path.canonicalize().map_err(|err| {
+                DebuggerError::InvalidArgument(format!("unable to canonicalize {}: {err}", descriptor.path.display()))
+            })
+        }
+    }
+
+    fn image_id(descriptor: &ImageDescriptor, slice: Option<&ImageSlice>) -> Result<ImageId>
+    {
+        Ok(ImageId::with_slice(
+            &Self::canonical(descriptor)?,
+            descriptor.load_address,
+            slice,
+        ))
     }
 
     /// Stamp the files [`load_image`](Self::load_image) would read for `descriptor`,
@@ -239,7 +289,9 @@ impl SymbolCache
     /// Find the binary image containing the given address.
     ///
     /// Searches through all cached images to find one that contains the address
-    /// (i.e., the address is within the image's load address range).
+    /// (i.e., the address is within the image's load address range). The image may have
+    /// no source debug information ([`BinaryImage::has_debug_info`]) when it was loaded
+    /// only for its unwind tables.
     ///
     /// ## Returns
     ///
@@ -282,7 +334,8 @@ impl SymbolCache
     /// or an error if DWARF parsing fails.
     pub fn describe_type(&self, name: &str) -> Result<Option<Arc<TypeSummary>>>
     {
-        for image in self.images.values() {
+        // An image kept only for unwinding has no types to describe.
+        for image in self.images.values().filter(|image| image.has_debug_info()) {
             if let Some(summary) = image.describe_type(name)? {
                 return Ok(Some(summary));
             }

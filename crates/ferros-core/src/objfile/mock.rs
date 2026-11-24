@@ -27,7 +27,9 @@
 //! its kind, address and length followed by that many bytes. An entry is a DWARF section
 //! (kind = its index in [`DWARF_SECTIONS`](super::DWARF_SECTIONS)), `eh_frame`,
 //! `eh_frame_hdr`, `debug_frame`, or an unwind hint for the function at its address. A
-//! file without `.debug_info` has no debug information. Files are always arm64 and
+//! file without `.debug_info` has no debug information: its `eh_frame`, `eh_frame_hdr`
+//! and hints are still returned for unwinding, and its `debug_frame` is dropped with
+//! the DWARF. Files are always arm64 and
 //! little-endian, and their build id is never checked.
 
 use std::collections::HashMap;
@@ -38,8 +40,8 @@ use std::sync::Arc;
 use gimli::{RunTimeEndian, SectionId};
 
 use super::{
-    DWARF_SECTIONS, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice, MappedImage,
-    MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
+    DWARF_SECTIONS, DebugSections, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice,
+    MappedImage, MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
 };
 use crate::error::{DebuggerError, Result as EngineResult};
 use crate::types::{Address, Architecture, BuildIdentity};
@@ -499,22 +501,23 @@ impl MockObjectFile
                 }
             }
         }
-        if !dwarf.contains_key(&SectionId::DebugInfo) {
-            return Err(DebuggerError::NoDebugInfo {
+        let debug = if dwarf.contains_key(&SectionId::DebugInfo) {
+            Ok(DebugSections { dwarf, debug_frame })
+        } else {
+            Err(DebuggerError::NoDebugInfo {
                 path: path.to_path_buf(),
                 detail: "mock object file has no .debug_info".into(),
-            });
-        }
+            })
+        };
         hints.sort_unstable_by_key(|&(start, _)| start);
         Ok(ImageContents {
             architecture: Architecture::Arm64,
             endian: RunTimeEndian::Little,
             mapping,
-            dwarf,
             eh_frame,
             eh_frame_hdr,
-            debug_frame,
             unwind_hints: (!hints.is_empty()).then(|| Box::new(MockHints(hints)) as Box<dyn UnwindHints>),
+            debug,
         })
     }
 }

@@ -39,7 +39,8 @@ use std::sync::Arc;
 pub use gimli::{RunTimeEndian, SectionId};
 
 pub use self::contents::{
-    DWARF_SECTIONS, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData, UnwindHint, UnwindHints,
+    DWARF_SECTIONS, DebugSections, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData, UnwindHint,
+    UnwindHints,
 };
 pub use crate::symbols::image::{ImageMapping, ImageSegment};
 use crate::types::Address;
@@ -104,16 +105,21 @@ pub trait ObjectFormat: Send + Sync
     /// image stays loaded as the same build.
     fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage;
 
-    /// Read the file at `path`, mapped at `load_address`, for its debug and unwind
+    /// Read the file at `path`, mapped at `load_address`, for its unwind and debug
     /// information. `slice` is the [`MappedImage::slice`] the session read from the
     /// mapped header, with any build id the loader reported since; `None` when it is
     /// unknown. A format whose files hold several images reads the one `slice` names, and
     /// a file of another build than `slice` names is an error.
     ///
+    /// The image file's layout and unwind tables are returned whether or not debug
+    /// information is found: a missing or unreadable companion debug file is
+    /// [`ImageContents::debug`], not an error of this call, so the session can still
+    /// unwind through the image.
+    ///
     /// # Errors
-    /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the image
-    /// has no usable debug information (the session keeps it while the image stays
-    /// loaded); any other error for a file that cannot be read, does not parse, or is
+    /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the format
+    /// cannot tell which part of the file is mapped (the session keeps it while the image
+    /// stays loaded); any other error for a file that cannot be read, does not parse, or is
     /// another build (the session retries once [`load_inputs`](Self::load_inputs)
     /// change).
     fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> crate::Result<ImageContents>;

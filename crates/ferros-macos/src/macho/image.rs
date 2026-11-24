@@ -16,7 +16,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferros_core::error::{DebuggerError, Result};
-use ferros_core::objfile::{DWARF_SECTIONS, ImageContents, ImageSlice, RunTimeEndian, SectionData, SectionId};
+use ferros_core::objfile::{
+    DWARF_SECTIONS, DebugSections, ImageContents, ImageSlice, RunTimeEndian, SectionData, SectionId,
+};
 use ferros_core::symbols::{ImageMapping, ImageSegment};
 use ferros_core::types::{Architecture, BuildId, BuildIdentity};
 use object::macho::MachHeader64;
@@ -370,6 +372,11 @@ fn dwarf_names(id: SectionId) -> [String; 2]
 /// Read the image at `path`, mapped at `load_address`, for the engine. For a universal
 /// file the slice `target` names is read ([`image_slice`]); without one, a universal file
 /// has no usable debug info.
+///
+/// The image's own layout, `__eh_frame`, `__eh_frame_hdr` and `__unwind_info` are read
+/// before its DWARF is discovered ([`debuginfo::discover`]), so an executable without a
+/// companion debug file still unwinds: the discovery failure is
+/// [`ImageContents::debug`], not an error of this call.
 pub(crate) fn open(
     path: &Path,
     load_address: u64,
@@ -394,7 +401,24 @@ pub(crate) fn open(
     };
 
     let mapping = mapping_from_file(&file, load_address)?;
-    let debug_bytes = debuginfo::discover(path, data, options)?;
+    let unwind_hints = section_data(&file, &["__unwind_info"])?
+        .map(|section| Box::new(CompactUnwind::new(section.data, load_address)) as Box<_>);
+    Ok(ImageContents {
+        architecture,
+        endian,
+        mapping,
+        eh_frame: section_data(&file, &[".eh_frame", "__eh_frame"])?,
+        eh_frame_hdr: section_data(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?,
+        unwind_hints,
+        debug: debug_sections(path, data, options),
+    })
+}
+
+/// The image's DWARF and `__debug_frame`, from the image `executable` itself or a
+/// companion debug file ([`debuginfo::discover`]).
+fn debug_sections(path: &Path, executable: &[u8], options: &DebugInfoOptions) -> Result<DebugSections>
+{
+    let debug_bytes = debuginfo::discover(path, executable, options)?;
     let debug_file = object::File::parse(&*debug_bytes)
         .map_err(|err| DebuggerError::InvalidArgument(format!("failed to parse DWARF: {err}")))?;
 
@@ -405,18 +429,9 @@ pub(crate) fn open(
             dwarf.insert(id, section_bytes(&section, id.name())?);
         }
     }
-
-    let unwind_hints = section_data(&file, &["__unwind_info"])?
-        .map(|section| Box::new(CompactUnwind::new(section.data, load_address)) as Box<_>);
-    Ok(ImageContents {
-        architecture,
-        endian,
-        mapping,
+    Ok(DebugSections {
         dwarf,
-        eh_frame: section_data(&file, &[".eh_frame", "__eh_frame"])?,
-        eh_frame_hdr: section_data(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?,
         debug_frame: section_data(&debug_file, &[".debug_frame", "__debug_frame"])?,
-        unwind_hints,
     })
 }
 

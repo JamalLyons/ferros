@@ -923,3 +923,134 @@ fn cargo_built_fixture_contains_debug_map_stabs()
         println!("hello fixture N_OSO stabs: {object_files}");
     });
 }
+
+/// A launch of `frameless_stack` copied without its dSYM and with its debug map stripped
+/// (`strip -S`), so no source debug information can be found for the main executable.
+/// Its `__eh_frame`, `__unwind_info` and symbol table stay. The copy lives under the
+/// test target directory, where `just kill-fixtures` finds a leaked process.
+struct StrippedFixture
+{
+    directory: PathBuf,
+    fixture: Fixture,
+}
+
+impl StrippedFixture
+{
+    fn new() -> Self
+    {
+        let built = fixture!("frameless_stack");
+        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ferros-stripped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create stripped fixture directory");
+        let file_name = built.path().file_name().expect("fixture file name");
+        let executable = directory.join(file_name);
+        fs::copy(built.path(), &executable).expect("copy executable without its dSYM");
+        let status = Command::new("strip").arg("-S").arg(&executable).status().expect("run strip");
+        assert!(status.success(), "strip -S failed: {status}");
+        // `strip` invalidates the ad-hoc signature arm64 macOS requires to run the copy.
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .status()
+            .expect("run codesign");
+        assert!(status.success(), "codesign failed: {status}");
+        let fixture = Fixture::from_built(
+            "frameless_stack",
+            Box::leak(executable.to_str().expect("UTF-8 path").to_owned().into_boxed_str()),
+        );
+        Self { directory, fixture }
+    }
+}
+
+impl Drop for StrippedFixture
+{
+    fn drop(&mut self)
+    {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// The first instruction at or after `from` that is `insn`, within 64 instructions.
+fn instruction_at_or_after(session: &mut Session, from: Address, insn: u32) -> Address
+{
+    (0..64)
+        .map(|index| Address::new(from.value() + 4 * index))
+        .find(|&at| {
+            let bytes = session.read_memory(at, 4).expect("read code");
+            u32::from_le_bytes(bytes.try_into().expect("four bytes")) == insn
+        })
+        .unwrap_or_else(|| panic!("no instruction {insn:#010x} after {from}"))
+}
+
+/// `unwind_only_callee` of `frameless_stack` (see `fixtures/asm/frameless_stack.s`) has
+/// only an `__eh_frame` FDE (compact unwind `UNWIND_ARM64_MODE_DWARF`). Stopped on its
+/// `nop` the frame pointer is zero and the link register points at the callee itself, so
+/// only that FDE finds the caller `unwind_only_caller`. The executable is run without a
+/// dSYM or a debug map: it has no source debug information, but its unwind tables still
+/// give the caller frame, at the return address the FDE's saved link register holds.
+/// Symbolication there still reports the missing debug information, and step-out stops
+/// in the caller.
+#[test]
+fn stripped_executable_still_unwinds_its_caller()
+{
+    harness::run(|t| {
+        let stripped = StrippedFixture::new();
+        let fixture = &stripped.fixture;
+        assert!(!fixture.dsym_path().exists(), "the copy has no dSYM");
+        let mut d = t.launch(fixture);
+        let leaf = ferros_tests::symbols::raw_symbol_address(&mut d, fixture, "_unwind_only_callee");
+        let outer = ferros_tests::symbols::raw_symbol_address(&mut d, fixture, "_unwind_only_caller");
+        let stop = instruction_at_or_after(&mut d, leaf, 0xD503_201F); // nop
+        let return_address = (0..16)
+            .map(|index| Address::new(outer.value() + 4 * index))
+            .find(|&at| {
+                let bytes = d.read_memory(at, 4).expect("read code");
+                u32::from_le_bytes(bytes.try_into().expect("four bytes")) & 0xFC00_0000 == 0x9400_0000
+            })
+            .map(|call| Address::new(call.value() + 4))
+            .expect("the caller's `bl`");
+        d.add_breakpoint(BreakpointRequest::Software { address: stop })
+            .expect("break on the callee's nop");
+        d.resume().expect("resume");
+        let thread = match d.wait(Some(Duration::from_secs(10))).expect("wait") {
+            Some(StopEvent::Breakpoint { pc, thread }) if pc == stop => thread,
+            other => panic!("expected a breakpoint stop at {stop}, got {other:?}"),
+        };
+        d.select_thread(thread).expect("select the stopped thread");
+
+        let registers = d.read_registers_for(thread).expect("registers");
+        assert_eq!(registers.fp, Address::ZERO, "the callee cleared the frame pointer");
+        assert_ne!(
+            registers.general.get(30).copied(),
+            Some(return_address.value()),
+            "the link register must not point at the caller"
+        );
+        let error = d.symbolicate(stop).expect_err("no source debug information");
+        assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+
+        let frames = d.stack_trace(8).expect("stack trace");
+        assert_eq!(frames[0].pc, stop, "{frames:#?}");
+        assert!(frames.len() >= 2, "the caller is missing: {frames:#?}");
+        assert_eq!(
+            frames[1].pc, return_address,
+            "the caller is `unwind_only_caller` after its call: {frames:#?}"
+        );
+        assert_eq!(frames[1].sp.value(), frames[0].sp.value() + 16, "{frames:#?}");
+        let error = d.symbolicate(stop).expect_err("still no source debug information");
+        assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+
+        d.step_out().expect("step out");
+        match d.wait(Some(Duration::from_secs(10))).expect("wait") {
+            Some(StopEvent::SingleStep { thread: stepped }) if stepped == thread => {}
+            other => panic!("expected step-out to stop {thread:?}, got {other:?}"),
+        }
+        let registers = d.read_registers_for(thread).expect("registers");
+        assert_eq!(registers.pc, return_address, "step-out stops in the caller");
+    });
+}

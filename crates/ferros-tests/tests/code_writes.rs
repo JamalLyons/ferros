@@ -10,14 +10,14 @@
 //! core they run on.
 #![cfg(target_os = "macos")]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ferros_core::{Address, Backend, ResumeRequest, StopEvent, ThreadAction, ThreadId};
+use ferros_core::{Address, Backend, ResumeRequest, StopEvent, ThreadAction};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::TRAP;
-use ferros_tests::fixture;
 use ferros_tests::harness::{self, Debuggee};
 use ferros_tests::symbols::function_address;
+use ferros_tests::{Fixture, fixture};
 
 /// How long a test waits for a stop it expects.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -182,6 +182,55 @@ fn raw_word(d: &Debuggee, address: Address) -> Vec<u8>
     diagnostics::raw_memory(d.pid(), address, 4).unwrap_or_else(|err| panic!("read the raw bytes at {address}: {err}"))
 }
 
+/// Stop the creator of `spawn_thread` at `spawn_later`, then run only it until its
+/// newborn is enumerated and held on a birth trap. Returns that trap's address, with
+/// the target stopped.
+fn hold_a_newborn(d: &mut Debuggee, fixture: &Fixture) -> Address
+{
+    // Stop the creator at `spawn_later`, then let only it run so the newborn is held.
+    let spawn_later = function_address(d.session_mut(), fixture, "spawn_later");
+    let entry = backend(d).read_memory(spawn_later, TRAP.len()).expect("read spawn_later");
+    backend(d).write_memory(spawn_later, &TRAP).expect("plant a trap");
+    backend(d).resume(&ResumeRequest::continue_all()).expect("continue");
+    let creator = match backend(d).wait(Some(STOP_TIMEOUT)).expect("wait for spawn_later") {
+        Some(StopEvent::Breakpoint { thread, pc }) if pc == spawn_later => thread,
+        other => panic!("expected a breakpoint at spawn_later, got {other:?}"),
+    };
+    while backend(d).wait(Some(Duration::ZERO)).expect("drain").is_some() {}
+    backend(d).write_memory(spawn_later, &entry).expect("restore spawn_later");
+    let known = backend(d).threads().expect("threads");
+    // Run only the creator until its newborn is enumerated and held on a birth trap,
+    // rather than for a fixed time a busy machine might not honor.
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    let mut newborn = None;
+    loop {
+        // A newborn seen before it reached the trap runs too, so it can get there.
+        let mut request = ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue);
+        if let Some(newborn) = newborn {
+            request = request.with_thread(newborn, ThreadAction::Continue);
+        }
+        backend(d).resume(&request).expect("resume the creator");
+        std::thread::sleep(Duration::from_millis(50));
+        interrupt(d);
+        newborn = backend(d)
+            .threads()
+            .expect("threads")
+            .into_iter()
+            .find(|id| !known.contains(id));
+        if let Some(newborn) = newborn {
+            let pc = backend(d).read_registers(newborn).expect("newborn registers").pc;
+            if raw_word(d, pc) == TRAP {
+                return pc;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no newborn held on a birth trap within {STOP_TIMEOUT:?}, stdout: {}",
+            d.stdout()
+        );
+    }
+}
+
 /// A write the backend refuses after planning it leaves a covered birth trap's saved
 /// instruction and client-breakpoint ownership as they were, and a later successful
 /// write is what disarm keeps.
@@ -203,35 +252,7 @@ fn failed_overlapping_birth_write_keeps_the_saved_instruction()
         let fail_store_again = backend_handle.memory_store_fault_injector();
         let mut d = t.launch_with_backend(&fixture, &[], backend_handle);
 
-        // Stop the creator at `spawn_later`, then let only it run so the newborn is held.
-        let spawn_later = function_address(d.session_mut(), &fixture, "spawn_later");
-        let entry = backend(&mut d)
-            .read_memory(spawn_later, TRAP.len())
-            .expect("read spawn_later");
-        backend(&mut d).write_memory(spawn_later, &TRAP).expect("plant a trap");
-        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
-        let creator = match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for spawn_later") {
-            Some(StopEvent::Breakpoint { thread, pc }) if pc == spawn_later => thread,
-            other => panic!("expected a breakpoint at spawn_later, got {other:?}"),
-        };
-        while backend(&mut d).wait(Some(Duration::ZERO)).expect("drain").is_some() {}
-        backend(&mut d)
-            .write_memory(spawn_later, &entry)
-            .expect("restore spawn_later");
-        let known = backend(&mut d).threads().expect("threads");
-        backend(&mut d)
-            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
-            .expect("resume the creator");
-        std::thread::sleep(Duration::from_millis(400));
-        interrupt(&mut d);
-        let newborn: ThreadId = backend(&mut d)
-            .threads()
-            .expect("threads")
-            .into_iter()
-            .find(|id| !known.contains(id))
-            .expect("the new thread was not enumerated");
-        let site = backend(&mut d).read_registers(newborn).expect("newborn registers").pc;
-        assert_eq!(raw_word(&d, site), TRAP, "the newborn is not held on a birth trap at {site}");
+        let site = hold_a_newborn(&mut d, &fixture);
         let saved = backend(&mut d).read_memory(site, 4).expect("read the entry");
         assert_ne!(saved, TRAP, "read_memory shows the birth trap instead of the entry");
 
@@ -260,6 +281,30 @@ fn failed_overlapping_birth_write_keeps_the_saved_instruction()
             "a refused write changed the saved instruction of the birth site"
         );
         assert_eq!(raw_word(&d, site), TRAP, "a refused write removed the birth trap");
+
+        // The same straddling write retried succeeds: it updates only the bytes it
+        // covers, including the saved instruction, and the birth trap stays armed.
+        backend(&mut d)
+            .write_memory(straddle, &[0x5a; 4])
+            .expect("the retried straddling write is stored");
+        let mut expected = before.clone();
+        expected[..4].copy_from_slice(&[0x5a; 4]);
+        assert_eq!(
+            backend(&mut d)
+                .read_memory(straddle, 8)
+                .expect("read after the retried write"),
+            expected,
+            "a successful straddling write did not update the saved instruction"
+        );
+        assert_eq!(raw_word(&d, site), TRAP, "a successful write removed the birth trap");
+        backend(&mut d)
+            .write_memory(straddle, &before[..4])
+            .expect("undo the straddling write");
+        assert_eq!(
+            backend(&mut d).read_memory(straddle, 8).expect("read after the undo"),
+            before,
+            "undoing the straddling write did not restore the saved instruction"
+        );
 
         // The same `brk` retried succeeds. Disarming keeps it: the newborn stops on it.
         backend(&mut d)

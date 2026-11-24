@@ -327,6 +327,9 @@ pub struct MacOSBackend
     reply_faults: ReplyFaultInjector,
     /// One-shot integration test fault for the next engine memory write.
     fail_memory_write: Arc<AtomicBool>,
+    /// One-shot integration test fault: the next store of an engine write fails after
+    /// the backend has planned it, before any byte reaches the target.
+    fail_memory_store: Arc<AtomicBool>,
     /// One-shot integration test fault: the next interrupt of a running target neither
     /// suspends it nor queues `Interrupted`.
     drop_next_interrupt: Arc<AtomicBool>,
@@ -404,6 +407,7 @@ impl MacOSBackend
             saved_exception_ports: None,
             reply_faults: ReplyFaultInjector::default(),
             fail_memory_write: Arc::default(),
+            fail_memory_store: Arc::default(),
             drop_next_interrupt: Arc::default(),
             fail_hold_suspend: Arc::default(),
             events_tx: None,
@@ -514,6 +518,15 @@ impl MacOSBackend
     pub fn memory_write_fault_injector(&self) -> impl FnOnce() + use<>
     {
         let fail = Arc::clone(&self.fail_memory_write);
+        move || fail.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: fail the store of the next engine memory write after the backend has
+    /// planned it (including any birth-trap bookkeeping), before any byte is written.
+    #[doc(hidden)]
+    pub fn memory_store_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let fail = Arc::clone(&self.fail_memory_store);
         move || fail.store(true, Ordering::Relaxed)
     }
 
@@ -1714,17 +1727,34 @@ impl MacOSBackend
     /// Write `data` at `address`, all or nothing (see [`write_memory_all_or_nothing`]).
     fn write_target_memory(&mut self, address: Address, data: &[u8]) -> Result<()>
     {
-        let result = write_memory_all_or_nothing(self.task, address, data);
+        let result = if self.fail_memory_store.swap(false, Ordering::Relaxed) {
+            Err(DebuggerError::Backend(BackendError::Os {
+                code: -1,
+                message: "injected memory store failure".into(),
+            }))
+        } else {
+            write_memory_all_or_nothing(self.task, address, data)
+        };
         self.memory_cache.invalidate_range(address, data.len());
         result
     }
 
-    /// A write over a birth trap updates the instruction it stands for and keeps the trap.
-    fn birth_engine_write(&mut self, address: Address, data: &[u8]) -> Option<Vec<u8>>
+    /// An engine write. A write over a birth trap updates the instruction that trap
+    /// stands for and keeps the trap, but only once the target has accepted the bytes.
+    ///
+    /// The shared state stays locked from the plan to the commit, so the exception loop
+    /// cannot arm, disarm or rewrite a birth site in between.
+    fn write_engine_memory(&mut self, address: Address, data: &[u8]) -> Result<()>
     {
-        lock_shared(&self.exception_state)
-            .birth
-            .filter_engine_write(address.value(), data)
+        let shared = Arc::clone(&self.exception_state);
+        let mut state = lock_shared(&shared);
+        let Some(write) = state.birth.plan_engine_write(address.value(), data) else {
+            drop(state);
+            return self.write_target_memory(address, data);
+        };
+        self.write_target_memory(address, &write.bytes)?;
+        state.birth.commit_engine_write(write);
+        Ok(())
     }
 }
 
@@ -2276,10 +2306,7 @@ impl Backend for MacOSBackend
                 message: "injected memory write failure".into(),
             });
         }
-        if let Some(word) = self.birth_engine_write(address, data) {
-            return self.write_target_memory(address, &word).map_err(backend_error);
-        }
-        self.write_target_memory(address, data).map_err(backend_error)
+        self.write_engine_memory(address, data).map_err(backend_error)
     }
 
     fn memory_regions(&mut self) -> BackendResult<Vec<MemoryRegion>>

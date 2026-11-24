@@ -90,6 +90,7 @@ use crate::backend::{Backend, StopEvent};
 use crate::breakpoints::BreakpointStore;
 use crate::error::{DebuggerError, Result};
 use crate::objfile::ObjectFormat;
+use crate::runtime::{NoRuntime, TargetRuntime};
 use crate::symbols::SymbolCache;
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 
@@ -118,6 +119,9 @@ pub struct Session
     /// The object-file format of the target's images, for container questions the
     /// backend does not answer (symbol tables of code without DWARF).
     format: Arc<dyn ObjectFormat>,
+    /// What the platform's system code does in the target (non-local exit entries,
+    /// signal trampolines); [`NoRuntime`] until [`with_runtime`](Self::with_runtime).
+    runtime: Arc<dyn TargetRuntime>,
     state: SessionState,
     ownership: Option<ProcessOwnership>,
     pid: Option<ProcessId>,
@@ -307,7 +311,8 @@ impl Session
     /// The backend should have no process either; the session starts in
     /// [`SessionState::NotStarted`]. `format` is the object-file format of the images
     /// the backend reports (see [`objfile`](crate::objfile)); a platform crate pairs its
-    /// backend with its format (`ferros_macos::new_session` on macOS).
+    /// backend with its format (`ferros_macos::new_session` on macOS), and with its
+    /// [`runtime`](Self::with_runtime).
     #[must_use]
     pub fn new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>) -> Self
     {
@@ -315,6 +320,7 @@ impl Session
         Self {
             backend,
             format,
+            runtime: NoRuntime::shared(),
             state: SessionState::NotStarted,
             ownership: None,
             pid: None,
@@ -342,6 +348,20 @@ impl Session
             symbol_request: 0,
             stop_generation: 0,
         }
+    }
+
+    /// This session with the platform's `runtime`: the system code through which a
+    /// thread leaves frames without returning, and the signal trampoline (see
+    /// [`runtime`](crate::runtime)). Without one ([`NoRuntime`]) no non-local exit is
+    /// trapped and a backtrace through a signal handler follows the trampoline's frame
+    /// record. A platform crate pairs its runtime with its backend
+    /// (`ferros_macos::new_session` on macOS).
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<dyn TargetRuntime>) -> Self
+    {
+        self.runtime = runtime;
+        self.exit_images.clear();
+        self
     }
 
     /// Current state of the session.

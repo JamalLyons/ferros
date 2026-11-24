@@ -82,6 +82,13 @@
 //! images the loader does not list. [`new_session`] and [`session_with`] pair it with a
 //! [`MacOSBackend`].
 //!
+//! ## Runtime
+//!
+//! [`runtime::MacOSRuntime`] implements [`ferros_core::runtime::TargetRuntime`]: the
+//! non-local exit entries (`libunwind`'s resume, `__longjmp` in `libsystem_platform`) and
+//! the xnu `_sigtramp` signal frame. [`new_session`] and [`session_with`] give it to the
+//! session.
+//!
 //! ## Known gaps
 //!
 //! - New-thread suspension covers arm64 `libsystem_pthread` entries only. Before
@@ -201,16 +208,18 @@ mod lifecycle;
 pub mod macho;
 pub mod memory;
 pub mod registers;
+pub mod runtime;
 pub mod task;
 pub mod terminal;
 pub mod threads;
 pub mod types;
 
 pub use macho::{DebugInfoOptions, MachOFormat};
+pub use runtime::MacOSRuntime;
 pub use task::MacOSBackend;
 
 /// A [`ferros_core::Session`] with no process on a new [`MacOSBackend`], reading images
-/// as Mach-O ([`MachOFormat`]).
+/// as Mach-O ([`MachOFormat`]) with the macOS runtime ([`MacOSRuntime`]).
 ///
 /// # Errors
 /// The error from [`MacOSBackend::new`].
@@ -220,9 +229,10 @@ pub fn new_session() -> ferros_core::Result<ferros_core::Session>
 }
 
 /// A [`ferros_core::Session`] driving `backend`, which the caller may have prepared first
-/// (for example to keep a test hook handle of it), reading images as Mach-O.
+/// (for example to keep a test hook handle of it), reading images as Mach-O with the
+/// macOS runtime.
 #[must_use]
 pub fn session_with(backend: MacOSBackend) -> ferros_core::Session
 {
-    ferros_core::Session::new(Box::new(backend), MachOFormat::shared())
+    ferros_core::Session::new(Box::new(backend), MachOFormat::shared()).with_runtime(MacOSRuntime::shared())
 }

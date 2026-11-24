@@ -69,8 +69,9 @@
 //! their original bytes, so a stop at a breakpoint inside a prologue or epilogue still
 //! decodes the real instructions.
 //!
-//! Images whose files could not be loaded (for example libraries in the dyld shared cache)
-//! have none of this, and use the frame-pointer chain.
+//! Images whose files could not be loaded (for example system libraries the loader maps
+//! from a shared region rather than from a file) have none of this, and use the
+//! frame-pointer chain.
 //!
 //! Before any of these, a caller frame is checked for a signal trampoline (see
 //! [Signal handler frames](#signal-handler-frames)).
@@ -88,51 +89,32 @@
 //!
 //! ## Signal handler frames
 //!
-//! On arm64 Darwin the kernel delivers a signal by building a signal frame on the
-//! interrupted thread's stack and starting the thread in `_sigtramp`
-//! (`libsystem_platform`, in the dyld shared cache), which calls the handler. xnu's
-//! `sendsig` (`bsd/dev/arm/unix_signal.c`) lays the frame out as `struct user_sigframe64`
-//! at the new `sp`, 16-byte aligned below the interrupted `sp` and a 128-byte red zone:
+//! A kernel delivers a signal by saving the interrupted register state on the thread's
+//! stack (or on an alternate signal stack) and starting the thread in a trampoline that
+//! calls the handler. The trampoline's own frame record usually holds the interrupted
+//! `fp` and link register, so following it gives the interrupted function's caller (or a
+//! stale link register), and the interrupted function is skipped.
 //!
-//! | offset | size | field |
-//! |-------:|-----:|-------|
-//! | 0      | 104  | `siginfo_t` |
-//! | 104    | 56   | `ucontext_t`; `uc_mcsize` at +40 (816), `uc_mcontext` at +48 |
-//! | 160    | 816  | `__darwin_mcontext64`: `__es` (16: far, esr, exception), `__ss` at +16, `__ns` at +288 |
+//! How a trampoline frame is recognized and where the saved state lies belong to the
+//! platform: the unwinder asks the session's
+//! [`TargetRuntime::signal_context`](crate::runtime::TargetRuntime::signal_context)
+//! about every caller frame (arm64 only) before any other rule. A
+//! [`StackUnwinder::new`] without [`with_runtime`](StackUnwinder::with_runtime) finds
+//! none. When the runtime returns a [`SignalContext`], the trampoline's caller is the
+//! interrupted frame, with every register restored from it (all known, `x30` included),
+//! and it is treated like an innermost frame: its pc is the interrupted instruction, not
+//! a return address, so it is looked up at `pc` rather than `pc - 4`, and the
+//! innermost-frame rules (link register, first instruction, frameless leaf) apply to it.
+//! Its status is [`FrameStatus::Complete`]: the whole register state is known.
 //!
-//! `__ss` is the interrupted thread state: `x0`-`x28` at +0, `fp` at +232, `lr` at +240,
-//! `sp` at +248, `pc` at +256, `cpsr` at +264. The kernel passes the handler, `siginfo`
-//! and `ucontext` pointers in `x0`, `x3` and `x4`, and leaves every other register,
-//! `x29` and `x30` included, as the interrupted code had them. `_sigtramp` (disassembled
-//! with `otool -tV`; a frame-record function) runs `stp x22, x21, [sp, #-0x30]!`,
-//! `stp x29, x30, [sp, #0x20]`, `add x29, sp, #0x20`, then calls the handler with
-//! `blraaz x8`. So in the `_sigtramp` frame the signal frame starts at `fp + 16`, and its
-//! frame record holds the interrupted `fp` and the interrupted `x30`: following that
-//! record gives the interrupted function's own caller (or a stale link register), and the
-//! interrupted function is skipped. (Offsets checked with `offsetof` against the macOS
-//! SDK's `<sys/ucontext.h>` and a handler printing its `ucontext` pointer on this
-//! machine: `ucontext - (_sigtramp fp + 16) = 104`, `uc_mcsize = 816`.)
-//!
-//! The trampoline is recognized by what it leaves in memory rather than by its name, since
-//! its image is usually not loaded: a caller frame (arm64 only) whose call instruction
-//! (`pc - 4`) is an indirect call (`blr`, `blraa`, `blraaz`, `blrab`, `blrabz`), and whose
-//! `fp + 16` holds a `ucontext` whose `uc_mcsize` is 816 and whose `uc_mcontext` points just
-//! past it, with an interrupted `sp` above the signal frame or, for a handler on an
-//! alternate signal stack (`sigaltstack` and `SA_ONSTACK`), below `_sigtramp`'s `sp`. Its
-//! caller is then the
-//! interrupted frame, with every register restored from `__ss` (all known, `x30`
-//! included), and it is treated like an innermost frame: its pc is the interrupted
-//! instruction, not a return address, so it is looked up at `pc` rather than `pc - 4`,
-//! and the innermost-frame rules (link register, first instruction, frameless leaf) apply
-//! to it. Its status is [`FrameStatus::Complete`]: the whole register state is known.
-//!
-//! On an alternate signal stack the kernel builds the signal frame there instead, so the
-//! handler and `_sigtramp` frames are on one stack and the interrupted frame on another,
-//! possibly at lower addresses. That step alone is exempt from the rule that `sp` never
-//! moves down (see [Termination](#termination)): the interrupted `sp` must instead be
-//! non-zero, 16-byte aligned and outside the frames from `_sigtramp`'s `sp` to the end of
-//! the signal frame, and the interrupted pc executable. Every later step is checked
-//! against the interrupted `sp` again.
+//! The interrupted `sp` must lie at or above the end of the saved state (the signal was
+//! taken on the thread's own stack) or below the trampoline's `sp` (an alternate signal
+//! stack, possibly at lower addresses); anywhere in between it would be among the
+//! handler's own frames and the context is rejected. The alternate-stack step alone is
+//! exempt from the rule that `sp` never moves down (see [Termination](#termination)):
+//! the interrupted `sp` must instead be non-zero and 16-byte aligned, and the
+//! interrupted pc executable. Every later step is checked against the interrupted `sp`
+//! again.
 //!
 //! ## Termination
 //!
@@ -141,7 +123,8 @@
 //! increasing, when the stack pointer would move down (except into the frame a signal
 //! on an alternate signal stack interrupted), when memory cannot be read, or when
 //! the next pc is not in executable memory ([`MemoryAccess::is_executable`]). This is how
-//! the thread base (`thread_start`, dyld's `start`) ends a trace.
+//! the thread base (the thread entry point, or the loader's entry point on the main
+//! thread) ends a trace.
 //!
 //! ## Pointer authentication
 //!
@@ -159,8 +142,6 @@
 //!
 //! - [DWARF 5, section 6.4 Call Frame Information](https://dwarfstd.org/doc/DWARF5.pdf)
 //! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
-//! - [xnu `bsd/dev/arm/unix_signal.c`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/dev/arm/unix_signal.c)
-//!   (`sendsig`, `struct user_sigframe64`)
 
 use gimli::{
     BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset, EndianSlice, Register, RegisterRule,
@@ -171,6 +152,7 @@ use crate::arch::Arch;
 use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
 use crate::error::Result;
 use crate::objfile::UnwindHint;
+use crate::runtime::{NoRuntime, SignalContext, TargetRuntime, TrampolineFrame};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
 use crate::types::{Address, Architecture, FrameId, FrameKind, FrameStatus, Registers, StackFrame, ThreadId};
 
@@ -215,7 +197,11 @@ pub struct StackUnwinder<'a, M>
     arch: &'a dyn Arch,
     symbols: &'a SymbolCache,
     memory: &'a M,
+    runtime: &'a dyn TargetRuntime,
 }
+
+/// The runtime of an unwinder that was given none.
+static NO_RUNTIME: NoRuntime = NoRuntime;
 
 /// Register state of one physical frame while walking.
 #[derive(Clone)]
@@ -279,9 +265,26 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// - `arch`: target architecture knowledge (registers, pointer authentication)
     /// - `symbols`: loaded images, for CFI and symbolication
     /// - `memory`: reads the target's stack
+    ///
+    /// It finds no signal handler frames until it is given the platform's runtime
+    /// ([`with_runtime`](Self::with_runtime)).
     pub fn new(arch: &'a dyn Arch, symbols: &'a SymbolCache, memory: &'a M) -> Self
     {
-        Self { arch, symbols, memory }
+        Self {
+            arch,
+            symbols,
+            memory,
+            runtime: &NO_RUNTIME,
+        }
+    }
+
+    /// This unwinder recognizing the signal trampolines of `runtime` (see
+    /// [Signal handler frames](self#signal-handler-frames)).
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: &'a dyn TargetRuntime) -> Self
+    {
+        self.runtime = runtime;
+        self
     }
 
     /// Unwind at most `max_frames` logical frames (inlined frames included), innermost
@@ -800,46 +803,36 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         })
     }
 
-    /// A caller frame in `_sigtramp`: the frame the signal interrupted, with every register
-    /// restored from the signal frame's `__darwin_mcontext64` (see
+    /// A caller frame in the platform's signal trampoline: the frame the signal
+    /// interrupted, with every register restored from the state the kernel saved (see
     /// [Signal handler frames](self#signal-handler-frames)). `None` for any other frame.
     fn signal_frame_step(&self, cursor: &Cursor) -> Option<UnwindStep>
     {
-        if !cursor.is_caller || self.arch.architecture() != Architecture::Arm64 || cursor.known & (1 << 29) == 0 {
+        if !cursor.is_caller || self.arch.architecture() != Architecture::Arm64 {
             return None;
         }
-        // Little-endian: the low half of the word at `pc - 4` is the call instruction.
-        let call = self
-            .memory
-            .read_u64(Address::new(cursor.regs.pc.value().checked_sub(4)?))
-            .ok()?;
-        if !is_indirect_call(call as u32) {
-            return None;
-        }
-        let frame = cursor.regs.fp.value().checked_add(16)?;
-        let ucontext = frame.checked_add(sigframe::UCONTEXT)?;
-        let mcontext = frame.checked_add(sigframe::MCONTEXT)?;
-        let read = |offset: u64| {
-            let address = mcontext.checked_add(offset)?;
-            self.memory.read_u64(Address::new(address)).ok()
+        let frame = TrampolineFrame {
+            architecture: Architecture::Arm64,
+            pc: cursor.regs.pc,
+            sp: cursor.regs.sp,
+            fp: (cursor.known & (1 << 29) != 0).then_some(cursor.regs.fp),
         };
-        let mcsize = self
-            .memory
-            .read_u64(Address::new(ucontext.checked_add(sigframe::UC_MCSIZE)?))
-            .ok()?;
-        let mcontext_pointer = self
-            .memory
-            .read_u64(Address::new(ucontext.checked_add(sigframe::UC_MCONTEXT)?))
-            .ok()?;
-        if mcsize != sigframe::MCONTEXT_SIZE || mcontext_pointer != mcontext {
+        let context = self.runtime.signal_context(self.memory, &frame)?;
+        self.restore_signal_context(cursor, &context)
+    }
+
+    /// The arm64 interrupted frame of `context`, checked as the module documentation says.
+    fn restore_signal_context(&self, cursor: &Cursor, context: &SignalContext) -> Option<UnwindStep>
+    {
+        if context.general.len() < 29 {
             return None;
         }
-        let sp = read(sigframe::SS_SP)?;
-        // On the interrupted stack the signal frame lies below the interrupted `sp`. On an
+        let sp = context.sp;
+        // On the interrupted stack the saved state lies below the interrupted `sp`. On an
         // alternate signal stack the interrupted `sp` is on another stack, and may be below
-        // the handler's frames; it can never be among them, from `_sigtramp`'s `sp` to the
-        // end of the signal frame.
-        let on_alternate_stack = if sp >= mcontext.checked_add(sigframe::MCONTEXT_SIZE)? {
+        // the handler's frames; it can never be among them, from the trampoline's `sp` to
+        // the end of the saved state.
+        let on_alternate_stack = if sp >= context.frame_end.value() {
             false
         } else if sp < cursor.regs.sp.value() {
             true
@@ -848,16 +841,15 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         };
 
         let mut next = cursor.regs.clone();
-        for (index, slot) in next.general.iter_mut().enumerate().take(29) {
-            *slot = read(sigframe::SS_X + 8 * index as u64)?;
+        for (slot, &value) in next.general.iter_mut().zip(&context.general).take(29) {
+            *slot = value;
         }
-        self.arch.set_fp(&mut next, Address::new(read(sigframe::SS_FP)?));
-        let lr = read(sigframe::SS_LR)?;
+        self.arch.set_fp(&mut next, Address::new(context.fp));
         if let Some(slot) = next.general.get_mut(30) {
-            *slot = lr;
+            *slot = context.lr;
         }
         next.sp = Address::new(sp);
-        next.pc = self.arch.strip_pointer_auth(Address::new(read(sigframe::SS_PC)?));
+        next.pc = self.arch.strip_pointer_auth(Address::new(context.pc));
         let step = UnwindStep {
             next,
             known: ALL_GENERAL,
@@ -871,8 +863,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     }
 
     /// The checks of [`accept`](Self::accept) for the one step that may move the stack
-    /// pointer down: from `_sigtramp` on an alternate signal stack to the frame the signal
-    /// interrupted. The interrupted state comes from a validated `ucontext`, so instead of
+    /// pointer down: from a signal trampoline on an alternate signal stack to the frame the
+    /// signal interrupted. The interrupted state comes from a validated context, so instead of
     /// `sp` growing, its `sp` must be a non-zero, 16-byte aligned (arm64 requires it)
     /// address and its pc executable. Later steps compare against the interrupted `sp`.
     fn accept_alternate_stack(&self, step: UnwindStep) -> Option<UnwindStep>
@@ -914,39 +906,6 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             _ => {}
         }
     }
-}
-
-/// Offsets in xnu's arm64 `struct user_sigframe64` (see
-/// [Signal handler frames](self#signal-handler-frames)).
-mod sigframe
-{
-    /// The `ucontext_t`, after the 104-byte `siginfo_t`.
-    pub(super) const UCONTEXT: u64 = 104;
-    /// `uc_mcsize` in `ucontext_t`.
-    pub(super) const UC_MCSIZE: u64 = 40;
-    /// `uc_mcontext` (a pointer) in `ucontext_t`.
-    pub(super) const UC_MCONTEXT: u64 = 48;
-    /// The `__darwin_mcontext64`, after the 56-byte `ucontext_t`.
-    pub(super) const MCONTEXT: u64 = UCONTEXT + 56;
-    /// `sizeof(__darwin_mcontext64)`, the kernel's `uc_mcsize` (`UC_FLAVOR_SIZE64`).
-    pub(super) const MCONTEXT_SIZE: u64 = 816;
-    /// `__ss.__x[0]` in the mcontext, after the 16-byte `__es`.
-    pub(super) const SS_X: u64 = 16;
-    /// `__ss.__fp`.
-    pub(super) const SS_FP: u64 = SS_X + 232;
-    /// `__ss.__lr`.
-    pub(super) const SS_LR: u64 = SS_X + 240;
-    /// `__ss.__sp`.
-    pub(super) const SS_SP: u64 = SS_X + 248;
-    /// `__ss.__pc`.
-    pub(super) const SS_PC: u64 = SS_X + 256;
-}
-
-/// Whether an arm64 instruction is a register-indirect call: `blr`, or the pointer
-/// authenticating `blraa`, `blraaz`, `blrab`, `blrabz`.
-fn is_indirect_call(instruction: u32) -> bool
-{
-    instruction & 0xffff_fc1f == 0xd63f_0000 || instruction & 0xfeff_f800 == 0xd63f_0800
 }
 
 /// The `known` bit of an arm64 DWARF register number `x0`-`x30`.
@@ -1066,6 +1025,11 @@ mod tests
     use crate::arch::Arm64;
     use crate::backend::mock::arm64_registers;
     use crate::error::DebuggerError;
+    use crate::runtime::mock::MockRuntime;
+
+    /// Code of the mock signal trampoline the tests' runtime recognizes.
+    static RUNTIME: std::sync::LazyLock<MockRuntime> =
+        std::sync::LazyLock::new(|| MockRuntime::new().with_signal_trampoline(0x5000_0000..0x5000_0100));
 
     /// Little-endian words at addresses; anything else is unreadable.
     #[derive(Default)]
@@ -1107,6 +1071,7 @@ mod tests
     {
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         StackUnwinder::new(&ARCH, &symbols, memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), regs, 64)
             .expect("unwind")
             .iter()
@@ -1197,7 +1162,7 @@ mod tests
     {
         let memory = FakeMemory::default();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
-        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
         let mut regs = regs(0x4000_0000, 0xf00, 0x1000, 0x8012_0000_4000_0abc);
         regs.general[3] = 33;
         regs.general[20] = 20;
@@ -1223,7 +1188,7 @@ mod tests
     {
         let memory = FakeMemory::default();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
-        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
         let cursor = Cursor {
             known: CALLEE_SAVED,
             is_caller: true,
@@ -1246,12 +1211,8 @@ mod tests
         );
     }
 
-    /// `blraaz x8`, the call in `_sigtramp`, and `bl` (a direct call).
-    const BLRAAZ_X8: u64 = 0xd63f_091f;
-    const BL: u64 = 0x9400_0010;
-
-    /// A handler frame record at 0x1000 returning into a `_sigtramp` at 0x5000_0040 whose
-    /// frame record (0x1100) sits right below an xnu signal frame; the interrupted frame
+    /// A handler frame record at 0x1000 returning into the mock trampoline at 0x5000_0044
+    /// whose frame record (0x1100) sits right below its saved state; the interrupted frame
     /// is at pc 0x4000_0100 with sp 0x2000, fp 0x2100, lr 0x4000_0aa0, and its own frame
     /// record at 0x2100 returns to 0x4000_0200 (fp chain end).
     fn signal_stack() -> FakeMemory
@@ -1259,22 +1220,17 @@ mod tests
         let mut memory = FakeMemory::default();
         memory.words.insert(0x1000, 0x1100);
         memory.words.insert(0x1008, 0x5000_0044);
-        // `_sigtramp`'s frame record: the interrupted fp and x30, not a caller of it.
+        // The trampoline's frame record: the interrupted fp and x30, not a caller of it.
         memory.words.insert(0x1100, 0x2100);
         memory.words.insert(0x1108, 0x4000_0aa0);
-        memory.words.insert(0x5000_0040, BLRAAZ_X8);
-        let frame = 0x1110;
-        let ucontext = frame + sigframe::UCONTEXT;
-        let mcontext = frame + sigframe::MCONTEXT;
-        memory.words.insert(ucontext + sigframe::UC_MCSIZE, sigframe::MCONTEXT_SIZE);
-        memory.words.insert(ucontext + sigframe::UC_MCONTEXT, mcontext);
+        let context = 0x1110;
         for index in 0..29 {
-            memory.words.insert(mcontext + sigframe::SS_X + 8 * index, 0x100 + index);
+            memory.words.insert(context + 8 * index, 0x100 + index);
         }
-        memory.words.insert(mcontext + sigframe::SS_FP, 0x2100);
-        memory.words.insert(mcontext + sigframe::SS_LR, 0x4000_0aa0);
-        memory.words.insert(mcontext + sigframe::SS_SP, 0x2000);
-        memory.words.insert(mcontext + sigframe::SS_PC, 0x8012_0000_4000_0100);
+        memory.words.insert(context + MockRuntime::FP, 0x2100);
+        memory.words.insert(context + MockRuntime::LR, 0x4000_0aa0);
+        memory.words.insert(context + MockRuntime::SP, 0x2000);
+        memory.words.insert(context + MockRuntime::PC, 0x8012_0000_4000_0100);
         memory.words.insert(0x2100, 0);
         memory.words.insert(0x2108, 0x4000_0200);
         memory
@@ -1286,6 +1242,7 @@ mod tests
         let memory = signal_stack();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 64)
             .expect("unwind");
         let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
@@ -1301,13 +1258,13 @@ mod tests
     {
         let memory = signal_stack();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
-        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
-        let sigtramp = Cursor {
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
+        let trampoline = Cursor {
             known: 1 << 29,
             is_caller: true,
             ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
         };
-        let step = unwinder.signal_frame_step(&sigtramp).expect("a signal frame");
+        let step = unwinder.signal_frame_step(&trampoline).expect("a signal frame");
         assert_eq!(step.known, ALL_GENERAL);
         assert_eq!(step.next.general[0], 0x100);
         assert_eq!(step.next.general[28], 0x100 + 28);
@@ -1323,47 +1280,93 @@ mod tests
     }
 
     #[test]
-    fn a_frame_without_a_signal_frame_is_not_a_trampoline()
+    fn a_context_with_too_few_registers_is_ignored()
     {
+        /// A runtime that recognizes every frame and returns `general` short of `x28`.
+        struct Short;
+        impl TargetRuntime for Short
+        {
+            fn signal_context(&self, _memory: &dyn MemoryAccess, _frame: &TrampolineFrame) -> Option<SignalContext>
+            {
+                Some(SignalContext {
+                    general: vec![0; 28],
+                    fp: 0x2100,
+                    lr: 0x4000_0aa0,
+                    sp: 0x2000,
+                    pc: 0x4000_0100,
+                    frame_end: Address::new(0x1200),
+                })
+            }
+        }
+        let memory = signal_stack();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
-        let sigtramp = Cursor {
+        let trampoline = Cursor {
             known: 1 << 29,
             is_caller: true,
             ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
         };
-        // A direct call before the return address.
-        let mut memory = signal_stack();
-        memory.words.insert(0x5000_0040, BL);
         assert!(
             StackUnwinder::new(&ARCH, &symbols, &memory)
-                .signal_frame_step(&sigtramp)
+                .with_runtime(&Short)
+                .signal_frame_step(&trampoline)
                 .is_none()
         );
-        // A `uc_mcontext` that does not point just past the `ucontext`.
-        let mut memory = signal_stack();
-        memory
-            .words
-            .insert(0x1110 + sigframe::UCONTEXT + sigframe::UC_MCONTEXT, 0x9999);
+    }
+
+    #[test]
+    fn a_frame_without_a_signal_frame_is_not_a_trampoline()
+    {
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
+        let trampoline = Cursor {
+            known: 1 << 29,
+            is_caller: true,
+            ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
+        };
+        // A pc outside the runtime's trampoline.
+        let memory = signal_stack();
+        let elsewhere = Cursor {
+            regs: regs(0x4000_0044, 0x10f0, 0x1100, 0),
+            ..trampoline.clone()
+        };
         assert!(
             StackUnwinder::new(&ARCH, &symbols, &memory)
-                .signal_frame_step(&sigtramp)
+                .with_runtime(&*RUNTIME)
+                .signal_frame_step(&elsewhere)
+                .is_none()
+        );
+        // An unknown frame pointer.
+        let unknown_fp = Cursor {
+            known: 0,
+            ..trampoline.clone()
+        };
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .with_runtime(&*RUNTIME)
+                .signal_frame_step(&unknown_fp)
+                .is_none()
+        );
+        // Without the platform's runtime no frame is a trampoline.
+        assert!(
+            StackUnwinder::new(&ARCH, &symbols, &memory)
+                .signal_frame_step(&trampoline)
                 .is_none()
         );
         // The innermost frame is never a trampoline's caller frame.
         let memory = signal_stack();
         let innermost = Cursor {
             is_caller: false,
-            ..sigtramp
+            ..trampoline
         };
         assert!(
             StackUnwinder::new(&ARCH, &symbols, &memory)
+                .with_runtime(&*RUNTIME)
                 .signal_frame_step(&innermost)
                 .is_none()
         );
     }
 
     /// [`signal_stack`] with the signal frame on an alternate signal stack at 0x9000:
-    /// the handler's frame record at 0x9000 returns into `_sigtramp`, whose record at
+    /// the handler's frame record at 0x9000 returns into the trampoline, whose record at
     /// 0x9100 sits right below the signal frame. The interrupted frame (sp 0x2000, fp
     /// 0x2100) is on the thread's own stack, below every frame on the alternate stack.
     fn alternate_signal_stack() -> FakeMemory
@@ -1379,14 +1382,10 @@ mod tests
             memory.words.insert(moved, word);
         }
         memory.words.insert(0x9000, 0x9100);
-        let mcontext = 0x9110 + sigframe::MCONTEXT;
-        memory
-            .words
-            .insert(0x9110 + sigframe::UCONTEXT + sigframe::UC_MCONTEXT, mcontext);
         memory
     }
 
-    fn alternate_stack_sigtramp() -> Cursor
+    fn alternate_stack_trampoline() -> Cursor
     {
         Cursor {
             known: 1 << 29,
@@ -1401,6 +1400,7 @@ mod tests
         let memory = alternate_signal_stack();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
             .expect("unwind");
         let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
@@ -1423,6 +1423,7 @@ mod tests
         memory.words.insert(0x1f08, 0x4000_0300);
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
             .expect("unwind");
         let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
@@ -1433,10 +1434,11 @@ mod tests
     fn an_alternate_stack_signal_frame_still_needs_a_plausible_interrupted_state()
     {
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
-        let mcontext = 0x9110 + sigframe::MCONTEXT;
-        let cursor = alternate_stack_sigtramp();
+        let context = 0x9110;
+        let cursor = alternate_stack_trampoline();
         assert!(
             StackUnwinder::new(&ARCH, &symbols, &alternate_signal_stack())
+                .with_runtime(&*RUNTIME)
                 .signal_frame_step(&cursor)
                 .is_some()
         );
@@ -1444,31 +1446,28 @@ mod tests
             let mut memory = alternate_signal_stack();
             change(&mut memory);
             StackUnwinder::new(&ARCH, &symbols, &memory)
+                .with_runtime(&*RUNTIME)
                 .signal_frame_step(&cursor)
                 .is_none()
         };
         // An interrupted sp among the handler's frames on the alternate stack.
         assert!(rejected(&|memory| {
-            memory.words.insert(mcontext + sigframe::SS_SP, 0x9200);
+            memory.words.insert(context + MockRuntime::SP, 0x9200);
         }));
         // A zero or misaligned interrupted sp.
         assert!(rejected(&|memory| {
-            memory.words.insert(mcontext + sigframe::SS_SP, 0);
+            memory.words.insert(context + MockRuntime::SP, 0);
         }));
         assert!(rejected(&|memory| {
-            memory.words.insert(mcontext + sigframe::SS_SP, 0x2008);
+            memory.words.insert(context + MockRuntime::SP, 0x2008);
         }));
         // An interrupted pc outside code.
         assert!(rejected(&|memory| {
             memory.code = Some((0x4000_0000, 0x4000_0100));
         }));
-        // An unreadable mcontext.
+        // An unreadable context.
         assert!(rejected(&|memory| {
-            memory.words.remove(&(mcontext + sigframe::SS_X + 8 * 7));
-        }));
-        // A wrong `uc_mcsize`.
-        assert!(rejected(&|memory| {
-            memory.words.insert(0x9110 + sigframe::UCONTEXT + sigframe::UC_MCSIZE, 512);
+            memory.words.remove(&(context + 8 * 7));
         }));
     }
 
@@ -1479,16 +1478,16 @@ mod tests
         // stack, so taking it again and again would repeat the same frames until
         // `max_frames`. Only the first downward signal step is taken.
         let mut memory = alternate_signal_stack();
-        let mcontext = 0x9110 + sigframe::MCONTEXT;
-        memory.words.insert(mcontext + sigframe::SS_SP, 0x8f00);
-        memory.words.insert(mcontext + sigframe::SS_FP, 0x9000);
-        memory.words.insert(mcontext + sigframe::SS_PC, 0x4000_0000);
+        let context = 0x9110;
+        memory.words.insert(context + MockRuntime::SP, 0x8f00);
+        memory.words.insert(context + MockRuntime::FP, 0x9000);
+        memory.words.insert(context + MockRuntime::PC, 0x4000_0000);
         let trace = pcs(&memory, &regs(0x4000_0000, 0x8f00, 0x9000, 0));
         assert!(trace.len() < 8, "the trace loops: {trace:x?}");
         assert_eq!(
             trace.iter().filter(|&&pc| pc == 0x5000_0044).count(),
             2,
-            "`_sigtramp` is reached at most twice: {trace:x?}"
+            "the trampoline is reached at most twice: {trace:x?}"
         );
     }
 
@@ -1514,8 +1513,8 @@ mod tests
         // rejected by `accept`, which the signal step bypasses only on an alternate stack.
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let memory = alternate_signal_stack();
-        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
-        let caller = alternate_stack_sigtramp();
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
+        let caller = alternate_stack_trampoline();
         let signal = unwinder.signal_frame_step(&caller).expect("the alternate-stack signal step");
         assert_eq!(signal.next.sp, Address::new(0x2000));
         assert!(
@@ -1579,13 +1578,14 @@ mod tests
         loaded.expect("load synthetic image");
 
         let mut memory = alternate_signal_stack();
-        let mcontext = 0x9110 + sigframe::MCONTEXT;
+        let context = 0x9110;
         let interrupted_pc = CFI_FUNCTION + 0x10;
-        memory.words.insert(mcontext + sigframe::SS_PC, interrupted_pc);
-        memory.words.insert(mcontext + sigframe::SS_FP, 0x1f00);
+        memory.words.insert(context + MockRuntime::PC, interrupted_pc);
+        memory.words.insert(context + MockRuntime::FP, 0x1f00);
         memory.words.insert(0x1f00, 0);
         memory.words.insert(0x1f08, 0x4000_0300);
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
             .expect("unwind");
         let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
@@ -1593,7 +1593,7 @@ mod tests
         assert_eq!(frames[2].sp, Address::new(0x2000));
 
         // The rejected step is the CFI row, not the frame-pointer fallback.
-        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
         let interrupted = Cursor {
             regs: regs(interrupted_pc, 0x2000, 0x1f00, 0x4000_0aa0),
             known: ALL_GENERAL,
@@ -1609,24 +1609,12 @@ mod tests
     }
 
     #[test]
-    fn indirect_calls_are_recognized()
-    {
-        // blr x8, blraa x8, x9, blraaz x8, blrab x8, x9, blrabz x8.
-        for call in [0xd63f_0100, 0xd73f_0909, 0xd63f_091f, 0xd73f_0d09, 0xd63f_0d1f] {
-            assert!(is_indirect_call(call), "{call:#x}");
-        }
-        // bl, br x8, ret.
-        for other in [0x9400_0010, 0xd61f_0100, 0xd65f_03c0] {
-            assert!(!is_indirect_call(other), "{other:#x}");
-        }
-    }
-
-    #[test]
     fn max_frames_limits_the_trace()
     {
         let memory = chain();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
+            .with_runtime(&*RUNTIME)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 2)
             .expect("unwind");
         assert_eq!(frames.len(), 2);

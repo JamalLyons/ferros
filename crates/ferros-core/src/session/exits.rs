@@ -2,10 +2,13 @@
 //! without returning from them, so an operation that waits for a frame to return sees
 //! the thread leave it by another route.
 //!
-//! Two routes are trapped: the system unwinder resuming at a landing pad (a panic caught
-//! further out) and `_longjmp` in `libsystem_platform` (`longjmp` and `siglongjmp` end in
-//! a branch to it). A thread that hits one is single-stepped until it leaves that image
-//! above the stack it entered with: it has then landed where the exit goes.
+//! The routes are the platform's: the session's
+//! [`TargetRuntime::exit_sources`](crate::runtime::TargetRuntime::exit_sources) names
+//! each image and its entry symbols (typically the system unwinder resuming at a landing
+//! pad, for a panic caught further out, and the leaf of `longjmp`). A thread that hits
+//! one is single-stepped until it leaves that image above the stack it entered with: it
+//! has then landed where the exit goes. A session whose runtime names no source traps
+//! nothing.
 
 use std::sync::Arc;
 
@@ -16,57 +19,18 @@ use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
 use crate::objfile::MappedSymbols;
+use crate::runtime::ExitSource;
 use crate::types::{Address, BuildIdentity, ThreadId};
 
-/// Functions through which the unwinder transfers control to a landing pad:
-/// `unw_resume` and, on current macOS, the variant `_Unwind_RaiseException` and
-/// `_Unwind_Resume` call. Matched with every leading underscore removed: the shared
-/// cache's symbol table names them `___unw_resume` (the internal alias), the exports
-/// `_unw_resume`.
-const RESUME_SYMBOLS: [&str; 2] = ["unw_resume", "unw_resume_with_frames_walked"];
-
 /// Instructions single-stepped from an exit entry to its landing before giving up (an
-/// unwinder resume takes a few dozen, `_longjmp` about twenty-five).
+/// unwinder resume takes a few dozen, a `longjmp` leaf a few tens).
 const MAX_EXIT_STEPS: u32 = 4096;
-
-/// An image whose code a thread passes through to leave frames without returning.
-struct ExitSource
-{
-    /// File name of the image.
-    image: &'static str,
-    /// Whether a raw symbol table name (leading underscores kept) is an entry to trap.
-    entry: fn(&str) -> bool,
-}
-
-const SOURCES: [ExitSource; 2] = [
-    ExitSource {
-        image: "libunwind.dylib",
-        entry: is_unwinder_resume,
-    },
-    ExitSource {
-        image: "libsystem_platform.dylib",
-        entry: is_long_jump,
-    },
-];
-
-fn is_unwinder_resume(name: &str) -> bool
-{
-    RESUME_SYMBOLS.contains(&name.trim_start_matches('_'))
-}
-
-/// `_longjmp`, the leaf that restores a `jmp_buf`. `longjmp` (raw `_longjmp`) and
-/// `siglongjmp` restore the signal state and branch to it, so trapping it covers all
-/// three without stepping through their system calls.
-fn is_long_jump(name: &str) -> bool
-{
-    name == "__longjmp"
-}
 
 /// One exit image's code and entries in one process.
 #[derive(Clone)]
 pub(super) struct ExitImage
 {
-    /// Index into `SOURCES`.
+    /// Index into the runtime's exit sources.
     source: usize,
     load_address: u64,
     build_id: BuildIdentity,
@@ -293,13 +257,14 @@ impl Session
         }
         let mut previous = std::mem::take(&mut self.exit_images);
         let mut found = Vec::new();
-        for (source, exit) in SOURCES.iter().enumerate() {
+        let runtime = Arc::clone(&self.runtime);
+        for (source, exit) in runtime.exit_sources().iter().enumerate() {
             let Some(image) = self
                 .loaded_images
                 .iter()
-                .find(|image| image.descriptor_path().file_name().is_some_and(|name| name == exit.image))
+                .find(|image| image.descriptor_path().file_name().is_some_and(|name| name == exit.image()))
             else {
-                tracing::debug!("no exit hooks: {} is not loaded", exit.image);
+                tracing::debug!("no exit hooks: {} is not loaded", exit.image());
                 continue;
             };
             let load_address = image.descriptor_load_address();
@@ -314,9 +279,9 @@ impl Session
                 found.push(cached);
                 continue;
             }
-            match self.read_exit_image(source, load_address, build_id) {
+            match self.read_exit_image(exit, source, load_address, build_id) {
                 Ok(image) => found.push(image),
-                Err(detail) => tracing::debug!("no exit hooks in {}: {detail}", exit.image),
+                Err(detail) => tracing::debug!("no exit hooks in {}: {detail}", exit.image()),
             }
         }
         self.exit_images.clone_from(&found);
@@ -325,24 +290,24 @@ impl Session
 
     fn read_exit_image(
         &mut self,
+        exit: &ExitSource,
         source: usize,
         load_address: u64,
         build_id: BuildIdentity,
     ) -> std::result::Result<ExitImage, String>
     {
-        let exit = &SOURCES[source];
         let mut memory = BackendTarget(self.backend.as_mut());
         let code = self.format.mapped_symbols(&mut memory, Address::new(load_address))?;
         let index = code.load(&mut memory)?;
         let mut entries = Vec::new();
         for (address, key) in index.symbols().filter(|&(address, _)| code.contains(address)) {
             let name = index.read_name(&mut memory, key)?;
-            if name.is_some_and(|name| (exit.entry)(&name)) && !entries.contains(&address) {
+            if name.is_some_and(|name| exit.is_entry(&name)) && !entries.contains(&address) {
                 entries.push(address);
             }
         }
         if entries.is_empty() {
-            return Err(format!("{} has no exit entry symbol", exit.image));
+            return Err(format!("{} has no exit entry symbol", exit.image()));
         }
         Ok(ExitImage {
             source,

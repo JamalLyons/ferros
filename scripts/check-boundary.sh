@@ -9,7 +9,11 @@
 #   4. crates/ferros-core/src must not contain Mach-O knowledge (comments
 #      included), and crates/ferros-core/Cargo.toml must not name an
 #      object-file parser crate (ADR 0001, #193).
-#   5. The CLI (crates/ferros/src) may name `ferros_macos` only in its factory
+#   5. crates/ferros-core/src must not contain macOS runtime knowledge (comments
+#      included): system libraries and the loader (`dylib`, `dyld`, `libunwind`,
+#      `libsystem_`, `unw_resume`, `__longjmp`) and the xnu signal frame (`xnu`,
+#      `_sigtramp`, `ucontext`, `mcontext`, `sigframe`, `uc_mcsize`) (#201).
+#   6. The CLI (crates/ferros/src) may name `ferros_macos` only in its factory
 #      module, platform.rs, and its manifest may not rename that dependency.
 #
 # Every offending line is printed as `file:line: rule: text` on stderr and the
@@ -107,7 +111,22 @@ awk '
     END { exit bad }
 ' crates/ferros-core/Cargo.toml >&2 || failed=1
 
-# Rule 5: the CLI names the macOS crate only in platform.rs.
+# Rule 5: macOS runtime text in ferros-core sources, case-insensitive substrings.
+# shellcheck disable=SC2086
+awk '
+    {
+        lower = tolower($0)
+        n = split("dylib dyld sigtramp ucontext mcontext sigframe uc_mcsize xnu libunwind libsystem_ unw_resume __longjmp", tokens, " ")
+        for (i = 1; i <= n; i++) if (index(lower, tokens[i])) {
+            printf "%s:%d: macOS runtime knowledge belongs in ferros-macos (%s): %s\n", FILENAME, FNR, tokens[i], $0
+            bad = 1
+            break
+        }
+    }
+    END { exit bad }
+' $core_sources >&2 || failed=1
+
+# Rule 6: the CLI names the macOS crate only in platform.rs.
 cli_sources=$(find crates/ferros/src -type f -name '*.rs' ! -path 'crates/ferros/src/platform.rs' | sort)
 if [ -n "$cli_sources" ]; then
     # shellcheck disable=SC2086

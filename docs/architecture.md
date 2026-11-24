@@ -144,6 +144,7 @@ ferros-core/src/
 │   ├── stack.rs        # Stack traces and symbolication
 │   ├── images.rs       # Loading the backend's image list into the symbol cache
 │   └── exits.rs        # Non-local exits (panic landing pads, longjmp)
+├── runtime/            # TargetRuntime: exit sources and signal frames (platform-supplied)
 ├── backend/            # Backend trait (mechanism), StopEvent, LaunchSpec, MockBackend
 ├── arch/               # CPU knowledge independent of the OS
 ├── breakpoints/        # Breakpoint types and store
@@ -158,6 +159,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 ├── exception.rs        # Mach exception port loop, stop events
 ├── launch.rs           # posix_spawn with LaunchSpec
 ├── images.rs           # Backend::images (target dyld image list)
+├── runtime.rs          # MacOSRuntime: libunwind/__longjmp exit hooks, _sigtramp frame
 ├── memory.rs
 ├── threads.rs
 ├── breakpoints.rs      # Hardware breakpoints and watchpoints (not on Session)
@@ -167,7 +169,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 └── ...
 ```
 
-`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session (`ferros_macos::new_session()` on macOS). See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
+`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session, and `Session::with_runtime(Arc<dyn TargetRuntime>)` gives it the platform's runtime knowledge: which system libraries and entry symbols a thread leaves frames through (unwinder resumes, `longjmp`), and how a signal trampoline's saved registers are found. `ferros_macos::new_session()` pairs `MacOSBackend`, `MachOFormat`, and `MacOSRuntime` on macOS. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
 
 #### Platform Factory
 
@@ -460,13 +462,14 @@ Two backends exist:
 1. `ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`, a platform crate), no `cfg(target_os)` and no `unsafe`. It declares `#![forbid(unsafe_code)]`.
 2. `unsafe` is allowed only in a platform crate, for raw OS bindings.
 3. The CLI names a platform crate in exactly one module, [`crates/ferros/src/platform.rs`](../crates/ferros/src/platform.rs). That module is also the only `cfg(target_os)` switch outside the platform and test crates.
-4. Engine behaviour is tested twice: against `MockBackend` in `ferros-core`, and against real fixture processes in `crates/ferros-tests`.
+4. `ferros-core` names no system library and no kernel signal-frame layout: they come from the platform's `runtime::TargetRuntime` ([#201](https://github.com/JamalLyons/ferros/issues/201)).
+5. Engine behaviour is tested twice: against `MockBackend` in `ferros-core`, and against real fixture processes in `crates/ferros-tests`.
 
 The rules are enforced by `just check-boundary` ([`scripts/check-boundary.sh`](../scripts/check-boundary.sh)), which CI runs on both the Ubuntu and the macOS runner, and by [`crates/ferros-tests/tests/platform_boundary.rs`](../crates/ferros-tests/tests/platform_boundary.rs).
 
 ### How to Add a Platform
 
-1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type and `ferros_core::objfile::ObjectFormat` for its object-file format. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
+1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type, `ferros_core::objfile::ObjectFormat` for its object-file format, and `ferros_core::runtime::TargetRuntime` for its system libraries and signal frames. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
 2. Add the crate as a target-specific dependency of `crates/ferros` and add one arm to the factory:
 
 ```rust
@@ -479,7 +482,8 @@ pub fn create_session() -> ferros_core::Result<Session>
 
     #[cfg(target_os = "linux")]
     {
-        Ok(Session::new(Box::new(ferros_linux::LinuxBackend::new()?), ferros_linux::ElfFormat::shared()))
+        Ok(Session::new(Box::new(ferros_linux::LinuxBackend::new()?), ferros_linux::ElfFormat::shared())
+            .with_runtime(ferros_linux::LinuxRuntime::shared()))
     }
     // ...
 }
@@ -487,7 +491,7 @@ pub fn create_session() -> ferros_core::Result<Session>
 
 3. Add integration tests for the platform in `crates/ferros-tests` that debug the fixture programs through `Session`.
 
-`Session`'s process-control policy (state machine, software breakpoints, stepping) works with any `Backend`, and its symbolication works with any `objfile::ObjectFormat`. Per [ADR 0001](adr/0001-object-file-boundary.md) ([#193](https://github.com/JamalLyons/ferros/issues/193)), the Mach-O implementor (headers, universal slices, symbol tables, compact unwind, dSYM discovery) is `ferros_macos::macho::MachOFormat`; `LoadedImage.build_id` holds up to 32 bytes, so an ELF build-id fits. DWARF stays in core. A new platform implements both `Backend` and `ObjectFormat`. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
+`Session`'s process-control policy (state machine, software breakpoints, stepping) works with any `Backend`, and its symbolication works with any `objfile::ObjectFormat`. Per [ADR 0001](adr/0001-object-file-boundary.md) ([#193](https://github.com/JamalLyons/ferros/issues/193)), the Mach-O implementor (headers, universal slices, symbol tables, compact unwind, dSYM discovery) is `ferros_macos::macho::MachOFormat`; `LoadedImage.build_id` holds up to 32 bytes, so an ELF build-id fits. DWARF stays in core. A new platform implements `Backend`, `ObjectFormat`, and `TargetRuntime` ([#201](https://github.com/JamalLyons/ferros/issues/201)); `ferros-core` names no system library and no kernel signal-frame layout. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
 
 ---
 

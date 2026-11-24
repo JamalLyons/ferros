@@ -93,7 +93,7 @@ impl Session
     ///
     /// The backend's images are loaded into the symbol cache first (see
     /// [`images`](Self::images)). A frame whose code has no DWARF (std linked without
-    /// debug info, dyld, the system libraries in the dyld shared cache) is named from its
+    /// debug info, the dynamic loader, system libraries) is named from its
     /// image's symbol table instead, read from the target's memory through the session's
     /// [`ObjectFormat`](crate::objfile::ObjectFormat); code in no listed image is named
     /// from the image whose header precedes it in memory, if the format searches for one.
@@ -128,7 +128,9 @@ impl Session
             let frames = {
                 let traps = self.trap_originals();
                 let memory = BackendMemory::new(self.backend.as_mut(), traps);
-                StackUnwinder::new(arch, &self.symbols, &memory).unwind(thread, &registers, max_frames)?
+                StackUnwinder::new(arch, &self.symbols, &memory)
+                    .with_runtime(self.runtime.as_ref())
+                    .unwind(thread, &registers, max_frames)?
             };
             let mut added = false;
             for frame in &frames {
@@ -169,11 +171,10 @@ impl Session
     /// Name `address` from the symbol table of an image the backend does not list, found
     /// by the nearest image header before `address` in its executable region.
     ///
-    /// This is a fallback for code no listed image contains. The macOS backend lists dyld
-    /// itself, though dyld leaves itself out of the array it publishes, so the base of a
-    /// main-thread trace (dyld's `start`) is named from a listed image and needs no
-    /// search; a backend that leaves out an image, or code mapped outside every image,
-    /// still gets one. The header is searched for at the format's
+    /// This is a fallback for code no listed image contains. A backend that lists every
+    /// image, the dynamic loader included, needs no search for the base of a main-thread
+    /// trace (the loader's entry point); a backend that leaves out an image, or code
+    /// mapped outside every image, still gets one. The header is searched for at the format's
     /// [`unlisted_image_alignment`](crate::objfile::ObjectFormat::unlisted_image_alignment),
     /// from `address` back to the start of its region; a format without one gets no
     /// search. A

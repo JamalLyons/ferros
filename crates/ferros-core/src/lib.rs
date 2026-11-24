@@ -39,6 +39,13 @@
 //! the images mapped in a target (symbol tables, unlisted images). Each platform crate
 //! implements it for its own format and pairs it with its backend; `ferros-core` holds no
 //! object-file format's parser for those questions. DWARF is read here.
+//!
+//! ## Runtime boundary
+//!
+//! [`runtime::TargetRuntime`] answers what the platform's system code does in every
+//! process: through which libraries and entry points a thread leaves frames without
+//! returning (unwinder resumes, `longjmp`), and how a signal trampoline's saved register
+//! state is found. A platform crate implements it; `ferros-core` names no system library.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
@@ -49,6 +56,7 @@ pub mod breakpoints;
 pub mod error;
 pub mod events;
 pub mod objfile;
+pub mod runtime;
 pub mod session;
 pub mod symbols;
 pub mod types;

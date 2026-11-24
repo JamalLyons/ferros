@@ -238,8 +238,8 @@ impl Session
     }
 
     /// Refresh mappings without requesting DWARF or reading image files. Images whose
-    /// mapped header has no segment at file offset zero (for example libraries in the
-    /// shared cache) stay unmapped, which is harmless here.
+    /// mapped header has no segment at file offset zero (for example system libraries the
+    /// loader maps from a shared region) stay unmapped, which is harmless here.
     ///
     /// A previous [`SessionImage`] is reused only when its path and load address are
     /// unchanged and its build identity can be the same build ([`same_build`]). Otherwise a

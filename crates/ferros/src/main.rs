@@ -105,9 +105,11 @@ impl Script
 fn main() -> ExitCode
 {
     // The logging session owns the log worker. It lives until `main` returns, so the
-    // records written just before exit reach the file.
+    // records written just before exit (the last one is below) reach the file.
     let mut logging = None;
-    run(&mut logging)
+    let code = run(&mut logging);
+    info!("ferros exiting");
+    code
 }
 
 fn run(logging: &mut Option<ferros_utils::LoggingSession>) -> ExitCode
@@ -136,10 +138,7 @@ fn run(logging: &mut Option<ferros_utils::LoggingSession>) -> ExitCode
     };
 
     let (script, mut target, stdin_file, give_terminal) = match cli.command {
-        Commands::FindLogs => {
-            println!("{}", log_directory().display());
-            return ExitCode::SUCCESS;
-        }
+        Commands::FindLogs => return print_log_directory(),
         Commands::Launch {
             script,
             stdin,
@@ -194,6 +193,27 @@ fn run(logging: &mut Option<ferros_utils::LoggingSession>) -> ExitCode
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Print [`log_directory`], the directory the logger opens, followed by a newline.
+///
+/// The OS bytes are written unchanged (`Path::display` would replace bytes that are
+/// not UTF-8), so the printed path names the directory the logger actually opened.
+fn print_log_directory() -> ExitCode
+{
+    let directory = log_directory();
+    let mut out = io::stdout().lock();
+    let written = out
+        .write_all(directory.as_os_str().as_encoded_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    match written {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

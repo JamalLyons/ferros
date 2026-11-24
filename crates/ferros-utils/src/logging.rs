@@ -45,17 +45,18 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::time::Duration;
 use std::{env, io};
 
 use chrono::Utc;
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_log::AsLog as _;
 use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::fmt::{self};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// Log output format
@@ -190,19 +191,43 @@ pub fn init_logging_with_level(level: LogLevel, format: LogFormat) -> Result<(),
     init_logging_internal(format, level.into())
 }
 
-/// The directory that holds the Ferros log files.
+/// The directory that holds the Ferros log files, always an absolute path.
 ///
 /// `~/.ferros` when `HOME` is set and not empty, otherwise the OS temporary
-/// directory. Every file logger opens this directory, and `ferros find-logs`
-/// prints it, so the two cannot disagree. The path is built from the OS string,
-/// so a home directory that is not valid Unicode works.
+/// directory. A relative result (a relative `HOME` or `TMPDIR`) is joined onto
+/// the working directory, and an empty `TMPDIR` means `/tmp` on Unix. Every file
+/// logger opens this directory, and `ferros find-logs` prints it, so the two
+/// cannot disagree. The path is built from the OS string, so a home directory
+/// that is not valid Unicode works.
 #[must_use]
 pub fn log_directory() -> PathBuf
 {
-    match env::var_os("HOME") {
+    let directory = match env::var_os("HOME") {
         Some(home) if !home.is_empty() => PathBuf::from(home).join(".ferros"),
         _ => env::temp_dir(),
+    };
+    absolute_directory(directory)
+}
+
+/// Where an empty temporary-directory setting points.
+#[cfg(unix)]
+const EMPTY_TEMP_DIR: &str = "/tmp";
+#[cfg(not(unix))]
+const EMPTY_TEMP_DIR: &str = ".";
+
+/// `directory` as an absolute path. `std::env::temp_dir` returns an empty path
+/// for an empty `TMPDIR`, which a file opener would read as the working directory.
+fn absolute_directory(directory: PathBuf) -> PathBuf
+{
+    if directory.is_absolute() {
+        return directory;
     }
+    let directory = if directory.as_os_str().is_empty() {
+        PathBuf::from(EMPTY_TEMP_DIR)
+    } else {
+        directory
+    };
+    std::path::absolute(&directory).unwrap_or(directory)
 }
 
 /// Create [`log_directory`] if needed and return it.
@@ -233,8 +258,14 @@ fn open_appender(file: &Path, rotation: Rotation) -> Result<RollingFileAppender,
 /// A running file logger that owns its flush worker.
 ///
 /// Records are written by a background worker. Keep the session alive until the
-/// program is about to exit; dropping it flushes every record written so far.
-/// Without it, records written just before exit can be lost.
+/// program is about to exit; dropping it (or [`LoggingSession::finish`]) flushes
+/// the records written so far. Without it, records written just before exit can
+/// be lost.
+///
+/// The flush is bounded: dropping waits about 100 ms to queue the shutdown and
+/// then up to about one second for the worker to drain. A worker still behind
+/// after that (a sink that blocks, or a full queue) is abandoned and its
+/// remaining records are lost, so exit never hangs on the log file.
 #[derive(Debug)]
 #[must_use = "dropping the session stops the log worker; hold it until the program exits"]
 pub struct LoggingSession
@@ -260,7 +291,7 @@ impl LoggingSession
         &self.directory
     }
 
-    /// Flush every record written so far and stop the worker.
+    /// Flush the records written so far (within the bound above) and stop the worker.
     pub fn finish(self)
     {
         drop(self.worker);
@@ -285,10 +316,49 @@ pub fn start_file_logging(level: Option<LogLevel>, format: LogFormat) -> Result<
 {
     let directory = open_log_directory()?;
     let file = directory.join(dated_file_name("ferros"));
-    let appender = open_appender(&file, Rotation::NEVER)?;
+    let appender = SlowWrites {
+        inner: open_appender(&file, Rotation::NEVER)?,
+        delay: test_write_delay(),
+    };
     let (writer, worker) = tracing_appender::non_blocking(appender);
     install_file_only(writer, format, level.map(Into::into))?;
     Ok(LoggingSession { file, directory, worker })
+}
+
+/// Test-only: milliseconds the background worker waits before each write.
+///
+/// The exit tests set it so the last record is provably still queued when the
+/// program returns from `main`; only a flush that waits for the worker gets that
+/// record into the file. Unset (always, outside tests) it costs nothing.
+const TEST_WRITE_DELAY: &str = "FERROS_TEST_LOG_WRITE_DELAY_MS";
+
+fn test_write_delay() -> Option<Duration>
+{
+    let millis = env::var(TEST_WRITE_DELAY).ok()?.parse().ok()?;
+    Some(Duration::from_millis(millis))
+}
+
+/// The log file behind the background worker, optionally slowed for tests.
+struct SlowWrites<W>
+{
+    inner: W,
+    delay: Option<Duration>,
+}
+
+impl<W: io::Write> io::Write for SlowWrites<W>
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize>
+    {
+        if let Some(delay) = self.delay {
+            std::thread::sleep(delay);
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()>
+    {
+        self.inner.flush()
+    }
 }
 
 /// Initialize logging for TUI mode (file-only, no stdout)
@@ -385,17 +455,10 @@ fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), 
                     .with_ansi(false) // No ANSI in files
                     .with_filter(env_filter);
 
-                Registry::default()
-                    .with(console_layer)
-                    .with(file_layer)
-                    .try_init()
-                    .map_err(initialization_failed)?;
+                install(Registry::default().with(console_layer).with(file_layer))?;
             } else {
                 // Console only
-                Registry::default()
-                    .with(console_layer)
-                    .try_init()
-                    .map_err(initialization_failed)?;
+                install(Registry::default().with(console_layer))?;
             }
         }
         LogFormat::Json => {
@@ -427,17 +490,10 @@ fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), 
                     .with_span_list(true)
                     .with_filter(env_filter);
 
-                Registry::default()
-                    .with(console_layer)
-                    .with(file_layer)
-                    .try_init()
-                    .map_err(initialization_failed)?;
+                install(Registry::default().with(console_layer).with(file_layer))?;
             } else {
                 // Console only
-                Registry::default()
-                    .with(console_layer)
-                    .try_init()
-                    .map_err(initialization_failed)?;
+                install(Registry::default().with(console_layer))?;
             }
         }
     }
@@ -448,6 +504,23 @@ fn init_logging_internal(format: LogFormat, default_level: Level) -> Result<(), 
 fn initialization_failed(error: impl std::fmt::Display) -> LoggingError
 {
     LoggingError::InitializationFailed(error.to_string())
+}
+
+/// Install `subscriber` as the global default, then forward `log` records to it.
+///
+/// The `log` bridge is optional: when another `log` logger is already installed,
+/// that logger keeps the `log` records and the tracing subscriber still works.
+/// Installing both in one step would leave the subscriber installed but report
+/// failure, so the caller would drop its worker and lose every later record.
+fn install<S>(subscriber: S) -> Result<(), LoggingError>
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    tracing::subscriber::set_global_default(subscriber).map_err(initialization_failed)?;
+    let _ = tracing_log::LogTracer::builder()
+        .with_max_level(tracing::level_filters::LevelFilter::current().as_log())
+        .init();
+    Ok(())
 }
 
 /// Install a global file-only subscriber that writes to `writer`.
@@ -484,7 +557,7 @@ where
                 .with_ansi(false) // No ANSI in files
                 .with_filter(env_filter);
 
-            Registry::default().with(file_layer).try_init().map_err(initialization_failed)
+            install(Registry::default().with(file_layer))
         }
         LogFormat::Json => {
             let file_layer = fmt::layer()
@@ -500,7 +573,7 @@ where
                 .with_span_list(true)
                 .with_filter(env_filter);
 
-            Registry::default().with(file_layer).try_init().map_err(initialization_failed)
+            install(Registry::default().with(file_layer))
         }
     }
 }
@@ -574,6 +647,25 @@ mod session_tests
 
     use super::*;
 
+    /// Milliseconds the worker holds each record: well under the guard's
+    /// one-second flush bound, far longer than the child takes to exit.
+    const SLOW_WRITE_MS: &str = "250";
+
+    /// A `log` logger that some other library installed first.
+    struct OtherLogger;
+
+    impl tracing_log::log::Log for OtherLogger
+    {
+        fn enabled(&self, _: &tracing_log::log::Metadata<'_>) -> bool
+        {
+            true
+        }
+
+        fn log(&self, _: &tracing_log::log::Record<'_>) {}
+
+        fn flush(&self) {}
+    }
+
     const MODE: &str = "FERROS_LOG_TEST_MODE";
     const REPORT: &str = "FERROS_LOG_TEST_REPORT";
     const CHILD: &str = "logging::session_tests::child";
@@ -595,6 +687,7 @@ mod session_tests
             .env(MODE, mode)
             .env(REPORT, report)
             .env("HOME", home)
+            .env(TEST_WRITE_DELAY, SLOW_WRITE_MS)
             .env_remove("RUST_LOG")
             .output()
             .unwrap()
@@ -636,15 +729,19 @@ mod session_tests
                 };
                 let session = start_file_logging(None, format).unwrap();
                 std::fs::write(&report, session.directory().as_os_str().as_encoded_bytes()).unwrap();
-                // A burst keeps the worker busy, so a worker that is never flushed is
-                // still behind when the process exits.
-                for index in 0..50_000 {
-                    tracing::info!(index, "filler");
-                }
+                // The slowed worker is still holding this record when `drop` runs.
                 tracing::info!("flush-me");
-                // The CLI returns from `main`, dropping the session, then the process
-                // exits at once. Nothing may be lost between the two.
+                // Returning from `main` drops the session, then the process exits at
+                // once. Nothing may be lost between the two.
                 drop(session);
+                std::process::exit(0);
+            }
+            "other-log-logger" => {
+                tracing_log::log::set_logger(&OtherLogger).unwrap();
+                let session = start_file_logging(None, LogFormat::Pretty);
+                let session = session.expect("an existing `log` logger must not stop tracing from installing");
+                tracing::info!("flush-me");
+                session.finish();
                 std::process::exit(0);
             }
             "second-install" => {
@@ -711,6 +808,16 @@ mod session_tests
     }
 
     #[test]
+    fn an_existing_log_logger_leaves_tracing_working()
+    {
+        let home = scratch("other-log");
+        assert_clean_exit(&run_child("other-log-logger", &home, &home.join("report")));
+        let log = only_log(&home.join(".ferros"));
+        assert!(log.contains("flush-me"), "log file is missing the record: {log:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn synchronous_file_log_needs_no_guard()
     {
         let home = scratch("synchronous");
@@ -737,6 +844,16 @@ mod session_tests
         std::fs::write(home.join(".ferros"), b"not a directory").unwrap();
         assert_clean_exit(&run_child("unwritable", &home, &home.join("report")));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_relative_or_empty_directory_is_made_absolute()
+    {
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(absolute_directory(PathBuf::from("logs")), cwd.join("logs"));
+        assert_eq!(absolute_directory(PathBuf::new()), PathBuf::from(EMPTY_TEMP_DIR));
+        assert!(absolute_directory(PathBuf::new()).is_absolute());
+        assert_eq!(absolute_directory(PathBuf::from("/a/b")), PathBuf::from("/a/b"));
     }
 
     #[test]

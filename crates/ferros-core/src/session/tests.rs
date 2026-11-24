@@ -6,6 +6,7 @@ use super::*;
 use crate::arch::Arm64;
 use crate::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use crate::backend::{BackendError, LaunchSpec, LoadedImage, ResumeRequest, ThreadAction};
+use crate::breakpoints::builder::BreakpointBuilder;
 use crate::breakpoints::{BreakpointId, BreakpointRequest, BreakpointState, WatchpointAccess};
 use crate::objfile::mock::MockObjectFormat;
 
@@ -1338,6 +1339,56 @@ fn wait_with_timeout_while_running_and_nothing_happens_stays_running()
     session.resume().expect("resume");
     assert_eq!(session.wait(Some(Duration::from_millis(200))).expect("wait"), None);
     assert_eq!(session.state(), SessionState::Running);
+}
+
+fn assert_install_refused(mock: &MockBackend, session: &mut Session, builder: BreakpointBuilder, option: &str)
+{
+    let result = builder.install(session);
+    assert!(
+        matches!(&result, Err(DebuggerError::InvalidArgument(message)) if message.contains(option)),
+        "{option}: {result:?}"
+    );
+    assert!(session.breakpoints().is_empty(), "{option}: table not empty");
+    assert!(
+        mock.calls().iter().all(|call| !matches!(call, MockCall::WriteMemory { .. })),
+        "{option}: trap written: {:?}",
+        mock.calls()
+    );
+    assert_eq!(peek(mock, BP), original(BP), "{option}: memory changed");
+}
+
+#[test]
+fn install_rejects_a_hit_count_instead_of_dropping_it()
+{
+    let at = || BreakpointBuilder::software(Address::new(BP));
+
+    let mock = process();
+    let mut session = launched(&mock);
+    assert_install_refused(&mock, &mut session, at().with_hit_count(5), "hit count");
+
+    let mock = process();
+    let mut session = launched(&mock);
+    assert_install_refused(&mock, &mut session, at().with_condition(|_| true), "condition");
+
+    let mock = process();
+    let mut session = launched(&mock);
+    assert_install_refused(&mock, &mut session, at().for_thread(T1), "thread filter");
+
+    let mock = process();
+    let mut session = launched(&mock);
+    assert_install_refused(&mock, &mut session, at().with_command("continue"), "commands");
+}
+
+#[test]
+fn install_without_options_plants_the_trap()
+{
+    let mock = process();
+    let mut session = launched(&mock);
+    let id = BreakpointBuilder::software(Address::new(BP))
+        .install(&mut session)
+        .expect("install");
+    assert_eq!(peek(&mock, BP), TRAP.to_vec());
+    assert_eq!(session.breakpoint_info(id).expect("info").address, Address::new(BP));
 }
 
 #[path = "tests/stepping.rs"]

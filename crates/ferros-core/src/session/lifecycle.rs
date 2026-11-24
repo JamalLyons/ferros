@@ -6,7 +6,7 @@ use super::{ProcessOwnership, SIGKILL, Session, SessionState};
 use crate::arch;
 use crate::backend::{BackendError, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 use crate::error::{DebuggerError, Result};
-use crate::types::{ProcessId, ThreadId};
+use crate::types::ProcessId;
 
 #[derive(Clone, Copy)]
 pub(super) enum SignalPolicy
@@ -231,13 +231,6 @@ impl Session
             self.carried_signals.push((thread, signal));
             self.last_signal_taken = true;
         }
-    }
-
-    /// Commit a validated step's signal suppression, preserving held signals for peers.
-    pub(super) fn suppress_thread_signal(&mut self, thread: ThreadId)
-    {
-        self.carry_last_signal();
-        self.carried_signals.retain(|(carried, _)| *carried != thread);
     }
 
     /// Add held signals to a forwarding resume for the threads it allows to run.

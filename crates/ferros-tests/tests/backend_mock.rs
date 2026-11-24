@@ -1234,10 +1234,11 @@ fn refused_step_over_keeps_a_stopped_handlers_rendezvous()
     assert_eq!(mock.script_len(), 0);
 }
 
-/// A validated instruction step discards its thread's carried signal even if the
-/// backend fails to start the step. A suspended peer's signal remains held.
+/// #150 review: an instruction step that fails to start ran nothing, so the stepping
+/// thread's carried signal is still held, as is a peer's, and the next
+/// `resume_with_signal` passes both.
 #[test]
-fn failed_step_instruction_drops_only_the_stepping_threads_signal()
+fn failed_step_instruction_keeps_the_threads_carried_signal()
 {
     let mock = MockBackend::new()
         .with_thread(THREAD, arm64_registers())
@@ -1277,10 +1278,14 @@ fn failed_step_instruction_drops_only_the_stepping_threads_signal()
     assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
 
     mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
-    session.resume_with_signal().expect("pass the suspended peer's signal");
+    session.resume_with_signal().expect("pass both carried signals");
     assert_eq!(
         resumes(&mock),
-        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+        vec![
+            ResumeRequest::continue_all()
+                .with_signal(THREAD, 30)
+                .with_signal(SIGNAL_THREAD, 6)
+        ]
     );
 }
 
@@ -3439,8 +3444,10 @@ fn plain_resume_drops_the_suspended_peers_signal_before_step_over()
     assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
 }
 
+/// A step deferred by a queued stop ran nothing, so the selected thread's signal is
+/// still held, like a peer's (#150): a step drops it only once the step starts.
 #[test]
-fn deferred_steps_drop_the_selected_threads_signal()
+fn deferred_steps_keep_the_selected_threads_signal()
 {
     let steps: [fn(&mut Session) -> ferros_core::Result<()>; 4] = [
         |session| session.step_instruction(THREAD),
@@ -3454,10 +3461,14 @@ fn deferred_steps_drop_the_selected_threads_signal()
         assert!(resumes(&mock).is_empty(), "the deferred step ran nothing");
         assert_eq!(session.wait(None).expect("wait"), Some(second));
 
-        session.resume_with_signal().expect("deliver the peer's signal");
+        session.resume_with_signal().expect("deliver both held signals");
         assert_eq!(
             resumes(&mock),
-            vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+            vec![
+                ResumeRequest::continue_all()
+                    .with_signal(THREAD, 5)
+                    .with_signal(SIGNAL_THREAD, 6)
+            ]
         );
     }
 }

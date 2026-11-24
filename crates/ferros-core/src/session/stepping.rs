@@ -425,9 +425,9 @@ impl Session
     /// dropped as for `resume`.
     /// At an enabled software breakpoint its original instruction is executed and the
     /// trap is restored before the stop is returned. Completion is reported as
-    /// [`StopEvent::SingleStep`]. Other events are reported normally. Once the call
-    /// validates the stopped state and thread, it discards that thread's held signal
-    /// even if the step is deferred or fails to start. Peers keep their held signals.
+    /// [`StopEvent::SingleStep`]. Other events are reported normally. The stepping
+    /// thread's held signal is discarded when the step starts it; a deferred or failed
+    /// start keeps it held. Peers keep their held signals.
     ///
     /// # Errors
     ///
@@ -442,7 +442,7 @@ impl Session
         if !self.threads.contains(&thread) {
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
-        self.suppress_thread_signal(thread);
+        self.carry_last_signal();
         self.interrupt_requested = false;
         // An instruction step reports a handler's return like any other stop.
         self.handler_return = None;

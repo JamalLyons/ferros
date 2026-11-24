@@ -160,7 +160,7 @@ fn session_drop_reaps_at_entry_and_while_running()
         for running in [false, true] {
             let mut d = t.launch(&fixture!("loop_counter"));
             let pid = d.pid();
-            let empty = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            let empty = ferros_macos::new_session().expect("backend");
             let mut session = std::mem::replace(d.session_mut(), empty);
             if running {
                 session.resume().expect("resume");
@@ -342,7 +342,7 @@ fn signal_sent_while_stopped_is_reported_after_resume()
             let spawned = (stop == "attach").then(|| t.spawn(&fixture!("loop_counter"), &[]));
             let mut d = match &spawned {
                 Some(target) => {
-                    let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+                    let mut session = ferros_macos::new_session().expect("backend");
                     session.attach(target.pid()).expect("attach");
                     Err(session)
                 }
@@ -422,7 +422,7 @@ fn signal_deferred_while_stopped_survives_teardown_and_session_resume()
             let pid = target.pid();
             let backend = MacOSBackend::new().expect("backend");
             let faults = backend.reply_fault_injector();
-            let mut session = Session::new(Box::new(backend));
+            let mut session = ferros_macos::session_with(backend);
             session.attach(pid).expect("attach");
             signal(pid.0, "-USR1");
             assert_eq!(
@@ -492,7 +492,7 @@ fn attached_session_drop_releases_ownership_and_restores_ports()
             let target = t.spawn(&fixture!("loop_counter"), &[]);
             let pid = target.pid();
             let before = diagnostics::exception_ports(pid).expect("ports before");
-            let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            let mut session = ferros_macos::new_session().expect("backend");
             session.attach(pid).expect("attach");
             assert_eq!(session.ownership(), Some(ProcessOwnership::Attached));
             if running {
@@ -501,7 +501,7 @@ fn attached_session_drop_releases_ownership_and_restores_ports()
             drop(session);
             assert!(!harness::process_is_gone(pid.0));
             assert_eq!(diagnostics::exception_ports(pid).expect("restored ports"), before);
-            let mut again = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            let mut again = ferros_macos::new_session().expect("backend");
             again.attach(pid).expect("attach again: previous session released tracing");
             again.detach().expect("detach again");
             assert_eq!(diagnostics::exception_ports(pid).expect("ports after second detach"), before);
@@ -518,7 +518,7 @@ fn attached_session_drop_keeps_the_target_when_trap_restore_fails()
         let pid = target.pid();
         let backend = MacOSBackend::new().expect("backend");
         let fail_write = backend.memory_write_fault_injector();
-        let mut session = Session::new(Box::new(backend));
+        let mut session = ferros_macos::session_with(backend);
         session.attach(pid).expect("attach");
         session
             .set_breakpoint(BreakpointLocation::Line {
@@ -669,7 +669,7 @@ fn external_kill_of_an_attached_signal_stop_is_reported()
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
         let pid = target.pid();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         session.attach(pid).expect("attach");
         session.resume().expect("resume");
         signal(pid.0, "-USR1");
@@ -871,7 +871,7 @@ fn released_processes_run_to_completion()
         for &case in CASES {
             let mut target = Grandchild::spawn(&[SHORT_LOOP, "--progress"]);
             let pid = ProcessId::from(target.pid);
-            let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+            let mut session = ferros_macos::new_session().expect("backend");
             let started = Instant::now();
             session.attach(pid).expect("attach");
             match case {
@@ -1101,7 +1101,7 @@ fn detach_resumes_a_target_stopped_before_attach()
             assert!(Instant::now() < deadline, "target never stopped");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         session.attach(target.pid()).expect("attach stopped target");
         session.detach().expect("detach resumes even a previously stopped target");
         let deadline = Instant::now() + TIMEOUT;

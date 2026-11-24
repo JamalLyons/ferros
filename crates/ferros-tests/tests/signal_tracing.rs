@@ -225,7 +225,7 @@ fn dropping_a_running_session_with_a_pending_stop_releases_the_target_promptly()
         observer.wait("ready");
         let backend = MacOSBackend::new().expect("backend");
         let probe = backend.reply_fault_injector();
-        let mut session = ferros_core::Session::new(Box::new(backend));
+        let mut session = ferros_macos::session_with(backend);
         session.attach(target.pid()).expect("attach");
         session.resume().expect("resume");
         assert!(

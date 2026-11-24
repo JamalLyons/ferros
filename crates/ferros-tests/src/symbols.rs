@@ -9,8 +9,10 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use ferros_core::symbols::{ImageDescriptor, ImageMapping};
+use ferros_core::symbols::ImageDescriptor;
 use ferros_core::{Address, Session, SymbolCache};
+use ferros_macos::MachOFormat;
+use ferros_macos::macho::file_mapping;
 use object::{Object, ObjectSymbol, SymbolKind};
 
 use crate::Fixture;
@@ -96,10 +98,7 @@ fn runtime_address(session: &mut Session, fixture: &Fixture, name: &str, file_ad
             let current_main = session
                 .images()
                 .map(|images| images.into_iter().find(|image| image.path == main.path));
-            let mapping = ImageMapping::parse(&ImageDescriptor {
-                path: main.path.clone(),
-                load_address: main.load_address.value(),
-            });
+            let mapping = file_mapping(&main.path, main.load_address.value());
             let direct_address = mapping.as_ref().map(|mapping| mapping.runtime_address(file_address));
             let mut detail = format!("mapped symbol {name}: file_address={file_address:#x}");
             write!(detail, ", image={main:?}, current_main={current_main:?}").expect("format image diagnostic");
@@ -180,7 +179,7 @@ pub fn marker_address(d: &mut Session, fixture: &Fixture, marker: &str) -> Addre
         .find(|region| region.contains(main.load_address) && region.is_executable())
         .unwrap_or_else(|| panic!("no executable region holds the image at {}", main.load_address));
     // The executable supplies the runtime layout; its matching dSYM is discovered.
-    let mut symbols = SymbolCache::new();
+    let mut symbols = SymbolCache::new(MachOFormat::shared());
     symbols
         .load_image(ImageDescriptor {
             path: fixture.path().to_path_buf(),

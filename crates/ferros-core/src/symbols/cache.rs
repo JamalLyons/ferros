@@ -10,12 +10,14 @@
 //! ## Usage
 //!
 //! ```rust,no_run
+//! # use ferros_core::objfile::mock::MockObjectFormat;
 //! use ferros_core::symbols::{ImageDescriptor, SymbolCache};
 //! use ferros_core::types::Address;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>>
 //! {
-//!     let mut cache = SymbolCache::new();
+//!     // A platform crate supplies the object format of its images.
+//!     let mut cache = SymbolCache::new(MockObjectFormat::shared());
 //!     let descriptor = ImageDescriptor {
 //!         path: "/path/to/binary".into(),
 //!         load_address: 0x100000000,
@@ -44,10 +46,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::debuginfo::{DebugInfoOptions, LoadInputs};
 use super::extractor::TypeSummary;
-use super::image::{BinaryImage, ImageDescriptor, ImageId, SliceIdentity};
+use super::image::{BinaryImage, ImageDescriptor, ImageId};
+use super::load_inputs::LoadInputs;
 use crate::error::{DebuggerError, Result};
+use crate::objfile::{ImageSlice, ObjectFormat};
 use crate::types::{Address, FunctionParameter, SourceLocation, SymbolName};
 
 /// Cached symbol metadata for a given address.
@@ -82,42 +85,35 @@ pub struct SymbolFrame
 ///
 /// This cache stores parsed binary images to avoid re-parsing DWARF sections
 /// multiple times. It provides efficient lookup of images by address and
-/// symbolication of addresses to function names and source locations.
+/// symbolication of addresses to function names and source locations. Image files are
+/// read through the [`ObjectFormat`] the cache is given.
 ///
 /// ## Thread Safety
 ///
 /// The cache is not thread-safe. If you need concurrent access, wrap it in
 /// a `Mutex` or `RwLock`.
-#[derive(Default)]
 pub struct SymbolCache
 {
     images: HashMap<ImageId, Arc<BinaryImage>>,
-    debug_info_options: DebugInfoOptions,
+    format: Arc<dyn ObjectFormat>,
 }
 
 impl SymbolCache
 {
-    /// Create a new empty symbol cache.
+    /// Create an empty symbol cache reading image files as `format`.
     #[must_use]
-    pub fn new() -> Self
-    {
-        Self::default()
-    }
-
-    /// Create a cache with explicit debug-info discovery options.
-    #[must_use]
-    pub fn with_debug_info_options(debug_info_options: DebugInfoOptions) -> Self
+    pub fn new(format: Arc<dyn ObjectFormat>) -> Self
     {
         Self {
             images: HashMap::new(),
-            debug_info_options,
+            format,
         }
     }
 
     /// Drop metadata for images no longer reported by the loader.
     ///
     /// The ids are computed as [`load_image`](Self::load_image) computes them. To
-    /// keep entries loaded with a slice selector, use [`retain_ids`](Self::retain_ids)
+    /// keep entries loaded with a slice, use [`retain_ids`](Self::retain_ids)
     /// with the returned images' IDs (#170, #175).
     pub fn retain_images(&mut self, descriptors: &[ImageDescriptor])
     {
@@ -169,48 +165,36 @@ impl SymbolCache
     /// - The binary cannot be parsed
     /// - DWARF sections cannot be loaded
     ///
-    /// The descriptor does not say which architecture the target runs, so a universal
-    /// (fat) file reports [`DebuggerError::NoDebugInfo`]. Use
-    /// [`load_image_slice`](Self::load_image_slice) to select a slice (#175).
+    /// The descriptor does not say which slice or build of the file the target mapped
+    /// (see [`ImageSlice`]); a format whose files hold several images may report
+    /// [`DebuggerError::NoDebugInfo`] for such a file. Use
+    /// [`load_image_slice`](Self::load_image_slice) to name the slice (#175).
     pub fn load_image(&mut self, descriptor: ImageDescriptor) -> Result<Arc<BinaryImage>>
     {
         self.load_mapped_image(descriptor, None)
     }
 
-    /// Load and cache DWARF for the selected Mach-O slice (#175).
+    /// Load and cache DWARF for the slice of the file `slice` names (#175).
     ///
-    /// The cache key includes the CPU type, subtype, and supplied UUID. When
-    /// loading several slices at the same address, use the returned images directly
-    /// for symbol lookups to specify which slice to query.
+    /// The cache key includes the slice. When loading several slices at the same
+    /// address, use the returned images directly for symbol lookups to specify which
+    /// slice to query.
     ///
     /// # Errors
     /// Returns the same errors as [`load_image`](Self::load_image), including
-    /// [`DebuggerError::NoDebugInfo`] if the universal file has no slice of the
-    /// requested CPU type and subtype. A UUID mismatch returns
-    /// [`DebuggerError::InvalidArgument`].
-    ///
-    /// ```rust,no_run
-    /// use ferros_core::symbols::{ImageDescriptor, SliceIdentity, SymbolCache};
-    ///
-    /// let descriptor = ImageDescriptor {
-    ///     path: "/path/to/universal-binary".into(),
-    ///     load_address: 0x100000000,
-    /// };
-    /// let arm64e = SliceIdentity::new(0x0100_000c, 2, None);
-    /// let image = SymbolCache::new().load_image_slice(descriptor, &arm64e)?;
-    /// # Ok::<(), ferros_core::DebuggerError>(())
-    /// ```
-    pub fn load_image_slice(&mut self, descriptor: ImageDescriptor, selector: &SliceIdentity) -> Result<Arc<BinaryImage>>
+    /// [`DebuggerError::NoDebugInfo`] if the file has no such slice. A file of another
+    /// build than `slice` names returns [`DebuggerError::InvalidArgument`].
+    pub fn load_image_slice(&mut self, descriptor: ImageDescriptor, slice: &ImageSlice) -> Result<Arc<BinaryImage>>
     {
-        self.load_mapped_image(descriptor, Some(selector))
+        self.load_mapped_image(descriptor, Some(slice))
     }
 
-    /// [`load_image`](Self::load_image), reading the slice `target` identifies when the
-    /// file is universal (#169).
+    /// [`load_image`](Self::load_image), reading the slice `slice` names when it is
+    /// known (#169).
     pub(crate) fn load_mapped_image(
         &mut self,
         descriptor: ImageDescriptor,
-        target: Option<&SliceIdentity>,
+        slice: Option<&ImageSlice>,
     ) -> Result<Arc<BinaryImage>>
     {
         let canonical = if descriptor.path.is_absolute() {
@@ -221,20 +205,20 @@ impl SymbolCache
             })?
         };
 
-        let id = ImageId::with_slice(&canonical, descriptor.load_address, target);
+        let id = ImageId::with_slice(&canonical, descriptor.load_address, slice);
         if let Some(existing) = self.images.get(&id) {
             return Ok(existing.clone());
         }
 
-        #[allow(clippy::arc_with_non_send_sync)]
-        let image = Arc::new(BinaryImage::parse(
+        let contents = self.format.open_image(&canonical, descriptor.load_address, slice)?;
+        let image = Arc::new(BinaryImage::from_contents(
             ImageDescriptor {
                 path: canonical,
                 load_address: descriptor.load_address,
             },
-            target,
-            &self.debug_info_options,
-        )?);
+            slice,
+            contents,
+        ));
         debug_assert_eq!(image.id(), id);
         self.images.insert(id, image.clone());
         Ok(image)
@@ -249,7 +233,7 @@ impl SymbolCache
         } else {
             descriptor.path.canonicalize().unwrap_or_else(|_| descriptor.path.clone())
         };
-        LoadInputs::of(&path, &self.debug_info_options)
+        LoadInputs::of(self.format.load_inputs(&path))
     }
 
     /// Find the binary image containing the given address.

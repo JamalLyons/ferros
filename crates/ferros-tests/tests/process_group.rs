@@ -1,8 +1,8 @@
 //! Native process-group placement (issue #94).
 #![cfg(target_os = "macos")]
 
+use ferros_core::ProcessId;
 use ferros_core::backend::{LaunchSpec, ProcessGroup, StdioSpec};
-use ferros_core::{ProcessId, Session};
 use ferros_macos::launch::process_group;
 use ferros_tests::{fixture, harness};
 
@@ -14,7 +14,7 @@ fn new_group_is_distinct_and_default_inherits()
         let fixture = fixture!("hello");
         let parent = process_group(ProcessId(std::process::id())).expect("test process group");
         for new_group in [false, true] {
-            let mut session = Session::new(Box::new(ferros_macos::MacOSBackend::new().expect("backend")));
+            let mut session = ferros_macos::new_session().expect("backend");
             let mut spec = LaunchSpec::new(fixture.path())
                 .arg(tag.as_str())
                 .stdin(StdioSpec::Null)

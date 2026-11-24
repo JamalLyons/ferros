@@ -73,12 +73,11 @@ pub enum SymbolSource
     /// Debug information (DWARF): the name of the function or inlined call, usually with
     /// a source location.
     DebugInfo,
-    /// Only the image's symbol table (Mach-O `LC_SYMTAB`), for code without DWARF: the
-    /// nearest symbol at or before the address. Such a name has no source location. On
-    /// current macOS a dyld shared-cache image's mapped table includes its local symbols.
-    /// A stripped image, or an older cache that keeps locals in a separate `.symbols`
-    /// file which is not read, can name a pc after an earlier function when the
-    /// containing one has no symbol of its own.
+    /// Only the image's symbol table (read by the session's
+    /// [`ObjectFormat`](crate::objfile::ObjectFormat)), for code without DWARF: the
+    /// nearest symbol at or before the address. Such a name has no source location. A
+    /// stripped image, or a table without local symbols, can name a pc after an earlier
+    /// function when the containing one has no symbol of its own.
     SymbolTable,
 }
 

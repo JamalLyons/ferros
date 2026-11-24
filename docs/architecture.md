@@ -167,14 +167,14 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 └── ...
 ```
 
-`Session::new(backend: Box<dyn Backend>)` creates a session. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
+`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session (`ferros_macos::new_session()` on macOS). See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
 
 #### Platform Factory
 
 The CLI factory is `crates/ferros/src/platform.rs`:
 
 ```rust
-pub fn create_backend() -> ferros_core::Result<Box<dyn ferros_core::Backend>>
+pub fn create_session() -> ferros_core::Result<ferros_core::Session>
 ```
 
 It is the only CLI module that names a platform crate and the only `cfg(target_os)` switch outside platform and test crates.
@@ -220,15 +220,17 @@ The `symbols` module provides symbol resolution, DWARF parsing, and type introsp
 
 **Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../crates/ferros-core/src/symbols/mod.rs)
 
-Debug information is discovered in this order: embedded DWARF, an adjacent
+On macOS, `ferros_macos::MachOFormat` (the session's `ObjectFormat`; `ferros-core` only
+consumes the DWARF bytes it returns) discovers debug information in this order: embedded DWARF, an adjacent
 `<executable>.dSYM` with matching UUID and architecture, a validated UUID/architecture
 cache entry, then `dsymutil`. Companion member names are not used as identity.
 Generated DWARF is validated before an atomic cache publication, with a 30-second
 per-tool deadline and cleanup on failure. The cache defaults to
 `$XDG_CACHE_HOME/ferros/debuginfo`, or `$HOME/.cache/ferros/debuginfo`, falling back to
-the temporary directory when neither variable is set. `DebugInfoOptions` configures
+the temporary directory when neither variable is set. `ferros_macos::DebugInfoOptions` configures
 these locations, tool selection (including disabling it), and the deadline through
-`SymbolCache::with_debug_info_options` or the Session builder of the same name.
+`MachOFormat::with_debug_info_options`, passed to `SymbolCache::new`, `Session::new` or
+`Session::with_object_format`.
 
 `Session::symbolicate` returns `DebuggerError::NoDebugInfo` for a mapped image without
 usable debug information, with `split-debuginfo` and `dsymutil` remedies. Stack traces
@@ -401,7 +403,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros launch ./target/debug/my_program`
 2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
-3. **Create backend**: `create_backend()` returns the platform backend, then `Session::new` creates the engine session
+3. **Create session**: `create_session()` pairs the platform backend with its object format (`Session::new`)
 4. **Launch process**: `session.launch()` spawns process in suspended state
 5. **Run commands**: the REPL drives the session (`continue`, `break`, `registers`, ...) until `quit` or the end of input
 6. **End**: a launched process is killed with `session.kill()`; an attached one is released with `session.detach()`
@@ -410,7 +412,7 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 
 1. **User invokes**: `ferros attach <pid>`
 2. **CLI parses command**: [`crates/ferros/src/main.rs`](../crates/ferros/src/main.rs)
-3. **Create backend**: `create_backend()` supplies the platform mechanism
+3. **Create session**: `create_session()` supplies the platform mechanism and object format
 4. **Attach to process**: `session.attach(pid)` asks the backend to stop the process. On macOS that takes a Mach task port. There is no Linux backend.
 5. **Run commands & detach**: the REPL drives the session; at `quit` or the end of input `session.detach()` releases the process, which keeps running
 
@@ -464,20 +466,20 @@ The rules are enforced by `just check-boundary` ([`scripts/check-boundary.sh`](.
 
 ### How to Add a Platform
 
-1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
+1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type and `ferros_core::objfile::ObjectFormat` for its object-file format. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
 2. Add the crate as a target-specific dependency of `crates/ferros` and add one arm to the factory:
 
 ```rust
-pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
+pub fn create_session() -> ferros_core::Result<Session>
 {
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(ferros_macos::MacOSBackend::new()?))
+        ferros_macos::new_session()
     }
 
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(ferros_linux::LinuxBackend::new()?))
+        Ok(Session::new(Box::new(ferros_linux::LinuxBackend::new()?), ferros_linux::ElfFormat::shared()))
     }
     // ...
 }
@@ -485,7 +487,7 @@ pub fn create_backend() -> ferros_core::Result<Box<dyn Backend>>
 
 3. Add integration tests for the platform in `crates/ferros-tests` that debug the fixture programs through `Session`.
 
-`Session`'s process-control policy (state machine, software breakpoints, stepping) already works with any `Backend`. Image format does not. Mach-O headers, `LC_UUID`, compact unwind, and the symbol-table reader still live in `ferros-core`, and `LoadedImage.uuid` is a 16-byte Mach-O UUID. [ADR 0001](adr/0001-object-file-boundary.md) (accepted 2026-11-22, tracked by [#193](https://github.com/JamalLyons/ferros/issues/193)) moves that Mach-O knowledge into `ferros-macos` behind a format-neutral trait in `ferros-core`. DWARF stays in core. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
+`Session`'s process-control policy (state machine, software breakpoints, stepping) works with any `Backend`, and its symbolication works with any `objfile::ObjectFormat`. Per [ADR 0001](adr/0001-object-file-boundary.md) ([#193](https://github.com/JamalLyons/ferros/issues/193)), the Mach-O implementor (headers, universal slices, symbol tables, compact unwind, dSYM discovery) is `ferros_macos::macho::MachOFormat`; `LoadedImage.build_id` holds up to 32 bytes, so an ELF build-id fits. DWARF stays in core. A new platform implements both `Backend` and `ObjectFormat`. A Linux or Windows crate implements the trait for its own format and does not receive Mach-O code, and `ferros-core` does not receive ELF or PE. If the new platform needs something the `Backend` trait cannot express, extend the trait (and `MockBackend`) rather than reaching around it.
 
 ---
 

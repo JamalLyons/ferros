@@ -7,13 +7,16 @@
 //! a branch to it). A thread that hits one is single-stepped until it leaves that image
 //! above the stack it entered with: it has then landed where the exit goes.
 
+use std::sync::Arc;
+
 use super::Session;
-use super::images::same_build;
+use super::images::same_image;
+use super::stack::BackendTarget;
 use crate::backend::StopEvent;
 use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
 use crate::error::Result;
-use crate::symbols::symtab::SymtabLayout;
-use crate::types::{Address, ThreadId};
+use crate::objfile::MappedSymbols;
+use crate::types::{Address, BuildIdentity, ThreadId};
 
 /// Functions through which the unwinder transfers control to a landing pad:
 /// `unw_resume` and, on current macOS, the variant `_Unwind_RaiseException` and
@@ -66,8 +69,11 @@ pub(super) struct ExitImage
     /// Index into `SOURCES`.
     source: usize,
     load_address: u64,
-    uuid: Option<[u8; 16]>,
-    code: SymtabLayout,
+    build_id: BuildIdentity,
+    /// Stop generation it was read at (see [`same_image`]).
+    generation: u64,
+    /// The image's code, which an exit is stepped through until it leaves.
+    code: Arc<dyn MappedSymbols>,
     entries: Vec<Address>,
 }
 
@@ -278,7 +284,7 @@ impl Session
     }
 
     /// The process's exit images, read from their symbol tables in the target's memory.
-    /// Cached while the source and load address match and the UUID does not conflict (#170).
+    /// Cached while the source and load address match and the build can be the same (#170).
     fn exit_images(&mut self) -> Vec<ExitImage>
     {
         if let Err(error) = self.load_images() {
@@ -297,16 +303,18 @@ impl Session
                 continue;
             };
             let load_address = image.descriptor_load_address();
-            let uuid = image.uuid();
+            let build_id = image.build_id();
             if let Some(index) = previous.iter().position(|cached| {
-                cached.source == source && cached.load_address == load_address && same_build(cached.uuid, uuid)
+                cached.source == source
+                    && cached.load_address == load_address
+                    && same_image(cached.build_id, cached.generation, build_id, self.stop_generation)
             }) {
                 let mut cached = previous.swap_remove(index);
-                cached.uuid = cached.uuid.or(uuid);
+                cached.build_id = cached.build_id.or_later(build_id);
                 found.push(cached);
                 continue;
             }
-            match self.read_exit_image(source, load_address, uuid) {
+            match self.read_exit_image(source, load_address, build_id) {
                 Ok(image) => found.push(image),
                 Err(detail) => tracing::debug!("no exit hooks in {}: {detail}", exit.image),
             }
@@ -319,16 +327,16 @@ impl Session
         &mut self,
         source: usize,
         load_address: u64,
-        uuid: Option<[u8; 16]>,
+        build_id: BuildIdentity,
     ) -> std::result::Result<ExitImage, String>
     {
         let exit = &SOURCES[source];
-        let header = self.read_mapped_header(load_address)?;
-        let code = SymtabLayout::from_header(&header, load_address).map_err(|error| error.to_string())?;
-        let table = super::stack::read_symbol_table(self.backend.as_mut(), &code)?;
+        let mut memory = BackendTarget(self.backend.as_mut());
+        let code = self.format.mapped_symbols(&mut memory, Address::new(load_address))?;
+        let index = code.load(&mut memory)?;
         let mut entries = Vec::new();
-        for (address, strx) in table.symbols().filter(|&(address, _)| code.contains(address)) {
-            let name = super::stack::read_symbol_string(self.backend.as_mut(), &code, strx)?;
+        for (address, key) in index.symbols().filter(|&(address, _)| code.contains(address)) {
+            let name = index.read_name(&mut memory, key)?;
             if name.is_some_and(|name| (exit.entry)(&name)) && !entries.contains(&address) {
                 entries.push(address);
             }
@@ -339,7 +347,8 @@ impl Session
         Ok(ExitImage {
             source,
             load_address,
-            uuid,
+            build_id,
+            generation: self.stop_generation,
             code,
             entries,
         })

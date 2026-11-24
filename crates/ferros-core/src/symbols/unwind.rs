@@ -4,58 +4,48 @@
 //!
 //! ## Unwind sources and their order
 //!
-//! Rust binaries built for `aarch64-apple-darwin` carry these unwind sources (checked on
-//! a debug build of the `nested_calls` fixture with `xcrun dwarfdump --eh-frame
-//! --debug-frame` and `objdump --unwind-info`):
+//! An image's [`ObjectFormat`](crate::objfile::ObjectFormat) can supply a per-function
+//! unwind table ([`UnwindHints`](crate::objfile::UnwindHints)) besides the image's call
+//! frame information. On an arm64 Rust binary the platform's table has an entry for every
+//! function, and most say "use the FDE at this `eh_frame` offset"; leaves without an FDE
+//! (such as `__rust_alloc`) and C shims with a plain frame record (such as the C `main`
+//! shim) have hints of their own and no FDE. Those FDE rows describe the prologue exactly,
+//! including the first instruction (`CFA=sp`, return address still in `x30`). Frameless
+//! leaves do not set up `x29`: there `fp` is still the caller's, so following the
+//! frame-pointer chain from such a leaf skips its caller.
 //!
-//! - `__TEXT,__unwind_info` (compact unwind) has an entry for every function: 257 with
-//!   `UNWIND_ARM64_MODE_DWARF` (0x03, the low 24 bits are the offset of the function's
-//!   FDE in `__eh_frame`), 77 `UNWIND_ARM64_MODE_FRAMELESS` (0x02, leaves with no FDE, such
-//!   as `__rust_alloc`), 21 `UNWIND_ARM64_MODE_FRAME` (0x04, a frame record at `x29` and
-//!   no FDE, such as the C `_main` shim), 5 with encoding 0, and 134 DWARF-mode entries
-//!   with personality/LSDA bits. Rust functions, including the fixture's own `main`, are
-//!   DWARF mode.
-//! - `__TEXT,__eh_frame` holds the FDEs the DWARF-mode entries point to. Their rows
-//!   describe the prologue exactly, including the first instruction (`CFA=sp`, return
-//!   address still in `x30`).
-//! - `.debug_frame` in the dSYM is empty.
-//! - Frameless leaves do not set up `x29`: there `fp` is still the caller's, so following
-//!   the frame-pointer chain from such a leaf skips its caller.
+//! Each step looks up the hint of the function containing the lookup address (the pc of
+//! the innermost frame, the call instruction of a caller) and uses:
 //!
-//! Each step looks up the compact entry of the function containing the lookup address
-//! (the pc of the innermost frame, the call instruction of a caller) and uses:
-//!
-//! 1. **`MODE_DWARF`**: the FDE at the encoded offset in `__eh_frame`, evaluated directly
-//!    (no search: the main `ferros` binary has about 34,000 FDEs). If it cannot be
-//!    evaluated, the frame-pointer chain.
-//! 2. **`MODE_FRAMELESS`**: in the innermost frame, the caller is the link register and
-//!    its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
+//! 1. **[`UnwindHint::Cfi`]**: the FDE at the hinted offset in `eh_frame`, evaluated
+//!    directly (no search: the main `ferros` binary has about 34,000 FDEs). If it cannot
+//!    be evaluated, the frame-pointer chain.
+//! 2. **[`UnwindHint::Leaf`]**: in the innermost frame, the caller is the link register
+//!    and its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
 //!    allocation). Elsewhere the instructions are analysed first (see *Prologues and
 //!    epilogues* below), so a stop after the epilogue released the allocation gets the
 //!    caller's `sp` right. A frameless leaf makes no calls, so it cannot be a caller frame;
 //!    there the walk stops instead of guessing.
-//! 3. **`MODE_FRAME`**: the frame-pointer chain: the record at `fp` holds the caller's
-//!    `fp` and the return address. On the function's first instruction (innermost frame
-//!    only) the record is not built yet, so the caller is the link register. The linker
-//!    merges a run of adjacent functions with the same encoding into one entry (33 such
-//!    function starts under a `MODE_FRAME` entry in this build), so a first instruction is
-//!    recognized from the entry or from the DWARF function index. Elsewhere in the
-//!    innermost frame the instructions are analysed first (see *Prologues and epilogues*),
-//!    which covers the rest of the prologue, the epilogue after `x29`/`x30` are reloaded,
-//!    and a shrink-wrapped path before the record is built.
-//! 4. **Encoding 0, no entry, or no `__unwind_info`** (for example an ELF image or a
-//!    synthetic one): `.eh_frame_hdr` lookup, else a linear scan of `__eh_frame` (FDE
-//!    ranges as runtime addresses), then of `.debug_frame` (FDE ranges as file addresses,
-//!    since it lives in the unslid dSYM); then, in the innermost frame on the first
-//!    instruction of a function known to DWARF, the link register; then the frame-pointer
-//!    chain.
+//! 3. **[`UnwindHint::FrameRecord`]**: the frame-pointer chain: the record at `fp` holds
+//!    the caller's `fp` and the return address. On the function's first instruction
+//!    (innermost frame only) the record is not built yet, so the caller is the link
+//!    register. A table may give one entry to a run of adjacent functions with the same
+//!    hint, so a first instruction is recognized from the entry or from the DWARF function
+//!    index. Elsewhere in the innermost frame the instructions are analysed first (see
+//!    *Prologues and epilogues*), which covers the rest of the prologue, the epilogue after
+//!    `x29`/`x30` are reloaded, and a shrink-wrapped path before the record is built.
+//! 4. **No hint** (no table, no entry, or an entry without information): `.eh_frame_hdr`
+//!    lookup, else a linear scan of `eh_frame` (FDE ranges as runtime addresses), then of
+//!    `.debug_frame` (FDE ranges as file addresses, since it may live in an unslid
+//!    companion file); then, in the innermost frame on the first instruction of a
+//!    function known to DWARF, the link register; then the frame-pointer chain.
 //!
 //! ## Prologues and epilogues
 //!
-//! Compact unwind cannot describe the instructions of a `MODE_FRAME` function before
-//! `x29` is set to its frame record or after the epilogue reloads `x29`/`x30`, nor a
-//! `MODE_FRAMELESS` function after its epilogue released the stack. For an innermost
-//! frame in those modes, past the first instruction, the unwinder decodes the code around
+//! A hint cannot describe the instructions of a frame-record function before `x29` is set
+//! to its frame record or after the epilogue reloads `x29`/`x30`, nor a leaf after its
+//! epilogue released the stack. For an innermost frame with those hints, past the first
+//! instruction, the unwinder decodes the code around
 //! the pc ([`arch::arm64_frame`](crate::arch::arm64_frame)), read with
 //! [`MemoryAccess::read_u32`]:
 //!
@@ -64,13 +54,13 @@
 //!    registers from the stack. The registers at the `ret` are the caller's: the return
 //!    address in `x30`, `sp`, `x29` and the reloaded `x19`-`x28`.
 //! 2. **Prologue**: otherwise, from the function's start up to the pc. The start is the
-//!    later of the compact entry's function and the nearest DWARF function start (the
-//!    linker merges entries). If an instruction sets `x29` from `sp`, the record is built
+//!    later of the hint's start and the nearest DWARF function start (a table may merge
+//!    entries). If an instruction sets `x29` from `sp`, the record is built
 //!    and the frame-pointer chain applies. Otherwise the caller's `sp` is `sp` plus what
 //!    the code allocated, and `x29`, `x30`, `x19`-`x28` come from where it stored them,
 //!    else they still hold the caller's values.
 //! 3. If neither is understood (a branch or call on the way, an instruction that is not
-//!    decoded, an unreadable word), the mode's rule above applies unchanged.
+//!    decoded, an unreadable word), the hint's rule above applies unchanged.
 //!
 //! Recognized instructions include `stp`/`ldp`/`str`/`ldr` through `sp` (offset,
 //! pre-index, post-index), `sub`/`add sp, sp, #N`, `add x29, sp, #N` and `mov x29, sp`,
@@ -114,7 +104,7 @@
 //! `sp` at +248, `pc` at +256, `cpsr` at +264. The kernel passes the handler, `siginfo`
 //! and `ucontext` pointers in `x0`, `x3` and `x4`, and leaves every other register,
 //! `x29` and `x30` included, as the interrupted code had them. `_sigtramp` (disassembled
-//! with `otool -tV`; compact unwind `MODE_FRAME`) runs `stp x22, x21, [sp, #-0x30]!`,
+//! with `otool -tV`; a frame-record function) runs `stp x22, x21, [sp, #-0x30]!`,
 //! `stp x29, x30, [sp, #0x20]`, `add x29, sp, #0x20`, then calls the handler with
 //! `blraaz x8`. So in the `_sigtramp` frame the signal frame starts at `fp + 16`, and its
 //! frame record holds the interrupted `fp` and the interrupted `x30`: following that
@@ -180,7 +170,7 @@ use gimli::{
 use crate::arch::Arch;
 use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
 use crate::error::Result;
-use crate::symbols::compact_unwind::{self, Arm64Mode};
+use crate::objfile::UnwindHint;
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
 use crate::types::{Address, Architecture, FrameId, FrameKind, FrameStatus, Registers, StackFrame, ThreadId};
 
@@ -267,16 +257,16 @@ struct UnwindStep
     status: FrameStatus,
 }
 
-/// What an image's `__unwind_info` says about the function containing an address.
-enum Compact
+/// What an image's unwind hints say about the function containing an address.
+enum Hinted
 {
-    /// No `__unwind_info`, no entry, or encoding 0.
+    /// No table, or no entry for the address.
     Absent,
-    /// The function's mode, whether the address is its first instruction, and the
+    /// The function's hint, whether the address is its first instruction, and the
     /// runtime address of the entry's first function.
-    Mode
+    Hint
     {
-        mode: Arm64Mode,
+        hint: UnwindHint,
         at_entry: bool,
         start: Address,
     },
@@ -396,15 +386,15 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// Steps 1-4 of the module documentation for a pc inside a loaded image.
     fn image_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
     {
-        match compact_entry(image, lookup) {
-            Compact::Mode {
-                mode: Arm64Mode::Dwarf { fde_offset },
+        match hinted(image, lookup) {
+            Hinted::Hint {
+                hint: UnwindHint::Cfi { eh_frame_offset },
                 ..
             } => self
-                .eh_frame_fde_step(image, cursor, lookup, fde_offset)
+                .eh_frame_fde_step(image, cursor, lookup, eh_frame_offset)
                 .or_else(|| self.frame_pointer_step(cursor)),
-            Compact::Mode {
-                mode: Arm64Mode::Frameless { stack_size },
+            Hinted::Hint {
+                hint: UnwindHint::Leaf { stack_size },
                 at_entry,
                 start,
             } => {
@@ -417,14 +407,14 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                     _ => self.frameless_step(cursor, stack_size),
                 }
             }
-            Compact::Mode {
-                mode: Arm64Mode::Frame,
+            Hinted::Hint {
+                hint: UnwindHint::FrameRecord,
                 at_entry,
                 start,
             } => {
-                // The linker gives one compact entry to a run of adjacent functions with
-                // the same encoding, so only the first of them is recognized from the
-                // entry; the others are recognized from the DWARF function index.
+                // A table may give one entry to a run of adjacent functions with the same
+                // hint, so only the first of them is recognized from the entry; the others
+                // are recognized from the DWARF function index.
                 if at_entry || self.is_dwarf_function_start(image, cursor) {
                     return self.entry_step(cursor);
                 }
@@ -433,10 +423,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                     _ => self.frame_pointer_step(cursor),
                 }
             }
-            Compact::Mode {
-                mode: Arm64Mode::None, ..
-            }
-            | Compact::Absent => self
+            Hinted::Absent => self
                 .scan_cfi_step(image, cursor, lookup)
                 .or_else(|| self.dwarf_entry_step(image, cursor))
                 .or_else(|| self.frame_pointer_step(cursor)),
@@ -476,8 +463,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Some((section, bases))
     }
 
-    /// `UNWIND_ARM64_MODE_DWARF`: evaluate the FDE at `fde_offset` in `__eh_frame`
-    /// directly, with no search.
+    /// [`UnwindHint::Cfi`]: evaluate the FDE at `fde_offset` in `eh_frame` directly, with
+    /// no search.
     fn eh_frame_fde_step(
         &self,
         image: &BinaryImage,
@@ -497,12 +484,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         self.apply_row(cursor, row)
     }
 
-    /// Without a compact entry: `.eh_frame_hdr` (ELF), then a linear scan of `__eh_frame`,
-    /// then `.debug_frame`.
+    /// Without a hint: `.eh_frame_hdr`, then a linear scan of `eh_frame`, then
+    /// `.debug_frame`.
     ///
-    /// `__eh_frame` FDE ranges are runtime addresses (pc-relative, resolved through the
-    /// section's runtime base); `.debug_frame` lives in the unslid dSYM, so its ranges are
-    /// file addresses. Each section is searched with its own address form only: trying the
+    /// `eh_frame` FDE ranges are runtime addresses (pc-relative, resolved through the
+    /// section's runtime base); `.debug_frame` may live in an unslid companion file, so its
+    /// ranges are file addresses. Each section is searched with its own address form only: trying the
     /// other one could match an unrelated function's FDE.
     fn scan_cfi_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
     {
@@ -657,7 +644,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
     }
 
-    /// `UNWIND_ARM64_MODE_FRAMELESS`: a leaf that never saves `x30` or `fp`. In the
+    /// [`UnwindHint::Leaf`]: a leaf that never saves `x30` or `fp`. In the
     /// innermost frame the caller is the link register and the caller's `sp` is `sp`
     /// plus the leaf's stack allocation. A frameless leaf makes no calls, so it cannot be a
     /// caller frame with a valid return address: as a caller (or without `x30`) the walk
@@ -695,8 +682,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         })
     }
 
-    /// [`entry_step`](Self::entry_step) when the image has no compact entry: the entry
-    /// is recognized from the DWARF function index.
+    /// [`entry_step`](Self::entry_step) when the image has no hint: the entry is
+    /// recognized from the DWARF function index.
     fn dwarf_entry_step(&self, image: &BinaryImage, cursor: &Cursor) -> Option<UnwindStep>
     {
         if !self.is_dwarf_function_start(image, cursor) {
@@ -721,8 +708,8 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     }
 
     /// The start of the function containing the innermost frame's pc: the later of the
-    /// compact entry's first function (`entry_start`) and the nearest DWARF function start
-    /// at or below the pc, since the linker merges adjacent functions into one entry.
+    /// hint's first function (`entry_start`) and the nearest DWARF function start at or
+    /// below the pc, since a table may merge adjacent functions into one entry.
     fn function_start(&self, image: &BinaryImage, cursor: &Cursor, entry_start: Address) -> Address
     {
         let dwarf = image.file_address(cursor.regs.pc).and_then(|file| {
@@ -968,27 +955,16 @@ fn general_bit(register: Register) -> Option<u32>
     (register.0 <= 30).then(|| 1 << register.0)
 }
 
-/// The compact-unwind entry of the function containing `lookup`, if the image has one.
-fn compact_entry(image: &BinaryImage, lookup: Address) -> Compact
+/// The unwind hint of the function containing `lookup`, if the image has one.
+fn hinted(image: &BinaryImage, lookup: Address) -> Hinted
 {
-    let Some(section) = image.unwind_info_section() else {
-        return Compact::Absent;
-    };
-    let (header, _) = image.runtime_range();
-    let Some(offset) = lookup
-        .value()
-        .checked_sub(header)
-        .and_then(|offset| u32::try_from(offset).ok())
-    else {
-        return Compact::Absent;
-    };
-    match compact_unwind::lookup(section, offset) {
-        Some(entry) if entry.encoding != 0 => Compact::Mode {
-            mode: Arm64Mode::decode(entry.encoding),
-            at_entry: entry.function_offset == offset,
-            start: Address::new(header + u64::from(entry.function_offset)),
+    match image.unwind_hints().and_then(|hints| hints.lookup(lookup)) {
+        Some(entry) => Hinted::Hint {
+            hint: entry.hint,
+            at_entry: entry.start == lookup,
+            start: entry.start,
         },
-        _ => Compact::Absent,
+        None => Hinted::Absent,
     }
 }
 
@@ -1129,7 +1105,7 @@ mod tests
 
     fn pcs(memory: &FakeMemory, regs: &Registers) -> Vec<u64>
     {
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         StackUnwinder::new(&ARCH, &symbols, memory)
             .unwind(ThreadId::from(1), regs, 64)
             .expect("unwind")
@@ -1220,7 +1196,7 @@ mod tests
     fn frameless_leaf_returns_through_the_link_register_only_when_innermost()
     {
         let memory = FakeMemory::default();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
         let mut regs = regs(0x4000_0000, 0xf00, 0x1000, 0x8012_0000_4000_0abc);
         regs.general[3] = 33;
@@ -1246,7 +1222,7 @@ mod tests
     fn unknown_registers_cannot_feed_a_rule()
     {
         let memory = FakeMemory::default();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
         let cursor = Cursor {
             known: CALLEE_SAVED,
@@ -1308,7 +1284,7 @@ mod tests
     fn a_signal_frame_restores_the_interrupted_frame()
     {
         let memory = signal_stack();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 64)
             .expect("unwind");
@@ -1324,7 +1300,7 @@ mod tests
     fn the_interrupted_frame_keeps_every_register_and_is_not_a_caller()
     {
         let memory = signal_stack();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
         let sigtramp = Cursor {
             known: 1 << 29,
@@ -1349,7 +1325,7 @@ mod tests
     #[test]
     fn a_frame_without_a_signal_frame_is_not_a_trampoline()
     {
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let sigtramp = Cursor {
             known: 1 << 29,
             is_caller: true,
@@ -1423,7 +1399,7 @@ mod tests
     fn a_signal_frame_on_an_alternate_stack_restores_the_interrupted_frame()
     {
         let memory = alternate_signal_stack();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
             .expect("unwind");
@@ -1445,7 +1421,7 @@ mod tests
         memory.words.insert(0x2100, 0x1f00);
         memory.words.insert(0x1f00, 0);
         memory.words.insert(0x1f08, 0x4000_0300);
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0x8f00, 0x9000, 0), 64)
             .expect("unwind");
@@ -1456,7 +1432,7 @@ mod tests
     #[test]
     fn an_alternate_stack_signal_frame_still_needs_a_plausible_interrupted_state()
     {
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let mcontext = 0x9110 + sigframe::MCONTEXT;
         let cursor = alternate_stack_sigtramp();
         assert!(
@@ -1536,7 +1512,7 @@ mod tests
 
         // Any other step that would restore that state (a CFI row, for example) is
         // rejected by `accept`, which the signal step bypasses only on an alternate stack.
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let memory = alternate_signal_stack();
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
         let caller = alternate_stack_sigtramp();
@@ -1548,13 +1524,13 @@ mod tests
         );
     }
 
-    /// Link-time and load address of [`cfi_image`]'s `__TEXT`, and the one function its
-    /// `__eh_frame` describes: CFA `x29 + 16`, `x29` at CFA - 16, `x30` at CFA - 8.
+    /// Link-time and load address of [`cfi_image`]'s one segment, and the one function
+    /// its `eh_frame` describes: CFA `x29 + 16`, `x29` at CFA - 16, `x30` at CFA - 8.
     const CFI_BASE: u64 = 0x1_0000_0000;
     const CFI_FUNCTION: u64 = CFI_BASE + 0x1000;
 
-    /// An arm64 Mach-O with `__eh_frame` and no `__unwind_info` (so CFI is used), plus
-    /// placeholder DWARF sections so loading it looks for no dSYM.
+    /// A neutral mock image with `eh_frame` and no unwind hints (so CFI is used), plus
+    /// placeholder DWARF.
     fn cfi_image() -> Vec<u8>
     {
         fn u32s(bytes: &mut Vec<u8>, values: &[u32])
@@ -1563,15 +1539,7 @@ mod tests
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
-        fn name(bytes: &mut Vec<u8>, name: &str)
-        {
-            let mut field = [0u8; 16];
-            field[..name.len()].copy_from_slice(name.as_bytes());
-            bytes.extend_from_slice(&field);
-        }
-        const EH_FRAME: u64 = 0x400;
-        const DEBUG: u64 = 0x500;
-        const FILE_SIZE: u64 = 0x600;
+        const EH_FRAME: u64 = CFI_BASE + 0x400;
 
         let mut eh_frame = Vec::new();
         // CIE `zR`, pcrel|sdata4 pointers, code alignment 4, data alignment -8, RA x30,
@@ -1579,42 +1547,19 @@ mod tests
         u32s(&mut eh_frame, &[20, 0]);
         eh_frame.extend_from_slice(&[1, b'z', b'R', 0, 4, 0x78, 30, 1, 0x1b, 0x0c, 31, 0, 0, 0, 0, 0]);
         // FDE at offset 24 for [CFI_FUNCTION, +0x100).
-        let pc_begin_field = CFI_BASE + EH_FRAME + 24 + 8;
+        let pc_begin_field = EH_FRAME + 24 + 8;
         let pc_begin = i32::try_from(CFI_FUNCTION.cast_signed() - pc_begin_field.cast_signed()).unwrap();
         u32s(&mut eh_frame, &[20, 28, pc_begin.cast_unsigned(), 0x100]);
         // def_cfa x29, 16; offset x30 at cfa - 8; offset x29 at cfa - 16.
         eh_frame.extend_from_slice(&[0, 0x0c, 29, 16, 0x9e, 1, 0x9d, 2]);
         u32s(&mut eh_frame, &[0]);
 
-        let sections = [
-            ("__eh_frame", EH_FRAME, eh_frame.len() as u64),
-            ("__debug_info", DEBUG, 8),
-            ("__debug_abbrev", DEBUG + 8, 8),
-            ("__debug_line", DEBUG + 16, 8),
-        ];
-        let command_size = 72 + 80 * sections.len() as u32;
-        let mut bytes = Vec::new();
-        // MH_MAGIC_64, CPU_TYPE_ARM64, subtype, MH_EXECUTE, ncmds, sizeofcmds, flags, reserved.
-        u32s(&mut bytes, &[0xfeed_facf, 0x0100_000c, 0, 2, 1, command_size, 0, 0]);
-        u32s(&mut bytes, &[0x19, command_size]); // LC_SEGMENT_64
-        name(&mut bytes, "__TEXT");
-        for value in [CFI_BASE, 0x1_0000, 0, FILE_SIZE] {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        u32s(&mut bytes, &[5, 5, sections.len() as u32, 0]);
-        for (section, offset, size) in sections {
-            name(&mut bytes, section);
-            name(&mut bytes, "__TEXT");
-            bytes.extend_from_slice(&(CFI_BASE + offset).to_le_bytes());
-            bytes.extend_from_slice(&size.to_le_bytes());
-            u32s(&mut bytes, &[offset as u32, 0, 0, 0, 0, 0, 0, 0]);
-        }
-        bytes.resize(EH_FRAME as usize, 0);
-        bytes.extend_from_slice(&eh_frame);
-        bytes.resize(DEBUG as usize, 0);
-        bytes.extend_from_slice(&[0xaa; 24]);
-        bytes.resize(FILE_SIZE as usize, 0);
-        bytes
+        crate::objfile::mock::MockObjectFile::new(CFI_BASE, 0x1_0000)
+            .with_eh_frame(EH_FRAME, &eh_frame)
+            .with_dwarf(gimli::SectionId::DebugInfo, &[0xaa; 8])
+            .with_dwarf(gimli::SectionId::DebugAbbrev, &[0xaa; 8])
+            .with_dwarf(gimli::SectionId::DebugLine, &[0xaa; 8])
+            .to_bytes()
     }
 
     #[test]
@@ -1623,12 +1568,9 @@ mod tests
         // Issue #134: the interrupted frame (sp 0x2000) is in a function with CFI whose row
         // restores sp 0x1f10 (x29 0x1f00 + 16), below the interrupted sp. The frame record
         // and return address it reads are valid, so only `accept`'s sp check ends the trace.
-        let path = std::env::temp_dir().join(format!("ferros-unwind-cfi-sp-{}.macho", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ferros-unwind-cfi-sp-{}.mock", std::process::id()));
         std::fs::write(&path, cfi_image()).expect("write synthetic image");
-        let mut symbols = SymbolCache::with_debug_info_options(crate::symbols::DebugInfoOptions {
-            dsymutil: None,
-            ..crate::symbols::DebugInfoOptions::default()
-        });
+        let mut symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let loaded = symbols.load_image(crate::symbols::ImageDescriptor {
             path: path.clone(),
             load_address: CFI_BASE,
@@ -1683,7 +1625,7 @@ mod tests
     fn max_frames_limits_the_trace()
     {
         let memory = chain();
-        let symbols = SymbolCache::new();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let frames = StackUnwinder::new(&ARCH, &symbols, &memory)
             .unwind(ThreadId::from(1), &regs(0x4000_0000, 0xf00, 0x1000, 0), 2)
             .expect("unwind");

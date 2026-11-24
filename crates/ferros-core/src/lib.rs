@@ -32,6 +32,13 @@
 //! [`session::Session`] is the portable engine: it owns a `Box<dyn Backend>` and holds
 //! the policy (state machine, software breakpoint table, stack traces and
 //! symbolication) that works the same with every backend.
+//!
+//! ## Object-file boundary
+//!
+//! [`objfile::ObjectFormat`] is the format-neutral question set the session asks about
+//! the images mapped in a target (symbol tables, unlisted images). Each platform crate
+//! implements it for its own format and pairs it with its backend; `ferros-core` holds no
+//! object-file format's parser for those questions. DWARF is read here.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
@@ -41,6 +48,7 @@ pub mod backend;
 pub mod breakpoints;
 pub mod error;
 pub mod events;
+pub mod objfile;
 pub mod session;
 pub mod symbols;
 pub mod types;
@@ -57,7 +65,7 @@ pub use session::{
 };
 pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use types::{
-    Address, Architecture, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion, MemoryRegionId, ProcessId,
-    RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName, SymbolSource, ThreadId,
-    VectorRegisterValue,
+    Address, Architecture, BuildId, BuildIdentity, FloatingPointState, FrameId, FrameKind, FrameStatus, MemoryRegion,
+    MemoryRegionId, ProcessId, RegisterId, Registers, SourceLocation, StackFrame, StopReason, SymbolLanguage, SymbolName,
+    SymbolSource, ThreadId, VectorRegisterValue,
 };

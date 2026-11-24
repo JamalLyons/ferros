@@ -81,6 +81,7 @@ mod stepping;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use self::breakpoints::{BreakpointHit, LogicalBreakpoint, LogicalBreakpointId};
@@ -88,6 +89,7 @@ pub use self::location::{BreakpointLocation, BreakpointSite, SourcePosition};
 use crate::backend::{Backend, StopEvent};
 use crate::breakpoints::BreakpointStore;
 use crate::error::{DebuggerError, Result};
+use crate::objfile::ObjectFormat;
 use crate::symbols::SymbolCache;
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 
@@ -113,6 +115,9 @@ pub enum SessionState
 pub struct Session
 {
     backend: Box<dyn Backend>,
+    /// The object-file format of the target's images, for container questions the
+    /// backend does not answer (symbol tables of code without DWARF).
+    format: Arc<dyn ObjectFormat>,
     state: SessionState,
     ownership: Option<ProcessOwnership>,
     pid: Option<ProcessId>,
@@ -158,6 +163,10 @@ pub struct Session
     loaded_images: Vec<images::SessionImage>,
     /// Counter identifying the current symbol request; see `begin_symbol_request`.
     symbol_request: u64,
+    /// Counter of stops the backend reported, raised by `backend_wait`. An image whose
+    /// build id is [`BuildIdentity::Absent`](crate::types::BuildIdentity::Absent) is kept
+    /// only while this is unchanged: within one stop the process cannot replace it.
+    stop_generation: u64,
 }
 
 /// How the session got its process, which decides what dropping the session does.
@@ -293,15 +302,19 @@ impl Session
             }
         }
     }
-    /// A session with no process, driving `backend`.
+    /// A session with no process, driving `backend`, whose images are in `format`.
     ///
     /// The backend should have no process either; the session starts in
-    /// [`SessionState::NotStarted`].
+    /// [`SessionState::NotStarted`]. `format` is the object-file format of the images
+    /// the backend reports (see [`objfile`](crate::objfile)); a platform crate pairs its
+    /// backend with its format (`ferros_macos::new_session` on macOS).
     #[must_use]
-    pub fn new(backend: Box<dyn Backend>) -> Self
+    pub fn new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>) -> Self
     {
+        let symbols = SymbolCache::new(format.clone());
         Self {
             backend,
+            format,
             state: SessionState::NotStarted,
             ownership: None,
             pid: None,
@@ -324,9 +337,10 @@ impl Session
             logical: Vec::new(),
             next_logical: 0,
             detach_intent: None,
-            symbols: SymbolCache::new(),
+            symbols,
             loaded_images: Vec::new(),
             symbol_request: 0,
+            stop_generation: 0,
         }
     }
 

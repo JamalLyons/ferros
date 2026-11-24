@@ -7,6 +7,7 @@ use crate::arch::Arm64;
 use crate::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use crate::backend::{BackendError, LaunchSpec, LoadedImage, ResumeRequest, ThreadAction};
 use crate::breakpoints::{BreakpointId, BreakpointRequest, BreakpointState, WatchpointAccess};
+use crate::objfile::mock::MockObjectFormat;
 
 const T1: ThreadId = ThreadId(1);
 const T2: ThreadId = ThreadId(2);
@@ -39,7 +40,7 @@ fn spec() -> LaunchSpec
 
 fn session(mock: &MockBackend) -> Session
 {
-    Session::new(Box::new(mock.clone()))
+    Session::new(Box::new(mock.clone()), MockObjectFormat::shared())
 }
 
 fn launched(mock: &MockBackend) -> Session
@@ -692,7 +693,7 @@ fn stack_trace_reads_memory_through_the_backend_and_skips_bad_images()
         .with_image(LoadedImage {
             path: "/nonexistent/ferros-session-test-image".into(),
             load_address: Address::new(CODE),
-            uuid: None,
+            build_id: crate::types::BuildIdentity::Unknown,
         });
     let mut session = launched(&mock);
     let frames = session.stack_trace(8).expect("stack trace");
@@ -718,7 +719,7 @@ fn runtime_address_reports_the_original_header_failure_once_read()
     let image = LoadedImage {
         path: "/nonexistent/ferros-session-test-image".into(),
         load_address: Address::new(CODE),
-        uuid: None,
+        build_id: crate::types::BuildIdentity::Unknown,
     };
     let mock = process().with_image(image.clone());
     let mut session = launched(&mock);
@@ -731,7 +732,7 @@ fn runtime_address_reports_the_original_header_failure_once_read()
             panic!("unexpected error {error}");
         };
         assert_eq!(path, &image.path);
-        assert!(detail.contains("Unsupported Mach-O header"), "{detail}");
+        assert!(detail.contains("mock header at"), "{detail}");
     }
     assert_eq!(
         mock.take_calls(),
@@ -739,7 +740,7 @@ fn runtime_address_reports_the_original_header_failure_once_read()
             MockCall::Images,
             MockCall::ReadMemory {
                 address: Address::new(CODE),
-                len: crate::symbols::ImageMapping::MACH_HEADER_SIZE
+                len: MockObjectFormat::HEADER_SIZE
             },
             MockCall::Images
         ]
@@ -751,24 +752,13 @@ fn runtime_address_reports_the_original_header_failure_once_read()
     assert_eq!(session.runtime_address(&moved, 0x1_0000_0000).expect("not loaded"), None);
 }
 
-/// A 64-bit Mach-O header with one `__TEXT` segment (vmaddr 0x1_0000_0000, 0x1000 bytes
-/// at file offset 0), as the loader would map it.
+/// A neutral mock image header with one segment (file address 0x1_0000_0000, 0x1000
+/// bytes, the header at its start), as the loader would map it.
 fn mapped_text_header() -> Vec<u8>
 {
-    let mut bytes = vec![0; 32 + 72];
-    bytes[0..4].copy_from_slice(&0xfeed_facf_u32.to_le_bytes());
-    bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
-    bytes[12..16].copy_from_slice(&2_u32.to_le_bytes());
-    bytes[16..20].copy_from_slice(&1_u32.to_le_bytes());
-    bytes[20..24].copy_from_slice(&72_u32.to_le_bytes());
-    let command = &mut bytes[32..];
-    command[0..4].copy_from_slice(&0x19_u32.to_le_bytes());
-    command[4..8].copy_from_slice(&72_u32.to_le_bytes());
-    command[8..14].copy_from_slice(b"__TEXT");
-    command[24..32].copy_from_slice(&0x1_0000_0000_u64.to_le_bytes());
-    command[32..40].copy_from_slice(&0x1000_u64.to_le_bytes());
-    command[48..56].copy_from_slice(&0x1000_u64.to_le_bytes());
-    bytes
+    crate::objfile::mock::MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(0x1_0000_0000, 0x1000)
+        .header_bytes()
 }
 
 #[test]
@@ -780,7 +770,7 @@ fn symbolicate_reports_an_unreadable_image_every_time_and_stack_traces_continue(
     let image = LoadedImage {
         path: "/nonexistent/ferros-session-test-image".into(),
         load_address: Address::new(IMAGE),
-        uuid: None,
+        build_id: crate::types::BuildIdentity::Unknown,
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x40))
@@ -1455,5 +1445,5 @@ mod logical
     }
 }
 
-#[path = "tests/symtab.rs"]
-mod symtab;
+#[path = "tests/symbol_tables.rs"]
+mod symbol_tables;

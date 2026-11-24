@@ -17,8 +17,52 @@
 //! Function offsets are relative to the image's Mach-O header, so a runtime pc maps to
 //! `pc - load_address`.
 //!
-//! Only lookup is implemented. Interpreting an encoding is architecture-specific and is
-//! done by the unwinder; [`Arm64Mode`] decodes the arm64 modes it uses.
+//! [`CompactUnwind`] gives the engine each function's encoding as a format-neutral
+//! [`UnwindHint`], decoding the arm64 modes ([`Arm64Mode`]). An entry with encoding 0 or a
+//! mode without a hint is no hint, so the engine falls back to the image's CFI, exactly as
+//! for an image without the section.
+
+use std::sync::Arc;
+
+use ferros_core::objfile::{FunctionUnwind, UnwindHint, UnwindHints};
+use ferros_core::types::Address;
+
+/// An image's `__unwind_info`, as the engine's [`UnwindHints`].
+pub(crate) struct CompactUnwind
+{
+    section: Arc<[u8]>,
+    /// Runtime address of the image's Mach-O header, which function offsets are relative to.
+    header: u64,
+}
+
+impl CompactUnwind
+{
+    pub(crate) fn new(section: Arc<[u8]>, header: u64) -> Self
+    {
+        Self { section, header }
+    }
+}
+
+impl UnwindHints for CompactUnwind
+{
+    fn lookup(&self, address: Address) -> Option<FunctionUnwind>
+    {
+        let offset = u32::try_from(address.value().checked_sub(self.header)?).ok()?;
+        let entry = lookup(&self.section, offset).filter(|entry| entry.encoding != 0)?;
+        let hint = match Arm64Mode::decode(entry.encoding) {
+            Arm64Mode::None => return None,
+            Arm64Mode::Frameless { stack_size } => UnwindHint::Leaf { stack_size },
+            Arm64Mode::Dwarf { fde_offset } => UnwindHint::Cfi {
+                eh_frame_offset: fde_offset,
+            },
+            Arm64Mode::Frame => UnwindHint::FrameRecord,
+        };
+        Some(FunctionUnwind {
+            start: Address::new(self.header + u64::from(entry.function_offset)),
+            hint,
+        })
+    }
+}
 
 /// Encoding found for an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +217,7 @@ impl Arm64Mode
 }
 
 #[cfg(test)]
-mod tests
+pub(crate) mod tests
 {
     use super::*;
 
@@ -189,7 +233,7 @@ mod tests
 
     /// One compressed page for functions at 0x1000 and 0x1040 (common encodings 0 and the
     /// page's own encoding), one regular page for 0x2000, and a sentinel at 0x3000.
-    fn section() -> Vec<u8>
+    pub(crate) fn section() -> Vec<u8>
     {
         let mut s = Vec::new();
         // Header: version, common encodings (offset 28, count 1), personalities (0, 0),
@@ -237,6 +281,39 @@ mod tests
         assert_eq!(entry(0x2abc), Some((0x2000, 0x0300_0158)));
         assert_eq!(entry(0x3000), None);
         assert_eq!(lookup(&s[..40], 0x1000), None, "truncated sections are rejected");
+    }
+
+    #[test]
+    fn hints_are_relative_to_the_header_and_skip_entries_without_information()
+    {
+        let mut s = section();
+        let hints = CompactUnwind::new(s.clone().into(), 0x5_0000_0000);
+        let hint = |address: u64| hints.lookup(Address::new(0x5_0000_0000 + address));
+        assert_eq!(
+            hint(0x1004),
+            Some(FunctionUnwind {
+                start: Address::new(0x5_0000_1000),
+                hint: UnwindHint::FrameRecord,
+            })
+        );
+        assert_eq!(
+            hint(0x1044).map(|entry| entry.hint),
+            Some(UnwindHint::Leaf { stack_size: 16 })
+        );
+        assert_eq!(
+            hint(0x2abc).map(|entry| entry.hint),
+            Some(UnwindHint::Cfi { eh_frame_offset: 0x158 })
+        );
+        assert_eq!(hint(0x0fff), None);
+        assert_eq!(hints.lookup(Address::new(0x4_ffff_ffff)), None, "below the header");
+        // Encoding 0 and an unknown mode are no hint.
+        let regular_encoding = s.len() - 4;
+        s[regular_encoding..].copy_from_slice(&0_u32.to_le_bytes());
+        let zero = CompactUnwind::new(s.clone().into(), 0);
+        assert_eq!(zero.lookup(Address::new(0x2000)), None);
+        s[regular_encoding..].copy_from_slice(&0x0100_0000_u32.to_le_bytes());
+        let unknown = CompactUnwind::new(s.into(), 0);
+        assert_eq!(unknown.lookup(Address::new(0x2000)), None);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ferros_core::{Address, BreakpointRequest, ResumeRequest, Session, SessionState, StopEvent, ThreadAction, ThreadId};
+use ferros_core::{Address, BreakpointRequest, ResumeRequest, SessionState, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::control::ControlDir;
 use ferros_tests::fixture;
@@ -118,7 +118,7 @@ fn detach_restores_the_exception_ports_from_before_attach()
         let pid = target.pid();
         let before = diagnostics::exception_ports(pid).expect("exception ports before attach");
 
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")));
+        let mut session = ferros_macos::new_session().expect("MacOSBackend::new");
         session.attach(pid).expect("attach");
         let attached = diagnostics::exception_ports(pid).expect("exception ports while attached");
         assert_ne!(

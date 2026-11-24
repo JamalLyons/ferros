@@ -12,9 +12,7 @@ use std::fmt::Write as _;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ferros_core::{
-    Address, Backend, BackendError, BreakpointRequest, ResumeRequest, Session, StopEvent, ThreadAction, ThreadId,
-};
+use ferros_core::{Address, Backend, BackendError, BreakpointRequest, ResumeRequest, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::{Flow, TRAP, flow};
 use ferros_tests::control::ControlDir;
@@ -341,7 +339,7 @@ fn detach_after_a_step_leaves_the_process_running()
     harness::run_with_timeout(Duration::from_secs(60), |t| {
         let target = t.spawn(&fixture!("loop_counter"), &[SHORT_LOOP]);
         let pid = target.pid();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("MacOSBackend::new")));
+        let mut session = ferros_macos::new_session().expect("MacOSBackend::new");
         session.attach(pid).expect("attach");
         let main = *session.threads().expect("threads").first().expect("a thread");
 
@@ -1551,7 +1549,7 @@ fn detach_releases_a_held_new_thread_and_the_process_finishes()
         let fixture = fixture!("spawn_thread");
         let mut target = t.spawn(&fixture, &["pause=4000"]);
         let pid = target.pid();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             match session.attach(pid) {
@@ -1617,7 +1615,7 @@ fn drop_releases_a_held_new_thread_and_the_process_finishes()
         let fixture = fixture!("spawn_thread");
         let mut target = t.spawn(&fixture, &["pause=4000"]);
         let pid = target.pid();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             match session.attach(pid) {
@@ -1742,7 +1740,7 @@ fn detach_cleanup_after_starting_step_releases_suspended_threads()
             control.wait("ready-1");
             let debugger = MacOSBackend::new().expect("backend");
             let faults = debugger.reply_fault_injector();
-            let mut session = Session::new(Box::new(debugger));
+            let mut session = ferros_macos::session_with(debugger);
             let _release = ReleasePublication(faults.clone());
             session.attach(target.pid()).expect("attach");
             let address = marker_address(&mut session, &fixture, "step_site");

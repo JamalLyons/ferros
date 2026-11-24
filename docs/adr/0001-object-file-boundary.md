@@ -62,7 +62,7 @@ Accepted. Option D. Owner decision 2026-11-22.
 
 Do not add container methods to `Backend`. Widen build identity so a 20-byte ELF build-id fits, and stop using "both ids missing" as proof of the same build unless the format implementor says a missing id is not evidence (the macOS case of a failed `LC_UUID` read has to stay distinct from "this format has no id"). The `object` crate's Mach-O feature leaves `ferros-core` with the parsers; direct dependencies collapse to one version as part of that move.
 
-No code moves in this pull request. [#193](https://github.com/JamalLyons/ferros/issues/193) does the move. Until it lands, the Mach-O listed in Context is still in `ferros-core`. That is a leak against this decision. New Mach-O, ELF, or PE knowledge does not go into `ferros-core`, and one platform crate does not gain another's format code.
+No code moved in the pull request that recorded this decision. [#193](https://github.com/JamalLyons/ferros/issues/193) did the move: the trait is `ferros_core::objfile::ObjectFormat`, the Mach-O implementor is `ferros_macos::macho::MachOFormat`, and `ferros-core` no longer depends on `object`. The Context section describes the code before that move. New Mach-O, ELF, or PE knowledge does not go into `ferros-core`, and one platform crate does not gain another's format code.
 
 ## Consequences
 

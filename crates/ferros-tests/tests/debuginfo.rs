@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::backend::mock::MockBackend;
-use ferros_core::symbols::{BinaryImage, DebugInfoOptions, ImageDescriptor, ImageMapping};
+use ferros_core::symbols::{BinaryImage, ImageDescriptor};
 use ferros_core::{
     Address, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache, ThreadId,
 };
-use ferros_macos::MacOSBackend;
+use ferros_macos::{DebugInfoOptions, MachOFormat};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
@@ -58,7 +58,7 @@ fn descriptor(path: &Path, load_address: u64) -> ImageDescriptor
 fn with_mapped_header(mock: MockBackend, path: &Path, load_address: u64) -> MockBackend
 {
     let bytes = fs::read(path).expect("read executable");
-    let size = ImageMapping::header_size(&bytes).expect("Mach-O header");
+    let size = ferros_macos::macho::header_size(&bytes).expect("Mach-O header");
     mock.with_region(Address::new(load_address), "r-x", &bytes[..size])
 }
 
@@ -143,7 +143,7 @@ fn packed_fixture_discovers_uuid_matching_dsym()
     harness::run(|_| {
         let fixture = fixture!("hello");
         let scratch = Scratch::new();
-        let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
         let image = cache
             .load_image(descriptor(fixture.path(), 0x2_0000_0000))
             .expect("adjacent dSYM");
@@ -161,7 +161,7 @@ fn mismatched_dsym_is_rejected_and_no_tool_has_actionable_typed_error()
         let scratch = Scratch::new();
         let executable = scratch.0.join("program");
         fs::copy(fixture.path(), &executable).expect("copy executable without companion");
-        let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
         expect_no_debug_info(cache.load_image(descriptor(&executable, 0x2_0000_0000)));
 
         let directory = scratch.0.join("program.dSYM/Contents/Resources/DWARF");
@@ -218,7 +218,7 @@ fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
 
         let mut options = scratch.options();
         options.dsymutil = Some(PathBuf::from("/usr/bin/dsymutil"));
-        let mut cache = SymbolCache::with_debug_info_options(options);
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(options).into_shared());
         let image = cache
             .load_image(descriptor(&executable, 0x3_0000_0000))
             .expect("dsymutil fallback");
@@ -227,7 +227,7 @@ fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
         assert_eq!(entries.len(), 1, "only validated output is published");
 
         // A new resolver with no tool can use the persisted artifact at another slide.
-        let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
         let image = cache
             .load_image(descriptor(&executable, 0x4_0000_0000))
             .expect("UUID cache hit");
@@ -240,7 +240,7 @@ fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
             .unwrap()
             .path();
         fs::copy(fixture!("nested_calls").path(), entry).expect("replace cache with wrong UUID");
-        let mut cache = SymbolCache::with_debug_info_options(scratch.options());
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
         expect_no_debug_info(cache.load_image(descriptor(&executable, 0x3_0000_0000)));
     });
 }
@@ -255,7 +255,7 @@ fn failed_and_empty_tool_output_is_not_published()
             fs::copy(fixture!("hello").path(), &executable).expect("copy executable");
             let mut options = scratch.options();
             options.dsymutil = Some(tool.into());
-            let mut cache = SymbolCache::with_debug_info_options(options);
+            let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(options).into_shared());
             expect_no_debug_info(cache.load_image(descriptor(&executable, 0x2_0000_0000)));
             assert_eq!(fs::read_dir(scratch.0.join("cache")).expect("cache directory").count(), 0);
         }
@@ -276,7 +276,7 @@ fn timed_out_tool_is_killed_and_temporary_output_is_removed()
         options.dsymutil = Some(tool);
         options.tool_timeout = Duration::from_millis(20);
         let start = std::time::Instant::now();
-        let mut cache = SymbolCache::with_debug_info_options(options);
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(options).into_shared());
         let Err(error) = cache.load_image(descriptor(&executable, 0x2_0000_0000)) else {
             panic!("unexpected symbols");
         };
@@ -296,7 +296,7 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
         let executable = scratch.0.join("program");
         fs::copy(fixture.path(), &executable).expect("copy executable without dSYM");
         let (file, _) = symbol(&executable, "ferros_fixture_hello::main");
-        let address = ImageMapping::parse(&descriptor(&executable, 0x2_0000_0000))
+        let address = ferros_macos::macho::file_mapping(&executable, 0x2_0000_0000)
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
@@ -307,9 +307,12 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
             .with_image(LoadedImage {
                 path: executable,
                 load_address: Address::new(0x2_0000_0000),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         for _ in 0..2 {
             let error = session.symbolicate(address).expect_err("missing debug info");
@@ -341,7 +344,7 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
         std::os::unix::fs::symlink(fixture.dsym_path(), scratch.0.join("program.dSYM")).expect("link the dSYM");
         let load_address = 0x2_0000_0000;
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
-        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+        let address = ferros_macos::macho::file_mapping(fixture.path(), load_address)
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
@@ -350,9 +353,12 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
 
         for _ in 0..2 {
@@ -396,7 +402,7 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
         fs::write(&executable, b"not a Mach-O image").expect("write a corrupt image");
         let load_address = 0x2_0000_0000;
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
-        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+        let address = ferros_macos::macho::file_mapping(fixture.path(), load_address)
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
@@ -407,9 +413,12 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         let assert_parse_failure = |error: DebuggerError| {
             let DebuggerError::SymbolLoad { path, source } = &error else {
@@ -461,10 +470,10 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
         let executable = scratch.0.join("program");
         let dsym = scratch.0.join("program.dSYM");
         let load_address = Address::new(0x2_0000_0000);
-        let loaded = |uuid| LoadedImage {
+        let loaded = |uuid: Option<[u8; 16]>| LoadedImage {
             path: executable.clone(),
             load_address,
-            uuid,
+            build_id: uuid.map(ferros_core::BuildId::from).into(),
         };
         let header_and_uuid = |fixture: &Fixture| {
             let mut bytes = fs::read(fixture.path()).expect("read executable");
@@ -473,7 +482,7 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
                 .mach_uuid()
                 .expect("read UUID")
                 .expect("Mach-O has a UUID");
-            bytes.truncate(ImageMapping::header_size(&bytes).expect("header size"));
+            bytes.truncate(ferros_macos::macho::header_size(&bytes).expect("header size"));
             (bytes, uuid)
         };
         let (mut header, first_uuid) = header_and_uuid(&first);
@@ -486,7 +495,10 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
             .with_region(load_address, "r-x", header)
             .with_thread(ThreadId(1), Registers::default())
             .with_image(loaded(None));
-        let mut session = Session::new(Box::new(mock.clone())).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock.clone()),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         let install = |fixture: &Fixture| {
             fs::copy(fixture.path(), &executable).expect("copy executable");
             std::os::unix::fs::symlink(fixture.dsym_path(), &dsym).expect("link matching dSYM");
@@ -494,7 +506,7 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
         let check = |session: &mut Session, fixture: &Fixture, function: &str, marker: &str| {
             let file = format!("{}.rs", fixture.name());
             let line = fixture.marker_line(marker);
-            let image = SymbolCache::with_debug_info_options(scratch.options())
+            let image = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared())
                 .load_image(descriptor(fixture.path(), load_address.value()))
                 .expect("read fixture DWARF");
             let addresses = image.line_addresses(&file, line).expect("fixture marker addresses");
@@ -543,7 +555,7 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
         let dsym = scratch.0.join("program.dSYM");
         let load_address = Address::new(0x2_0000_0000);
         let mut header = fs::read(mapped.path()).expect("read executable");
-        header.truncate(ImageMapping::header_size(&header).expect("header size"));
+        header.truncate(ferros_macos::macho::header_size(&header).expect("header size"));
         // The loader reports no UUID; the session reads it from the mapped header.
         let mock = MockBackend::new()
             .with_region(load_address, "r-x", header)
@@ -551,9 +563,12 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
             .with_image(LoadedImage {
                 path: executable.clone(),
                 load_address,
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         let install = |fixture: &Fixture| {
             let _ = fs::remove_file(&executable);
             let _ = fs::remove_file(&dsym);
@@ -561,7 +576,7 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
             std::os::unix::fs::symlink(fixture.dsym_path(), &dsym).expect("link matching dSYM");
         };
         let line = mapped.marker_line("hello_print");
-        let address = SymbolCache::with_debug_info_options(scratch.options())
+        let address = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared())
             .load_image(descriptor(mapped.path(), load_address.value()))
             .expect("read fixture DWARF")
             .line_addresses("hello.rs", line)
@@ -601,14 +616,14 @@ fn session_refreshes_unloaded_and_relocated_images()
         let first = LoadedImage {
             path: fixture.path().to_path_buf(),
             load_address: Address::new(0x2_0000_0000),
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         };
         let second = LoadedImage {
             load_address: Address::new(0x3_0000_0000),
             ..first.clone()
         };
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
-        let old_address = ImageMapping::parse(&descriptor(fixture.path(), first.load_address.value()))
+        let old_address = ferros_macos::macho::file_mapping(fixture.path(), first.load_address.value())
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
@@ -617,7 +632,7 @@ fn session_refreshes_unloaded_and_relocated_images()
         let mock = with_mapped_header(mock, fixture.path(), second.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(first.clone());
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), ferros_macos::MachOFormat::shared());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         assert!(session.symbolicate(old_address).expect("symbolicate").is_some());
         assert_eq!(
@@ -642,17 +657,17 @@ fn relative_image_paths_keep_symbols_across_refreshes()
         let image = LoadedImage {
             path: relative.clone(),
             load_address: Address::new(0x2_0000_0000),
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         };
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
-        let address = ImageMapping::parse(&descriptor(&relative, image.load_address.value()))
+        let address = ferros_macos::macho::file_mapping(&relative, image.load_address.value())
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
         let mock = with_mapped_header(MockBackend::new(), fixture.path(), image.load_address.value())
             .with_thread(ThreadId(1), Registers::default())
             .with_image(image);
-        let mut session = Session::new(Box::new(mock));
+        let mut session = Session::new(Box::new(mock), ferros_macos::MachOFormat::shared());
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         assert!(session.symbolicate(address).expect("first lookup").is_some());
         assert!(session.symbolicate(address).expect("second lookup").is_some());
@@ -676,7 +691,7 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
         let relative = relative_to_cwd(&executable);
         let load_address = 0x2_0000_0000;
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
-        let address = ImageMapping::parse(&descriptor(fixture.path(), load_address))
+        let address = ferros_macos::macho::file_mapping(fixture.path(), load_address)
             .expect("mapping")
             .runtime_address(file)
             .expect("runtime");
@@ -685,9 +700,12 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
             .with_image(LoadedImage {
                 path: relative.clone(),
                 load_address: Address::new(load_address),
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
-        let mut session = Session::new(Box::new(mock)).with_debug_info_options(scratch.options());
+        let mut session = Session::new(
+            Box::new(mock),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         let is_main = |symbolication: &ferros_core::Symbolication| {
             symbolication.frames.iter().any(|frame| {
@@ -790,7 +808,7 @@ fn loaded_image_maps_after_its_file_is_removed()
         };
         let path_text: &'static str = Box::leak(path.to_str().expect("UTF-8 scratch path").into());
         let target = t.spawn(&Fixture::from_built("spawn_thread", path_text), &["pause=4000"]);
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend")));
+        let mut session = ferros_macos::new_session().expect("backend");
         // Attach once the first worker runs: dyld has then published the image list, as
         // it had in the reported failure, so the main image's path is the loader's.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -862,7 +880,9 @@ fn dyld_entry_skips_dsymutil_without_a_debug_map()
         options.dsymutil = Some(tool);
 
         let tag = t.tag();
-        let mut session = Session::new(Box::new(MacOSBackend::new().expect("backend"))).with_debug_info_options(options);
+        let mut session = ferros_macos::new_session()
+            .expect("backend")
+            .with_object_format(MachOFormat::with_debug_info_options(options).into_shared());
         session
             .launch(&LaunchSpec::new(fixture.path()).arg(tag.as_str()))
             .expect("launch at dyld entry");
@@ -897,7 +917,7 @@ fn cargo_built_fixture_contains_debug_map_stabs()
         let object_files = file
             .macho_symbol_table()
             .iter()
-            .filter(|entry| entry.is_stab() && entry.n_type() == object::macho::N_OSO)
+            .filter(|entry| entry.stab() == Some(object::macho::N_OSO))
             .count();
         assert!(object_files > 0, "fixture must have N_OSO stabs");
         println!("hello fixture N_OSO stabs: {object_files}");

@@ -5,7 +5,8 @@ use std::sync::atomic::AtomicBool;
 
 use ferros_core::backend::LoadedImage;
 use ferros_core::backend::mock::{MockBackend, MockCallKind, MockState, MockStop, arm64_registers};
-use ferros_core::{Address, LaunchSpec, ProcessId, StopEvent, ThreadId};
+use ferros_core::objfile::mock::MockObjectFormat;
+use ferros_core::{Address, LaunchSpec, ProcessId, Session, StopEvent, ThreadId};
 
 use super::commands::{find, parse_address, parse_number};
 use super::jobs::NoJobControl;
@@ -25,8 +26,13 @@ fn mock() -> MockBackend
         .with_image(LoadedImage {
             path: "/bin/prog".into(),
             load_address: Address::new(CODE),
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         })
+}
+
+fn session(mock: &MockBackend) -> Session
+{
+    Session::new(Box::new(mock.clone()), MockObjectFormat::shared())
 }
 
 struct Transcript
@@ -38,7 +44,7 @@ struct Transcript
 
 fn run_with(mock: &MockBackend, target: Target, input: Input<Cursor<Vec<u8>>>) -> Transcript
 {
-    let (mut debugger, _) = Debugger::start(Box::new(mock.clone()), target).expect("start");
+    let (mut debugger, _) = Debugger::start(session(mock), target).expect("start");
     let mut out = Vec::new();
     let mut err = Vec::new();
     let ok = super::run(
@@ -338,8 +344,7 @@ fn continue_does_not_pass_sigint_on()
 fn interrupt_flag_interrupts_a_running_process()
 {
     let mock = mock();
-    let (mut debugger, _) =
-        Debugger::start(Box::new(mock.clone()), Target::Launch(LaunchSpec::new("/bin/prog"))).expect("start");
+    let (mut debugger, _) = Debugger::start(session(&mock), Target::Launch(LaunchSpec::new("/bin/prog"))).expect("start");
     debugger.session.resume().expect("resume");
     let flag = AtomicBool::new(true);
     let event = super::interrupt::wait_for_stop(&mut debugger.session, &flag, &NoJobControl).expect("wait");

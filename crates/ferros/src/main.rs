@@ -10,7 +10,7 @@ use ferros_core::backend::{ProcessGroup, StdioSpec};
 use ferros_core::{LaunchSpec, ProcessId};
 use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
 
-use crate::platform::create_backend;
+use crate::platform::create_session;
 use crate::repl::jobs::JobControl;
 use crate::repl::{Debugger, Input, Target};
 
@@ -264,7 +264,7 @@ fn run_session(target: Target, mode: Mode, jobs: &mut dyn JobControl) -> bool
     // ours afterwards so signals received while a command runs reach wait_for_stop.
     // At the prompt Ctrl-C is a raw-mode key, handled by the editor itself.
     let interrupt = repl::interrupt::install();
-    let started = create_backend().and_then(|backend| Debugger::start(backend, target));
+    let started = create_session().and_then(|session| Debugger::start(session, target));
     let (mut debugger, message) = match started {
         Ok(started) => started,
         Err(error) => {

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use ferros_core::backend::mock::{MockBackend, MockCall, MockCallKind, MockState, MockStop, arm64_registers};
 use ferros_core::backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent};
+use ferros_core::objfile::mock::{MockObjectFormat, MockObjectImage};
 use ferros_core::types::{Address, ProcessId, ThreadId};
 use ferros_core::{BreakpointLocation, LogicalBreakpointId, Session, SessionState, arch};
 
@@ -132,7 +133,7 @@ fn detach_cleanup_error_clears_session_but_ordinary_error_keeps_it_stopped()
 
     for teardown in [false, true] {
         let mock = scripted_process();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
         session
             .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
@@ -174,7 +175,7 @@ fn kill_cleanup_error_clears_session_but_ordinary_error_preserves_it()
 
     for teardown in [false, true] {
         let mock = scripted_process();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
         session
             .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
@@ -225,7 +226,7 @@ fn session_carries_process_group_to_backend()
 
     for group in [None, Some(ProcessGroup::New)] {
         let mock = MockBackend::new();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         let mut spec = LaunchSpec::new("/bin/prog");
         assert_eq!(spec.process_group, None, "default must inherit");
         if let Some(group) = group {
@@ -237,14 +238,18 @@ fn session_carries_process_group_to_backend()
     }
 }
 
-/// A portable, synthetic arm64 Mach-O with two DWARF subprograms named `multi`.
-/// No compiler, fixture process, or platform API is needed to resolve multiple sites.
+/// A portable, synthetic arm64 image in the neutral `MockObjectFormat` with two DWARF
+/// subprograms named `multi`. No compiler, fixture process, or platform API is needed to
+/// resolve multiple sites.
 struct MultiSiteImage(std::path::PathBuf);
 
 impl MultiSiteImage
 {
     fn new() -> (Self, MockBackend)
     {
+        use ferros_core::objfile::SectionId;
+        use ferros_core::objfile::mock::MockObjectFile;
+
         let (mut image, path) = ferros_tests::scratch::create_file("ferros-mock-multi", "");
         // DWARF 4: a compile unit with children, then subprograms with inline name,
         // low_pc (address), high_pc (data4 offset). No statement table is referenced.
@@ -260,42 +265,17 @@ impl MultiSiteImage
         let length = u32::try_from(info.len() - 4).unwrap();
         info[..4].copy_from_slice(&length.to_le_bytes());
 
-        let sections =
-            vec![("__debug_info", info), ("__debug_abbrev", abbrev), ("__debug_line", vec![0])].into_boxed_slice();
-        let commands_size = 72 + 72 + 80 * sections.len();
-        let mut bytes = vec![0; 32 + commands_size];
-        let word = |bytes: &mut [u8], offset, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        let long = |bytes: &mut [u8], offset, value: u64| bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        word(&mut bytes, 0, 0xfeed_facf);
-        word(&mut bytes, 4, 0x0100_000c);
-        word(&mut bytes, 12, 2);
-        word(&mut bytes, 16, 2);
-        word(&mut bytes, 20, u32::try_from(commands_size).unwrap());
-        word(&mut bytes, 32, 0x19); // LC_SEGMENT_64: header and code mapping.
-        word(&mut bytes, 36, 72);
-        bytes[40..46].copy_from_slice(b"__TEXT");
-        long(&mut bytes, 56, IMAGE_BASE.value());
-        long(&mut bytes, 64, 0x2000);
-        long(&mut bytes, 80, 0x2000);
-        word(&mut bytes, 88, 5);
-        word(&mut bytes, 92, 5);
-        let dwarf = 104;
-        word(&mut bytes, dwarf, 0x19);
-        word(&mut bytes, dwarf + 4, u32::try_from(72 + 80 * sections.len()).unwrap());
-        bytes[dwarf + 8..dwarf + 15].copy_from_slice(b"__DWARF");
-        word(&mut bytes, dwarf + 64, u32::try_from(sections.len()).unwrap());
-        for (index, (name, data)) in sections.into_iter().enumerate() {
-            let section = dwarf + 72 + 80 * index;
-            bytes[section..section + name.len()].copy_from_slice(name.as_bytes());
-            bytes[section + 16..section + 23].copy_from_slice(b"__DWARF");
-            long(&mut bytes, section + 40, data.len() as u64);
-            let offset = u32::try_from(bytes.len()).unwrap();
-            word(&mut bytes, section + 48, offset);
-            bytes.extend(data);
-        }
-        bytes.resize(0x2000, 0x1F);
-        std::io::Write::write_all(&mut image, &bytes).expect("write synthetic image");
+        let file = MockObjectFile::new(IMAGE_BASE.value(), 0x2000)
+            .with_dwarf(SectionId::DebugInfo, &info)
+            .with_dwarf(SectionId::DebugAbbrev, &abbrev)
+            .with_dwarf(SectionId::DebugLine, &[0]);
+        std::io::Write::write_all(&mut image, &file.to_bytes()).expect("write synthetic image");
         drop(image);
+        // The mapped image: its header, then code (`0x1F` bytes) up to the segment's end.
+        let mut bytes = MockObjectImage::new(0..1, 0, 0)
+            .with_mapping(IMAGE_BASE.value(), 0x2000)
+            .header_bytes();
+        bytes.resize(0x2000, 0x1F);
         let mut registers = arm64_registers();
         registers.pc = IMAGE_BASE;
         let mock = MockBackend::new()
@@ -304,7 +284,7 @@ impl MultiSiteImage
             .with_image(ferros_core::backend::LoadedImage {
                 path: path.clone(),
                 load_address: IMAGE_BASE,
-                uuid: None,
+                build_id: ferros_core::types::BuildIdentity::Unknown,
             });
         (Self(path), mock)
     }
@@ -324,7 +304,7 @@ const SECOND_SITE: Address = Address::new(0x1_0000_0010);
 fn multi_site_session() -> (MultiSiteImage, MockBackend, Session, LogicalBreakpointId)
 {
     let (image, mock) = MultiSiteImage::new();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let id = session
         .set_breakpoint(BreakpointLocation::Function("multi".into()))
@@ -613,7 +593,7 @@ fn enabling_a_breakpoint_at_a_line_step_site_keeps_it_enabled_and_armed()
     // site again when the step ends. The session is running for the whole step, so
     // enabling a logical breakpoint there is refused and the release cannot undo it.
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let id = session.set_breakpoint(BreakpointLocation::Address(BREAKPOINT)).unwrap();
     session.disable_logical_breakpoint(id).unwrap();
@@ -667,7 +647,7 @@ fn signal_during_breakpoint_step_does_not_report_or_count_a_second_hit()
     let mock = MockBackend::new()
         .with_thread(thread, registers)
         .with_region(address, "r-x", vec![0; 64]);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-signal-step")).expect("launch mock");
     let id = session
         .add_breakpoint(BreakpointRequest::Software { address })
@@ -733,7 +713,7 @@ fn removing_the_breakpoint_drops_a_stopped_handlers_rendezvous()
     let mock = MockBackend::new()
         .with_thread(thread, registers.clone())
         .with_region(original, "r-x", vec![0; 64]);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-handler-stop"))
         .expect("launch mock");
@@ -818,7 +798,7 @@ fn step_out_interrupted_at_return_trap(mock: &MockBackend, session: &mut Session
 fn resume_drops_a_stale_return_trap_stop_and_continues()
 {
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     step_out_interrupted_at_return_trap(&mock, &mut session, Vec::new());
 
@@ -834,7 +814,7 @@ fn resume_drops_a_stale_return_trap_stop_and_continues()
 fn step_instruction_drops_a_stale_return_trap_stop_and_steps()
 {
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     step_out_interrupted_at_return_trap(&mock, &mut session, Vec::new());
 
@@ -862,7 +842,7 @@ fn resume_still_reports_a_queued_stop_at_an_armed_breakpoint()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session.select_thread(THREAD).expect("select the stepping thread");
     let id = session
@@ -897,7 +877,7 @@ fn resume_reports_a_drained_breakpoint_stop_at_an_armed_breakpoint()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 40;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let a = session
         .add_breakpoint(BreakpointRequest::Software { address: first })
@@ -946,7 +926,7 @@ fn resume_reports_a_drained_breakpoint_stop_at_an_armed_breakpoint()
 fn resume_reports_a_stop_that_arrives_after_its_drain()
 {
     let mock = scripted_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session
         .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
@@ -981,7 +961,7 @@ fn resume_reports_a_stop_that_arrives_after_its_drain()
 fn step_instruction_reports_a_stop_that_arrives_after_its_drain()
 {
     let mock = scripted_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let late = StopEvent::Signal {
         thread: THREAD,
@@ -1000,7 +980,7 @@ fn step_instruction_reports_a_stop_that_arrives_after_its_drain()
 fn step_out_reports_a_stop_that_arrives_after_its_drain()
 {
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let late = StopEvent::Signal {
         thread: THREAD,
@@ -1021,7 +1001,7 @@ fn step_out_reports_a_stop_that_arrives_after_its_drain()
 fn step_over_reports_a_stop_that_arrives_before_its_final_continue()
 {
     let mock = scripted_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session
         .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
@@ -1073,7 +1053,7 @@ fn signal_of_a_refused_resume_is_passed_by_the_next_resume_with_signal()
         .with_thread(THREAD, registers.clone())
         .with_thread(other, registers)
         .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let first = StopEvent::Signal {
         thread: THREAD,
@@ -1111,7 +1091,7 @@ fn refused_step_out_keeps_a_signal_carried_for_another_thread()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let signal = StopEvent::Signal {
         thread: other,
@@ -1175,7 +1155,7 @@ fn refused_step_over_keeps_a_stopped_handlers_rendezvous()
         .with_thread(stepper, elsewhere)
         .with_thread(handler, registers.clone())
         .with_region(original, "r-x", vec![0; 64]);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-refused-step")).expect("launch");
     mock.script(
         MockStop::new(StopEvent::Signal {
@@ -1262,7 +1242,7 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
         "r-x",
         vec![0x1F; 64],
     );
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let signal = StopEvent::Signal {
         thread: THREAD,
@@ -1377,7 +1357,7 @@ fn unstarted_step_over_elsewhere_keeps_a_stopped_handlers_rendezvous()
 
     for refused in [true, false] {
         let mock = handler_stopped_process();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session.launch(&LaunchSpec::new("scripted-step-elsewhere")).expect("launch");
         let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -1445,7 +1425,7 @@ fn unstarted_step_over_elsewhere_keeps_a_stopped_handlers_rendezvous()
 fn handler_return_continue_passes_a_signal_carried_from_a_deferred_resume()
 {
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-deferred-signal")).expect("launch");
     let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -1498,7 +1478,7 @@ fn refused_step_over_final_continue_keeps_another_threads_signal()
         .with_thread(THREAD, registers.clone())
         .with_thread(other, registers)
         .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let mut elsewhere = session.read_registers_for(other).expect("registers");
     elsewhere.pc = BREAKPOINT + 16;
@@ -1577,7 +1557,7 @@ fn step_out_drops_a_stale_trap_stop_queued_for_its_return_continue()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session.select_thread(THREAD).expect("select the stepping thread");
     step_out_interrupted_at_return_trap(&mock, &mut session, vec![stale_trap_stop(other, CALLEE + 16)]);
@@ -1605,7 +1585,7 @@ fn step_out_drops_another_threads_stale_trap_stop_queued_before_it()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let interrupted = StopEvent::Interrupted { thread: Some(THREAD) };
     mock.script_simultaneous(vec![
@@ -1637,7 +1617,7 @@ fn step_out_reports_a_real_breakpoint_stop_queued_for_its_return_continue()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session.select_thread(THREAD).expect("select the stepping thread");
     let id = session
@@ -1696,7 +1676,7 @@ fn step_out_from_a_breakpoint_drops_a_stale_trap_stop_that_refuses_its_continue(
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let id = step_out_from_a_user_breakpoint(&mock, &mut session);
     mock.stop_before_nth_resume(2, std::iter::once(stale_trap_stop(other, CALLEE + 16)));
@@ -1756,7 +1736,7 @@ fn step_out_reports_another_threads_program_trap_queued_before_it()
     let other = ThreadId(2);
     let program_trap = CALLEE + 16;
     let mock = returning_to_breakpoint_with_program_trap(other);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let interrupted = StopEvent::Interrupted { thread: Some(THREAD) };
     let trapped = StopEvent::Breakpoint {
@@ -1790,7 +1770,7 @@ fn step_out_reports_a_program_trap_stop_queued_for_its_return_continue()
     let other = ThreadId(2);
     let program_trap = CALLEE + 16;
     let mock = returning_to_breakpoint_with_program_trap(other);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session.select_thread(THREAD).expect("select the stepping thread");
     let trapped = StopEvent::Breakpoint {
@@ -1826,7 +1806,7 @@ fn step_out_drops_an_abandoned_steps_completion_that_refuses_its_continue()
     use ferros_core::BreakpointRequest;
 
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
 
     // `resume` steps THREAD over the breakpoint at its pc; an interrupt is reported
@@ -1873,7 +1853,7 @@ fn step_out_drops_a_stale_trap_stop_that_refuses_its_recursive_continue()
     let mut registers = arm64_registers();
     registers.pc = CALLEE + 32;
     let mock = returning_to_breakpoint().with_thread(other, registers);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     session.select_thread(THREAD).expect("select the stepping thread");
 
@@ -1953,7 +1933,7 @@ fn step_over_process(two_sites: bool, trap: PeerTrap) -> (MockBackend, Session)
         .with_thread(ThreadId(2), at(second))
         .with_thread(PEER, at(CALLEE + 0x38))
         .with_region(CALLEE, "r-x", code);
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let mut sites = vec![BREAKPOINT];
     if two_sites {
@@ -2166,7 +2146,7 @@ fn refused_step_over_on_a_dying_target_reports_its_death()
 fn refused_step_out_continue_on_a_dying_target_reports_its_death()
 {
     let mock = returning_to_breakpoint();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let killed = StopEvent::Killed { signal: 9 };
     mock.die_refusing_nth_resume(1, killed.clone(), Duration::from_millis(50));
@@ -2239,7 +2219,7 @@ fn zero_timeout_wait_does_not_block_on_a_dying_targets_refused_continue()
 fn zero_timeout_wait_reports_a_dying_targets_refused_handler_continue_later()
 {
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-dying-handler")).expect("launch");
     let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2279,66 +2259,20 @@ const LONG_JUMP_IMAGE: Address = Address::new(0x2_0000_0000);
 /// `__longjmp` in that image, where the session traps a stopped handler's exit.
 const LONG_JUMP: Address = Address::new(0x2_0000_1000);
 
-/// A mapped `libsystem_platform.dylib` with one symbol, `__longjmp` at `LONG_JUMP`:
-/// `__TEXT` (one `__text` section at 0x1000..0x1100), `__LINKEDIT` from file offset
-/// 0x4000, its `nlist` at 0x4000 and string table at 0x5000.
+/// A mapped `libsystem_platform.dylib` with one symbol, `__longjmp` at `LONG_JUMP`, in
+/// the neutral `MockObjectFormat`: its header at the load address, code at
+/// 0x1000..0x1100, its table at 0x4000 and names at 0x5000.
 fn long_jump_image() -> Vec<u8>
 {
-    fn u32s(out: &mut Vec<u8>, values: &[u32])
-    {
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    fn u64s(out: &mut Vec<u8>, values: &[u64])
-    {
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    fn name(out: &mut Vec<u8>, name: &str)
-    {
-        let mut bytes = [0; 16];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        out.extend_from_slice(&bytes);
-    }
     let base = LONG_JUMP_IMAGE.value();
-    let mut commands = Vec::new();
-    u32s(&mut commands, &[0x19, 72 + 80]);
-    name(&mut commands, "__TEXT");
-    u64s(&mut commands, &[base, 0x4000, 0, 0x4000]);
-    u32s(&mut commands, &[5, 5, 1, 0]);
-    name(&mut commands, "__text");
-    name(&mut commands, "__TEXT");
-    u64s(&mut commands, &[LONG_JUMP.value(), 0x100]);
-    u32s(&mut commands, &[0x1000, 2, 0, 0, 0x8000_0400, 0, 0, 0]);
-    u32s(&mut commands, &[0x19, 72]);
-    name(&mut commands, "__LINKEDIT");
-    u64s(&mut commands, &[base + 0x4000, 0x2000, 0x4000, 0x2000]);
-    u32s(&mut commands, &[1, 1, 0, 0]);
-    u32s(&mut commands, &[0x2, 24, 0x4000, 1, 0x5000, 0x10]);
-    let mut bytes = Vec::new();
-    u32s(
-        &mut bytes,
-        &[
-            0xfeed_facf,
-            0x0100_000c,
-            0,
-            6,
-            3,
-            u32::try_from(commands.len()).unwrap(),
-            0,
-            0,
-        ],
-    );
-    bytes.extend(commands);
+    let image = MockObjectImage::new(LONG_JUMP.value()..LONG_JUMP.value() + 0x100, base + 0x4000, base + 0x5000)
+        .with_symbol(LONG_JUMP.value(), "__longjmp");
+    let mut bytes = image.header_bytes();
     bytes.resize(0x1000, 0);
     bytes.extend(std::iter::repeat_n(0x1F, 0x3000));
-    u32s(&mut bytes, &[1]);
-    bytes.extend_from_slice(&[0x0f, 1, 0, 0]);
-    u64s(&mut bytes, &[LONG_JUMP.value()]);
+    bytes.extend(image.table_bytes());
     bytes.resize(0x5000, 0);
-    bytes.extend_from_slice(b"\0__longjmp\0");
+    bytes.extend(image.name_bytes());
     bytes.resize(0x6000, 0);
     bytes
 }
@@ -2352,7 +2286,7 @@ fn handler_stopped_with_long_jump() -> MockBackend
         .with_image(ferros_core::backend::LoadedImage {
             path: "/usr/lib/system/libsystem_platform.dylib".into(),
             load_address: LONG_JUMP_IMAGE,
-            uuid: None,
+            build_id: ferros_core::types::BuildIdentity::Unknown,
         })
 }
 
@@ -2408,7 +2342,7 @@ fn handler_step_off() -> MockStop
 fn handler_return_drops_a_stale_trap_stop_reported_with_it()
 {
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-stale-handler-return"))
         .expect("launch");
@@ -2443,7 +2377,7 @@ fn handler_return_reports_a_real_trap_stop_reported_with_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_process();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session
             .launch(&LaunchSpec::new("scripted-real-handler-return"))
             .expect("launch");
@@ -2473,7 +2407,7 @@ fn handler_return_reports_a_real_trap_stop_reported_with_it()
 fn handler_continue_drops_a_stale_trap_stop_that_refuses_it()
 {
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-stale-handler-refusal"))
         .expect("launch");
@@ -2508,7 +2442,7 @@ fn handler_continue_reports_a_real_trap_stop_that_refuses_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_process();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session
             .launch(&LaunchSpec::new("scripted-real-handler-refusal"))
             .expect("launch");
@@ -2556,7 +2490,7 @@ fn handler_at_long_jump(registers: &ferros_core::Registers) -> MockStop
 fn handler_exit_drops_a_stale_trap_stop_reported_with_it()
 {
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-stale-handler-exit"))
         .expect("launch");
@@ -2603,7 +2537,7 @@ fn handler_exit_reports_a_real_trap_stop_reported_with_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_with_long_jump();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session
             .launch(&LaunchSpec::new("scripted-real-handler-exit"))
             .expect("launch");
@@ -2633,7 +2567,7 @@ fn handler_exit_reports_a_real_trap_stop_reported_with_it()
 fn handler_exit_step_drops_a_stale_trap_stop_that_refuses_it()
 {
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-stale-exit-step")).expect("launch");
     let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2672,7 +2606,7 @@ fn handler_exit_step_reports_a_real_trap_stop_that_refuses_it()
 {
     for trap in [PeerTrap::Armed, PeerTrap::Program] {
         let mock = handler_stopped_with_long_jump();
-        let mut session = Session::new(Box::new(mock.clone()));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
         session.launch(&LaunchSpec::new("scripted-real-exit-step")).expect("launch");
         let (id, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2707,7 +2641,7 @@ fn handler_continue_drops_an_abandoned_steps_completion_that_refuses_it()
     use ferros_core::BreakpointRequest;
 
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-late-step-handler"))
         .expect("launch");
@@ -2754,7 +2688,7 @@ fn handler_continue_consumes_a_fresh_step_of_the_previously_stepped_thread()
     use ferros_core::BreakpointRequest;
 
     let mock = handler_stopped_process();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session
         .launch(&LaunchSpec::new("scripted-handler-fresh-step"))
         .expect("launch");
@@ -2811,36 +2745,24 @@ fn step_out_arms_the_replacement_exit_images_entry()
     const BASE: u64 = 0x2_0000_0000;
     const FIRST_ENTRY: u64 = BASE + 0x400;
     const SECOND_ENTRY: u64 = BASE + 0x408;
-    const NLIST: u64 = BASE + 0x1000;
-    let u32s = |words: &[u32]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    let u64s = |words: &[u64]| words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    let mut image = u32s(&[0xfeed_facf, 0x0100_000c, 0, 6, 3, 248, 0, 0]); // mach_header_64
-    image.extend(u32s(&[0x19, 152])); // LC_SEGMENT_64, with one section
-    image.extend(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
-    image.extend(u64s(&[BASE, 0x1000, 0, 0x1000]));
-    image.extend(u32s(&[5, 5, 1, 0]));
-    image.extend(b"__text\0\0\0\0\0\0\0\0\0\0__TEXT\0\0\0\0\0\0\0\0\0\0");
-    image.extend(u64s(&[FIRST_ENTRY, 16]));
-    image.extend(u32s(&[0x400, 2, 0, 0, 0x8000_0400, 0, 0, 0]));
-    image.extend(u32s(&[0x19, 72])); // LC_SEGMENT_64, with no sections
-    image.extend(b"__LINKEDIT\0\0\0\0\0\0");
-    image.extend(u64s(&[NLIST, 0x1000, 0x1000, 0x1000]));
-    image.extend(u32s(&[1, 1, 0, 0]));
-    image.extend(u32s(&[2, 24, 0x1000, 1, 0x1010, 11])); // LC_SYMTAB
+    const TABLE: u64 = BASE + 0x1000;
+    let symbols =
+        MockObjectImage::new(FIRST_ENTRY..FIRST_ENTRY + 16, TABLE, TABLE + 0x100).with_symbol(FIRST_ENTRY, "__longjmp");
+    let mut image = symbols.header_bytes();
     image.resize(0x1000, 0);
-    image.extend(u32s(&[1, 0x010f])); // n_strx 1, N_SECT | N_EXT, section 1
-    image.extend(FIRST_ENTRY.to_le_bytes());
-    image.extend(b"\0__longjmp\0");
+    image.extend(symbols.table_bytes());
+    image.resize(0x1100, 0);
+    image.extend(symbols.name_bytes());
 
-    let loaded = |uuid| LoadedImage {
+    let loaded = |uuid: Option<[u8; 16]>| LoadedImage {
         path: "/usr/lib/system/libsystem_platform.dylib".into(),
         load_address: Address::new(BASE),
-        uuid,
+        build_id: uuid.map(ferros_core::types::BuildId::from).into(),
     };
     let mock = returning_to_breakpoint()
         .with_region(Address::new(BASE), "r-x", image)
         .with_image(loaded(Some([1; 16])));
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
     step_out_to_breakpoint(&mock, &mut session);
@@ -2850,7 +2772,8 @@ fn step_out_arms_the_replacement_exit_images_entry()
         Some(StopEvent::SingleStep { thread: THREAD })
     );
 
-    mock.overwrite_memory(Address::new(NLIST + 8), &SECOND_ENTRY.to_le_bytes());
+    // The table's first word is the symbol's address.
+    mock.overwrite_memory(Address::new(TABLE), &SECOND_ENTRY.to_le_bytes());
     mock.set_images(vec![loaded(None)]);
     let callee = in_callee(session.read_registers_for(THREAD).expect("read registers"));
     session.write_registers_for(THREAD, &callee).expect("return to callee");
@@ -2888,7 +2811,7 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     use ferros_core::BreakpointRequest;
 
     let mock = handler_stopped_with_long_jump();
-    let mut session = Session::new(Box::new(mock.clone()));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("scripted-exit-fresh-step")).expect("launch");
     let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
 
@@ -2930,4 +2853,187 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     );
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(mock.script_len(), 0);
+}
+
+/// Load address of the image in the build-identity tests below.
+const BUILD_IMAGE: u64 = 0x3_0000_0000;
+
+/// A mapped image header in the neutral `MockObjectFormat` with one segment at file
+/// address `text`, so a runtime address in the image maps back to an offset from `text`.
+fn build_image_header(text: u64) -> Vec<u8>
+{
+    let mut header = MockObjectImage::new(0..1, 0, 0).with_mapping(text, 0x1000).header_bytes();
+    header.resize(0x100, 0);
+    header
+}
+
+fn build_image(build_id: ferros_core::BuildIdentity) -> ferros_core::backend::LoadedImage
+{
+    ferros_core::backend::LoadedImage {
+        path: "/nonexistent/ferros-build-id-image".into(),
+        load_address: Address::new(BUILD_IMAGE),
+        build_id,
+    }
+}
+
+/// A session over an image whose mapped header puts its segment at `0x1000`, reported with
+/// `build_id`.
+fn build_id_session(build_id: ferros_core::BuildIdentity) -> (MockBackend, Session)
+{
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_region(Address::new(BUILD_IMAGE), "r-x", build_image_header(0x1000))
+        .with_image(build_image(build_id));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    (mock, session)
+}
+
+/// The file address the session maps the image's first code byte past its header to.
+/// It follows the mapped header only when the session reads the image again.
+fn mapped_text(session: &mut Session) -> Option<u64>
+{
+    session
+        .file_address(Address::new(BUILD_IMAGE + 0x10))
+        .expect("file address")
+        .map(|(_, file)| file)
+}
+
+fn known(bytes: &[u8]) -> ferros_core::BuildIdentity
+{
+    ferros_core::BuildIdentity::Known(ferros_core::BuildId::new(bytes).expect("build id"))
+}
+
+/// A 20-byte id (an ELF GNU build-id) whose last byte changes is another build at the same
+/// path and address: the session reads its mapped header again, and refuses to map file
+/// addresses of the old build.
+#[test]
+fn a_twenty_byte_build_id_that_changes_its_last_byte_is_a_new_build()
+{
+    let first = [0x5A; 20];
+    let mut second = first;
+    second[19] ^= 1;
+    let (mock, mut session) = build_id_session(known(&first));
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    mock.set_images(vec![build_image(known(&second))]);
+    assert_eq!(mapped_text(&mut session), Some(0x8010), "the replaced build's header is read");
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&first)), 0x8010)
+            .expect("runtime address"),
+        None,
+        "file addresses of the old build do not apply"
+    );
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&second)), 0x8010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10))
+    );
+}
+
+/// An image whose format records no build id is never assumed to be the same build
+/// across stops: with the id absent at both stops, the session reads the mapped header
+/// again after the process ran. Within one stop the image is reused, and
+/// `runtime_address` accepts the image it was handed (#193).
+#[test]
+fn an_absent_build_id_at_both_stops_is_not_the_same_build()
+{
+    let absent = ferros_core::BuildIdentity::Absent;
+    let (mock, mut session) = build_id_session(absent);
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+    assert_eq!(
+        session
+            .runtime_address(&build_image(absent), 0x1010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10)),
+        "within one stop the image is the one just read"
+    );
+
+    // Same stop: memory changes under the session are not re-read.
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    assert_eq!(mapped_text(&mut session), Some(0x1010), "the image is reused within a stop");
+
+    mock.script(MockStop::new(StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: Address::new(BUILD_IMAGE + 0x10),
+    }));
+    session.resume().expect("resume");
+    session.wait(None).expect("wait");
+    mock.set_images(vec![build_image(absent)]);
+    assert_eq!(
+        mapped_text(&mut session),
+        Some(0x8010),
+        "after a stop the image is read again"
+    );
+}
+
+/// #170: an id the backend could not read at one stop and reads at the next is the same
+/// build, so the session keeps the mapping it read; the header is not read again.
+#[test]
+fn an_unknown_build_id_that_becomes_known_keeps_the_mapping()
+{
+    let id = [0xC3; 16];
+    let (mock, mut session) = build_id_session(ferros_core::BuildIdentity::Unknown);
+    assert_eq!(mapped_text(&mut session), Some(0x1010));
+
+    mock.overwrite_memory(Address::new(BUILD_IMAGE), &build_image_header(0x8000));
+    mock.set_images(vec![build_image(known(&id))]);
+    assert_eq!(mapped_text(&mut session), Some(0x1010), "the mapping read earlier is kept");
+    assert_eq!(
+        session
+            .runtime_address(&build_image(known(&id)), 0x1010)
+            .expect("runtime address"),
+        Some(Address::new(BUILD_IMAGE + 0x10))
+    );
+}
+
+/// #193: the session names a frame without DWARF through the object format it was given,
+/// not through a parser of its own. The image is in the neutral `MockObjectFormat`, whose
+/// bytes no Mach-O parser accepts, and its symbol `mock_entry` is named as written (the
+/// format strips no prefix).
+#[test]
+fn a_frame_is_named_through_the_injected_object_format()
+{
+    use ferros_core::backend::LoadedImage;
+    use ferros_core::types::SymbolSource;
+
+    const BASE: u64 = 0x5_0000_0000;
+    let symbols = MockObjectImage::new(BASE + 0x1000..BASE + 0x1100, BASE + 0x4000, BASE + 0x5000)
+        .with_symbol(BASE + 0x1000, "mock_entry")
+        .with_symbol(BASE + 0x1080, "_mock_next");
+    let mut registers = arm64_registers();
+    registers.pc = Address::new(BASE + 0x1090);
+    let launched = |format: std::sync::Arc<dyn ferros_core::objfile::ObjectFormat>| {
+        let mock = MockBackend::new()
+            .with_thread(THREAD, registers.clone())
+            .with_region(Address::new(BASE), "r-x", symbols.header_bytes())
+            .with_region(Address::new(BASE + 0x1000), "r-x", vec![0; 0x100])
+            .with_region(Address::new(BASE + 0x4000), "r--", symbols.table_bytes())
+            .with_region(Address::new(BASE + 0x5000), "r--", symbols.name_bytes())
+            .with_image(LoadedImage {
+                path: "/nonexistent/ferros-mock-format-image".into(),
+                load_address: Address::new(BASE),
+                build_id: ferros_core::BuildIdentity::Unknown,
+            });
+        let mut session = Session::new(Box::new(mock), format);
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        session
+    };
+    let mut session = launched(MockObjectFormat::shared());
+    let frames = session.stack_trace(1).expect("stack trace");
+    let symbol = frames[0].symbol.as_ref().expect("a symbol table name");
+    assert_eq!(symbol.display_name(), "_mock_next");
+    assert_eq!(symbol.source(), SymbolSource::SymbolTable);
+
+    // The same image in a session given the Mach-O format has no name: the format, not
+    // the session, decides what the image's bytes mean.
+    #[cfg(target_os = "macos")]
+    {
+        let mut session = launched(ferros_macos::MachOFormat::shared());
+        let frames = session.stack_trace(1).expect("stack trace");
+        assert_eq!(frames[0].symbol, None, "{frames:?}");
+    }
 }

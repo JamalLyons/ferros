@@ -220,7 +220,7 @@ impl FrameKind
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameStatus
 {
-    /// The innermost frame, or a frame recovered with DWARF CFI (`__eh_frame` or
+    /// The innermost frame, or a frame recovered with DWARF CFI (`eh_frame` or
     /// `.debug_frame`).
     Complete,
     /// No CFI covered the callee: recovered from the frame-pointer chain, or from the link

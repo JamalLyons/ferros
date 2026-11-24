@@ -1,4 +1,5 @@
-//! Portable discovery of embedded and companion DWARF.
+//! Discovery of a Mach-O image's DWARF: embedded in the image, in an adjacent `.dSYM`
+//! bundle, in a UUID-keyed cache, or linked from the image's debug map by `dsymutil`.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -6,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
+use ferros_core::error::{DebuggerError, Result};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64, Nlist};
 use object::{Object, ObjectSection, macho};
 
-use crate::error::{DebuggerError, Result};
-
-/// Locations and limits used when looking for companion debug information.
+/// Locations and limits [`MachOFormat`](super::MachOFormat) uses when looking for
+/// companion debug information.
 ///
 /// Supplying these explicitly keeps callers and tests independent of the user's cache
 /// and PATH. `dsymutil: None` disables generation, while still allowing cached DWARF.
@@ -60,13 +61,13 @@ fn has_dwarf(file: &object::File<'_>) -> bool
 }
 
 // Mach-O's <mach-o/stab.h> defines N_LIB alongside N_OSO.
-const N_LIB: u8 = 0x68;
+const N_LIB: macho::SymbolStab = macho::SymbolStab(0x68);
 
 fn has_debug_map(file: &object::File<'_>) -> bool
 {
     fn is_debug_map_entry(entry: &impl Nlist) -> bool
     {
-        entry.is_stab() && matches!(entry.n_type(), macho::N_OSO | N_LIB)
+        matches!(entry.stab(), Some(macho::N_OSO | N_LIB))
     }
 
     match file {
@@ -76,11 +77,16 @@ fn has_debug_map(file: &object::File<'_>) -> bool
     }
 }
 
-fn no_debug_info(path: &Path, detail: impl Into<String>) -> DebuggerError
+/// Missing debug information for the image at `path`, with how to provide it.
+pub(crate) fn no_debug_info(path: &Path, detail: impl Into<String>) -> DebuggerError
 {
     DebuggerError::NoDebugInfo {
         path: path.to_path_buf(),
-        detail: detail.into(),
+        detail: format!(
+            "{}. Build with debug symbols and split-debuginfo = \"packed\", or install/run dsymutil to generate a matching \
+             dSYM",
+            detail.into()
+        ),
     }
 }
 
@@ -113,8 +119,8 @@ pub(crate) fn universal_slices(bytes: &[u8]) -> Option<object::Result<Vec<Univer
         arches
             .iter()
             .map(|arch| UniversalSlice {
-                cpu_type: arch.cputype(),
-                cpu_subtype: arch.cpusubtype(),
+                cpu_type: arch.cputype().0,
+                cpu_subtype: arch.cpusubtype().0,
                 architecture: arch.architecture(),
                 data: arch.data(bytes),
             })
@@ -241,74 +247,20 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
     Ok(bytes)
 }
 
-/// What can be observed of the files one symbol load reads, without reading them: the
-/// image itself, its `.dSYM` bundle's DWARF members and the debug cache directory. Two
-/// equal stamps mean none of those files was created, removed, resized or modified in
-/// between, as far as the filesystem's size and timestamps tell.
-///
-/// A file rewritten in place with the same size and its timestamps restored is not
-/// seen as changed; neither is one changed within the filesystem's timestamp resolution.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LoadInputs(Vec<(PathBuf, FileStamp)>);
-
-/// One path's stamp: the link itself and what it resolves to (equal for a regular
-/// file), so retargeting a symlink is seen too. `None` when the path does not exist or
-/// cannot be inspected.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp
+/// The files [`discover`] and the image parse read for the image at `path`, in a stable
+/// order: the image, its `.dSYM` bundle's DWARF directory and members, and the debug
+/// cache directory.
+pub(crate) fn load_inputs(path: &Path, options: &DebugInfoOptions) -> Vec<PathBuf>
 {
-    link: Option<MetadataStamp>,
-    target: Option<MetadataStamp>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MetadataStamp
-{
-    is_dir: bool,
-    len: u64,
-    modified: Option<SystemTime>,
-    created: Option<SystemTime>,
-}
-
-impl MetadataStamp
-{
-    fn of(metadata: std::io::Result<fs::Metadata>) -> Option<Self>
-    {
-        let metadata = metadata.ok()?;
-        Some(Self {
-            is_dir: metadata.is_dir(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            created: metadata.created().ok(),
-        })
-    }
-}
-
-impl LoadInputs
-{
-    /// Stamp the inputs [`discover`] and the image parse read for the image at `path`
-    /// (the path the load reads, after canonicalization).
-    pub(crate) fn of(path: &Path, options: &DebugInfoOptions) -> Self
-    {
-        let mut stamps = Vec::new();
-        let mut stamp = |path: PathBuf| {
-            let stamp = FileStamp {
-                link: MetadataStamp::of(fs::symlink_metadata(&path)),
-                target: MetadataStamp::of(fs::metadata(&path)),
-            };
-            stamps.push((path, stamp));
-        };
-        stamp(path.to_path_buf());
-        let dwarf_directory = dwarf_directory(path);
-        let mut members: Vec<_> = fs::read_dir(&dwarf_directory)
-            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
-            .unwrap_or_default();
-        members.sort();
-        stamp(dwarf_directory);
-        members.into_iter().for_each(&mut stamp);
-        stamp(options.cache_directory.clone());
-        Self(stamps)
-    }
+    let dwarf_directory = dwarf_directory(path);
+    let mut members: Vec<_> = fs::read_dir(&dwarf_directory)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    members.sort();
+    let mut inputs = vec![path.to_path_buf(), dwarf_directory];
+    inputs.extend(members);
+    inputs.push(options.cache_directory.clone());
+    inputs
 }
 
 /// The directory of DWARF members in the `.dSYM` bundle next to `path`.
@@ -352,6 +304,8 @@ impl Drop for Workspace
 #[cfg(test)]
 mod tests
 {
+    use object::macho;
+
     use super::*;
 
     // A minimal little-endian arm64 Mach-O, sufficient to exercise portable discovery
@@ -397,7 +351,7 @@ mod tests
         bytes[16..20].copy_from_slice(&2_u32.to_le_bytes()); // Command count.
         bytes[20..24].copy_from_slice(&(2 * command_size).to_le_bytes());
         for field in [
-            macho::LC_SYMTAB,
+            macho::LC_SYMTAB.0,
             command_size,
             symbols_offset,
             1,
@@ -540,10 +494,10 @@ mod tests
     {
         for (bytes, expected) in [
             (image([1; 16], false), false),
-            (image_with_symbol(macho::N_SECT), false),
-            (image_with_symbol(macho::N_SO), false),
-            (image_with_symbol(macho::N_OSO), true),
-            (image_with_symbol(N_LIB), true),
+            (image_with_symbol(macho::N_SECT.0), false),
+            (image_with_symbol(macho::N_SO.0), false),
+            (image_with_symbol(macho::N_OSO.0), true),
+            (image_with_symbol(N_LIB.0), true),
         ] {
             assert_eq!(has_debug_map(&object::File::parse(bytes.as_slice()).unwrap()), expected);
         }
@@ -555,7 +509,7 @@ mod tests
         let workspace = Workspace::create(&std::env::temp_dir()).unwrap();
         let mut options = options(&workspace.0);
         options.dsymutil = Some(workspace.0.join("missing-dsymutil"));
-        let error = discover(&workspace.0.join("program"), &image_with_symbol(macho::N_OSO), &options).unwrap_err();
+        let error = discover(&workspace.0.join("program"), &image_with_symbol(macho::N_OSO.0), &options).unwrap_err();
         assert!(matches!(error, DebuggerError::NoDebugInfo { .. }));
         assert!(error.to_string().contains("split-debuginfo"));
         assert!(error.to_string().contains("dsymutil"));

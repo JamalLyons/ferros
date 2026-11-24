@@ -1,5 +1,8 @@
 //! Function names from a Mach-O image's symbol table (`LC_SYMTAB`), for code without DWARF.
 //!
+//! [`super::MachOFormat`] exposes this to the engine through the format-neutral
+//! [`ferros_core::objfile`] traits.
+//!
 //! Some code has no DWARF: Rust's standard library linked without debug info
 //! (`std::rt::lang_start_internal`), the C `main` shim, dyld's `start`, and the system
 //! libraries in the dyld shared cache (`libsystem_pthread`'s `_pthread_start` and
@@ -38,14 +41,11 @@
 //! `S_ATTR_SOME_INSTRUCTIONS`) count, and only for a pc in the same section, so a pc
 //! never takes a name from data or from a symbol in another section.
 
-use object::macho::{
-    LC_FUNCTION_STARTS, MachHeader64, N_SECT, N_STAB, N_TYPE, Nlist64, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS,
-};
+use ferros_core::error::{DebuggerError, Result};
+use ferros_core::types::Address;
+use object::macho::{LC_FUNCTION_STARTS, MachHeader64, N_SECT, Nlist64, S_ATTR_PURE_INSTRUCTIONS, S_ATTR_SOME_INSTRUCTIONS};
 use object::read::macho::{MachHeader as _, Section as _, Segment as _};
 use object::{Endianness, LittleEndian, pod};
-
-use crate::error::{DebuggerError, Result};
-use crate::types::Address;
 
 /// Size of one 64-bit `nlist` entry.
 pub(crate) const NLIST_SIZE: usize = 16;
@@ -110,7 +110,7 @@ impl SymtabLayout
                 for section in segment.sections(endian, data).map_err(invalid)? {
                     index += 1;
                     let flags = section.flags(endian);
-                    if flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS) != 0
+                    if flags.intersects(S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
                         && let Ok(index) = u8::try_from(index)
                     {
                         let start = section.addr(endian);
@@ -260,7 +260,7 @@ impl SymtabLayout
             .unwrap_or_default();
         let mut symbols: Vec<(u64, u32)> = entries
             .iter()
-            .filter(|nlist| nlist.n_type & N_STAB == 0 && nlist.n_type & N_TYPE == N_SECT)
+            .filter(|nlist| !nlist.n_type.is_stab() && nlist.n_type.typ() == N_SECT)
             .filter(|nlist| self.sections.iter().any(|&(index, ..)| index == nlist.n_sect))
             .map(|nlist| {
                 (
@@ -382,7 +382,7 @@ mod tests
     fn segment(name: &str, vmaddr: u64, vmsize: u64, fileoff: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8>
     {
         let mut out = Vec::new();
-        push_u32(&mut out, LC_SEGMENT_64);
+        push_u32(&mut out, LC_SEGMENT_64.0);
         push_u32(&mut out, u32::try_from(72 + 80 * sections.len()).unwrap());
         out.extend_from_slice(&name16(name));
         push_u64(&mut out, vmaddr);
@@ -423,12 +423,12 @@ mod tests
             0x4000,
             0,
             &[
-                ("__text", 0x1_0000_1000, 0x1000, S_ATTR_PURE_INSTRUCTIONS),
+                ("__text", 0x1_0000_1000, 0x1000, S_ATTR_PURE_INSTRUCTIONS.0),
                 ("__const", 0x1_0000_2000, 0x100, 0),
             ],
         );
         commands.extend(segment("__LINKEDIT", 0x1_0000_8000, 0x4000, 0x8000, &[]));
-        push_u32(&mut commands, LC_SYMTAB);
+        push_u32(&mut commands, LC_SYMTAB.0);
         push_u32(&mut commands, 24);
         push_u32(&mut commands, symoff);
         push_u32(&mut commands, nsyms);
@@ -436,7 +436,7 @@ mod tests
         push_u32(&mut commands, strsize);
         let mut ncmds = 3;
         if let Some((dataoff, datasize)) = function_starts {
-            push_u32(&mut commands, LC_FUNCTION_STARTS);
+            push_u32(&mut commands, LC_FUNCTION_STARTS.0);
             push_u32(&mut commands, 16);
             push_u32(&mut commands, dataoff);
             push_u32(&mut commands, datasize);
@@ -446,7 +446,7 @@ mod tests
         push_u32(&mut out, MH_MAGIC_64);
         push_u32(&mut out, 0x0100_000c);
         push_u32(&mut out, 0);
-        push_u32(&mut out, MH_EXECUTE);
+        push_u32(&mut out, MH_EXECUTE.0);
         push_u32(&mut out, ncmds);
         push_u32(&mut out, u32::try_from(commands.len()).unwrap());
         push_u32(&mut out, 0);
@@ -483,11 +483,11 @@ mod tests
     {
         let layout = SymtabLayout::from_header(&header(), 0x1_0000_0000).expect("layout");
         let nlists = [
-            nlist(1, N_SECT | 1, 1, 0x1_0000_1000),
-            nlist(2, N_SECT, 1, 0x1_0000_1100),
+            nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000),
+            nlist(2, N_SECT.0, 1, 0x1_0000_1100),
             // A debugging (stab) entry, a data symbol and an undefined symbol never name code.
             nlist(3, 0x24, 1, 0x1_0000_1180),
-            nlist(4, N_SECT, 2, 0x1_0000_2000),
+            nlist(4, N_SECT.0, 2, 0x1_0000_2000),
             nlist(5, 1, 0, 0),
         ]
         .concat();
@@ -512,7 +512,7 @@ mod tests
         let starts = layout.parse_function_starts(&[0x80, 0x20, 0x80, 0x02, 0, 0, 0, 0]);
         assert_eq!(starts, [0x1_0000_1000, 0x1_0000_1100]);
         let table = layout
-            .parse_symbols(&nlist(1, N_SECT | 1, 1, 0x1_0000_1000))
+            .parse_symbols(&nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000))
             .with_function_starts(starts);
         let at = |address| table.lookup(&layout, Address::new(address));
         assert_eq!(at(0x1_0000_1010), Some(1), "inside foo");
@@ -520,7 +520,7 @@ mod tests
         assert_eq!(at(0x1_0000_1110), None, "inside an unnamed function");
 
         // Without function starts the nearest symbol is the fallback.
-        let table = layout.parse_symbols(&nlist(1, N_SECT | 1, 1, 0x1_0000_1000));
+        let table = layout.parse_symbols(&nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000));
         assert_eq!(table.lookup(&layout, Address::new(0x1_0000_1110)), Some(1));
     }
 

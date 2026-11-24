@@ -1184,7 +1184,7 @@ mod tests
             .with_image(LoadedImage {
                 path: "/bin/prog".into(),
                 load_address: Address::new(CODE),
-                uuid: None,
+                build_id: crate::types::BuildIdentity::Unknown,
             })
     }
 
@@ -1401,7 +1401,7 @@ mod tests
             Ok(vec![LoadedImage {
                 path: "/bin/prog".into(),
                 load_address: Address::new(CODE),
-                uuid: None,
+                build_id: crate::types::BuildIdentity::Unknown,
             }])
         );
     }

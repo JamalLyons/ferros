@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::types::{Address, ThreadId};
+use crate::types::{Address, BuildIdentity, ThreadId};
 
 /// Why a running target stopped, as reported by [`Backend::wait`](super::Backend::wait).
 #[non_exhaustive]
@@ -398,11 +398,11 @@ pub struct LoadedImage
     pub path: PathBuf,
     /// Runtime address where the image is loaded.
     pub load_address: Address,
-    /// The image's Mach-O `LC_UUID`, when the backend knows it.
+    /// The image's build identity, as far as the backend knows it at this stop.
     ///
-    /// On macOS, UUIDs come from dyld's UUID array or the mapped header (#170). A mapped
-    /// header's UUID is cached by load address until that image list entry changes (#182).
-    /// `None` means the backend had no UUID source, the header lacked `LC_UUID`, or the
-    /// lookup failed. Two `None` values compare equal.
-    pub uuid: Option<[u8; 16]>,
+    /// The session compares it with [`same_build`](crate::types::same_build): two known,
+    /// different ids mean another build was loaded at the same path and address;
+    /// [`BuildIdentity::Unknown`] is no evidence either way; [`BuildIdentity::Absent`]
+    /// is no evidence across stops, so such an image is read again once per stop.
+    pub build_id: BuildIdentity,
 }

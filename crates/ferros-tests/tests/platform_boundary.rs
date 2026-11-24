@@ -71,6 +71,24 @@ const MACH_O_CASED: &[&str] = &["dSYM"];
 /// (see [`starts_word`]).
 const MACH_O_WORD_STARTS: &[&str] = &["LC_", "lc_", "nlist", "Nlist", "NLIST"];
 
+/// Text that marks macOS operating-system knowledge: its system libraries and the xnu
+/// signal frame. The platform supplies these through `runtime::TargetRuntime` (#201).
+/// Matched case-insensitively anywhere on a line, comments included.
+const MACOS_RUNTIME_TEXT: &[&str] = &[
+    "dylib",
+    "dyld",
+    "sigtramp",
+    "ucontext",
+    "mcontext",
+    "sigframe",
+    "uc_mcsize",
+    "xnu",
+    "libunwind",
+    "libsystem_",
+    "unw_resume",
+    "__longjmp",
+];
+
 /// Crates that parse object-file containers. `ferros-core` takes DWARF and CFI as bytes
 /// from its `ObjectFormat`, so it never needs one.
 const FORMAT_DEPENDENCIES: &[&str] = &["object", "goblin", "macho", "mach_object"];
@@ -166,6 +184,13 @@ fn mach_o_marker(line: &str) -> Option<&'static str>
         .or_else(|| MACH_O_WORD_STARTS.iter().copied().find(|token| starts_word(line, token)))
 }
 
+/// The macOS runtime marker a source line contains, if any (comments included).
+fn macos_runtime_marker(line: &str) -> Option<&'static str>
+{
+    let lower = line.to_ascii_lowercase();
+    MACOS_RUNTIME_TEXT.iter().copied().find(|token| lower.contains(token))
+}
+
 /// Manifest lines that name an OS dependency, in each syntax Cargo accepts.
 const MANIFEST_LINES_FORBIDDEN: &[&str] = &[
     "libc = \"0.2\"",
@@ -225,6 +250,27 @@ const MACH_O_LINES_FORBIDDEN: &[&str] = &[
     "lc_uuid",
     "LC_segment",
 ];
+const MACOS_RUNTIME_LINES_FORBIDDEN: &[&str] = &[
+    "image: \"libunwind.dylib\",",
+    "/// in `_sigtramp`",
+    "const UCONTEXT: u64 = 104;",
+    "let mcontext = frame + 160;",
+    "mod sigframe {",
+    "// uc_mcsize is 816",
+    "\"/usr/lib/libSystem.B.DYLIB\"",
+    "/// xnu's sendsig",
+    "const RESUME: &str = \"unw_resume\";",
+    "image: \"libsystem_platform\",",
+    "// libunwind resumes here",
+    "if name == \"__longjmp\" {",
+    "/// If dyld has not published it",
+];
+const MACOS_RUNTIME_LINES_ALLOWED: &[&str] = &[
+    "/// the signal trampoline",
+    "let context = runtime.signal_context(memory, &frame);",
+    "/// a dynamic library",
+    "\"libexits.so.1\"",
+];
 const MACH_O_LINES_ALLOWED: &[&str] = &[
     "/// An unlisted image",
     "fn unlisted_image_alignment()",
@@ -262,6 +308,12 @@ fn checks_recognise_what_they_forbid()
     }
     for line in MACH_O_LINES_ALLOWED {
         assert_eq!(mach_o_marker(line), None, "wrongly flagged: {line}");
+    }
+    for line in MACOS_RUNTIME_LINES_FORBIDDEN {
+        assert!(macos_runtime_marker(line).is_some(), "not recognised: {line}");
+    }
+    for line in MACOS_RUNTIME_LINES_ALLOWED {
+        assert_eq!(macos_runtime_marker(line), None, "wrongly flagged: {line}");
     }
 }
 
@@ -349,6 +401,31 @@ fn core_sources_have_no_mach_o_knowledge()
     assert!(
         offending.is_empty(),
         "Mach-O knowledge belongs in ferros-macos, not ferros-core (ADR 0001):\n{}",
+        offending.join("\n")
+    );
+}
+
+#[test]
+fn core_sources_have_no_macos_runtime_knowledge()
+{
+    let src = core_dir().join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    assert!(!files.is_empty(), "no .rs files found under {}", src.display());
+
+    let mut offending = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file).unwrap_or_else(|err| panic!("read {}: {err}", file.display()));
+        for (index, line) in text.lines().enumerate() {
+            if let Some(marker) = macos_runtime_marker(line) {
+                let location = format!("{}:{}", file.display(), index + 1);
+                offending.push(format!("{location}: `{marker}`: {}", line.trim()));
+            }
+        }
+    }
+    assert!(
+        offending.is_empty(),
+        "macOS runtime knowledge (system libraries, the signal frame) belongs in ferros-macos (#201):\n{}",
         offending.join("\n")
     );
 }

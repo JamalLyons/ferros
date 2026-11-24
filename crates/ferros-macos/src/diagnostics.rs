@@ -500,7 +500,7 @@ pub fn send_sigusr1_to_thread(pid: ProcessId, index: usize) -> Result<usize>
                 "process {} has {} threads, not {}",
                 pid.0,
                 threads.len(),
-                index + 1
+                index.saturating_add(1)
             ))),
         };
         for port in threads {

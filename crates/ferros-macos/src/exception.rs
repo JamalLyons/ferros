@@ -995,6 +995,8 @@ fn queue_single_step_exception(task: mach_port_t, exception_port: mach_port_t) -
                     Ok(_) => {}
                     Err(kr) => {
                         error!("teardown hook: cannot read the exception port's queue: {kr}");
+                        // Clear the bit, so the thread cannot trap after the teardown.
+                        let _ = set_single_step_while_suspended(thread, false);
                         return false;
                     }
                 }
@@ -2111,7 +2113,7 @@ impl SuspendRetry
     {
         self.next_at.map_or(0, |next| {
             let left = next.saturating_duration_since(std::time::Instant::now());
-            u32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(SUSPEND_RETRY_MAX_MS)
+            u32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(SUSPEND_RETRY_MAX_MS)
         })
     }
 

@@ -1262,11 +1262,16 @@ const BACKOFF_THREADS: usize = 8;
 /// doublings (10 + 20 + ... + 320 ms), so the delay has reached its 500 ms ceiling.
 const BACKOFF_SETTLE: Duration = Duration::from_millis(1300);
 
+/// Attempts after which the delay has reached its ceiling: 10 ms doubled six times
+/// passes 500 ms, so the seventh retry waits the full delay.
+const BACKOFF_SETTLED_ATTEMPTS: u32 = 7;
+
 /// The window the backoff test measures, at the 500 ms ceiling.
 const BACKOFF_WINDOW: Duration = Duration::from_millis(1000);
 
 /// The most `task_suspend` attempts allowed within [`BACKOFF_WINDOW`]: two delays fit,
-/// plus one for the window's edges.
+/// plus one for the window's edges. At least one must happen: arrivals must not
+/// postpone the retry either.
 const BACKOFF_WINDOW_ATTEMPTS: u32 = 3;
 
 /// Exceptions that arrive while a batch is held behind failing `task_suspend`s do not
@@ -1292,6 +1297,15 @@ fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
         diagnostics::send_sigusr1_to_thread(pid, 0).expect("SIGUSR1 to the first thread");
         expect_suspend_failure(d.wait(Some(STOP_TIMEOUT)), "the first signal's suspend");
         std::thread::sleep(BACKOFF_SETTLE);
+        // Under load the loop may lag: measure only once the doublings are spent.
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while faults.exception_suspend_attempts() < BACKOFF_SETTLED_ATTEMPTS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held batch did not retry its suspend"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let before = faults.exception_suspend_attempts();
         let began = std::time::Instant::now();
@@ -1303,21 +1317,29 @@ fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
         let attempts = faults.exception_suspend_attempts() - before;
         let took = began.elapsed();
         assert!(
-            attempts <= BACKOFF_WINDOW_ATTEMPTS,
+            (1..=BACKOFF_WINDOW_ATTEMPTS).contains(&attempts),
             "{attempts} task_suspend attempts in {took:?} with a 500 ms backoff: arriving exceptions advanced the retry"
         );
         let quiet = d.session_mut().backend_mut().wait(Some(Duration::ZERO));
         assert!(matches!(quiet, Ok(None)), "a held signal was reported: {quiet:?}");
 
         // Every thread raised its signal and is held by its own suspend, the task not.
-        let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
-        assert_eq!(counts.task.expect("task suspend count"), 0, "the task was suspended");
-        let held: Vec<i32> = counts
-            .threads
-            .expect("thread suspend counts")
-            .into_iter()
-            .map(|thread| thread.expect("thread suspend count").suspend_count)
-            .collect();
+        // The last signal may still be on its way: wait for its hold.
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        let held = loop {
+            let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
+            assert_eq!(counts.task.expect("task suspend count"), 0, "the task was suspended");
+            let held: Vec<i32> = counts
+                .threads
+                .expect("thread suspend counts")
+                .into_iter()
+                .map(|thread| thread.expect("thread suspend count").suspend_count)
+                .collect();
+            if held == [1; BACKOFF_THREADS] || std::time::Instant::now() >= deadline {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(held, [1; BACKOFF_THREADS], "a signalled thread is not held exactly once");
 
         assert!(

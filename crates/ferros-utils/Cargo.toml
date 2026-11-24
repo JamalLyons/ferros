@@ -18,6 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi"
 tracing-appender = "0.2"
 chrono = "0.4.42"
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [lints.clippy]
 # Allow multiple crate versions (needed for tracing-appender which uses thiserror 1.0)
 # Use priority 0 to override the default deny from -D warnings

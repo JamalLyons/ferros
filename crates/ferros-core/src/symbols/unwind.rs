@@ -297,7 +297,27 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// the walk with an error in the future.
     pub fn unwind(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<Vec<StackFrame>>
     {
+        Ok(self.unwind_with_lookups(thread, regs, max_frames)?.0)
+    }
+
+    /// Like [`unwind`](Self::unwind), also returning each frame's lookup address, in the
+    /// same order: the address the unwinder symbolicated that frame's physical frame at.
+    /// It is the call instruction for a caller frame, and the pc itself for the innermost
+    /// frame and for a frame a signal interrupted, which no call reached. Inlined frames
+    /// share their physical frame's.
+    ///
+    /// # Errors
+    ///
+    /// As [`unwind`](Self::unwind).
+    pub fn unwind_with_lookups(
+        &self,
+        thread: ThreadId,
+        regs: &Registers,
+        max_frames: usize,
+    ) -> Result<(Vec<StackFrame>, Vec<Address>)>
+    {
         let mut frames = Vec::new();
+        let mut lookups = Vec::new();
         let mut cursor = Cursor {
             regs: regs.clone(),
             known: ALL_GENERAL,
@@ -334,6 +354,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 status,
                 return_address,
             );
+            lookups.resize(frames.len(), lookup);
 
             let Some(step) = next else {
                 break;
@@ -356,11 +377,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             depth += 1;
         }
 
-        Ok(frames)
+        Ok((frames, lookups))
     }
 
     /// The address used for symbolication and unwind lookup: the call instruction for a
-    /// caller frame, the pc itself for the innermost frame.
+    /// caller frame, the pc itself for the innermost frame and for a frame a signal
+    /// interrupted.
     fn lookup_address(&self, cursor: &Cursor) -> Address
     {
         if cursor.is_caller {

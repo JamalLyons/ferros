@@ -400,6 +400,13 @@ pub(crate) fn open(
         _ => Architecture::Unknown("unknown"),
     };
 
+    // A file that records no `LC_UUID` is `Absent`: a mapped image whose id is known is
+    // then another build. A UUID command that does not parse says nothing either way.
+    let build_id = match file.mach_uuid() {
+        Ok(Some(uuid)) => BuildIdentity::Known(BuildId::from(uuid)),
+        Ok(None) => BuildIdentity::Absent,
+        Err(_) => BuildIdentity::Unknown,
+    };
     let mapping = mapping_from_file(&file, load_address)?;
     let unwind_hints = section_data(&file, &["__unwind_info"])?
         .map(|section| Box::new(CompactUnwind::new(section.data, load_address)) as Box<_>);
@@ -410,6 +417,7 @@ pub(crate) fn open(
         ImageContents {
             architecture,
             endian,
+            build_id,
             mapping,
             eh_frame,
             eh_frame_hdr,

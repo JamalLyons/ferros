@@ -63,6 +63,9 @@ impl Session
     ///   there (reported as `SingleStep`, possibly at code without a source line).
     /// - Inlined callees are stepped over, never entered.
     ///
+    /// The selected thread's held signal is discarded once the step starts it; a
+    /// deferred or failed start keeps it held. Peers keep their held signals.
+    ///
     /// # Errors
     ///
     /// As for [`step_instruction`](Self::step_instruction), plus errors reading debug
@@ -107,6 +110,7 @@ impl Session
     {
         self.require_stopped()?;
         let thread = self.selected_or_error()?;
+        self.carry_last_signal();
         self.interrupt_requested = false;
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             // The session is stopped, so a queued single-step completion of this thread
@@ -127,7 +131,6 @@ impl Session
         // resume), and it belongs to no request of this step either.
         // A source step reports a stopped handler's return like any other stop.
         self.handler_return = None;
-        self.carried_signals.retain(|(carried, _)| *carried != thread);
         let registers = self.backend.read_registers(thread)?;
         let position = self.position_at(registers.pc, None);
         let ranges = self.line_ranges(registers.pc);

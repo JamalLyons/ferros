@@ -299,9 +299,9 @@ fn resume_runs_hello()
 
 ## Tests without a real process
 
-`tests/backend_mock.rs` and `tests/unwind_eh_frame.rs` launch no process and do not use the
+`tests/backend_mock/` and `tests/unwind_eh_frame.rs` launch no process and do not use the
 harness. `tests/unwind_eh_frame.rs` runs the stack unwinder over a synthetic `MockObjectFormat` image and fake
-stack memory, pinning that `__eh_frame` FDEs are matched by runtime address. `tests/backend_mock.rs`
+stack memory, pinning that `__eh_frame` FDEs are matched by runtime address. `tests/backend_mock/`
 drives `ferros_core::backend::mock::MockBackend`, an in-memory, scripted backend
 enabled through the `test-util` feature, to prove the portable `Backend` trait and the mock work
 from outside `ferros-core`. With nothing to launch it needs no entitlement, no fixtures and no

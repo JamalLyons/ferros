@@ -282,6 +282,7 @@ impl Session
                 kept.build_id = kept.build_id.or_later(image.build_id);
                 kept.role = image.role;
                 kept.slice = kept.slice.map(|slice| slice.or_later(kept.build_id));
+                self.forget_contradicted_file(&mut kept);
                 self.loaded_images.push(kept);
             } else {
                 let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, image.build_id);
@@ -305,6 +306,39 @@ impl Session
         self.symbols
             .retain_ids(&self.loaded_images.iter().filter_map(|image| image.symbols).collect());
         Ok(())
+    }
+
+    /// Stop serving the file `image` was loaded from when its build is not the mapped
+    /// one (#221).
+    ///
+    /// A file opened while the mapped build id was unknown was read without a check of
+    /// its build. Once the id is known, the build the file records is compared with it
+    /// ([`same_build`]): a file of another build, or one recording no id, loses both
+    /// halves, its unwind tables and its source debug information, along with what the
+    /// session learned from loading it, so the next lookup opens the file again for the
+    /// known build. A file of the same build, or one whose id the format could not tell,
+    /// is kept without being opened again. The mapping and the symbol table come from the
+    /// target's memory, not from the file, and are kept either way.
+    fn forget_contradicted_file(&self, image: &mut SessionImage)
+    {
+        let Some(id) = image.symbols else {
+            return;
+        };
+        let Some(file) = self.symbols.file_build_id(id) else {
+            return;
+        };
+        if image.build_id.known().is_none() || same_build(file, image.build_id) {
+            return;
+        }
+        tracing::debug!(
+            "{} at 0x{:x}: the opened file is another build ({file:?}) than the mapped one ({:?}); reading it again",
+            image.descriptor.path.display(),
+            image.descriptor.load_address,
+            image.build_id
+        );
+        image.symbols = None;
+        image.no_debug_info = None;
+        image.failed_load = None;
     }
 
     /// Read the segment layout and the slice from the header mapped at `load_address`,
@@ -429,7 +463,7 @@ impl Session
             }
             (previous, failed) => self
                 .symbols
-                .load_executable(image.descriptor.clone(), image.slice.as_ref(), previous)
+                .load_executable(image.descriptor.clone(), image.slice.as_ref(), image.build_id, previous)
                 .map(Some)
                 .or_else(|error| {
                     // Reopening a changed file can fail while the live mapping and its

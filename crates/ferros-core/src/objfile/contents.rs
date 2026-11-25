@@ -120,6 +120,12 @@ pub struct ImageContents
     pub architecture: Architecture,
     /// Byte order of the image's DWARF and CFI.
     pub endian: RunTimeEndian,
+    /// The build identity the opened file records: [`BuildIdentity::Absent`] when it
+    /// records none, [`BuildIdentity::Unknown`] when the format could not tell. When the
+    /// file was opened while the mapped build was unknown and the loader reports the mapped
+    /// id later, the session stops serving the file unless this can be the same build
+    /// ([`same_build`](crate::types::same_build)).
+    pub build_id: BuildIdentity,
     /// The file's segment layout at the load address.
     pub mapping: ImageMapping,
     /// `.eh_frame` (or the format's equivalent) of the image file itself, whose FDE
@@ -151,6 +157,7 @@ impl std::fmt::Debug for ImageContents
         f.debug_struct("ImageContents")
             .field("architecture", &self.architecture)
             .field("endian", &self.endian)
+            .field("build_id", &self.build_id)
             .field("mapping", &self.mapping)
             .field("eh_frame", &self.eh_frame.is_some())
             .field("eh_frame_hdr", &self.eh_frame_hdr.is_some())

@@ -51,7 +51,7 @@ use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use super::load_inputs::LoadInputs;
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageSlice, ObjectFormat};
-use crate::types::{Address, FunctionParameter, SourceLocation, SymbolName};
+use crate::types::{Address, BuildIdentity, FunctionParameter, SourceLocation, SymbolName, same_build};
 
 /// Cached symbol metadata for a given address.
 ///
@@ -100,6 +100,10 @@ pub struct SymbolCache
     /// repeated load returns the error again without reading the file. Kept apart from
     /// `images`: a failed public load does not make the image visible to lookups.
     missing_debug: HashMap<ImageId, MissingDebug>,
+    /// The build identity each image in `images` read from its file
+    /// ([`ImageContents::build_id`](crate::objfile::ImageContents::build_id)), so a build
+    /// id the loader reports later can be checked against the file that was opened.
+    file_builds: HashMap<ImageId, BuildIdentity>,
     format: Arc<dyn ObjectFormat>,
 }
 
@@ -127,6 +131,7 @@ impl SymbolCache
         Self {
             images: HashMap::new(),
             missing_debug: HashMap::new(),
+            file_builds: HashMap::new(),
             format,
         }
     }
@@ -160,6 +165,7 @@ impl SymbolCache
     pub fn retain_ids(&mut self, ids: &HashSet<ImageId>)
     {
         self.images.retain(|id, _| ids.contains(id));
+        self.file_builds.retain(|id, _| ids.contains(id));
         self.missing_debug.retain(|id, _| ids.contains(id));
     }
 
@@ -230,7 +236,7 @@ impl SymbolCache
             return Err(missing.error.duplicate());
         }
         let image = self.read_image(descriptor, slice);
-        let image = match image {
+        let (image, build_id) = match image {
             Ok(image) => image,
             Err(error) => {
                 self.missing_debug.remove(&id);
@@ -245,6 +251,7 @@ impl SymbolCache
         }
         self.missing_debug.remove(&id);
         self.images.insert(id, image.clone());
+        self.file_builds.insert(id, build_id);
         Ok(image)
     }
 
@@ -252,13 +259,21 @@ impl SymbolCache
     /// without debug information. When refreshing a cached image, keep the previous entry
     /// until its replacement's executable has been read successfully.
     ///
+    /// `mapped` is the build identity the loader reports for the mapping. A file that
+    /// records another build is refused even when `slice` could not carry that identity to
+    /// the format, so a file opened again after a late build id contradicted it is never
+    /// cached for the wrong build (#221).
+    ///
     /// # Errors
     /// An error of [`ObjectFormat::open_image`]: the file cannot be read, does not parse,
     /// is another build, or the format cannot tell which part of it is mapped.
+    /// [`DebuggerError::InvalidArgument`] when `mapped` is known and the file records
+    /// another build or none.
     pub(crate) fn load_executable(
         &mut self,
         mut descriptor: ImageDescriptor,
         slice: Option<&ImageSlice>,
+        mapped: BuildIdentity,
         replacing: Option<ImageId>,
     ) -> Result<Arc<BinaryImage>>
     {
@@ -269,11 +284,20 @@ impl SymbolCache
         {
             return Ok(existing.clone());
         }
-        let image = self.read_image(descriptor, slice)?;
+        let path = descriptor.path.clone();
+        let (image, build_id) = self.read_image(descriptor, slice)?;
+        if mapped.known().is_some() && !same_build(build_id, mapped) {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "{} is another build ({build_id:?}) than the mapped image ({mapped:?})",
+                path.display()
+            )));
+        }
         if let Some(previous) = replacing.filter(|&previous| previous != id) {
             self.images.remove(&previous);
+            self.file_builds.remove(&previous);
         }
         self.images.insert(id, image.clone());
+        self.file_builds.insert(id, build_id);
         Ok(image)
     }
 
@@ -285,12 +309,28 @@ impl SymbolCache
         Some(image)
     }
 
-    fn read_image(&self, descriptor: ImageDescriptor, slice: Option<&ImageSlice>) -> Result<Arc<BinaryImage>>
+    /// The build identity the file of the cached image `id` records, or `None` when `id`
+    /// is not cached.
+    pub(crate) fn file_build_id(&self, id: ImageId) -> Option<BuildIdentity>
+    {
+        self.file_builds.get(&id).copied()
+    }
+
+    /// Read the image and the build identity its file records.
+    fn read_image(
+        &self,
+        descriptor: ImageDescriptor,
+        slice: Option<&ImageSlice>,
+    ) -> Result<(Arc<BinaryImage>, BuildIdentity)>
     {
         let (contents, retry_debug) =
             self.format
                 .open_image_with_debug_retry(&descriptor.path, descriptor.load_address, slice)?;
-        Ok(Arc::new(BinaryImage::from_contents(descriptor, slice, contents, retry_debug)))
+        let build_id = contents.build_id;
+        Ok((
+            Arc::new(BinaryImage::from_contents(descriptor, slice, contents, retry_debug)),
+            build_id,
+        ))
     }
 
     fn canonical(descriptor: &ImageDescriptor) -> Result<std::path::PathBuf>

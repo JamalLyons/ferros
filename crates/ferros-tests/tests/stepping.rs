@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use ferros_core::{BreakpointLocation, LogicalBreakpointId, Session, StopEvent};
+use ferros_core::{BreakpointLocation, LogicalBreakpointId, Session, StopEvent, ThreadId};
 use ferros_tests::{Fixture, fixture, harness};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,12 +45,19 @@ fn line(session: &mut Session) -> u32
     session.source_position(pc).expect("position").line.expect("source line")
 }
 
-fn stepped(session: &mut Session)
+/// The thread a step must stop on, captured before the step resumes it.
+fn thread_before_step(session: &Session) -> ThreadId
+{
+    session.selected_thread().expect("a selected thread before the step")
+}
+
+fn stepped(session: &mut Session, thread: ThreadId)
 {
     let event = stop(session);
-    assert!(
-        matches!(event, StopEvent::SingleStep { .. }),
-        "expected source step, got {event:?}"
+    assert_eq!(
+        event,
+        StopEvent::SingleStep { thread },
+        "expected a source step on the thread that was resumed"
     );
 }
 
@@ -61,8 +68,9 @@ fn next_moves_to_the_following_marked_line()
         let fixture = fixture!("nested_calls");
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "in_b");
+        let thread = thread_before_step(&d);
         d.step_over().expect("next");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(line(&mut d), fixture.marker_line("call_c"));
     });
 }
@@ -74,8 +82,9 @@ fn next_over_a_call_never_stops_inside_it()
         let fixture = fixture!("nested_calls");
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "call_a");
+        let thread = thread_before_step(&d);
         d.step_over().expect("next over level_a");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(line(&mut d), fixture.marker_line("after_calls"));
         assert!(d.breakpoints().is_empty(), "private return breakpoint leaked");
     });
@@ -88,8 +97,9 @@ fn step_enters_the_callee_after_its_prologue()
         let fixture = fixture!("nested_calls");
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "call_a");
+        let thread = thread_before_step(&d);
         d.step_into().expect("step into level_a");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(line(&mut d), fixture.marker_line("in_a"));
         let pc = d.read_registers().expect("registers").pc;
         let entry = d
@@ -113,8 +123,9 @@ fn step_into_stops_after_the_prologue(call: &'static str, inside: &'static str)
         let fixture = fixture!("step_targets");
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, call);
+        let thread = thread_before_step(&d);
         d.step_into().expect("step into the call");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(line(&mut d), fixture.marker_line(inside), "stopped in the callee from {call}");
         let pc = d.read_registers().expect("registers").pc;
         let bp = d.set_breakpoint(location(&fixture, inside)).expect("callee line");
@@ -153,8 +164,9 @@ fn finish_returns_to_the_caller()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "in_c");
         let before = d.stack_trace(64).expect("trace").len();
+        let thread = thread_before_step(&d);
         d.step_out().expect("finish");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(d.stack_trace(64).expect("trace").len(), before - 1);
         let pc = d.read_registers().expect("registers").pc;
         assert!(
@@ -187,15 +199,17 @@ fn finish_from_recursive_depth_three_stops_at_depth_two()
                 .count()
         };
         assert_eq!(count(&trace), 4, "depth zero plus three recursive calls");
+        let thread = thread_before_step(&d);
         d.step_out().expect("finish from depth three");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         let after = d.stack_trace(64).expect("caller trace");
         assert_eq!(after.len(), trace.len() - 1);
         assert_eq!(count(&after), 3);
         // Finish again at the repeated return address: the frame guard must skip
         // the deeper recursion sharing that address.
+        let thread = thread_before_step(&d);
         d.step_out().expect("finish from depth two");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(count(&d.stack_trace(64).expect("trace")), 2);
     });
 }
@@ -226,8 +240,9 @@ fn ten_next_commands_follow_loop_lines_in_order()
         start(&mut d, &fixture, "loop_call");
         let mut visited = Vec::new();
         for _ in 0..10 {
+            let thread = thread_before_step(&d);
             d.step_over().expect("next");
-            stepped(&mut d);
+            stepped(&mut d, thread);
             let pc = d.read_registers().expect("registers").pc;
             let position = d.source_position(pc).expect("source position");
             assert!(position.function.expect("function").ends_with("::main"));
@@ -334,8 +349,9 @@ fn next_over_a_call_that_unwinds_past_its_caller_stops_in_the_outer_frame()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "call_inner");
         let before = d.stack_trace(64).expect("trace").len();
+        let thread = thread_before_step(&d);
         d.step_over().expect("next over a panicking call");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         let after = d.stack_trace(64).expect("trace").len();
         assert!(
             after < before,
@@ -367,8 +383,9 @@ fn finish_from_a_frame_that_unwinds_stops_in_the_outer_frame()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "in_inner");
         let before = d.stack_trace(64).expect("trace").len();
+        let thread = thread_before_step(&d);
         d.step_out().expect("finish from a panicking frame");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         let after = d.stack_trace(64).expect("trace").len();
         assert!(
             after + 1 < before,
@@ -390,10 +407,11 @@ fn next_through_the_return_from_main_eventually_reports_exit()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "hello_print");
         for _ in 0..32 {
+            let thread = thread_before_step(&d);
             d.step_over().expect("next through main return");
             match stop(&mut d) {
                 StopEvent::Exited { code: 0 } => return,
-                StopEvent::SingleStep { .. } => {}
+                StopEvent::SingleStep { thread: stopped } if stopped == thread => {}
                 other => panic!("unexpected stop: {other:?}"),
             }
         }
@@ -414,8 +432,9 @@ fn next_over_recursion_ignores_deeper_frames_at_the_same_return_pc()
             .iter()
             .filter(|frame| !frame.is_inlined())
             .count();
+        let thread = thread_before_step(&d);
         d.step_over().expect("next over recursion");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         assert_eq!(line(&mut d), fixture.marker_line("after_recurse"));
         assert_eq!(
             d.stack_trace(64)
@@ -501,12 +520,14 @@ fn next_holds_other_threads_even_when_their_pc_is_a_user_breakpoint()
             d.add_breakpoint(ferros_core::BreakpointRequest::Software { address: registers.pc })
                 .expect("peer breakpoint");
         }
+        let thread = thread_before_step(&d);
         d.step_over().expect("next");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         // The next line includes a sleep call, so this also checks the temporary
         // return-breakpoint phase, rather than only hardware single-step.
+        let thread = thread_before_step(&d);
         d.step_over().expect("next over sleep");
-        stepped(&mut d);
+        stepped(&mut d, thread);
         for (thread, before) in others {
             let after = d.read_registers_for(thread).expect("peer registers");
             assert_eq!(after.pc, before.pc, "suspended peer {thread:?} moved");
@@ -546,8 +567,9 @@ fn interrupt_ends_a_next_that_never_leaves_its_line()
                 if line(&mut d) == fixture.marker_line("spin_line") {
                     break;
                 }
+                let thread = thread_before_step(&d);
                 d.step_out().expect("finish");
-                stepped(&mut d);
+                stepped(&mut d, thread);
             }
             assert_eq!(line(&mut d), fixture.marker_line("spin_line"), "still on the endless line");
         }

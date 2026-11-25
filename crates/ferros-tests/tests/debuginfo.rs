@@ -744,10 +744,12 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
 #[test]
 fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
 {
+    const MAX_LAUNCHES: usize = 5;
+
     harness::run(|t| {
         let fixture = fixture!("nested_calls");
-        let mut loads = Vec::new();
-        for _ in 0..2 {
+        let mut previous_load = None;
+        let different_slides = (0..MAX_LAUNCHES).any(|_| {
             let mut debuggee = t.launch(&fixture);
             let address = function_address(&mut debuggee, &fixture, "level_c");
             debuggee
@@ -775,7 +777,6 @@ fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
                 );
             }
             let main = images.iter().find(|image| image.path == fixture.path()).expect("main image");
-            loads.push(main.load_address);
             let result = debuggee.symbolicate(address).expect("symbolication").expect("known function");
             assert!(result.frames.iter().any(|frame| {
                 rustc_demangle::try_demangle(frame.symbol.raw())
@@ -784,8 +785,15 @@ fn two_aslr_launches_symbolicate_and_report_dyld_libraries()
             let (path, file) = debuggee.file_address(address).expect("file address").expect("mapped address");
             assert_eq!(path, fixture.path());
             assert_eq!(debuggee.runtime_address(main, file).expect("runtime address"), Some(address));
-        }
-        assert_ne!(loads[0], loads[1], "the test must exercise different ASLR slides");
+            previous_load
+                .replace(main.load_address)
+                .is_some_and(|load| load != main.load_address)
+        });
+        assert!(
+            different_slides,
+            "the test must exercise different ASLR slides, but all {MAX_LAUNCHES} launches mapped the executable at \
+             {previous_load:?}"
+        );
     });
 }
 

@@ -122,7 +122,7 @@ fn cache() -> SymbolCache
 
 fn parse(path: &Path, target: Option<&SliceIdentity>) -> Result<ImageContents>
 {
-    open(path, 0x5_0000_0000, target, &options())
+    open(path, 0x5_0000_0000, target, &options()).map(|(contents, _)| contents)
 }
 
 /// The link-time address of the parsed image's header: which slice was read.

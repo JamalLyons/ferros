@@ -9,7 +9,7 @@ use super::stack::BackendTarget;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey};
-use crate::symbols::load_inputs::LoadInputs;
+use crate::symbols::cache::ImageLoadInputs;
 use crate::symbols::{ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::{Address, BuildIdentity, same_build};
 
@@ -29,7 +29,7 @@ struct FailedLoad
     /// The symbol request in which `inputs` was last compared with the files. Within one
     /// request the image is not read again.
     checked: u64,
-    inputs: LoadInputs,
+    inputs: ImageLoadInputs,
     error: DebuggerError,
 }
 
@@ -77,8 +77,8 @@ pub(super) struct SessionImage
     /// without repeatedly running the format's debug-info discovery. With `symbols` set
     /// the image still unwinds from its own unwind tables.
     no_debug_info: Option<String>,
-    /// Why the image's last load failed for another reason, and what it read: the whole
-    /// image when `symbols` is unset, only its debug information when it is set.
+    /// Why the image's last load failed for another reason, and what it tried to read.
+    /// With `symbols` set, the cache still holds a usable executable.
     failed_load: Option<FailedLoad>,
     /// The image's symbol table layout as mapped in the target, read on the first frame
     /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
@@ -414,13 +414,33 @@ impl Session
                 inputs
             }
         };
-        // Never loaded, or loaded with failed debug information whose files changed since.
-        if let Some(id) = image.symbols.take() {
-            self.symbols.forget(id);
-        }
-        image.failed_load = None;
-        match self.symbols.load_executable(image.descriptor.clone(), image.slice.as_ref()) {
-            Ok(loaded) => {
+        let loaded = match (image.symbols, image.failed_load.as_ref()) {
+            (Some(id), Some(failed)) if inputs.executable == failed.inputs.executable => {
+                Ok(self.symbols.retry_debug_info(id))
+            }
+            (previous, failed) => self
+                .symbols
+                .load_executable(image.descriptor.clone(), image.slice.as_ref(), previous)
+                .map(Some)
+                .or_else(|error| {
+                    // Reopening a changed file can fail while the live mapping and its
+                    // companion are still usable. Try a changed companion independently.
+                    previous
+                        .filter(|_| failed.is_some_and(|failed| inputs.companions != failed.inputs.companions))
+                        .and_then(|id| self.symbols.retry_debug_info(id))
+                        .map_or(Err(error), |image| Ok(Some(image)))
+                }),
+        };
+        match loaded {
+            Ok(None) => {
+                // This format has no companion lookup for the cached executable.
+                if let Some(failed) = &mut image.failed_load {
+                    failed.inputs = inputs;
+                }
+                Ok(false)
+            }
+            Ok(Some(loaded)) => {
+                image.failed_load = None;
                 image.symbols = Some(loaded.id());
                 match loaded.debug_error() {
                     None => {}
@@ -436,22 +456,24 @@ impl Session
                 }
                 Ok(true)
             }
-            Err(DebuggerError::NoDebugInfo { detail, path }) => {
+            Err(DebuggerError::NoDebugInfo { detail, path }) if image.symbols.is_none() => {
+                image.failed_load = None;
                 image.no_debug_info = Some(detail.clone());
                 Err(DebuggerError::NoDebugInfo { path, detail })
             }
             Err(error) => {
-                let source = Box::new(error.duplicate());
+                let report_now = image.symbols.is_none();
+                let error_to_report = report_now.then(|| DebuggerError::SymbolLoad {
+                    path: image.descriptor.path.clone(),
+                    source: Box::new(error.duplicate()),
+                });
                 image.failed_load = Some(FailedLoad {
-                    reported: Some(request),
+                    reported: report_now.then_some(request),
                     checked: request,
                     inputs,
                     error,
                 });
-                Err(DebuggerError::SymbolLoad {
-                    path: image.descriptor.path.clone(),
-                    source,
-                })
+                error_to_report.map_or(Ok(false), Err)
             }
         }
     }

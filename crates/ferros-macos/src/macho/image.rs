@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::objfile::{
-    DWARF_SECTIONS, DebugSections, ImageContents, ImageSlice, RunTimeEndian, SectionData, SectionId,
+    DWARF_SECTIONS, DebugInfoRetry, DebugSections, ImageContents, ImageSlice, RunTimeEndian, SectionData, SectionId,
 };
 use ferros_core::symbols::{ImageMapping, ImageSegment};
 use ferros_core::types::{Architecture, BuildId, BuildIdentity};
@@ -374,7 +374,7 @@ fn dwarf_names(id: SectionId) -> [String; 2]
 /// has no usable debug info.
 ///
 /// The image's own layout, `__eh_frame`, `__eh_frame_hdr` and `__unwind_info` are read
-/// before its DWARF is discovered ([`debuginfo::discover`]), so an executable without a
+/// before its DWARF is discovered, so an executable without a
 /// companion debug file still unwinds: the discovery failure is
 /// [`ImageContents::debug`], not an error of this call.
 pub(crate) fn open(
@@ -382,7 +382,7 @@ pub(crate) fn open(
     load_address: u64,
     target: Option<&SliceIdentity>,
     options: &DebugInfoOptions,
-) -> Result<ImageContents>
+) -> Result<(ImageContents, Option<DebugInfoRetry>)>
 {
     let bytes = fs::read(path)?;
     let data = image_slice(path, &bytes, target)?;
@@ -403,25 +403,65 @@ pub(crate) fn open(
     let mapping = mapping_from_file(&file, load_address)?;
     let unwind_hints = section_data(&file, &["__unwind_info"])?
         .map(|section| Box::new(CompactUnwind::new(section.data, load_address)) as Box<_>);
-    Ok(ImageContents {
-        architecture,
-        endian,
-        mapping,
-        eh_frame: section_data(&file, &[".eh_frame", "__eh_frame"])?,
-        eh_frame_hdr: section_data(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?,
-        unwind_hints,
-        debug: debug_sections(path, data, options),
-    })
+    let eh_frame = section_data(&file, &[".eh_frame", "__eh_frame"])?;
+    let eh_frame_hdr = section_data(&file, &[".eh_frame_hdr", "__eh_frame_hdr"])?;
+    let (debug, retry_debug) = image_debug_info(path, &file, options);
+    Ok((
+        ImageContents {
+            architecture,
+            endian,
+            mapping,
+            eh_frame,
+            eh_frame_hdr,
+            unwind_hints,
+            debug,
+        },
+        retry_debug,
+    ))
 }
 
-/// The image's DWARF and `__debug_frame`, from the image `executable` itself or a
-/// companion debug file ([`debuginfo::discover`]).
-fn debug_sections(path: &Path, executable: &[u8], options: &DebugInfoOptions) -> Result<DebugSections>
+/// Read embedded DWARF or discover a companion. A failed companion lookup can
+/// be repeated using the validated slice's UUID, architecture and debug-map status.
+fn image_debug_info(
+    path: &Path,
+    file: &object::File<'_>,
+    options: &DebugInfoOptions,
+) -> (Result<DebugSections>, Option<DebugInfoRetry>)
 {
-    let debug_bytes = debuginfo::discover(path, executable, options)?;
-    let debug_file = object::File::parse(&*debug_bytes)
-        .map_err(|err| DebuggerError::InvalidArgument(format!("failed to parse DWARF: {err}")))?;
+    let search = match debuginfo::CompanionSearch::for_executable(path, file) {
+        Ok(None) => return (debug_sections(file), None),
+        Ok(Some(search)) => search,
+        Err(error) => return (Err(error), None),
+    };
+    let debug = companion_sections(path, search, options, || debuginfo::has_debug_map(file));
+    let retry: Option<DebugInfoRetry> = match &debug {
+        Ok(_) | Err(DebuggerError::NoDebugInfo { .. }) => None,
+        Err(_) => {
+            let path = path.to_path_buf();
+            let options = options.clone();
+            let has_map = debuginfo::has_debug_map(file);
+            Some(Arc::new(move || companion_sections(&path, search, &options, || has_map)))
+        }
+    };
+    (debug, retry)
+}
 
+fn companion_sections(
+    path: &Path,
+    search: debuginfo::CompanionSearch,
+    options: &DebugInfoOptions,
+    has_map: impl FnOnce() -> bool,
+) -> Result<DebugSections>
+{
+    let bytes = debuginfo::discover_companion(path, search, options, has_map)?;
+    let file = object::File::parse(&*bytes)
+        .map_err(|error| DebuggerError::InvalidArgument(format!("failed to parse DWARF: {error}")))?;
+    debug_sections(&file)
+}
+
+/// The source DWARF and `__debug_frame` of a file containing debug information.
+fn debug_sections(debug_file: &object::File<'_>) -> Result<DebugSections>
+{
     let mut dwarf = HashMap::new();
     for &id in DWARF_SECTIONS {
         let names = dwarf_names(id);
@@ -431,7 +471,7 @@ fn debug_sections(path: &Path, executable: &[u8], options: &DebugInfoOptions) ->
     }
     Ok(DebugSections {
         dwarf,
-        debug_frame: section_data(&debug_file, &[".debug_frame", "__debug_frame"])?,
+        debug_frame: section_data(debug_file, &[".debug_frame", "__debug_frame"])?,
     })
 }
 

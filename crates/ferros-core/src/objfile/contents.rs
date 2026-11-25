@@ -140,6 +140,10 @@ pub struct ImageContents
     pub debug: crate::Result<DebugSections>,
 }
 
+/// Re-read companion debug information for an already validated executable without
+/// reparsing it. Returned by [`ObjectFormat::open_image_with_debug_retry`](super::ObjectFormat::open_image_with_debug_retry).
+pub type DebugInfoRetry = Arc<dyn Fn() -> crate::Result<DebugSections> + Send + Sync>;
+
 impl std::fmt::Debug for ImageContents
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result

@@ -39,8 +39,8 @@ use std::sync::Arc;
 pub use gimli::{RunTimeEndian, SectionId};
 
 pub use self::contents::{
-    DWARF_SECTIONS, DebugSections, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData, UnwindHint,
-    UnwindHints,
+    DWARF_SECTIONS, DebugInfoRetry, DebugSections, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData,
+    UnwindHint, UnwindHints,
 };
 pub use crate::symbols::image::{ImageMapping, ImageSegment};
 use crate::types::Address;
@@ -123,6 +123,22 @@ pub trait ObjectFormat: Send + Sync
     /// another build (the session retries once [`load_inputs`](Self::load_inputs)
     /// change).
     fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> crate::Result<ImageContents>;
+
+    /// Open the image and, after a retryable companion error, optionally supply an
+    /// operation to re-read just the companion for the same executable. The default
+    /// opens the image without supplying a separate retry.
+    ///
+    /// # Errors
+    /// The same errors as [`open_image`](Self::open_image).
+    fn open_image_with_debug_retry(
+        &self,
+        path: &Path,
+        load_address: u64,
+        slice: Option<&ImageSlice>,
+    ) -> crate::Result<(ImageContents, Option<DebugInfoRetry>)>
+    {
+        self.open_image(path, load_address, slice).map(|contents| (contents, None))
+    }
 
     /// The files [`open_image`](Self::open_image) reads for the image at `path`, `path`
     /// included, in a stable order: companion debug files and any cache directory the

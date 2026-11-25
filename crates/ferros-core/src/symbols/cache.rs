@@ -98,6 +98,14 @@ pub struct SymbolCache
     format: Arc<dyn ObjectFormat>,
 }
 
+/// Stamps of the executable and of the files consulted for its companion debug information.
+#[derive(PartialEq, Eq)]
+pub(crate) struct ImageLoadInputs
+{
+    pub(crate) executable: LoadInputs,
+    pub(crate) companions: LoadInputs,
+}
+
 impl SymbolCache
 {
     /// Create an empty symbol cache reading image files as `format`.
@@ -190,68 +198,66 @@ impl SymbolCache
     }
 
     /// [`load_image`](Self::load_image), reading the slice `slice` names when it is
-    /// known (#169).
-    ///
-    /// An image whose file has no usable debug information is kept for unwinding
-    /// ([`load_executable`](Self::load_executable)) and its debug error returned. A later
-    /// call reads the image again, so a companion debug file that appeared since is found.
-    pub(crate) fn load_mapped_image(
-        &mut self,
-        descriptor: ImageDescriptor,
-        slice: Option<&ImageSlice>,
-    ) -> Result<Arc<BinaryImage>>
+    /// known (#169). Only a successful DWARF load changes the cache.
+    fn load_mapped_image(&mut self, mut descriptor: ImageDescriptor, slice: Option<&ImageSlice>)
+    -> Result<Arc<BinaryImage>>
     {
-        let id = Self::image_id(&descriptor, slice)?;
-        if self.images.get(&id).is_some_and(|image| !image.has_debug_info()) {
-            self.images.remove(&id);
+        descriptor.path = Self::canonical(&descriptor)?;
+        let id = ImageId::with_slice(&descriptor.path, descriptor.load_address, slice);
+        if let Some(existing) = self.images.get(&id).filter(|image| image.has_debug_info()) {
+            return Ok(existing.clone());
         }
-        let image = self.load_executable(descriptor, slice)?;
-        match image.debug_error() {
-            None => Ok(image),
-            Some(error) => Err(error.duplicate()),
+        let image = self.read_image(descriptor, slice)?;
+        if let Some(error) = image.debug_error() {
+            return Err(error.duplicate());
         }
+        self.images.insert(id, image.clone());
+        Ok(image)
     }
 
-    /// Load and cache the image `descriptor` names (the slice `slice` names when it is
-    /// known), whether or not its source debug information could be read.
-    ///
-    /// The returned image always has the file's layout and unwind tables;
-    /// [`BinaryImage::has_debug_info`] says whether it also has source debug information,
-    /// and the image keeps why not. A cached image is returned as it is: the caller drops
-    /// it with [`forget`](Self::forget) to read the image again.
+    /// Load and cache the image `descriptor` names (using `slice` when known), with or
+    /// without debug information. When refreshing a cached image, keep the previous entry
+    /// until its replacement's executable has been read successfully.
     ///
     /// # Errors
     /// An error of [`ObjectFormat::open_image`]: the file cannot be read, does not parse,
     /// is another build, or the format cannot tell which part of it is mapped.
     pub(crate) fn load_executable(
         &mut self,
-        descriptor: ImageDescriptor,
+        mut descriptor: ImageDescriptor,
         slice: Option<&ImageSlice>,
+        replacing: Option<ImageId>,
     ) -> Result<Arc<BinaryImage>>
     {
-        let id = Self::image_id(&descriptor, slice)?;
-        if let Some(existing) = self.images.get(&id) {
+        descriptor.path = Self::canonical(&descriptor)?;
+        let id = ImageId::with_slice(&descriptor.path, descriptor.load_address, slice);
+        if replacing.is_none()
+            && let Some(existing) = self.images.get(&id)
+        {
             return Ok(existing.clone());
         }
-        let canonical = Self::canonical(&descriptor)?;
-        let contents = self.format.open_image(&canonical, descriptor.load_address, slice)?;
-        let image = Arc::new(BinaryImage::from_contents(
-            ImageDescriptor {
-                path: canonical,
-                load_address: descriptor.load_address,
-            },
-            slice,
-            contents,
-        ));
-        debug_assert_eq!(image.id(), id);
+        let image = self.read_image(descriptor, slice)?;
+        if let Some(previous) = replacing.filter(|&previous| previous != id) {
+            self.images.remove(&previous);
+        }
         self.images.insert(id, image.clone());
         Ok(image)
     }
 
-    /// Drop the cached image `id`, so the next load reads it again.
-    pub(crate) fn forget(&mut self, id: ImageId)
+    /// Retry the companion lookup against the executable already in the cache.
+    pub(crate) fn retry_debug_info(&mut self, id: ImageId) -> Option<Arc<BinaryImage>>
     {
-        self.images.remove(&id);
+        let image = Arc::new(self.images.get(&id)?.retry_debug_info()?);
+        self.images.insert(id, image.clone());
+        Some(image)
+    }
+
+    fn read_image(&self, descriptor: ImageDescriptor, slice: Option<&ImageSlice>) -> Result<Arc<BinaryImage>>
+    {
+        let (contents, retry_debug) =
+            self.format
+                .open_image_with_debug_retry(&descriptor.path, descriptor.load_address, slice)?;
+        Ok(Arc::new(BinaryImage::from_contents(descriptor, slice, contents, retry_debug)))
     }
 
     fn canonical(descriptor: &ImageDescriptor) -> Result<std::path::PathBuf>
@@ -265,25 +271,15 @@ impl SymbolCache
         }
     }
 
-    fn image_id(descriptor: &ImageDescriptor, slice: Option<&ImageSlice>) -> Result<ImageId>
-    {
-        Ok(ImageId::with_slice(
-            &Self::canonical(descriptor)?,
-            descriptor.load_address,
-            slice,
-        ))
-    }
-
     /// Stamp the files [`load_image`](Self::load_image) would read for `descriptor`,
     /// without reading them. A relative path that no longer resolves is stamped as given.
-    pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor) -> LoadInputs
+    pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor) -> ImageLoadInputs
     {
-        let path = if descriptor.path.is_absolute() {
-            descriptor.path.clone()
-        } else {
-            descriptor.path.canonicalize().unwrap_or_else(|_| descriptor.path.clone())
-        };
-        LoadInputs::of(self.format.load_inputs(&path))
+        let path = Self::canonical(descriptor).unwrap_or_else(|_| descriptor.path.clone());
+        ImageLoadInputs {
+            executable: LoadInputs::of([path.clone()]),
+            companions: LoadInputs::of(self.format.load_inputs(&path).into_iter().filter(|input| *input != path)),
+        }
     }
 
     /// Find the binary image containing the given address.

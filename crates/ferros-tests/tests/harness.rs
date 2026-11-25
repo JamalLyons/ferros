@@ -190,7 +190,7 @@ fn kill_tagged_kills_orphan_by_argument()
 }
 
 /// Opt-in failure for a manual leak check: `FERROS_TEST_FORCE_FAIL=1 just test-integration`
-/// must fail, and afterwards `pgrep -f ferros-fixture-` must print nothing.
+/// must fail, and afterwards `pgrep -fl ferros-fixture-` must print nothing.
 #[test]
 fn forced_failure_for_leak_check()
 {

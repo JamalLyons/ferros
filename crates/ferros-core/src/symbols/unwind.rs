@@ -309,7 +309,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// # Errors
     ///
     /// As [`unwind`](Self::unwind).
-    pub fn unwind_with_lookups(
+    pub(crate) fn unwind_with_lookups(
         &self,
         thread: ThreadId,
         regs: &Registers,

@@ -5,12 +5,14 @@
 //! stale link register or a stack scan) fails whichever test produced it.
 #![cfg(target_os = "macos")]
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, Session, StackFrame, StopEvent, SymbolSource,
 };
 use ferros_tests::harness::{self, TestContext};
+use ferros_tests::stripped::StrippedFixture;
 use ferros_tests::symbols::{function_address, marker_address, raw_symbol_address};
 use ferros_tests::transcript::{self, Interactive};
 use ferros_tests::{Fixture, find_marker, fixture};
@@ -183,9 +185,8 @@ fn backtrace_in_level_c_lists_the_callers_at_their_call_sites()
 ///
 /// Whether std's frames (`std::rt::lang_start_internal` and the shims around it) carry
 /// DWARF depends on the toolchain and machine, so they may be named either way (issue
-/// #135). dyld's `start` never has DWARF from any Rust toolchain, so it is the frame the
-/// symbol-table naming is checked on for certain. Any frame that does come from a symbol
-/// table under a mangled name must show it demangled.
+/// #135). dyld's `start` reliably exercises symbol-table naming. A second launch with
+/// a stripped copy of the fixture exercises demangling a known Rust symbol-table frame.
 #[test]
 fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
 {
@@ -236,6 +237,19 @@ fn frames_without_dwarf_below_main_are_named_from_the_symbol_table()
             Some("start"),
             "dyld's start is the base: {names:#?}"
         );
+        drop(d);
+
+        let stripped = StrippedFixture::new(&fixture, Path::new(env!("CARGO_TARGET_TMPDIR")));
+        let mut d = t.launch(&stripped.fixture);
+        let entry = function_address(&mut d, &stripped.fixture, "level_c");
+        run_to(&mut d, entry);
+        let frames = d.stack_trace(MAX_FRAMES).expect("stripped stack trace");
+        assert_sane(&mut d, &frames);
+        let frame = frames.first().expect("level_c frame");
+        assert_eq!(frame.pc, entry);
+        assert_symbol_table_frame(frame);
+        let symbol = frame.symbol.as_ref().expect("level_c symbol");
+        assert_eq!(symbol.display_name(), "ferros_fixture_nested_calls::level_c", "{frame:#?}");
     });
 }
 

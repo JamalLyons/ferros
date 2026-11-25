@@ -41,7 +41,7 @@ use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
-use crate::objfile::{ImageContents, ImageSlice, SectionData, UnwindHints};
+use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
 
 /// Describes a binary image mapped in the debuggee's address space.
@@ -295,17 +295,11 @@ impl ImageId
 /// to convert a runtime address to a file address for DWARF lookups.
 pub struct BinaryImage
 {
-    id: ImageId,
-    path: PathBuf,
-    architecture: Architecture,
-    endian: RunTimeEndian,
-    mapping: ImageMapping,
-    debug_sections: HashMap<SectionId, Arc<[u8]>>,
-    eh_frame: Option<SectionData>,
-    eh_frame_hdr: Option<SectionData>,
-    debug_frame: Option<SectionData>,
-    /// The format's own per-function unwind table, consulted before the CFI.
-    unwind_hints: Option<Box<dyn UnwindHints>>,
+    executable: Arc<ExecutableImage>,
+    /// The image's source debug information, or why there is none. The executable half
+    /// above is usable for unwinding either way.
+    debug: Result<DebugSections>,
+    retry_debug: Option<DebugInfoRetry>,
     dwarf_cache: OnceCell<OwnedDwarf>,
     /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
@@ -319,23 +313,49 @@ pub struct BinaryImage
     function_index: OnceCell<std::result::Result<FunctionIndex, SourceLookupError>>,
 }
 
+struct ExecutableImage
+{
+    id: ImageId,
+    path: PathBuf,
+    architecture: Architecture,
+    endian: RunTimeEndian,
+    mapping: ImageMapping,
+    eh_frame: Option<SectionData>,
+    eh_frame_hdr: Option<SectionData>,
+    /// The format's own per-function unwind table, consulted before the CFI.
+    unwind_hints: Option<Box<dyn UnwindHints>>,
+}
+
 impl BinaryImage
 {
     /// The image `desc` names, from what its format read of its file. `slice` is the
     /// mapped slice the contents were read for, part of the image's id.
-    pub(crate) fn from_contents(desc: ImageDescriptor, slice: Option<&ImageSlice>, contents: ImageContents) -> Self
+    pub(crate) fn from_contents(
+        desc: ImageDescriptor,
+        slice: Option<&ImageSlice>,
+        contents: ImageContents,
+        retry_debug: Option<DebugInfoRetry>,
+    ) -> Self
     {
-        Self {
+        let executable = Arc::new(ExecutableImage {
             id: ImageId::with_slice(&desc.path, desc.load_address, slice),
             path: desc.path,
             architecture: contents.architecture,
             endian: contents.endian,
             mapping: contents.mapping,
-            debug_sections: contents.dwarf,
             eh_frame: contents.eh_frame,
             eh_frame_hdr: contents.eh_frame_hdr,
-            debug_frame: contents.debug_frame,
             unwind_hints: contents.unwind_hints,
+        });
+        Self::new(executable, contents.debug, retry_debug)
+    }
+
+    fn new(executable: Arc<ExecutableImage>, debug: Result<DebugSections>, retry_debug: Option<DebugInfoRetry>) -> Self
+    {
+        Self {
+            executable,
+            debug,
+            retry_debug,
             dwarf_cache: OnceCell::new(),
             context_cache: OnceCell::new(),
             type_cache: RwLock::new(HashMap::new()),
@@ -344,9 +364,17 @@ impl BinaryImage
         }
     }
 
+    /// Refresh the source debug information and its indexes over the same executable.
+    pub(super) fn retry_debug_info(&self) -> Option<Self>
+    {
+        let retry = self.retry_debug.as_ref()?;
+        let debug = retry();
+        Some(Self::new(self.executable.clone(), debug, Some(retry.clone())))
+    }
+
     pub(crate) fn runtime_range(&self) -> (u64, u64)
     {
-        self.mapping.runtime_range()
+        self.executable.mapping.runtime_range()
     }
 
     /// Get the pointer size in bytes for this image's architecture.
@@ -371,37 +399,63 @@ impl BinaryImage
     /// ```
     pub fn pointer_size(&self) -> u8
     {
-        self.architecture.pointer_size_bytes()
+        self.executable.architecture.pointer_size_bytes()
     }
 
     pub(crate) fn endian(&self) -> RunTimeEndian
     {
-        self.endian
+        self.executable.endian
     }
 
     pub(crate) fn relocated_address(&self, vmaddr: u64) -> u64
     {
-        self.mapping.relocate(vmaddr).unwrap_or(0)
+        self.executable.mapping.relocate(vmaddr).unwrap_or(0)
     }
 
     pub(crate) fn eh_frame_section(&self) -> Option<(u64, &[u8])>
     {
-        self.eh_frame.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
+        self.executable
+            .eh_frame
+            .as_ref()
+            .map(|blob| (blob.address, blob.data.as_ref()))
     }
 
     pub(crate) fn eh_frame_hdr_section(&self) -> Option<(u64, &[u8])>
     {
-        self.eh_frame_hdr.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
+        self.executable
+            .eh_frame_hdr
+            .as_ref()
+            .map(|blob| (blob.address, blob.data.as_ref()))
     }
 
     pub(crate) fn debug_frame_section(&self) -> Option<(u64, &[u8])>
     {
-        self.debug_frame.as_ref().map(|blob| (blob.address, blob.data.as_ref()))
+        let debug_frame = self.debug.as_ref().ok()?.debug_frame.as_ref()?;
+        Some((debug_frame.address, debug_frame.data.as_ref()))
+    }
+
+    /// Whether the image has source debug information. Without it the image still
+    /// unwinds from its own unwind tables, but names no function and maps no line.
+    #[must_use]
+    pub fn has_debug_info(&self) -> bool
+    {
+        self.debug.is_ok()
+    }
+
+    /// Why the image has no source debug information, or `None` when it has some.
+    pub(crate) fn debug_error(&self) -> Option<&DebuggerError>
+    {
+        self.debug.as_ref().err()
+    }
+
+    fn debug_sections(&self) -> Result<&DebugSections>
+    {
+        self.debug.as_ref().map_err(DebuggerError::duplicate)
     }
 
     pub(crate) fn unwind_hints(&self) -> Option<&dyn UnwindHints>
     {
-        self.unwind_hints.as_deref()
+        self.executable.unwind_hints.as_deref()
     }
 
     /// Get the unique identifier for this image.
@@ -424,7 +478,7 @@ impl BinaryImage
     /// ```
     pub fn id(&self) -> ImageId
     {
-        self.id
+        self.executable.id
     }
 
     /// Get the path to the binary file.
@@ -447,7 +501,7 @@ impl BinaryImage
     /// ```
     pub fn path(&self) -> &Path
     {
-        &self.path
+        &self.executable.path
     }
 
     /// Get the CPU architecture of this image.
@@ -476,7 +530,7 @@ impl BinaryImage
     /// ```
     pub fn architecture(&self) -> Architecture
     {
-        self.architecture
+        self.executable.architecture
     }
 
     /// Check if an address is within this image's address range.
@@ -508,7 +562,7 @@ impl BinaryImage
     /// ```
     pub fn contains(&self, address: Address) -> bool
     {
-        self.mapping.contains(address)
+        self.executable.mapping.contains(address)
     }
 
     /// Convert a runtime address to a file address (link-time address).
@@ -545,13 +599,13 @@ impl BinaryImage
     /// ```
     pub fn file_address(&self, address: Address) -> Option<u64>
     {
-        self.mapping.file_address(address)
+        self.executable.mapping.file_address(address)
     }
 
     /// Convert a file virtual address within a mapped segment to a runtime address.
     pub fn runtime_address(&self, address: u64) -> Option<Address>
     {
-        self.mapping.runtime_address(address)
+        self.executable.mapping.runtime_address(address)
     }
 
     /// The lazily built line-table index slot, filled once by `symbols::lines` with the
@@ -568,28 +622,34 @@ impl BinaryImage
         &self.function_index
     }
 
+    /// The image's DWARF, loaded on first use.
+    ///
+    /// # Errors
+    /// Why the image has no source debug information, or why its DWARF does not load.
     pub(super) fn dwarf(&self) -> Result<&OwnedDwarf>
     {
+        let sections = self.debug_sections()?;
         self.dwarf_cache.get_or_try_init(|| {
-            Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))
+            Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF: {err}")))
         })
     }
 
-    fn section_reader(&self, id: SectionId) -> OwnedReader
+    fn section_reader(&self, sections: &DebugSections, id: SectionId) -> OwnedReader
     {
-        let data = self
-            .debug_sections
+        let data = sections
+            .dwarf
             .get(&id)
             .cloned()
             .unwrap_or_else(|| Arc::<[u8]>::from(Vec::new()));
-        EndianArcSlice::new(data, self.endian)
+        EndianArcSlice::new(data, self.executable.endian)
     }
 
     fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
     {
+        let sections = self.debug_sections()?;
         self.context_cache.get_or_try_init(|| {
-            let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(section)))
+            let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
                 .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF for addr2line: {err}")))?;
             Context::from_dwarf(dwarf)
                 .map(Mutex::new)
@@ -641,7 +701,11 @@ impl BinaryImage
             Some(addr) => addr,
             None => {
                 use tracing::debug;
-                debug!("Address 0x{:x} not in image {}", address.value(), self.path.display());
+                debug!(
+                    "Address 0x{:x} not in image {}",
+                    address.value(),
+                    self.executable.path.display()
+                );
                 return None;
             }
         };
@@ -650,7 +714,7 @@ impl BinaryImage
             Ok(ctx) => ctx.lock().unwrap_or_else(PoisonError::into_inner),
             Err(e) => {
                 use tracing::debug;
-                debug!("Failed to get symbol context for {}: {}", self.path.display(), e);
+                debug!("Failed to get symbol context for {}: {}", self.executable.path.display(), e);
                 return None;
             }
         };
@@ -665,7 +729,7 @@ impl BinaryImage
                 debug!(
                     "Failed to find frames for 0x{:x} in {}: {:?}",
                     file_addr,
-                    self.path.display(),
+                    self.executable.path.display(),
                     e
                 );
                 return None;
@@ -702,12 +766,16 @@ impl BinaryImage
 
         if frames.is_empty() {
             use tracing::debug;
-            debug!("No frames found for address 0x{:x} in {}", file_addr, self.path.display());
+            debug!(
+                "No frames found for address 0x{:x} in {}",
+                file_addr,
+                self.executable.path.display()
+            );
             return None;
         }
 
         Some(Symbolication {
-            image_id: self.id,
+            image_id: self.executable.id,
             frames,
         })
     }

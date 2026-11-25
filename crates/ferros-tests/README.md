@@ -23,8 +23,12 @@ The crate defines twenty fixture binaries:
   `MODE_FRAMELESS`, encoding `0x02002000`, no `__eh_frame` FDE). Both are assembly from
   `fixtures/asm/frameless_stack.s`, assembled and linked into this fixture only by `build.rs`
   (rustc gives such Rust leaves DWARF CFI in a debug build). Used for a backtrace stopped
-  after the epilogue released the stack (issue #130). Find them with
-  `ferros_tests::symbols::raw_symbol_address`.
+  after the epilogue released the stack (issue #130). A second initializer
+  `_unwind_only_caller` calls `_unwind_only_callee`, which saves the link register and
+  frame pointer out of frame-record order (compact unwind `MODE_DWARF`: only its
+  `__eh_frame` FDE describes it), then clears the frame pointer and points the link register
+  at itself before a `nop`. Used for unwinding a copy stripped of its debug map and dSYM
+  (`tests/debuginfo.rs`). Find them with `ferros_tests::symbols::raw_symbol_address`.
 - `ferros-fixture-long_jump`: A C program (`fixtures/c/long_jump.c`, compiled and linked by
   `build.rs`; `fixtures/long_jump.rs` is a `#![no_main]` stub) whose markers live in the C
   source. Without arguments, `main` (marker `call_middle`) calls `middle` (marker

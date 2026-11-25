@@ -9,11 +9,12 @@ use super::stack::BackendTarget;
 use crate::backend::{BackendError, LoadedImage};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey};
-use crate::symbols::load_inputs::LoadInputs;
+use crate::symbols::cache::ImageLoadInputs;
 use crate::symbols::{ImageDescriptor, ImageId, ImageMapping, SymbolCache};
 use crate::types::{Address, BuildIdentity, same_build};
 
-/// The image's symbols could not be loaded (see [`SessionImage`]).
+/// The image's file, or only its source debug information, could not be loaded (see
+/// [`SessionImage`]).
 ///
 /// Failures other than missing debug info are kept with a stamp of the files the load
 /// read, taken just before it read them. Later requests compare a fresh stamp (a few
@@ -22,10 +23,13 @@ use crate::types::{Address, BuildIdentity, same_build};
 /// the image again.
 struct FailedLoad
 {
-    /// The symbol request in which `error` was last reported. Within one request the
-    /// failure is reported once and the image is not read again.
-    request: u64,
-    inputs: LoadInputs,
+    /// The symbol request in which `error` was last reported, if any. Within one request
+    /// the failure is reported once.
+    reported: Option<u64>,
+    /// The symbol request in which `inputs` was last compared with the files. Within one
+    /// request the image is not read again.
+    checked: u64,
+    inputs: ImageLoadInputs,
     error: DebuggerError,
 }
 
@@ -62,15 +66,19 @@ pub(super) struct SessionImage
     /// session's [`ObjectFormat`]: the part of a file holding several images the symbols
     /// are loaded from (#169). `None` when the header could not be read.
     slice: Option<ImageSlice>,
-    /// The [`SymbolCache`] entry holding this image's symbols, once loaded. The cache keys
+    /// The [`SymbolCache`] entry holding this image's unwind tables and, unless
+    /// `no_debug_info` or `failed_load` says why not, its source debug information,
+    /// once loaded. The cache keys
     /// images by canonical path, load address and the slice known at parse time
     /// ([`ImageId`]). Retention uses this id because a relative loader path may stop
     /// resolving later (#99).
     symbols: Option<ImageId>,
     /// Why the image has no usable DWARF. Kept so the diagnostic survives later requests
-    /// without repeatedly running the format's debug-info discovery.
+    /// without repeatedly running the format's debug-info discovery. With `symbols` set
+    /// the image still unwinds from its own unwind tables.
     no_debug_info: Option<String>,
-    /// Why the image's last symbol load failed for another reason, and what it read.
+    /// Why the image's last load failed for another reason, and what it tried to read.
+    /// With `symbols` set, the cache still holds a usable executable.
     failed_load: Option<FailedLoad>,
     /// The image's symbol table layout as mapped in the target, read on the first frame
     /// that needs it (see [`Session::symbol_table_name`](super::Session)). Like `mapping`,
@@ -312,16 +320,60 @@ impl Session
         self.symbol_request = self.symbol_request.wrapping_add(1);
     }
 
-    /// Load only the image needed for a lookup. Returns whether symbols were newly
-    /// loaded; `Ok(false)` when no mapped image contains `address`, its symbols are
-    /// already loaded, or its load already failed in the current request.
+    /// Load only the image needed for a lookup, with its source debug information.
+    /// Returns whether the image was newly loaded; `Ok(false)` when no mapped image
+    /// contains `address`, it is already loaded, or its failure was already reported in
+    /// the current request.
     ///
     /// # Errors
     /// [`DebuggerError::NoDebugInfo`] when the image has no usable DWARF (kept while the
     /// image stays loaded), or [`DebuggerError::SymbolLoad`] with the original failure
     /// for any other load error (kept while the files the load read are unchanged; see
-    /// [`SessionImage`]).
+    /// [`SessionImage`]). An image whose file could be read keeps its unwind tables
+    /// loaded either way ([`load_executable_for_address`](Self::load_executable_for_address)).
     pub(super) fn load_symbols_for_address(&mut self, address: Address) -> Result<bool>
+    {
+        let request = self.symbol_request;
+        let loaded = self.load_executable_for_address(address)?;
+        let Some(image) = self.image_containing(address) else {
+            return Ok(loaded);
+        };
+        if image.symbols.is_none() {
+            return Ok(loaded);
+        }
+        if let Some(detail) = &image.no_debug_info {
+            return Err(DebuggerError::NoDebugInfo {
+                path: image.descriptor.path.clone(),
+                detail: detail.clone(),
+            });
+        }
+        match &mut image.failed_load {
+            Some(failed) if failed.reported != Some(request) => {
+                failed.reported = Some(request);
+                Err(DebuggerError::SymbolLoad {
+                    path: image.descriptor.path.clone(),
+                    source: Box::new(failed.error.duplicate()),
+                })
+            }
+            _ => Ok(loaded),
+        }
+    }
+
+    /// Load the image containing `address` into the [`SymbolCache`] for its layout and
+    /// unwind tables, and record the outcome of its source debug information on the
+    /// [`SessionImage`] without failing on it. Returns whether the image was newly
+    /// loaded: a stack trace walks again then, since the image's unwind tables can reveal
+    /// callers that the frame-pointer chain missed.
+    ///
+    /// Missing debug information is kept while the image stays loaded. Debug information
+    /// that failed for another reason is read again once the files the load read change,
+    /// compared at most once per request.
+    ///
+    /// # Errors
+    /// Only for an image whose file could not be loaded at all, once per request:
+    /// [`DebuggerError::NoDebugInfo`] when the format cannot tell which part of the file is
+    /// mapped, [`DebuggerError::SymbolLoad`] for any other failure.
+    pub(super) fn load_executable_for_address(&mut self, address: Address) -> Result<bool>
     {
         let request = self.symbol_request;
         let Some(image) = self
@@ -331,47 +383,105 @@ impl Session
         else {
             return Ok(false);
         };
-        if let Some(detail) = &image.no_debug_info {
+        if image.symbols.is_none()
+            && let Some(detail) = &image.no_debug_info
+        {
             return Err(DebuggerError::NoDebugInfo {
                 path: image.descriptor.path.clone(),
                 detail: detail.clone(),
             });
         }
-        if image.symbols.is_some() {
-            return Ok(false);
-        }
-        let inputs = self.symbols.load_inputs(&image.descriptor);
-        if let Some(failed) = &mut image.failed_load {
-            if failed.request == request {
-                return Ok(false);
+        let inputs = match &mut image.failed_load {
+            None if image.symbols.is_some() => return Ok(false),
+            None => self.symbols.load_inputs(&image.descriptor),
+            Some(failed) => {
+                if failed.checked == request {
+                    return Ok(false);
+                }
+                failed.checked = request;
+                let inputs = self.symbols.load_inputs(&image.descriptor);
+                if failed.inputs == inputs {
+                    if image.symbols.is_some() {
+                        // The debug information failed; `load_symbols_for_address` reports it.
+                        return Ok(false);
+                    }
+                    failed.reported = Some(request);
+                    return Err(DebuggerError::SymbolLoad {
+                        path: image.descriptor.path.clone(),
+                        source: Box::new(failed.error.duplicate()),
+                    });
+                }
+                inputs
             }
-            if failed.inputs == inputs {
-                failed.request = request;
-                return Err(DebuggerError::SymbolLoad {
-                    path: image.descriptor.path.clone(),
-                    source: Box::new(failed.error.duplicate()),
-                });
+        };
+        let loaded = match (image.symbols, image.failed_load.as_ref()) {
+            (Some(id), Some(failed)) if inputs.executable == failed.inputs.executable => {
+                Ok(self.symbols.retry_debug_info(id))
             }
-        }
-        match self.symbols.load_mapped_image(image.descriptor.clone(), image.slice.as_ref()) {
-            Ok(loaded) => {
-                image.symbols = Some(loaded.id());
+            (previous, failed) => self
+                .symbols
+                .load_executable(image.descriptor.clone(), image.slice.as_ref(), previous)
+                .map(Some)
+                .or_else(|error| {
+                    // Reopening a changed file can fail while the live mapping and its
+                    // companion are still usable. Try a changed companion independently.
+                    previous
+                        .filter(|_| failed.is_some_and(|failed| inputs.companions != failed.inputs.companions))
+                        .and_then(|id| self.symbols.retry_debug_info(id))
+                        .map_or(Err(error), |image| Ok(Some(image)))
+                }),
+        };
+        match loaded {
+            Ok(None) => {
+                // This format has no companion lookup for the cached executable.
+                if let Some(failed) = &mut image.failed_load {
+                    failed.inputs = inputs;
+                }
+                Ok(false)
+            }
+            Ok(Some(loaded)) => {
                 image.failed_load = None;
+                image.symbols = Some(loaded.id());
+                match loaded.debug_error() {
+                    None => {}
+                    Some(DebuggerError::NoDebugInfo { detail, .. }) => image.no_debug_info = Some(detail.clone()),
+                    Some(error) => {
+                        image.failed_load = Some(FailedLoad {
+                            reported: None,
+                            checked: request,
+                            inputs,
+                            error: error.duplicate(),
+                        });
+                    }
+                }
                 Ok(true)
             }
-            Err(DebuggerError::NoDebugInfo { detail, path }) => {
+            Err(DebuggerError::NoDebugInfo { detail, path }) if image.symbols.is_none() => {
                 image.failed_load = None;
                 image.no_debug_info = Some(detail.clone());
                 Err(DebuggerError::NoDebugInfo { path, detail })
             }
             Err(error) => {
-                let source = Box::new(error.duplicate());
-                image.failed_load = Some(FailedLoad { request, inputs, error });
-                Err(DebuggerError::SymbolLoad {
+                let report_now = image.symbols.is_none();
+                let error_to_report = report_now.then(|| DebuggerError::SymbolLoad {
                     path: image.descriptor.path.clone(),
-                    source,
-                })
+                    source: Box::new(error.duplicate()),
+                });
+                image.failed_load = Some(FailedLoad {
+                    reported: report_now.then_some(request),
+                    checked: request,
+                    inputs,
+                    error,
+                });
+                error_to_report.map_or(Ok(false), Err)
             }
         }
+    }
+
+    fn image_containing(&mut self, address: Address) -> Option<&mut SessionImage>
+    {
+        self.loaded_images
+            .iter_mut()
+            .find(|image| image.mapping.as_ref().is_ok_and(|mapping| mapping.contains(address)))
     }
 }

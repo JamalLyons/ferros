@@ -10,7 +10,7 @@ use crate::symbols::image::ImageMapping;
 use crate::types::{Address, Architecture, BuildIdentity};
 
 /// The DWARF sections the engine reads, in the order a format may look them up. A format
-/// returns any of them it finds in [`ImageContents::dwarf`]; one it does not return reads
+/// returns any of them it finds in [`DebugSections::dwarf`]; one it does not return reads
 /// as empty.
 pub const DWARF_SECTIONS: &[SectionId] = &[
     SectionId::DebugAbbrev,
@@ -106,8 +106,14 @@ pub struct SectionData
     pub data: Arc<[u8]>,
 }
 
-/// Debug and unwind information of one image, read from its file by
-/// [`ObjectFormat::open_image`](super::ObjectFormat::open_image).
+/// What [`ObjectFormat::open_image`](super::ObjectFormat::open_image) read of one image:
+/// the image file's own layout and unwind information, and, apart from it, the source
+/// debug information the format found for it.
+///
+/// The two halves are independent. An image whose file has unwind tables but no usable
+/// debug information (no companion file was found) still unwinds: `debug` is then an
+/// error and the rest is filled. Both halves describe the build the session asked for, at
+/// the same load address.
 pub struct ImageContents
 {
     /// The image's architecture.
@@ -116,19 +122,27 @@ pub struct ImageContents
     pub endian: RunTimeEndian,
     /// The file's segment layout at the load address.
     pub mapping: ImageMapping,
-    /// DWARF sections by id (see [`DWARF_SECTIONS`]), from the file or a companion file
-    /// the format found. A missing section reads as empty.
-    pub dwarf: HashMap<SectionId, Arc<[u8]>>,
-    /// `.eh_frame` (or the format's equivalent), whose FDE ranges are runtime addresses
-    /// once its own address is relocated.
+    /// `.eh_frame` (or the format's equivalent) of the image file itself, whose FDE
+    /// ranges are runtime addresses once its own address is relocated.
     pub eh_frame: Option<SectionData>,
     /// `.eh_frame_hdr`, the binary-search table over `eh_frame`.
     pub eh_frame_hdr: Option<SectionData>,
-    /// `.debug_frame`, whose FDE ranges are file addresses.
-    pub debug_frame: Option<SectionData>,
     /// Per-function unwind hints of the format, consulted before the CFI.
     pub unwind_hints: Option<Box<dyn UnwindHints>>,
+    /// The image's source debug information, from the file or a companion file the
+    /// format found, or why there is none.
+    ///
+    /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the image
+    /// has no usable debug information (the session keeps that while the image stays
+    /// loaded); any other error for debug information that could not be read or parsed
+    /// (the session retries once the format's
+    /// [`load_inputs`](super::ObjectFormat::load_inputs) change).
+    pub debug: crate::Result<DebugSections>,
 }
+
+/// Re-read companion debug information for an already validated executable without
+/// reparsing it. Returned by [`ObjectFormat::open_image_with_debug_retry`](super::ObjectFormat::open_image_with_debug_retry).
+pub type DebugInfoRetry = Arc<dyn Fn() -> crate::Result<DebugSections> + Send + Sync>;
 
 impl std::fmt::Debug for ImageContents
 {
@@ -138,11 +152,32 @@ impl std::fmt::Debug for ImageContents
             .field("architecture", &self.architecture)
             .field("endian", &self.endian)
             .field("mapping", &self.mapping)
-            .field("dwarf", &self.dwarf.keys().collect::<Vec<_>>())
             .field("eh_frame", &self.eh_frame.is_some())
             .field("eh_frame_hdr", &self.eh_frame_hdr.is_some())
-            .field("debug_frame", &self.debug_frame.is_some())
             .field("unwind_hints", &self.unwind_hints.is_some())
+            .field("debug", &self.debug)
+            .finish()
+    }
+}
+
+/// Source debug information of one image ([`ImageContents::debug`]): its DWARF, from the
+/// image file or a companion debug file. The image file's own unwind tables are not here.
+#[derive(Clone, Default)]
+pub struct DebugSections
+{
+    /// DWARF sections by id (see [`DWARF_SECTIONS`]). A missing section reads as empty.
+    pub dwarf: HashMap<SectionId, Arc<[u8]>>,
+    /// `.debug_frame`, whose FDE ranges are file addresses.
+    pub debug_frame: Option<SectionData>,
+}
+
+impl std::fmt::Debug for DebugSections
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        f.debug_struct("DebugSections")
+            .field("dwarf", &self.dwarf.keys().collect::<Vec<_>>())
+            .field("debug_frame", &self.debug_frame.is_some())
             .finish()
     }
 }

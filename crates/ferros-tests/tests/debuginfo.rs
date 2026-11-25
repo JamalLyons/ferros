@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ferros_core::backend::LoadedImage;
 use ferros_core::backend::mock::MockBackend;
+use ferros_core::backend::{LoadedImage, StdioSpec};
 use ferros_core::symbols::{BinaryImage, ImageDescriptor};
 use ferros_core::{
-    Address, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache, ThreadId,
+    Address, BreakpointLocation, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache,
+    ThreadId,
 };
-use ferros_macos::{DebugInfoOptions, MachOFormat};
+use ferros_macos::{DebugInfoOptions, MacOSBackend, MacOSRuntime, MachOFormat};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
@@ -921,5 +922,292 @@ fn cargo_built_fixture_contains_debug_map_stabs()
             .count();
         assert!(object_files > 0, "fixture must have N_OSO stabs");
         println!("hello fixture N_OSO stabs: {object_files}");
+    });
+}
+
+/// A launch of `frameless_stack` copied without its dSYM and with its debug map stripped
+/// (`strip -S`), so no source debug information can be found for the main executable.
+/// Its `__eh_frame`, `__unwind_info` and symbol table stay. The copy lives under the
+/// test target directory, where `just kill-fixtures` finds a leaked process.
+struct StrippedFixture
+{
+    directory: PathBuf,
+    fixture: Fixture,
+}
+
+impl StrippedFixture
+{
+    fn new() -> Self
+    {
+        let built = fixture!("frameless_stack");
+        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ferros-stripped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create stripped fixture directory");
+        let file_name = built.path().file_name().expect("fixture file name");
+        let executable = directory.join(file_name);
+        fs::copy(built.path(), &executable).expect("copy executable without its dSYM");
+        let status = Command::new("strip").arg("-S").arg(&executable).status().expect("run strip");
+        assert!(status.success(), "strip -S failed: {status}");
+        // `strip` invalidates the ad-hoc signature arm64 macOS requires to run the copy.
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .status()
+            .expect("run codesign");
+        assert!(status.success(), "codesign failed: {status}");
+        let fixture = Fixture::from_built(
+            "frameless_stack",
+            Box::leak(executable.to_str().expect("UTF-8 path").to_owned().into_boxed_str()),
+        );
+        Self { directory, fixture }
+    }
+}
+
+impl Drop for StrippedFixture
+{
+    fn drop(&mut self)
+    {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// The first instruction at or after `from` that is `insn`, within 64 instructions.
+fn instruction_at_or_after(session: &mut Session, from: Address, insn: u32) -> Address
+{
+    (0..64)
+        .map(|index| Address::new(from.value() + 4 * index))
+        .find(|&at| {
+            let bytes = session.read_memory(at, 4).expect("read code");
+            u32::from_le_bytes(bytes.try_into().expect("four bytes")) == insn
+        })
+        .unwrap_or_else(|| panic!("no instruction {insn:#010x} after {from}"))
+}
+
+fn stop_in_unwind_only_callee(d: &mut Session, fixture: &Fixture) -> (Address, Address, ThreadId)
+{
+    let leaf = ferros_tests::symbols::raw_symbol_address(d, fixture, "_unwind_only_callee");
+    let outer = ferros_tests::symbols::raw_symbol_address(d, fixture, "_unwind_only_caller");
+    let stop = instruction_at_or_after(d, leaf, 0xD503_201F); // nop
+    let return_address = (0..16)
+        .map(|index| Address::new(outer.value() + 4 * index))
+        .find(|&at| {
+            let bytes = d.read_memory(at, 4).expect("read code");
+            u32::from_le_bytes(bytes.try_into().expect("four bytes")) & 0xFC00_0000 == 0x9400_0000
+        })
+        .map(|call| Address::new(call.value() + 4))
+        .expect("the caller's `bl`");
+    d.add_breakpoint(BreakpointRequest::Software { address: stop })
+        .expect("break on the callee's nop");
+    d.resume().expect("resume");
+    let thread = match d.wait(Some(Duration::from_secs(10))).expect("wait") {
+        Some(StopEvent::Breakpoint { pc, thread }) if pc == stop => thread,
+        other => panic!("expected a breakpoint stop at {stop}, got {other:?}"),
+    };
+    d.select_thread(thread).expect("select the stopped thread");
+    (stop, return_address, thread)
+}
+
+fn launch_with_debug_options(fixture: &Fixture, tag: &str, options: DebugInfoOptions) -> Session
+{
+    let mut session = Session::new(
+        Box::new(MacOSBackend::new().expect("backend")),
+        MachOFormat::with_debug_info_options(options).into_shared(),
+    )
+    .with_runtime(MacOSRuntime::shared());
+    let spec = LaunchSpec::new(fixture.path())
+        .arg(tag)
+        .stdin(StdioSpec::Null)
+        .stdout(StdioSpec::Null)
+        .stderr(StdioSpec::Null);
+    session.launch(&spec).expect("launch fixture");
+    session
+}
+
+/// `unwind_only_callee` of `frameless_stack` (see `fixtures/asm/frameless_stack.s`) has
+/// only an `__eh_frame` FDE (compact unwind `UNWIND_ARM64_MODE_DWARF`). Stopped on its
+/// `nop` the frame pointer is zero and the link register points at the callee itself, so
+/// only that FDE finds the caller `unwind_only_caller`. The executable is run without a
+/// dSYM or a debug map: it has no source debug information, but its unwind tables still
+/// give the caller frame, at the return address the FDE's saved link register holds.
+/// Symbolication there still reports the missing debug information, and step-out stops
+/// in the caller.
+#[test]
+fn stripped_executable_still_unwinds_its_caller()
+{
+    harness::run(|t| {
+        let stripped = StrippedFixture::new();
+        let fixture = &stripped.fixture;
+        assert!(!fixture.dsym_path().exists(), "the copy has no dSYM");
+        let scratch = Scratch::new();
+        let tag = t.tag();
+        let mut d = launch_with_debug_options(fixture, tag.as_str(), scratch.options());
+        let (stop, return_address, thread) = stop_in_unwind_only_callee(&mut d, fixture);
+
+        let registers = d.read_registers_for(thread).expect("registers");
+        assert_eq!(registers.fp, Address::ZERO, "the callee cleared the frame pointer");
+        assert_ne!(
+            registers.general.get(30).copied(),
+            Some(return_address.value()),
+            "the link register must not point at the caller"
+        );
+        let error = d.symbolicate(stop).expect_err("no source debug information");
+        assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+
+        let frames = d.stack_trace(8).expect("stack trace");
+        assert_eq!(frames[0].pc, stop, "{frames:#?}");
+        assert!(frames.len() >= 2, "the caller is missing: {frames:#?}");
+        assert_eq!(
+            frames[1].pc, return_address,
+            "the caller is `unwind_only_caller` after its call: {frames:#?}"
+        );
+        assert_eq!(frames[1].sp.value(), frames[0].sp.value() + 16, "{frames:#?}");
+        let error = d.symbolicate(stop).expect_err("still no source debug information");
+        assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+
+        d.step_out().expect("step out");
+        match d.wait(Some(Duration::from_secs(10))).expect("wait") {
+            Some(StopEvent::SingleStep { thread: stepped }) if stepped == thread => {}
+            other => panic!("expected step-out to stop {thread:?}, got {other:?}"),
+        }
+        let registers = d.read_registers_for(thread).expect("registers");
+        assert_eq!(registers.pc, return_address, "step-out stops in the caller");
+    });
+}
+
+/// Keep the UUID, section names, and sizes valid for discovery, but make the
+/// debug-info section unreadable when the engine extracts it.
+fn corrupt_debug_info_offset(mut bytes: Vec<u8>) -> Vec<u8>
+{
+    let file = object::read::macho::MachOFile64::<object::Endianness>::parse(&*bytes).expect("parse dSYM");
+    let section = file.section_by_name("__debug_info").expect("debug info");
+    let offset = (&raw const section.macho_section().offset).addr() - bytes.as_ptr().addr();
+    bytes[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn failed_debug_retry_keeps_unwind_data_for_live_executable()
+{
+    harness::run(|t| {
+        let stripped = StrippedFixture::new();
+        let fixture = &stripped.fixture;
+        let original = fixture!("frameless_stack");
+        let directory = fixture.dsym_path().join("Contents/Resources/DWARF");
+        fs::create_dir_all(&directory).expect("create companion directory");
+        let member = fs::read_dir(original.dsym_path().join("Contents/Resources/DWARF"))
+            .expect("fixture companion")
+            .next()
+            .expect("DWARF member")
+            .expect("directory entry")
+            .path();
+        let original_dwarf = fs::read(member).expect("read fixture companion");
+        let companion = directory.join("symbols");
+        fs::write(&companion, corrupt_debug_info_offset(original_dwarf.clone())).expect("install malformed companion");
+
+        let scratch = Scratch::new();
+        let tag = t.tag();
+        let mut d = launch_with_debug_options(fixture, tag.as_str(), scratch.options());
+        let (stop, return_address, thread) = stop_in_unwind_only_callee(&mut d, fixture);
+
+        let error = d.symbolicate(stop).expect_err("malformed companion");
+        assert!(
+            matches!(error, DebuggerError::SymbolLoad { ref source, .. } if source.to_string().contains("failed to read .debug_info")),
+            "{error}"
+        );
+        let frames = d.stack_trace(2).expect("stack trace with a malformed companion");
+        assert_eq!(frames.get(1).map(|frame| frame.pc), Some(return_address), "{frames:#?}");
+
+        let moved = stripped.directory.join("moved");
+        fs::rename(fixture.path(), &moved).expect("remove executable from its original path");
+        let frames = d.stack_trace(2).expect("stack trace after a failed executable reopen");
+        assert_eq!(
+            frames.get(1).map(|frame| frame.pc),
+            Some(return_address),
+            "failed reopen lost the caller: {frames:#?}"
+        );
+
+        // Restoring the executable changes its stamp again. Let that reopen finish before
+        // changing the companion alone.
+        fs::rename(&moved, fixture.path()).expect("restore executable");
+        assert!(matches!(d.symbolicate(stop), Err(DebuggerError::SymbolLoad { .. })));
+
+        // Permissions are outside the stamp. Only the companion changes, so recovery
+        // must work even though reading the executable would now fail.
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o000)).expect("make executable unreadable");
+        assert!(fs::read(fixture.path()).is_err(), "executable is still readable");
+        let replacement = stripped.directory.join("replacement");
+        fs::write(&replacement, original_dwarf).expect("write the valid companion");
+        fs::rename(replacement, &companion).expect("replace the malformed companion");
+
+        let line = original.marker_line("frameless_done");
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "frameless_stack.rs".into(),
+            line,
+        })
+        .expect("reload DWARF independently of the executable");
+        let site = &d.logical_breakpoints()[0].sites[0];
+        assert_eq!(site.position.line, Some(line));
+        let address = site.address;
+        assert!(d.symbolicate(address).expect("symbolicate main").is_some());
+
+        d.step_out().expect("step out");
+        assert!(matches!(
+            d.wait(Some(Duration::from_secs(10))).expect("wait"),
+            Some(StopEvent::SingleStep { thread: stepped }) if stepped == thread
+        ));
+        assert_eq!(d.read_registers_for(thread).expect("registers").pc, return_address);
+    });
+}
+
+#[test]
+fn failed_public_loads_leave_symbol_cache_untouched()
+{
+    harness::run(|_| {
+        let stripped = StrippedFixture::new();
+        let fixture = fixture!("frameless_stack");
+        let scratch = Scratch::new();
+        let stripped_load = Address::new(0x2_0000_0000);
+        let full_load = stripped_load.value() + 0x4000;
+        let stripped_mapping =
+            ferros_macos::macho::file_mapping(stripped.fixture.path(), stripped_load.value()).expect("stripped mapping");
+        let slice = ferros_macos::macho::SliceIdentity::new(
+            object::macho::CPU_TYPE_ARM64.0,
+            object::macho::CPU_SUBTYPE_ARM64_ALL.0,
+            None,
+        )
+        .to_image_slice();
+        let observed = [None, Some(&slice)].map(|slice| {
+            let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
+            let full = cache.load_image(descriptor(fixture.path(), full_load)).expect("full DWARF");
+            let line = fixture.marker_line("frameless_done");
+            let address = full
+                .line_addresses("frameless_stack.rs", line)
+                .expect("main marker")
+                .addresses[0];
+            assert!(stripped_mapping.contains(address), "the mappings must overlap at the marker");
+            assert!(stripped_mapping.contains(stripped_load));
+            assert!(!full.contains(stripped_load));
+
+            let descriptor = descriptor(stripped.fixture.path(), stripped_load.value());
+            let result = match slice {
+                Some(slice) => cache.load_image_slice(descriptor, slice),
+                None => cache.load_image(descriptor),
+            };
+            expect_no_debug_info(result);
+
+            // This address belongs only to the stripped image. It detects an insertion
+            // regardless of which image overlapping-address lookup would find first.
+            (
+                cache.image_for_address(stripped_load).is_none(),
+                cache.symbolicate(address).is_some_and(|result| result.image_id == full.id()),
+            )
+        });
+        assert_eq!(observed, [(true, true); 2], "failed loads changed the cache");
     });
 }

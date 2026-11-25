@@ -265,14 +265,21 @@ impl Session
         None
     }
 
-    /// Load symbols for a frame's image. A failure leaves the frame without a symbol and
-    /// is logged, since a stack trace still returns raw frames.
+    /// Load a frame's image: its unwind tables, and its source debug information when it
+    /// has any. Returns whether the image was newly loaded, even without debug
+    /// information, since its unwind tables alone can reveal further callers. A failure
+    /// leaves the frame without a symbol and is logged, since a stack trace still returns
+    /// raw frames.
     fn load_symbols_for_frame(&mut self, pc: Address) -> bool
     {
-        self.load_symbols_for_address(pc).unwrap_or_else(|error| {
-            tracing::debug!("stack trace continues without symbols at {pc}: {error}");
+        let loaded = self.load_executable_for_address(pc).unwrap_or_else(|error| {
+            tracing::debug!("stack trace continues without unwind tables at {pc}: {error}");
             false
-        })
+        });
+        if let Err(error) = self.load_symbols_for_address(pc) {
+            tracing::debug!("stack trace continues without source symbols at {pc}: {error}");
+        }
+        loaded
     }
 
     /// Map `address` to function names and source locations.

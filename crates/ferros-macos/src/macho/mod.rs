@@ -32,7 +32,8 @@ use std::sync::Arc;
 
 use ferros_core::error::Result as EngineResult;
 use ferros_core::objfile::{
-    ImageContents, ImageProbe, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey, TargetMemory,
+    DebugInfoRetry, ImageContents, ImageProbe, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey,
+    TargetMemory,
 };
 use ferros_core::types::Address;
 use object::Endianness;
@@ -191,6 +192,17 @@ impl ObjectFormat for MachOFormat
     }
 
     fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> EngineResult<ImageContents>
+    {
+        self.open_image_with_debug_retry(path, load_address, slice)
+            .map(|(contents, _)| contents)
+    }
+
+    fn open_image_with_debug_retry(
+        &self,
+        path: &Path,
+        load_address: u64,
+        slice: Option<&ImageSlice>,
+    ) -> EngineResult<(ImageContents, Option<DebugInfoRetry>)>
     {
         let target = slice.and_then(SliceIdentity::from_image_slice);
         image::open(path, load_address, target.as_ref(), &self.debug_info)

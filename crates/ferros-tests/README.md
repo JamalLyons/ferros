@@ -2,6 +2,77 @@
 
 Integration test fixtures and test harness helpers for Ferros.
 
+## Quickstart
+
+Enough for the common case: one test that debugs a real fixture process. Read the reference
+sections below only when this does not cover your test.
+
+- Put the test in its own file `tests/<area>.rs`. Start it with `#![cfg(target_os = "macos")]`.
+- Run the whole body inside `harness::run(|t| { ... })` (30 s deadline). `t.launch*` returns a
+  `Debuggee` that derefs to `ferros_core::Session`; dropping it kills and reaps the process.
+- `fixture!("name")` resolves a fixture binary (names under [Fixtures](#fixtures)). Never write a
+  `target/...` path.
+- `fixture.marker_line("name")` gives the 1-based line of the `// BREAK: name` comment in the
+  fixture source ([Marker Convention](#marker-convention)). Never write a line number.
+
+```rust,ignore
+#![cfg(target_os = "macos")]
+
+use std::time::Duration;
+
+use ferros_core::{BreakpointLocation, StopEvent};
+use ferros_tests::{fixture, harness};
+
+#[test]
+fn stops_at_loop_call_then_exits()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch_with_args(&fixture, &["3"]);
+
+        let id = d
+            .set_breakpoint(BreakpointLocation::Line {
+                file: "loop_counter.rs".to_owned(),
+                line: fixture.marker_line("loop_call"),
+            })
+            .expect("set_breakpoint");
+
+        d.resume().expect("resume");
+        let stop = d.wait(Some(Duration::from_secs(5))).expect("wait").expect("a stop");
+        assert!(matches!(stop, StopEvent::Breakpoint { .. }), "got {stop:?}");
+        let hit = d.breakpoint_hit().expect("a logical breakpoint hit");
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.site.position.line, Some(fixture.marker_line("loop_call")));
+
+        d.delete_breakpoint(id).expect("delete_breakpoint");
+        d.resume().expect("resume");
+        let end = d.wait(Some(Duration::from_secs(10))).expect("wait").expect("an exit");
+        assert!(matches!(end, StopEvent::Exited { code: 0 }), "got {end:?}");
+    });
+}
+```
+
+Run one test (the cargo runner signs the executable; no sudo):
+
+```sh
+cargo test -p ferros-tests --test <file> <test_name>   # one test
+just test-integration                                  # all of them
+```
+
+After any run, check for leaked fixtures. It prints nothing when clean (it also lists other
+worktrees' fixtures). Clean only this worktree's with `just kill-fixtures`; never `pkill -f`.
+
+```sh
+pgrep -fl ferros-fixture-
+just kill-fixtures
+```
+
+Contents of the reference sections: [Fixtures](#fixtures) · [Marker Convention](#marker-convention) ·
+[Running the integration tests](#running-the-integration-tests) (signing, environment switches) ·
+[Writing an integration test](#writing-an-integration-test) (launch variants, per-area test notes) ·
+[Tests without a real process](#tests-without-a-real-process) ·
+[Debug-info regressions](#debug-info-regressions)
+
 ## Purpose
 
 This crate provides standalone fixture binaries and helper utilities used by Ferros

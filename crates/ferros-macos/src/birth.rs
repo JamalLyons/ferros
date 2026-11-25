@@ -28,7 +28,7 @@
 
 use std::fs;
 
-use ferros_core::backend::StopEvent;
+use ferros_core::backend::{ImageRole, LoadedImage, StopEvent};
 use ferros_core::types::{Address, Arm64Register, ProcessId, RegisterId};
 use libc::{mach_port_t, thread_act_t};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
@@ -656,7 +656,7 @@ fn resolve_main_entry(task: mach_port_t, pid: ProcessId) -> Result<Option<BirthS
             "dyld image list is unreadable ({err}); new threads cannot be suspended"
         ))
     })?;
-    let Some(image) = images.first() else {
+    let Some(image) = main_executable(&images).map_err(BirthInstallError::Os)? else {
         return Ok(None);
     };
     let load = image.load_address.value();
@@ -684,6 +684,24 @@ fn resolve_main_entry(task: mach_port_t, pid: ProcessId) -> Result<Option<BirthS
         client_breakpoint: original == BRK,
         entry: false,
     }))
+}
+
+/// The image marked [`ImageRole::MainExecutable`], wherever it is listed, so a list
+/// without one or in another order never has a library parsed for `LC_MAIN`. `None`
+/// when no image is marked; an error when several are, which breaks the
+/// [`ImageRole`] contract.
+fn main_executable(images: &[LoadedImage]) -> Result<Option<&LoadedImage>, String>
+{
+    let mut mains = images.iter().filter(|image| image.role == ImageRole::MainExecutable);
+    let main = mains.next();
+    if let Some(second) = mains.next() {
+        return Err(format!(
+            "the dyld image list marks more than one main executable ({} and {})",
+            main.map_or_else(String::new, |main| main.path.display().to_string()),
+            second.path.display()
+        ));
+    }
+    Ok(main)
 }
 
 const LC_MAIN: u32 = 0x8000_0028;
@@ -950,6 +968,42 @@ fn read_target(task: mach_port_t, address: u64, len: usize) -> Result<Vec<u8>, S
 mod tests
 {
     use super::*;
+
+    fn image(path: &str, role: ImageRole) -> LoadedImage
+    {
+        LoadedImage {
+            path: path.into(),
+            load_address: Address::from(0x1000u64),
+            build_id: ferros_core::types::BuildIdentity::Unknown,
+            role,
+        }
+    }
+
+    /// Issue #244: the `LC_MAIN` bridge is read from the image marked as the main
+    /// executable, not from whichever image is listed first.
+    #[test]
+    fn main_entry_image_is_the_one_marked_main_wherever_it_is_listed()
+    {
+        let library = image("/usr/lib/libSystem.B.dylib", ImageRole::Library);
+        let main = image("/bin/prog", ImageRole::MainExecutable);
+        let images = [library.clone(), main.clone()];
+        assert_eq!(main_executable(&images).unwrap().map(|image| &image.path), Some(&main.path));
+        assert!(main_executable(std::slice::from_ref(&library)).unwrap().is_none());
+        assert!(main_executable(&[]).unwrap().is_none());
+    }
+
+    /// Two images marked as the main executable break the `ImageRole` contract: report it
+    /// rather than use the first.
+    #[test]
+    fn two_marked_main_executables_are_reported()
+    {
+        let images = [
+            image("/bin/first", ImageRole::MainExecutable),
+            image("/bin/second", ImageRole::MainExecutable),
+        ];
+        let error = main_executable(&images).unwrap_err();
+        assert!(error.contains("/bin/first") && error.contains("/bin/second"), "{error}");
+    }
 
     /// On this machine both pthread entries are `stp xzr, xzr, [sp, #-16]!` then `bl`.
     /// The debugger must execute that `stp`; this locks the bytes the slice actually contains.

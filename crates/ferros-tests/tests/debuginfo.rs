@@ -731,12 +731,13 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
 
         fs::remove_file(&executable).expect("remove the executable link");
         assert!(relative.canonicalize().is_err(), "the relative path must stop resolving");
-        for _ in 0..2 {
+        // The symbols loaded above stay cached for the mapped image: a lookup must keep
+        // returning them, not reopen the vanished path and fail.
+        for lookup in 0..2 {
             match session.symbolicate(address) {
-                Ok(Some(symbolication)) => assert!(is_main(&symbolication), "{symbolication:?}"),
-                Err(DebuggerError::SymbolLoad { path, .. }) => assert_eq!(path, relative),
-                Ok(None) => panic!("symbols silently missing while the image is still mapped"),
-                Err(error) => panic!("unexpected error {error}"),
+                Ok(Some(symbolication)) => assert!(is_main(&symbolication), "lookup {lookup}: {symbolication:?}"),
+                Ok(None) => panic!("lookup {lookup}: symbols silently missing while the image is still mapped"),
+                Err(error) => panic!("lookup {lookup}: cached symbols were dropped: {error}"),
             }
         }
     });

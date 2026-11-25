@@ -7,7 +7,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use ferros_core::{Address, BreakpointRequest, ResumeRequest, SessionState, StopEvent, ThreadAction, ThreadId};
+use ferros_core::{Address, BreakpointRequest, FaultKind, ResumeRequest, SessionState, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::control::ControlDir;
 use ferros_tests::fixture;
@@ -1357,6 +1357,57 @@ fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
         assert_eq!(
             d.wait(Some(STOP_TIMEOUT)).expect("terminal event"),
             Some(StopEvent::Killed { signal: 9 })
+        );
+    });
+}
+
+/// A bad memory access is a synchronous fault, not a held signal (#219): it stops as
+/// [`StopEvent::Fault`], a forwarding continue after it is accepted and passes no signal
+/// for it, and the retried access faults again at the same pc.
+///
+/// The fault is raised for real: stopped at `tick_body`, the thread's pc is moved to
+/// address 0, so its next instruction fetch is an access to unmapped memory.
+#[test]
+fn access_fault_continue_is_not_rejected_as_a_signal()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch(&fixture);
+        let address = marker_address(&mut d, &fixture, "tick_body");
+        let id = d
+            .add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at tick_body");
+        d.resume().expect("resume");
+        let thread = expect_breakpoint(&mut d, address, "the tick_body stop");
+        d.remove_breakpoint(id).expect("remove_breakpoint");
+        let mut registers = d.read_registers_for(thread).expect("read registers");
+        registers.pc = Address::new(0);
+        d.write_registers_for(thread, &registers).expect("move the pc to address 0");
+
+        d.resume().expect("run into the fault");
+        let fault = d.wait(Some(STOP_TIMEOUT)).expect("wait for the fault");
+        let Some(StopEvent::Fault {
+            thread: faulted, kind, ..
+        }) = fault.clone()
+        else {
+            panic!("expected a memory access fault, got {fault:?}");
+        };
+        assert_eq!(faulted, thread, "the fault names another thread");
+        assert_eq!(kind, FaultKind::MemoryAccess, "{fault:?}");
+        let pc = d.read_registers_for(thread).expect("registers at the fault").pc;
+
+        d.resume_with_signal()
+            .expect("a forwarding continue after a fault is not rejected as signal injection");
+        let again = d.wait(Some(STOP_TIMEOUT)).expect("wait for the retried fault");
+        assert!(
+            matches!(again, Some(StopEvent::Fault { thread: t, kind: FaultKind::MemoryAccess, .. }) if t == thread),
+            "the retried access did not fault again: {again:?}"
+        );
+        assert_eq!(
+            d.read_registers_for(thread).expect("registers at the retried fault").pc,
+            pc,
+            "the retried fault is at another pc"
         );
     });
 }

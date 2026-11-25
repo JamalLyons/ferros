@@ -341,6 +341,36 @@ fn continue_does_not_pass_sigint_on()
 }
 
 #[test]
+fn continue_after_a_fault_prints_its_kind_and_passes_no_signal()
+{
+    use ferros_core::backend::mock::MockCall;
+    use ferros_core::{FaultKind, ResumeRequest};
+
+    let mock = mock();
+    mock.script(MockStop::new(StopEvent::Fault {
+        thread: THREAD,
+        kind: FaultKind::MemoryAccess,
+        detail: "native reason".into(),
+    }));
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    let t = batch(&mock, &["c", "c"]);
+    assert!(t.ok, "{}", t.err);
+    assert!(t.out.contains("stopped: memory access fault at 0x"), "{}", t.out);
+    assert!(t.out.contains("(thread 7)\n"), "{}", t.out);
+    assert!(!t.out.contains("native reason"), "{}", t.out);
+    assert!(!t.out.contains("signal"), "{}", t.out);
+    let resumes: Vec<ResumeRequest> = mock
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            MockCall::Resume(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resumes, vec![ResumeRequest::continue_all(), ResumeRequest::continue_all()]);
+}
+
+#[test]
 fn interrupt_flag_interrupts_a_running_process()
 {
     let mock = mock();

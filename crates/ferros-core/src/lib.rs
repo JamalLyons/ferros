@@ -62,7 +62,7 @@ pub mod symbols;
 pub mod types;
 
 pub use arch::Arch;
-pub use backend::{Backend, BackendError, BackendResult, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
+pub use backend::{Backend, BackendError, BackendResult, FaultKind, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 pub use breakpoints::{BreakpointId, BreakpointInfo, BreakpointKind, BreakpointRequest, BreakpointState, WatchpointAccess};
 // Re-export commonly used types
 pub use error::{DebuggerError, Result};

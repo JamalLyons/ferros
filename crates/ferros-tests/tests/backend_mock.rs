@@ -1081,6 +1081,52 @@ fn signal_of_a_refused_resume_is_passed_by_the_next_resume_with_signal()
     assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
 }
 
+/// A fault holds no signal: a forwarding continue after a fault on one thread passes
+/// only the signal still held for its peer, and a fault the thread raises again (the
+/// instruction is retried) is reported again without any signal (#219).
+#[test]
+fn forwarding_continue_after_a_fault_passes_only_the_peers_signal()
+{
+    use ferros_core::FaultKind;
+
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers())
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let held = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 30,
+    };
+    let fault = StopEvent::Fault {
+        thread: THREAD,
+        kind: FaultKind::MemoryAccess,
+        detail: "scripted".into(),
+    };
+    assert_eq!(fault.deliverable_signal(), None);
+    mock.script(MockStop::new(held.clone()).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("run to the signal");
+    assert_eq!(session.wait(None).expect("wait"), Some(held));
+    // The peer's signal is carried: the fault races the forwarding resume.
+    mock.stop_before_next_resume(std::iter::once(MockStop::new(fault.clone())));
+    session.resume_with_signal().expect("a fault raced the resume");
+    assert_eq!(session.wait(None).expect("wait"), Some(fault.clone()));
+    let _ = mock.take_calls();
+
+    mock.script(MockStop::new(fault.clone()));
+    session.resume_with_signal().expect("continue after the fault");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 30)]
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(fault));
+
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    session.resume_with_signal().expect("continue after the repeated fault");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
 /// #150 review: a source step's final continue (which passes no signal) refused for a
 /// late stop keeps a signal already carried for a suspended thread, from an earlier
 /// step-over that another stop cut short; the next `resume_with_signal` passes it.

@@ -95,7 +95,19 @@ pub struct SymbolFrame
 pub struct SymbolCache
 {
     images: HashMap<ImageId, Arc<BinaryImage>>,
+    /// Why a public load found no usable debug information, per image, with a stamp of
+    /// the files it read taken just before reading them. While the stamp is unchanged a
+    /// repeated load returns the error again without reading the file. Kept apart from
+    /// `images`: a failed public load does not make the image visible to lookups.
+    missing_debug: HashMap<ImageId, MissingDebug>,
     format: Arc<dyn ObjectFormat>,
+}
+
+/// A public load whose image file was read but whose debug information was not usable.
+struct MissingDebug
+{
+    inputs: ImageLoadInputs,
+    error: DebuggerError,
 }
 
 /// Stamps of the executable and of the files consulted for its companion debug information.
@@ -114,6 +126,7 @@ impl SymbolCache
     {
         Self {
             images: HashMap::new(),
+            missing_debug: HashMap::new(),
             format,
         }
     }
@@ -147,6 +160,7 @@ impl SymbolCache
     pub fn retain_ids(&mut self, ids: &HashSet<ImageId>)
     {
         self.images.retain(|id, _| ids.contains(id));
+        self.missing_debug.retain(|id, _| ids.contains(id));
     }
 
     /// Load a binary image and parse its DWARF sections.
@@ -198,7 +212,11 @@ impl SymbolCache
     }
 
     /// [`load_image`](Self::load_image), reading the slice `slice` names when it is
-    /// known (#169). Only a successful DWARF load changes the cache.
+    /// known (#169). Only a successful DWARF load changes the images lookups see.
+    ///
+    /// A file that was read but has no usable debug information is not read again while
+    /// the files the load read are unchanged ([`load_inputs`](Self::load_inputs)): the
+    /// same error is returned after a few `stat` calls (#236).
     fn load_mapped_image(&mut self, mut descriptor: ImageDescriptor, slice: Option<&ImageSlice>)
     -> Result<Arc<BinaryImage>>
     {
@@ -207,10 +225,25 @@ impl SymbolCache
         if let Some(existing) = self.images.get(&id).filter(|image| image.has_debug_info()) {
             return Ok(existing.clone());
         }
-        let image = self.read_image(descriptor, slice)?;
-        if let Some(error) = image.debug_error() {
-            return Err(error.duplicate());
+        let inputs = self.load_inputs(&descriptor);
+        if let Some(missing) = self.missing_debug.get(&id).filter(|missing| missing.inputs == inputs) {
+            return Err(missing.error.duplicate());
         }
+        let image = self.read_image(descriptor, slice);
+        let image = match image {
+            Ok(image) => image,
+            Err(error) => {
+                self.missing_debug.remove(&id);
+                return Err(error);
+            }
+        };
+        if let Some(error) = image.debug_error() {
+            let error = error.duplicate();
+            let reported = error.duplicate();
+            self.missing_debug.insert(id, MissingDebug { inputs, error });
+            return Err(reported);
+        }
+        self.missing_debug.remove(&id);
         self.images.insert(id, image.clone());
         Ok(image)
     }

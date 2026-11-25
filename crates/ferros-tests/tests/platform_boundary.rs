@@ -217,6 +217,10 @@ fn parser_marker(line: &str, markers: &[&'static str]) -> Option<&'static str>
     })
 }
 
+/// The one CLI file, relative to the crate directory, that may switch on the OS and name
+/// a platform crate.
+const CLI_PLATFORM_FILE: &str = "src/platform.rs";
+
 /// Platform backend crates, today's and the planned ones. A new platform crate is added
 /// here; a new portable `ferros-*` crate is not a platform crate.
 const PLATFORM_CRATES: &[&str] = &["ferros-macos", "ferros-linux", "ferros-windows"];
@@ -311,6 +315,24 @@ fn dependency_diagnostic(root: &Path, violation: &DependencyViolation<'_>) -> St
     diagnostic
 }
 
+/// The CLI's own rule, enforced on its own: only `src/platform.rs` may hold a
+/// `cfg(target_os)` switch or name a platform crate. `path` is relative to the crate
+/// directory, so `build.rs`, `examples/`, `tests/` and other `src/` files are all checked.
+fn cli_violation<'a>(path: &Path, line: &str, cli_platform_names: &'a BTreeSet<String>) -> Option<(&'static str, &'a str)>
+{
+    if path == Path::new(CLI_PLATFORM_FILE) {
+        return None;
+    }
+    if line.contains(OS_SWITCH) {
+        return Some(("only platform.rs may contain target_os in the CLI", OS_SWITCH));
+    }
+    cli_platform_names
+        .iter()
+        .find(|name| line.contains(name.as_str()))
+        .map(|name| ("only platform.rs may name a platform crate in the CLI", name.as_str()))
+}
+
+/// Checks `path` (relative to the crate directory) against the rules for crate `owner`.
 fn source_violation<'a>(
     owner: &str,
     path: &Path,
@@ -319,15 +341,7 @@ fn source_violation<'a>(
 ) -> Option<(&'static str, &'a str)>
 {
     match owner {
-        "ferros" => {
-            if path == Path::new("platform.rs") {
-                return None;
-            }
-            return cli_platform_names
-                .iter()
-                .find(|name| line.contains(name.as_str()))
-                .map(|name| ("only platform.rs may name a platform crate in the CLI", name.as_str()));
-        }
+        "ferros" => return cli_violation(path, line, cli_platform_names),
         "ferros-core" => {
             if line.contains(OS_SWITCH) {
                 return Some(("ferros-core must not contain target_os", OS_SWITCH));
@@ -371,51 +385,144 @@ fn read_text(path: &Path) -> String
     fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// A place Cargo compiles from: a directory of Rust files, or one file that sits directly
+/// in the crate directory (`build.rs`, a root-level `main.rs`).
+#[derive(Debug, PartialEq, Eq)]
+enum TargetRoot
+{
+    Dir(PathBuf),
+    File(PathBuf),
+}
+
+/// Every target root of `package`, from Cargo metadata: library, binaries, examples,
+/// tests, benches and the custom build script. A `build.rs` is its own root, so the whole
+/// crate directory (with `target/`) is never walked.
+fn target_roots(package: &Value) -> Vec<TargetRoot>
+{
+    let package_dir = manifest_path(package).parent().expect("manifest directory");
+    let mut roots = BTreeSet::new();
+    for target in package["targets"].as_array().expect("package targets") {
+        let src_path = Path::new(target["src_path"].as_str().expect("target src_path"));
+        let parent = src_path.parent().expect("target source directory");
+        roots.insert(if parent == package_dir {
+            TargetRoot::File(src_path.to_path_buf())
+        } else {
+            TargetRoot::Dir(parent.to_path_buf())
+        });
+    }
+    roots.into_iter().collect()
+}
+
+impl Ord for TargetRoot
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering
+    {
+        self.path().cmp(other.path())
+    }
+}
+
+impl PartialOrd for TargetRoot
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>
+    {
+        Some(self.cmp(other))
+    }
+}
+
+impl TargetRoot
+{
+    fn path(&self) -> &Path
+    {
+        match self {
+            Self::Dir(path) | Self::File(path) => path,
+        }
+    }
+}
+
+/// The sorted, deduplicated Rust files under `roots`.
+fn target_files(roots: &[TargetRoot]) -> Vec<PathBuf>
+{
+    let mut files = Vec::new();
+    for root in roots {
+        match root {
+            TargetRoot::Dir(dir) => rust_files(dir, &mut files),
+            TargetRoot::File(file) => files.push(file.clone()),
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+/// Checks the source files of one crate. `files` pairs each file's path with its text;
+/// nothing here touches the file system, so tests feed it synthetic input. Paths must lie
+/// under `package_dir`; diagnostics print them relative to `root`.
+fn check_sources(
+    root: &Path,
+    owner: &str,
+    package_dir: &Path,
+    files: &[(PathBuf, String)],
+    cli_platform_names: &BTreeSet<String>,
+) -> Vec<String>
+{
+    let mut offending = Vec::new();
+    for (path, text) in files {
+        let file = path.strip_prefix(root).unwrap_or(path).display();
+        let relative = path.strip_prefix(package_dir).expect("source path relative to its crate");
+        if owner == "ferros-core"
+            && relative == Path::new("src/lib.rs")
+            && !text.lines().any(|line| line.starts_with("#![forbid(unsafe_code)]"))
+        {
+            offending.push(format!(
+                "{file}:1: ferros-core must forbid unsafe code: missing #![forbid(unsafe_code)]"
+            ));
+        }
+        for (index, line) in text.lines().enumerate() {
+            if let Some((rule, marker)) = source_violation(owner, relative, line, cli_platform_names) {
+                let mut diagnostic = format!("{file}:{}: ", index + 1);
+                write!(diagnostic, "{rule} ({marker}): {line}").expect("write diagnostic");
+                offending.push(diagnostic);
+            }
+        }
+    }
+    offending
+}
+
+fn platform_crate_names(metadata: &Value) -> BTreeSet<String>
+{
+    packages(metadata)
+        .iter()
+        .flat_map(|package| std::iter::once(package).chain(dependencies(package)))
+        .map(package_name)
+        .filter(|name| is_platform_crate(name))
+        .map(|name| name.replace('-', "_"))
+        .collect()
+}
+
 fn check_workspace(root: &Path, metadata: &Value) -> Vec<String>
 {
     let mut offending = check_platform_edges(metadata)
         .iter()
         .map(|violation| dependency_diagnostic(root, violation))
         .collect::<Vec<_>>();
-    let cli_platform_names = packages(metadata)
-        .iter()
-        .flat_map(|package| std::iter::once(package).chain(dependencies(package)))
-        .map(package_name)
-        .filter(|name| is_platform_crate(name))
-        .map(|name| name.replace('-', "_"))
-        .collect::<BTreeSet<_>>();
+    let cli_platform_names = platform_crate_names(metadata);
 
     for package in packages(metadata) {
         let owner = package_name(package);
         if !matches!(owner, "ferros-core" | "ferros") && !is_platform_crate(owner) {
             continue;
         }
-        let src = manifest_path(package).with_file_name("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        files.sort_unstable();
-        assert!(!files.is_empty(), "no .rs files found under {}", src.display());
-
-        for path in files {
-            let text = read_text(&path);
-            let file = path.strip_prefix(root).unwrap_or(&path).display();
-            let relative = path.strip_prefix(&src).expect("source path relative to src");
-            if owner == "ferros-core"
-                && relative == Path::new("lib.rs")
-                && !text.lines().any(|line| line.starts_with("#![forbid(unsafe_code)]"))
-            {
-                offending.push(format!(
-                    "{file}:1: ferros-core must forbid unsafe code: missing #![forbid(unsafe_code)]"
-                ));
-            }
-            for (index, line) in text.lines().enumerate() {
-                if let Some((rule, marker)) = source_violation(owner, relative, line, &cli_platform_names) {
-                    let mut diagnostic = format!("{file}:{}: ", index + 1);
-                    write!(diagnostic, "{rule} ({marker}): {line}").expect("write diagnostic");
-                    offending.push(diagnostic);
-                }
-            }
-        }
+        let package_dir = manifest_path(package).parent().expect("manifest directory");
+        let paths = target_files(&target_roots(package));
+        assert!(!paths.is_empty(), "no .rs files found for {owner}");
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let text = read_text(&path);
+                (path, text)
+            })
+            .collect::<Vec<_>>();
+        offending.extend(check_sources(root, owner, package_dir, &files, &cli_platform_names));
     }
     offending
 }
@@ -769,10 +876,146 @@ fn cli_platform_names_stay_in_the_factory()
 {
     let cli_platform_names = BTreeSet::from(["ferros_macos".to_owned(), "ferros_linux".to_owned()]);
     for line in ["use ferros_macos::new_session;", "use ferros_linux::new_session;"] {
-        assert!(source_violation("ferros", Path::new("main.rs"), line, &cli_platform_names).is_some());
+        assert!(source_violation("ferros", Path::new("src/main.rs"), line, &cli_platform_names).is_some());
         assert_eq!(
-            source_violation("ferros", Path::new("platform.rs"), line, &cli_platform_names),
+            source_violation("ferros", Path::new("src/platform.rs"), line, &cli_platform_names),
             None
         );
     }
+}
+
+/// A synthetic crate: its directory and `(file, text)` pairs, as `check_sources` takes them.
+fn synthetic_files(package_dir: &str, files: &[(&str, &str)]) -> (PathBuf, Vec<(PathBuf, String)>)
+{
+    let dir = PathBuf::from(package_dir);
+    let files = files.iter().map(|&(name, text)| (dir.join(name), text.to_owned())).collect();
+    (dir, files)
+}
+
+fn synthetic_report(owner: &str, package_dir: &str, files: &[(&str, &str)]) -> Vec<String>
+{
+    let (dir, files) = synthetic_files(package_dir, files);
+    let names = BTreeSet::from(["ferros_macos".to_owned()]);
+    check_sources(Path::new(""), owner, &dir, &files, &names)
+}
+
+#[test]
+fn cli_target_os_outside_platform_rs_is_rejected()
+{
+    const SWITCH: &str = "#[cfg(target_os = \"macos\")]\nfn only_here() {}\n";
+    const FILES: &[(&str, &str)] = &[
+        ("src/platform.rs", SWITCH),
+        ("src/main.rs", "fn main() {}\n"),
+        ("src/repl.rs", SWITCH),
+    ];
+    let report = synthetic_report("ferros", "crates/ferros", FILES);
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(
+        report[0].starts_with("crates/ferros/src/repl.rs:1: only platform.rs may contain target_os"),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn cli_platform_crate_names_outside_platform_rs_are_rejected()
+{
+    const FILES: &[(&str, &str)] = &[
+        ("src/platform.rs", "use ferros_macos::new_session;\n"),
+        ("src/commands/launch.rs", "use ferros_macos::MacOSBackend;\n"),
+    ];
+    let report = synthetic_report("ferros", "crates/ferros", FILES);
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(
+        report[0].starts_with("crates/ferros/src/commands/launch.rs:1: "),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn cli_files_besides_platform_rs_are_checked_in_every_target_root()
+{
+    // Only `src/platform.rs` is exempt: a same-named file elsewhere is not.
+    const FILES: &[(&str, &str)] = &[
+        ("src/bin/platform.rs", "#[cfg(target_os = \"linux\")]\n"),
+        ("examples/platform.rs", "#[cfg(target_os = \"linux\")]\n"),
+        ("tests/probe.rs", "use ferros_macos::new_session;\n"),
+        ("build.rs", "fn main() { if cfg!(target_os = \"macos\") {} }\n"),
+    ];
+    let report = synthetic_report("ferros", "crates/ferros", FILES);
+    assert_eq!(report.len(), 4, "{report:?}");
+}
+
+#[test]
+fn build_script_violations_are_reported()
+{
+    const CORE: &[(&str, &str)] = &[
+        ("src/lib.rs", "#![forbid(unsafe_code)]\n"),
+        ("build.rs", "fn main() { if cfg!(target_os = \"macos\") {} }\n"),
+    ];
+    let core = synthetic_report("ferros-core", "crates/ferros-core", CORE);
+    assert_eq!(core.len(), 1, "{core:?}");
+    assert!(
+        core[0].starts_with("crates/ferros-core/build.rs:1: ferros-core must not contain target_os"),
+        "{core:?}"
+    );
+    let linux = synthetic_report(
+        "ferros-linux",
+        "crates/ferros-linux",
+        &[("build.rs", "use object::macho::MachHeader64;\n")],
+    );
+    assert_eq!(linux.len(), 1, "{linux:?}");
+    assert!(linux[0].contains("Mach-O parsing belongs in ferros-macos"), "{linux:?}");
+}
+
+#[test]
+fn core_example_bench_and_test_roots_are_checked()
+{
+    const FILES: &[(&str, &str)] = &[
+        ("src/lib.rs", "#![forbid(unsafe_code)]\n"),
+        ("benches/speed.rs", "let k = LC_SYMTAB;\n"),
+        ("examples/demo.rs", "unsafe { run() }\n"),
+        ("tests/probe/main.rs", "// via dyld\n"),
+    ];
+    let report = synthetic_report("ferros-core", "crates/ferros-core", FILES);
+    assert_eq!(report.len(), 3, "{report:?}");
+}
+
+#[test]
+fn core_lib_must_still_forbid_unsafe_code()
+{
+    let report = synthetic_report("ferros-core", "crates/ferros-core", &[("src/lib.rs", "pub mod a;\n")]);
+    assert_eq!(report.len(), 1, "{report:?}");
+    assert!(report[0].contains("missing #![forbid(unsafe_code)]"), "{report:?}");
+}
+
+#[test]
+fn target_roots_cover_every_cargo_target()
+{
+    let package = json!({
+        "name": "ferros",
+        "manifest_path": "/w/crates/ferros/Cargo.toml",
+        "targets": [
+            {"kind": ["bin"], "src_path": "/w/crates/ferros/src/main.rs"},
+            {"kind": ["bin"], "src_path": "/w/crates/ferros/src/bin/other.rs"},
+            {"kind": ["example"], "src_path": "/w/crates/ferros/examples/demo.rs"},
+            {"kind": ["test"], "src_path": "/w/crates/ferros/tests/probe/main.rs"},
+            {"kind": ["bench"], "src_path": "/w/crates/ferros/benches/speed.rs"},
+            {"kind": ["custom-build"], "src_path": "/w/crates/ferros/build.rs"},
+            {"kind": ["custom-build"], "src_path": "/w/crates/ferros/scripts/setup.rs"},
+        ],
+    });
+    let roots = target_roots(&package);
+    let expected_roots = vec![
+        TargetRoot::File(PathBuf::from("/w/crates/ferros/build.rs")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/src")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/src/bin")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/examples")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/tests/probe")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/benches")),
+        TargetRoot::Dir(PathBuf::from("/w/crates/ferros/scripts")),
+    ];
+    for expected in expected_roots {
+        assert!(roots.contains(&expected), "missing {expected:?} in {roots:?}");
+    }
+    assert_eq!(roots.len(), 7, "{roots:?}");
 }

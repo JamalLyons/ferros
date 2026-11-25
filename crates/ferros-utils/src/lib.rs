@@ -8,5 +8,8 @@
 pub mod logging;
 
 // Re-export commonly used logging functions for convenience
-pub use logging::{LogFormat, LogLevel, init_logging, init_logging_for_tui, init_logging_to_file, init_logging_with_level};
+pub use logging::{
+    LogFormat, LogLevel, LoggingError, LoggingSession, init_logging, init_logging_for_tui, init_logging_to_file,
+    init_logging_with_level, log_directory, start_file_logging,
+};
 pub use tracing::{debug, error, info, trace, warn};

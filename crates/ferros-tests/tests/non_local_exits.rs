@@ -76,11 +76,12 @@ fn next_over_a_call_that_long_jumps_past_its_caller_stops_in_the_outer_frame()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "call_middle");
         let before = d.stack_trace(64).expect("trace").len();
+        let thread = d.selected_thread().expect("a selected thread before the step");
         d.step_over().expect("next over a long-jumping call");
-        let event = stop(&mut d);
-        assert!(
-            matches!(event, StopEvent::SingleStep { .. }),
-            "expected a step stop, got {event:?}"
+        assert_eq!(
+            stop(&mut d),
+            StopEvent::SingleStep { thread },
+            "expected a step stop on the thread that was resumed"
         );
         assert_eq!(function(&mut d), "main");
         assert_eq!(d.stack_trace(64).expect("trace").len(), before);
@@ -99,11 +100,12 @@ fn finish_from_a_frame_that_long_jumps_stops_in_the_outer_frame()
         let mut d = t.launch(&fixture);
         start(&mut d, &fixture, "in_jumper");
         let before = d.stack_trace(64).expect("trace").len();
+        let thread = d.selected_thread().expect("a selected thread before the step");
         d.step_out().expect("finish from a long-jumping frame");
-        let event = stop(&mut d);
-        assert!(
-            matches!(event, StopEvent::SingleStep { .. }),
-            "expected a step stop, got {event:?}"
+        assert_eq!(
+            stop(&mut d),
+            StopEvent::SingleStep { thread },
+            "expected a step stop on the thread that was resumed"
         );
         assert_eq!(function(&mut d), "main");
         assert_eq!(d.stack_trace(64).expect("trace").len() + 2, before);
@@ -132,14 +134,11 @@ fn a_handler_that_leaves_by_siglongjmp_gives_up_its_rendezvous()
         assert!(matches!(stop(&mut d), StopEvent::Breakpoint { .. }));
         assert_eq!(d.breakpoint_hit().expect("handler hit").id, handler);
         d.delete_breakpoint(handler).expect("remove handler breakpoint");
+        let thread = d.selected_thread().expect("a selected thread before the resume");
         d.resume().expect("let the handler siglongjmp out");
-        let event = stop(&mut d);
         assert_eq!(
-            event,
-            StopEvent::Breakpoint {
-                thread: event.thread().expect("thread"),
-                pc
-            },
+            stop(&mut d),
+            StopEvent::Breakpoint { thread, pc },
             "the second raise reaches the original breakpoint"
         );
         assert_eq!(d.breakpoint_info(original).expect("original breakpoint").hit_count, 1);

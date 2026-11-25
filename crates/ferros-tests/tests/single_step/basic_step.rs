@@ -216,17 +216,22 @@ fn detach_after_a_step_leaves_the_process_running()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        // It is still this test's child, so it stays a zombie once it exits by itself.
+        // It is still this test's child: collect its status once it exits by itself, and
+        // require a clean exit (a crash or kill would also leave a zombie).
+        let mut target = target;
         let deadline = Instant::now() + EXIT_TIMEOUT;
-        while !process_state(pid.0).starts_with('Z') {
+        let status = loop {
+            if let Some(status) = target.try_wait().expect("collect the detached process's status") {
+                break status;
+            }
             assert!(
                 Instant::now() < deadline,
                 "the detached process did not run to completion (state {})",
                 process_state(pid.0)
             );
             std::thread::sleep(Duration::from_millis(50));
-        }
-        drop(target);
+        };
+        assert!(status.success(), "the detached process exited with {status}");
     });
 }
 
@@ -251,6 +256,12 @@ fn kill_after_a_step_leaves_no_process()
             } else {
                 assert_eq!(step(&mut d, stepped), StopEvent::SingleStep { thread: stepped });
                 d.kill().expect("kill after a step stop");
+                // Before the drop: `Debuggee::drop` sweeps by tag and would hide a `kill`
+                // that returned `Ok` without killing.
+                assert!(
+                    harness::wait_until_gone(pid, STOP_TIMEOUT),
+                    "kill returned Ok but pid {pid} survived before the drop"
+                );
                 drop(d);
             }
             assert!(

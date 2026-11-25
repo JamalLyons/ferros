@@ -4,7 +4,7 @@
 //! ending stop reporting.
 #![cfg(target_os = "macos")]
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use ferros_core::{Address, BreakpointRequest, FaultKind, ResumeRequest, SessionState, StopEvent, ThreadAction, ThreadId};
@@ -20,13 +20,23 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Iterations passed to `loop_counter`, so it outlives every test (10 ms each).
 const LONG_LOOP: &str = "100000";
 
-/// The tests of this file run one at a time. The port count test measures the whole IPC
-/// space of this process, which another test launching and attaching at the same time
-/// would change.
-fn serial() -> MutexGuard<'static, ()>
+/// Orders the tests of this file around the two that count this process's whole IPC space
+/// (`repeated_stops_do_not_grow_the_debuggers_ports`, `kept_exception_rights_do_not_grow_during_steps`).
+/// Another test launching or attaching at the same time would change those counts, so they
+/// take [`exclusive`]. Every other test only debugs its own fixture and takes [`shared`], so
+/// those run in parallel with each other.
+static IPC_SPACE: RwLock<()> = RwLock::new(());
+
+/// Held by a test whose result does not depend on this process's port counts.
+fn shared() -> RwLockReadGuard<'static, ()>
 {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    IPC_SPACE.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Held by a test that measures this process's port names or send-right references.
+fn exclusive() -> RwLockWriteGuard<'static, ()>
+{
+    IPC_SPACE.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Wait for the next stop and require a breakpoint stop at `address`; returns its thread.
@@ -73,7 +83,7 @@ const SIMULTANEOUS_TRIALS: usize = 20;
 #[test]
 fn simultaneous_breakpoints_on_two_threads_are_both_reported()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run_with_timeout(Duration::from_secs(120), |t| {
         let fixture = fixture!("threads");
         let mut outcomes = Vec::new();
@@ -111,7 +121,7 @@ fn simultaneous_breakpoints_on_two_threads_are_both_reported()
 #[test]
 fn detach_restores_the_exception_ports_from_before_attach()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         // Started outside the debugger, so this is a real attach.
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
@@ -153,7 +163,7 @@ const PORT_TOLERANCE: u64 = 2;
 #[test]
 fn repeated_stops_do_not_grow_the_debuggers_ports()
 {
-    let _serial = serial();
+    let _ipc = exclusive();
     harness::run_with_timeout(Duration::from_secs(120), |t| {
         let fixture = fixture!("loop_counter");
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
@@ -207,7 +217,7 @@ fn repeated_stops_do_not_grow_the_debuggers_ports()
 #[test]
 fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -250,7 +260,7 @@ fn failed_exception_reply_is_reported_by_wait_and_later_stops_still_are()
 #[test]
 fn failed_exception_suspend_is_reported_by_wait_not_as_a_stop()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -303,7 +313,7 @@ fn expect_suspend_failure<E: std::fmt::Display>(result: Result<Option<StopEvent>
 #[test]
 fn deferred_signal_survives_a_failed_exception_suspend()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -345,7 +355,7 @@ fn deferred_signal_survives_a_failed_exception_suspend()
 #[test]
 fn external_kill_ends_a_target_whose_exception_suspend_keeps_failing()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -392,7 +402,7 @@ fn external_kill_ends_a_target_whose_exception_suspend_keeps_failing()
 #[test]
 fn failed_exception_suspend_during_attach_fails_attach_promptly()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -413,7 +423,7 @@ fn failed_exception_suspend_during_attach_fails_attach_promptly()
 #[test]
 fn failed_exception_suspend_during_detach_fails_detach_promptly()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -469,7 +479,7 @@ fn assert_runs(pid: u32)
 #[test]
 fn held_client_sigstop_does_not_satisfy_a_detach_handshake()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -510,7 +520,7 @@ fn held_client_sigstop_does_not_satisfy_a_detach_handshake()
 #[test]
 fn detach_during_a_suspend_retry_still_receives_its_private_stop()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -558,7 +568,7 @@ fn detach_during_a_suspend_retry_still_receives_its_private_stop()
 #[test]
 fn failing_signal_suppression_holds_its_thread_once()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -621,7 +631,7 @@ fn failing_signal_suppression_holds_its_thread_once()
 #[test]
 fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run_with_timeout(Duration::from_secs(60), |t| {
         let fixture = fixture!("loop_counter");
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
@@ -654,7 +664,7 @@ fn external_kill_while_a_breakpoint_stop_is_held_is_reported()
 #[test]
 fn external_kill_after_a_signal_arrives_at_a_breakpoint_is_reported()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP, "--progress"]);
@@ -699,7 +709,7 @@ fn external_kill_after_a_signal_arrives_at_a_breakpoint_is_reported()
 #[test]
 fn ordinary_signals_do_not_release_a_breakpoint_stop()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         for other in "-USR2 -TERM -CONT -STOP".split_whitespace() {
             let fixture = fixture!("loop_counter");
@@ -731,7 +741,7 @@ fn ordinary_signals_do_not_release_a_breakpoint_stop()
 #[test]
 fn kept_exception_rights_do_not_grow_during_steps()
 {
-    let _serial = serial();
+    let _ipc = exclusive();
     harness::run(|t| {
         let control = ControlDir::new();
         let fixture = fixture!("step_races");
@@ -793,7 +803,7 @@ fn kept_exception_rights_do_not_grow_during_steps()
 #[test]
 fn resume_with_signal_from_breakpoint_then_passes_pending_signal()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
@@ -899,7 +909,7 @@ fn give_up_at_a_breakpoint(t: &harness::TestContext) -> (Debuggee, ferros_macos:
 #[test]
 fn failing_exception_suspend_backs_off_then_gives_up_once()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let (mut d, faults, _) = give_up_at_a_breakpoint(t);
         let pid = d.pid();
@@ -941,7 +951,7 @@ fn failing_exception_suspend_backs_off_then_gives_up_once()
 #[test]
 fn interrupt_after_a_suspend_give_up_publishes_the_held_stop()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let (mut d, faults, address) = give_up_at_a_breakpoint(t);
         let attempts = faults.exception_suspend_attempts();
@@ -975,7 +985,7 @@ fn interrupt_after_a_suspend_give_up_publishes_the_held_stop()
 #[test]
 fn failed_thread_freeze_leaves_the_exception_unanswered_until_a_retry_holds_it()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -1036,7 +1046,7 @@ fn failed_thread_freeze_leaves_the_exception_unanswered_until_a_retry_holds_it()
 #[test]
 fn detach_after_a_suspend_give_up_completes_its_handshake()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -1097,7 +1107,7 @@ fn wait_for_detach_stop_hold(faults: &ferros_macos::exception::ReplyFaultInjecto
 #[test]
 fn detach_armed_before_a_suspend_retry_takes_no_fresh_suspend()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -1156,7 +1166,7 @@ fn detach_armed_before_a_suspend_retry_takes_no_fresh_suspend()
 #[test]
 fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let target = t.spawn(&fixture!("loop_counter"), &[LONG_LOOP]);
         let pid = target.pid();
@@ -1208,7 +1218,7 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
 #[test]
 fn exception_queued_just_before_detach_teardown_is_answered()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let mut target = t.spawn(&fixture!("hot_loop"), &[&HOT_THREADS.to_string()]);
         let pid = target.pid();
@@ -1284,7 +1294,7 @@ const BACKOFF_WINDOW_ATTEMPTS: u32 = 3;
 #[test]
 fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("hot_loop");
         let backend = MacOSBackend::new().expect("MacOSBackend::new");
@@ -1370,7 +1380,7 @@ fn exceptions_arriving_during_a_suspend_backoff_do_not_advance_the_retry()
 #[test]
 fn access_fault_continue_is_not_rejected_as_a_signal()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let fixture = fixture!("loop_counter");
         let mut d = t.launch(&fixture);
@@ -1437,7 +1447,7 @@ const SIGUSR1: i32 = 30;
 #[test]
 fn null_store_fault_continue_is_not_rejected_as_a_signal()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--null-store"]);
         d.resume().expect("run into the null store");
@@ -1485,7 +1495,7 @@ fn null_store_fault_continue_is_not_rejected_as_a_signal()
 #[test]
 fn forwarded_soft_signal_runs_its_handler_once()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--handler-once"]);
         let handler = d
@@ -1526,7 +1536,7 @@ fn forwarded_soft_signal_runs_its_handler_once()
 #[test]
 fn software_exception_that_is_not_a_signal_is_continued_with_signal_forwarding()
 {
-    let _serial = serial();
+    let _ipc = shared();
     harness::run(|t| {
         let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--software-exception"]);
         d.resume().expect("run to the exception");

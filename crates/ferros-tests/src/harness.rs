@@ -497,9 +497,15 @@ impl Drop for Spawned
 {
     fn drop(&mut self)
     {
-        kill_debuggee(&self.tag);
-        let _ = self.child.try_wait();
+        // Kill and reap the owned child first. `kill_debuggee` waits for every signalled pid
+        // to leave the process table, and an unreaped child stays there as a zombie until
+        // this handle collects it, so sweeping first always spent the whole `KILL_SETTLE`.
+        // The tag sweep afterwards still catches anything else carrying the tag.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
+        kill_debuggee(&self.tag);
         self.shared.forget(&self.tag);
     }
 }

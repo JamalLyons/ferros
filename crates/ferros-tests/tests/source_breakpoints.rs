@@ -109,12 +109,19 @@ fn file_line_breakpoint_hits_on_every_iteration()
         );
         assert_eq!(site.position.function.as_deref(), Some(qualified(&fixture, "tick").as_str()));
 
-        for iteration in 1..=3 {
+        // The fixture runs `tick` five times: every call stops, and nothing stops after.
+        for iteration in 1..=5 {
             let hit = continue_to_hit(&mut d);
             assert_eq!(hit.id, id);
             assert_eq!(hit.site, site, "iteration {iteration}");
             assert_eq!(d.logical_breakpoints()[0].hit_count, iteration);
         }
+        d.resume().expect("resume after the last hit");
+        let end = d.wait(Some(STOP_TIMEOUT)).expect("wait for exit");
+        assert!(
+            matches!(end, Some(StopEvent::Exited { code: 0 })),
+            "expected a clean exit, got {end:?}"
+        );
     });
 }
 

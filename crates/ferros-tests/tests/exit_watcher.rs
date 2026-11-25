@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use ferros_core::SessionState;
 use ferros_core::backend::{Backend, BackendError};
-use ferros_core::{SessionState, StopEvent};
 use ferros_macos::MacOSBackend;
 use ferros_tests::{fixture, harness};
 
@@ -48,7 +48,8 @@ fn kill_releases_backend_and_session_after_a_watcher_reaping_error()
             d.backend_mut().wait(Some(Duration::ZERO)),
             Err(BackendError::InvalidState(_))
         ));
-        assert_ne!(d.last_stop(), Some(&StopEvent::Killed { signal: 9 }));
+        // Death was not confirmed through the watcher, so no terminal stop may be fabricated.
+        assert_eq!(d.last_stop(), None);
     });
 }
 

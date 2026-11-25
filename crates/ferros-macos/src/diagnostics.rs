@@ -133,7 +133,10 @@ pub fn send_right_count(name: u32) -> Result<u32>
 ///
 /// # Errors
 ///
-/// `DebuggerError` if `task_for_pid` or the read fails.
+/// `DebuggerError` if `task_for_pid` fails, or the read's error from
+/// [`memory::read_memory`](crate::memory::read_memory): `Backend(NotFound)` for unmapped
+/// bytes and `PermissionDenied` for unreadable ones, never the `Io` kinds it returned
+/// before issue #216 (see that function for why there is no `Io` adapter).
 pub fn raw_memory(pid: ProcessId, address: Address, len: usize) -> Result<Vec<u8>>
 {
     let mut task: mach_port_t = MACH_PORT_NULL;

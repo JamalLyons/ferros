@@ -1530,8 +1530,13 @@ mod tests
     }
 
     /// Two adjacent VM pages of this process, aligned to their combined size, whose second
-    /// page is unmapped or made unreadable: one cache page of two VM pages around bytes
-    /// that are readable.
+    /// page is mapped but unreadable (`PROT_NONE`): one cache page of two VM pages around
+    /// bytes that are readable.
+    ///
+    /// The second page is not unmapped: tests run in parallel, and another test's `mmap`
+    /// could take the freed page before this one reads it. A mapped, unreadable page stays
+    /// a hole for the read, and the cache falls back the same way whatever error the page
+    /// read returned.
     struct HalfReadablePair
     {
         base: *mut libc::c_void,
@@ -1540,7 +1545,7 @@ mod tests
 
     impl HalfReadablePair
     {
-        fn new(unmap_second: bool) -> Self
+        fn new() -> Self
         {
             let page = *SYSTEM_PAGE_SIZE;
             // Map four pages so that two of them start on a two-page boundary, then keep
@@ -1570,12 +1575,7 @@ mod tests
                     assert_eq!(libc::munmap(tail as *mut libc::c_void, start + 4 * page - tail), 0);
                 }
                 (base as *mut [u8; 4]).write_volatile([1, 2, 3, 4]);
-                let second = (base + page) as *mut libc::c_void;
-                if unmap_second {
-                    assert_eq!(libc::munmap(second, page), 0);
-                } else {
-                    assert_eq!(libc::mprotect(second, page, libc::PROT_NONE), 0);
-                }
+                assert_eq!(libc::mprotect((base + page) as *mut libc::c_void, page, libc::PROT_NONE), 0);
             }
             Self {
                 base: base as *mut libc::c_void,
@@ -1598,8 +1598,7 @@ mod tests
     {
         fn drop(&mut self)
         {
-            // SAFETY: unmaps the two pages this value kept; unmapping the already unmapped
-            // second page is harmless.
+            // SAFETY: unmaps the two pages this value kept.
             unsafe { libc::munmap(self.base, 2 * self.page) };
         }
     }
@@ -1607,28 +1606,19 @@ mod tests
     #[test]
     fn cache_page_larger_than_a_vm_page_reads_readable_bytes_next_to_a_hole()
     {
-        for unmap_second in [true, false] {
-            let pair = HalfReadablePair::new(unmap_second);
-            let cache = MemoryCache::with_page_size(2 * *SYSTEM_PAGE_SIZE);
-            // Before the fix the whole cache page was read, which fails on the second VM page.
-            let bytes = cache
-                .read(task(), pair.first(), 4)
-                .unwrap_or_else(|err| panic!("unmapped second page: {unmap_second}: {err:?}"));
-            assert_eq!(bytes, [1, 2, 3, 4]);
+        let pair = HalfReadablePair::new();
+        let cache = MemoryCache::with_page_size(2 * *SYSTEM_PAGE_SIZE);
+        // Before the fix the whole cache page was read, which fails on the second VM page.
+        let bytes = cache
+            .read(task(), pair.first(), 4)
+            .unwrap_or_else(|err| panic!("readable bytes next to an unreadable page: {err:?}"));
+        assert_eq!(bytes, [1, 2, 3, 4]);
 
-            // The bytes of the hole itself still fail with their own category.
-            let error = cache.read(task(), pair.second(), 4).expect_err("read of the hole");
-            if unmap_second {
-                assert!(
-                    matches!(error, DebuggerError::Backend(BackendError::NotFound(_))),
-                    "{error:?}"
-                );
-            } else {
-                assert!(matches!(error, DebuggerError::PermissionDenied(_)), "{error:?}");
-            }
-            // And so does a read that runs from readable bytes into it.
-            let last = Address::from(pair.second().value() - 2);
-            assert!(cache.read(task(), last, 4).is_err());
+        // The bytes of the hole itself still fail with their own category, and so does a
+        // read that runs from readable bytes into it.
+        for at in [pair.second(), Address::from(pair.second().value() - 2)] {
+            let error = cache.read(task(), at, 4).expect_err("read of the unreadable page");
+            assert!(matches!(error, DebuggerError::PermissionDenied(_)), "at {at}: {error:?}");
         }
     }
 }

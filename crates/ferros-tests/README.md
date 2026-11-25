@@ -113,7 +113,7 @@ Environment switches:
 - `FERROS_TEST_UNSIGNED=1`: the runner re-signs the test executable without the entitlement, so
   the permission-failure path can be checked on purpose. The next normal run signs it again.
 - `FERROS_TEST_FORCE_FAIL=1`: one harness test launches a fixture and then fails, for a manual
-  leak check (`pgrep -f ferros-fixture-` must print nothing afterwards).
+  leak check (`pgrep -fl ferros-fixture-` must print nothing afterwards).
 
 If a test fails with "task_for_pid was denied", the test executable is not signed with the
 entitlement. Run through `just test-integration` (or sign it with the `codesign` command the

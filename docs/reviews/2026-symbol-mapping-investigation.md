@@ -1,5 +1,7 @@
 # Issue #76 followup F2: symbol-mapping investigation
 
+> Historical record. Resolved in #78; see the fix in ferros-core image mapping.
+
 ## Resolution (issue #78)
 
 **Root cause.** Every Cargo command in a target directory, even one with nothing to rebuild, replaces each uplifted `target/debug/ferros-fixture-*` executable: it removes the file and creates it again (new inode, same mtime and contents). A fixture already running keeps its old, now-unlinked image, but its path is briefly missing. `Session::load_images` read each newly seen image's segment layout from that path with `ImageMapping::parse(..).ok()`. A read during the window failed with `ENOENT`, the error was discarded, and `mapping: None` was cached for the image's lifetime, so `runtime_address` returned `Ok(None)`. That is exactly the reported panic (executable path found, text symbol found, `runtime_address` `None`) and explains why only concurrent `cargo test` load produced it.

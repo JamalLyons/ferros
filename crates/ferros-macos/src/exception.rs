@@ -141,7 +141,7 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
-use ferros_core::backend::{BackendError, BackendResult, StopEvent};
+use ferros_core::backend::{BackendError, BackendResult, FaultKind, StopEvent};
 use ferros_core::types::{Address, Architecture, ProcessId, ThreadId};
 use libc::{c_int, mach_port_t, thread_act_t};
 #[cfg(target_os = "macos")]
@@ -1386,9 +1386,13 @@ pub(crate) fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
 /// - any other `EXC_BREAKPOINT` -> `StopEvent::Breakpoint` with the raw `pc` (not rewound;
 ///   on arm64 it already points at the `brk`, whose codes are `[EXC_ARM_BREAKPOINT, pc]`,
 ///   and the engine maps it with `Arch::pc_after_trap`)
-/// - `EXC_BAD_ACCESS` -> `StopEvent::Signal(SIGSEGV)`
-/// - `EXC_BAD_INSTRUCTION` -> `StopEvent::Signal(SIGILL)`
-/// - `EXC_ARITHMETIC` -> `StopEvent::Signal(SIGFPE)`
+/// - `EXC_BAD_ACCESS` -> `StopEvent::Fault(MemoryAccess)`
+/// - `EXC_BAD_INSTRUCTION` -> `StopEvent::Fault(IllegalInstruction)`
+/// - `EXC_ARITHMETIC` -> `StopEvent::Fault(Arithmetic)`
+///
+///   These are synchronous faults, not held Unix signals: XNU keeps no soft-signal
+///   decision for them, so a resume has no signal to deliver and the thread retries
+///   the faulting instruction.
 /// - `EXC_SOFTWARE/EXC_SOFT_SIGNAL` -> the held Unix signal; other software exceptions -> SIGTRAP
 /// - anything else (or a breakpoint whose pc cannot be read) -> `StopEvent::Other`
 ///
@@ -1401,6 +1405,11 @@ pub(crate) fn stop_event_from_exception(
 ) -> StopEvent
 {
     let signal = |signal| StopEvent::Signal { thread, signal };
+    let fault = |kind, name: &str| StopEvent::Fault {
+        thread,
+        kind,
+        detail: format!("{name}, codes {codes:?}"),
+    };
     match exception as u32 {
         EXC_BREAKPOINT if codes == [EXC_ARM_BREAKPOINT, 0] => StopEvent::SingleStep { thread },
         EXC_BREAKPOINT => match pc {
@@ -1413,9 +1422,9 @@ pub(crate) fn stop_event_from_exception(
                 reason: format!("EXC_BREAKPOINT (pc unreadable), codes {codes:?}"),
             },
         },
-        EXC_BAD_ACCESS => signal(libc::SIGSEGV),
-        EXC_BAD_INSTRUCTION => signal(libc::SIGILL),
-        EXC_ARITHMETIC => signal(libc::SIGFPE),
+        EXC_BAD_ACCESS => fault(FaultKind::MemoryAccess, "EXC_BAD_ACCESS"),
+        EXC_BAD_INSTRUCTION => fault(FaultKind::IllegalInstruction, "EXC_BAD_INSTRUCTION"),
+        EXC_ARITHMETIC => fault(FaultKind::Arithmetic, "EXC_ARITHMETIC"),
         EXC_SOFTWARE if codes[0] == EXC_SOFT_SIGNAL => signal(codes[1] as c_int),
         EXC_SOFTWARE => signal(libc::SIGTRAP),
         other => StopEvent::Other {
@@ -2974,8 +2983,8 @@ mod tests
     #[test]
     fn hardware_fault_is_not_requeued_as_a_unix_signal_during_a_handshake()
     {
-        // A hardware exception may map to Signal for the portable event API, but
-        // only EXC_SOFT_SIGNAL denotes a Unix signal that can be replayed.
+        // A hardware exception maps to Fault for the portable event API; only
+        // EXC_SOFT_SIGNAL denotes a Unix signal that can be replayed.
         // SAFETY: mach_thread_self returns an owned send right for this live thread.
         let thread = unsafe { mach2::mach_init::mach_thread_self() };
         let mut state = ExceptionSharedState::new();
@@ -2987,9 +2996,10 @@ mod tests
                 soft_signal: false,
                 handshake: 0,
             },
-            &StopEvent::Signal {
+            &StopEvent::Fault {
                 thread: ThreadId::from(u64::from(thread)),
-                signal: libc::SIGSEGV,
+                kind: FaultKind::MemoryAccess,
+                detail: "EXC_BAD_ACCESS".into(),
             },
             &mut state,
             std::process::id() as libc::pid_t,
@@ -3165,13 +3175,18 @@ mod tests
     fn other_exceptions_keep_their_mapping()
     {
         let thread = ThreadId::from(THREAD);
-        assert_eq!(
-            event(EXC_BAD_ACCESS, None, [1, 0]),
-            StopEvent::Signal {
-                thread,
-                signal: libc::SIGSEGV
-            }
-        );
+        for (exception, kind) in [
+            (EXC_BAD_ACCESS, FaultKind::MemoryAccess),
+            (EXC_BAD_INSTRUCTION, FaultKind::IllegalInstruction),
+            (EXC_ARITHMETIC, FaultKind::Arithmetic),
+        ] {
+            let stop = event(exception, None, [1, 0]);
+            assert!(
+                matches!(stop, StopEvent::Fault { thread: t, kind: k, .. } if t == thread && k == kind),
+                "exception {exception}: {stop:?}"
+            );
+            assert_eq!(stop.deliverable_signal(), None);
+        }
         assert_eq!(
             event(EXC_SOFTWARE, None, [EXC_SOFT_SIGNAL, i64::from(libc::SIGUSR1)]),
             StopEvent::Signal {

@@ -26,9 +26,13 @@
 //! first byte, the size of its one segment and the number of entries; then each entry as
 //! its kind, address and length followed by that many bytes. An entry is a DWARF section
 //! (kind = its index in [`DWARF_SECTIONS`](super::DWARF_SECTIONS)), `eh_frame`,
-//! `eh_frame_hdr`, `debug_frame`, or an unwind hint for the function at its address. A
-//! file without `.debug_info` has no debug information. Files are always arm64 and
-//! little-endian, and their build id is never checked.
+//! `eh_frame_hdr`, `debug_frame`, an unwind hint for the function at its address, or the
+//! file's build id. A file without `.debug_info` has no debug information: its
+//! `eh_frame`, `eh_frame_hdr` and hints are still returned for unwinding, and its
+//! `debug_frame` is dropped with the DWARF. Files are always arm64 and little-endian. A
+//! file with a build id is another build than a slice that knows a different one, and
+//! opening it for that slice fails; a file without one is never checked and its build id
+//! is unknown.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -38,11 +42,11 @@ use std::sync::Arc;
 use gimli::{RunTimeEndian, SectionId};
 
 use super::{
-    DWARF_SECTIONS, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice, MappedImage,
-    MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
+    DWARF_SECTIONS, DebugSections, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice,
+    MappedImage, MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
 };
 use crate::error::{DebuggerError, Result as EngineResult};
-use crate::types::{Address, Architecture, BuildIdentity};
+use crate::types::{Address, Architecture, BuildId, BuildIdentity};
 
 /// The made-up format of the [module documentation](self).
 #[derive(Debug, Clone, Copy, Default)]
@@ -142,10 +146,21 @@ impl ObjectFormat for MockObjectFormat
         }
     }
 
-    fn open_image(&self, path: &Path, load_address: u64, _slice: Option<&ImageSlice>) -> EngineResult<ImageContents>
+    /// A file whose build id is known and differs from the one `slice` knows is another
+    /// build: [`DebuggerError::InvalidArgument`].
+    fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> EngineResult<ImageContents>
     {
         let bytes = std::fs::read(path)?;
-        MockObjectFile::parse(&bytes, path, load_address)
+        let contents = MockObjectFile::parse(&bytes, path, load_address)?;
+        if let (Some(file), Some(mapped)) = (contents.build_id.known(), slice.and_then(|slice| slice.build_id().known()))
+            && file != mapped
+        {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "{} is another build than the mapped image: the file was replaced",
+                path.display()
+            )));
+        }
+        Ok(contents)
     }
 }
 
@@ -342,6 +357,7 @@ pub struct MockObjectFile
 const EH_FRAME: u64 = 0x100;
 const EH_FRAME_HDR: u64 = 0x101;
 const DEBUG_FRAME: u64 = 0x102;
+const BUILD_ID: u64 = 0x103;
 const HINT_CFI: u64 = 0x200;
 const HINT_LEAF: u64 = 0x201;
 const HINT_FRAME_RECORD: u64 = 0x202;
@@ -416,6 +432,14 @@ impl MockObjectFile
         self
     }
 
+    /// Record `id` as the file's build id. A file without one has an unknown build id.
+    #[must_use]
+    pub fn with_build_id(mut self, id: BuildId) -> Self
+    {
+        self.entries.push((BUILD_ID, 0, id.as_bytes().to_vec()));
+        self
+    }
+
     /// The file's bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8>
@@ -455,6 +479,7 @@ impl MockObjectFile
         let mut dwarf = HashMap::new();
         let (mut eh_frame, mut eh_frame_hdr, mut debug_frame) = (None, None, None);
         let mut hints = Vec::new();
+        let mut build_id = BuildIdentity::Unknown;
         for _ in 0..count {
             let mut next = || -> EngineResult<u64> {
                 let value = bytes
@@ -478,6 +503,7 @@ impl MockObjectFile
                 EH_FRAME => eh_frame = Some(section()),
                 EH_FRAME_HDR => eh_frame_hdr = Some(section()),
                 DEBUG_FRAME => debug_frame = Some(section()),
+                BUILD_ID => build_id = BuildId::new(&data).map(BuildIdentity::Known).ok_or_else(invalid)?,
                 HINT_CFI | HINT_LEAF | HINT_FRAME_RECORD => {
                     let value = value().ok_or_else(invalid)?;
                     let hint = match kind {
@@ -499,22 +525,24 @@ impl MockObjectFile
                 }
             }
         }
-        if !dwarf.contains_key(&SectionId::DebugInfo) {
-            return Err(DebuggerError::NoDebugInfo {
+        let debug = if dwarf.contains_key(&SectionId::DebugInfo) {
+            Ok(DebugSections { dwarf, debug_frame })
+        } else {
+            Err(DebuggerError::NoDebugInfo {
                 path: path.to_path_buf(),
                 detail: "mock object file has no .debug_info".into(),
-            });
-        }
+            })
+        };
         hints.sort_unstable_by_key(|&(start, _)| start);
         Ok(ImageContents {
             architecture: Architecture::Arm64,
             endian: RunTimeEndian::Little,
+            build_id,
             mapping,
-            dwarf,
             eh_frame,
             eh_frame_hdr,
-            debug_frame,
             unwind_hints: (!hints.is_empty()).then(|| Box::new(MockHints(hints)) as Box<dyn UnwindHints>),
+            debug,
         })
     }
 }

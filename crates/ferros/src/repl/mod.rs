@@ -149,7 +149,9 @@ impl Ctx<'_>
     /// Resume the stopped process (or step `step`), wait for the next stop and print it.
     ///
     /// A held `SIGINT` or `SIGTSTP` is not passed back to the program, any other held
-    /// signal is. See [`run_program`](Self::run_program) for Ctrl-C and Ctrl-Z.
+    /// signal is. A fault holds no signal, so continuing after one delivers nothing
+    /// for it (signals still held for other threads are passed on) and the program
+    /// retries the faulting instruction. See [`run_program`](Self::run_program) for Ctrl-C and Ctrl-Z.
     ///
     /// # Errors
     ///

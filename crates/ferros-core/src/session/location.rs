@@ -1,9 +1,9 @@
 //! Breakpoint locations: what a user asks for, and the addresses it resolves to.
 //!
 //! A [`BreakpointLocation`] is a source line, a function name or a raw address. The
-//! session resolves it against the main executable's debug info (the first image the
-//! backend reports, which is where a Rust program's own code and its statically linked
-//! `std` live) into one [`BreakpointSite`] per address:
+//! session resolves it against the main executable's debug info (the image the backend
+//! marks as the main executable, wherever it is listed, which is where a Rust program's own
+//! code and its statically linked `std` live) into one [`BreakpointSite`] per address:
 //!
 //! - `file:line` takes every statement address of the first line at or after `line` that
 //!   has code ([`BinaryImage::line_addresses`]). The line used is reported, so a line with
@@ -12,11 +12,16 @@
 //!   ([`BinaryImage::function_addresses`]), one per generic instantiation.
 //! - An address is used as is.
 //!
+//! A list that marks no image as the main executable resolves no file or function
+//! location: a library is never searched in its place.
+//!
 //! Each site records the [`SourcePosition`] of its address, taken from the address's
 //! symbolication: the frame of the function the address belongs to, not the innermost
 //! line-table row, which can be an inlined `std` function. A stop at the site reports that
 //! same position, so the file a breakpoint resolved to and the file of its stop are always
-//! spelled the same way (normalized as the line index normalizes paths).
+//! spelled the same way (normalized as the line index normalizes paths). A file or
+//! function location reads the image list once: its sites are positioned in the symbol
+//! request that found them, without enumerating the images again per site.
 
 use std::fmt;
 use std::sync::Arc;
@@ -91,7 +96,8 @@ impl Session
     /// line past the file's last line with code, or unreadable debug info; the main
     /// image's symbol-loading error ([`DebuggerError::NoDebugInfo`],
     /// [`DebuggerError::SymbolLoad`], [`DebuggerError::ImageMapping`]); or
-    /// [`DebuggerError::InvalidArgument`] when the process reports no image.
+    /// [`DebuggerError::InvalidArgument`] when the process marks no image as its main
+    /// executable.
     pub(super) fn resolve_location(&mut self, location: &BreakpointLocation) -> Result<Vec<BreakpointSite>>
     {
         let mut sites = match location {
@@ -105,7 +111,7 @@ impl Session
                     .addresses
                     .iter()
                     .map(|&address| {
-                        let position = self.position_at(address, Some((&found.file, found.line)));
+                        let position = self.position_in_request(address, Some((&found.file, found.line)));
                         BreakpointSite { address, position }
                     })
                     .collect()
@@ -123,7 +129,7 @@ impl Session
                     .into_iter()
                     .map(|address| BreakpointSite {
                         address,
-                        position: self.position_at(address, None),
+                        position: self.position_in_request(address, None),
                     })
                     .collect()
             }
@@ -133,7 +139,9 @@ impl Session
         Ok(sites)
     }
 
-    /// The main executable's symbols (the first image the backend reports).
+    /// The main executable's symbols (the image the backend marks as the main executable).
+    /// Refreshes the image list and starts the symbol request that the location's sites
+    /// are then positioned in ([`position_in_request`](Self::position_in_request)).
     fn main_image(&mut self) -> Result<Arc<BinaryImage>>
     {
         self.load_images()?;
@@ -180,13 +188,34 @@ impl Session
                 return SourcePosition::default();
             }
         };
-        match prefer {
-            Some((file, line)) => site_position(&symbolication.frames, file, line),
-            None => symbolication
-                .frames
-                .last()
-                .map_or_else(SourcePosition::default, frame_position),
+        position_from(&symbolication.frames, prefer)
+    }
+
+    /// [`position_at`](Self::position_at) within the current symbol request, over the
+    /// images loaded at its start: no new image enumeration and no new request. An image
+    /// whose load failed earlier in the request is not read again, and the address then
+    /// has an empty position.
+    fn position_in_request(&mut self, address: Address, prefer: Option<(&str, u32)>) -> SourcePosition
+    {
+        if let Err(error) = self.load_symbols_for_address(address) {
+            tracing::debug!("no source position for {address}: {error}");
+            return SourcePosition::default();
         }
+        self.symbols
+            .symbolicate(address)
+            .map_or_else(SourcePosition::default, |symbolication| {
+                position_from(&symbolication.frames, prefer)
+            })
+    }
+}
+
+/// The position of an address whose symbolication is `frames`: see
+/// [`Session::position_at`].
+fn position_from(frames: &[SymbolFrame], prefer: Option<(&str, u32)>) -> SourcePosition
+{
+    match prefer {
+        Some((file, line)) => site_position(frames, file, line),
+        None => frames.last().map_or_else(SourcePosition::default, frame_position),
     }
 }
 

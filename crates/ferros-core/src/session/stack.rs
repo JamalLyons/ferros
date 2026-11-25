@@ -125,23 +125,23 @@ impl Session
         // pass missed. A failed load is not retried within this request, so a bad image
         // is read at most once per trace.
         loop {
-            let frames = {
+            let (frames, lookups) = {
                 let traps = self.trap_originals();
                 let memory = BackendMemory::new(self.backend.as_mut(), traps);
                 StackUnwinder::new(arch, &self.symbols, &memory)
                     .with_runtime(self.runtime.as_ref())
-                    .unwind(thread, &registers, max_frames)?
+                    .unwind_with_lookups(thread, &registers, max_frames)?
             };
             let mut added = false;
-            for frame in &frames {
+            for (frame, &lookup) in frames.iter().zip(&lookups) {
                 added |= self.load_symbols_for_frame(frame.pc);
                 // A caller is symbolicated at its call instruction, which can lie in the
                 // previous image when the call was the image's last instruction.
-                added |= self.load_symbols_for_frame(Address::new(frame.pc.value().saturating_sub(4)));
+                added |= self.load_symbols_for_frame(lookup);
             }
             if !added {
                 let mut frames = frames;
-                self.name_frames_from_symbol_tables(&mut frames);
+                self.name_frames_from_symbol_tables(&mut frames, &lookups);
                 return Ok(frames);
             }
         }
@@ -149,19 +149,17 @@ impl Session
 
     /// Name each physical frame that has no DWARF symbol from its image's symbol table.
     ///
-    /// Such a frame has no inlined frames, so it is the innermost frame exactly when its
-    /// index is zero; any other frame is looked up at its call instruction, as the
-    /// unwinder does.
-    fn name_frames_from_symbol_tables(&mut self, frames: &mut [StackFrame])
+    /// `lookups` holds each frame's lookup address from the unwinder, in the order of
+    /// `frames`: the address the frame's code is found at, which is its call instruction
+    /// for a caller and its pc for a frame no call reached.
+    fn name_frames_from_symbol_tables(&mut self, frames: &mut [StackFrame], lookups: &[Address])
     {
         // Images found by their header in this trace, for code the loader does not list.
         let mut unlisted = UnlistedImages::default();
-        for frame in frames.iter_mut().filter(|frame| frame.symbol.is_none()) {
-            let lookup = if frame.index == 0 {
-                frame.pc
-            } else {
-                Address::new(frame.pc.value().saturating_sub(4))
-            };
+        for (frame, &lookup) in frames.iter_mut().zip(lookups) {
+            if frame.symbol.is_some() {
+                continue;
+            }
             frame.symbol = self
                 .symbol_table_name(lookup)
                 .or_else(|| self.unlisted_symbol_table_name(&mut unlisted, lookup));
@@ -265,14 +263,21 @@ impl Session
         None
     }
 
-    /// Load symbols for a frame's image. A failure leaves the frame without a symbol and
-    /// is logged, since a stack trace still returns raw frames.
+    /// Load a frame's image: its unwind tables, and its source debug information when it
+    /// has any. Returns whether the image was newly loaded, even without debug
+    /// information, since its unwind tables alone can reveal further callers. A failure
+    /// leaves the frame without a symbol and is logged, since a stack trace still returns
+    /// raw frames.
     fn load_symbols_for_frame(&mut self, pc: Address) -> bool
     {
-        self.load_symbols_for_address(pc).unwrap_or_else(|error| {
-            tracing::debug!("stack trace continues without symbols at {pc}: {error}");
+        let loaded = self.load_executable_for_address(pc).unwrap_or_else(|error| {
+            tracing::debug!("stack trace continues without unwind tables at {pc}: {error}");
             false
-        })
+        });
+        if let Err(error) = self.load_symbols_for_address(pc) {
+            tracing::debug!("stack trace continues without source symbols at {pc}: {error}");
+        }
+        loaded
     }
 
     /// Map `address` to function names and source locations.

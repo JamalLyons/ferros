@@ -44,7 +44,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-use ferros_core::backend::LoadedImage;
+use ferros_core::backend::{ImageRole, LoadedImage};
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::types::{Address, BuildId, BuildIdentity, ProcessId};
 use libc::mach_port_t;
@@ -584,6 +584,7 @@ fn dyld_image(task: mach_port_t, bytes: &[u8], images: &[LoadedImage]) -> Option
         path,
         load_address,
         build_id: BuildIdentity::Unknown,
+        role: ImageRole::Library,
     })
 }
 
@@ -617,6 +618,7 @@ fn bootstrap_images(
         path,
         load_address: executable.start,
         build_id: BuildIdentity::Unknown,
+        role: ImageRole::MainExecutable,
     }];
     let dyld = infos.and_then(|infos| dyld_image(task, infos, &images)).or_else(|| {
         readable
@@ -625,6 +627,7 @@ fn bootstrap_images(
                 path: PathBuf::from(DEFAULT_DYLD_PATH),
                 load_address: region.start,
                 build_id: BuildIdentity::Unknown,
+                role: ImageRole::Library,
             })
     });
     images.extend(dyld);
@@ -702,12 +705,19 @@ pub(crate) fn loaded_images_with(
             path,
             load_address: Address::new(load_address),
             build_id: BuildIdentity::Unknown,
+            role: ImageRole::Library,
         });
     }
-    // Preserve the existing main-first contract for callers; dyld's order is not an API.
-    // The main image is found by its header, so this holds after its file is unlinked.
+    // Mark the main image by its `MH_EXECUTE` header, so this holds after its file is
+    // unlinked, and keep the main-first order callers see; dyld's order is not an API.
     if let Some(index) = images.iter().position(|image| is_executable_header(task, image.load_address)) {
+        images[index].role = ImageRole::MainExecutable;
         images.swap(0, index);
+    } else if let Some(first) = images.first_mut() {
+        // No readable `MH_EXECUTE` header at this stop (for example its page was made
+        // unreadable). dyld lists the main executable first, so keep resolving there
+        // rather than report a process with no program.
+        first.role = ImageRole::MainExecutable;
     }
     images.extend(dyld_image(task, &infos, &images));
     // UUID reads run before the stability check, as #170 required: a list that changes
@@ -939,6 +949,7 @@ mod tests
             path: PathBuf::from(path),
             load_address: Address::new(address),
             build_id: BuildIdentity::Unknown,
+            role: ImageRole::Library,
         }
     }
 

@@ -413,19 +413,31 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
     harness::run(|t| {
         let fixture = fixture!("threads");
         let mut d = t.launch(&fixture);
-        let pid = d.pid().0;
         let worker_body = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, worker_body);
-        run_to_trap(&mut d, worker_body);
+        let (stepped, other_hits) = run_to_trap(&mut d, worker_body);
+        let continue_others = ResumeRequest::continue_all().with_thread(stepped, ThreadAction::Suspend);
+        // Both workers call worker_body. The second hit can be deferred until resume,
+        // so collect it with the trap still armed and the first worker suspended.
+        let signalled = match other_hits.as_slice() {
+            [thread] => *thread,
+            [] => {
+                match backend(&mut d).resume(&continue_others) {
+                    Ok(()) | Err(BackendError::StopPending) => {}
+                    Err(err) => panic!("continue to the second worker: {err}"),
+                }
+                match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the second worker") {
+                    Some(StopEvent::Breakpoint { thread, pc }) if pc == worker_body => thread,
+                    other => panic!("expected the second worker's breakpoint, got {other:?}"),
+                }
+            }
+            _ => panic!("expected exactly two workers, got additional hits {other_hits:?}"),
+        };
+        assert_ne!(stepped, signalled, "expected both workers to hit the trap");
         backend(&mut d).write_memory(worker_body, &original).expect("restore");
-        let main = *backend(&mut d).threads().expect("threads").first().expect("main thread");
 
-        // Raised while every thread is stopped, taken by some thread when they run.
-        let status = Command::new("/bin/kill")
-            .args(["-USR1", &pid.to_string()])
-            .status()
-            .expect("run /bin/kill");
-        assert!(status.success());
+        // Queue SIGUSR1 while stopped and keep the other worker at worker_body until its step.
+        diagnostics::send_sigusr1(signalled).expect("send SIGUSR1 to the second worker");
         assert_eq!(
             backend(&mut d)
                 .wait(Some(Duration::from_millis(100)))
@@ -433,21 +445,15 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
             None,
             "a signal sent while stopped was published before resume"
         );
-        backend(&mut d).resume(&ResumeRequest::continue_all()).expect("continue");
-        let signalled = match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the signal") {
-            Some(StopEvent::Signal { thread, signal: SIGUSR1 }) => thread,
-            other => panic!("expected the SIGUSR1 stop, got {other:?}"),
-        };
+        backend(&mut d).resume(&continue_others).expect("resume to the signal");
+        assert_eq!(
+            backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the signal"),
+            Some(StopEvent::Signal {
+                thread: signalled,
+                signal: SIGUSR1,
+            })
+        );
         assert_eq!(backend(&mut d).wait(Some(Duration::ZERO)).expect("drain"), None);
-
-        // Step a worker other than the signalled thread: the main thread waits in join
-        // for the suspended workers, so its step could never complete.
-        let stepped = backend(&mut d)
-            .threads()
-            .expect("threads")
-            .into_iter()
-            .find(|&thread| thread != signalled && thread != main)
-            .expect("a worker other than the signalled thread");
 
         let refused = backend(&mut d).resume(&ResumeRequest::step(stepped).with_signal(signalled, SIGUSR1));
         assert!(

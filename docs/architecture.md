@@ -387,15 +387,22 @@ The logging module in [`crates/ferros-utils/src/logging.rs`](../crates/ferros-ut
 - Multiple output formats (pretty, JSON)
 - Environment variable configuration (`RUST_LOG`, `FERROS_LOG_FORMAT`)
 - File and console logging
-- TUI mode file-only logging (prevents stdout interference)
+- File-only logging for the CLI and the TUI (keeps stdout deterministic)
+
+**The CLI session**: `ferros launch` and `ferros attach` call `start_file_logging`, which opens `YYYY-MM-DD-ferros.log` in `log_directory()` and returns a `LoggingSession`. The session owns the background worker that writes the file; `main` holds it until it returns, so the records written just before exit reach the file. Dropping the session flushes within a bound (about 100 ms to queue the shutdown, then up to about one second to drain); a worker still behind after that is abandoned, so exit never hangs on the log file.
+
+**The log directory**: `log_directory()` is `~/.ferros` when `HOME` is set and not empty, otherwise the OS temporary directory, always made absolute (an empty `TMPDIR` means `/tmp`, a relative one is joined onto the working directory). The logger opens exactly that path, and `ferros find-logs` prints its raw OS bytes, so the printed directory is the one the logger opened.
 
 **Key Functions**:
+- `start_file_logging()`: File-only logging for a CLI session; returns the `LoggingSession` to hold until exit
+- `log_directory()`: The directory every file logger opens (what `ferros find-logs` prints)
 - `init_logging()`: Initialize with environment variables
 - `init_logging_with_level()`: Initialize with explicit level/format
-- `init_logging_for_tui()`: Initialize file-only logging for TUI
-- `init_logging_to_file()`: Initialize file-only logging for a CLI session
+- `init_logging_for_tui()`, `init_logging_to_file()`: File-only logging written synchronously, for callers that cannot hold a session; nothing needs flushing at exit
 
-**Code Reference**: [`crates/ferros-utils/src/logging.rs:152-224`](../crates/ferros-utils/src/logging.rs#L152-L224)
+Every initializer installs the tracing subscriber first and the `log` bridge second; an already installed `log` logger keeps the `log` records and tracing still works.
+
+**Code Reference**: [`crates/ferros-utils/src/logging.rs`](../crates/ferros-utils/src/logging.rs)
 
 ---
 

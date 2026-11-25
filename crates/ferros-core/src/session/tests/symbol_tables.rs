@@ -30,6 +30,7 @@ fn image_at(path: &str, address: u64) -> LoadedImage
         path: format!("/nonexistent/{path}").into(),
         load_address: Address::new(address),
         build_id: crate::types::BuildIdentity::Unknown,
+        role: crate::backend::ImageRole::Library,
     }
 }
 
@@ -198,6 +199,7 @@ fn a_replaced_image_at_the_same_address_is_reread_only_when_its_known_uuid_chang
         path: path.into(),
         load_address: Address::new(IMAGE),
         build_id: uuid.map(BuildId::from).into(),
+        role: crate::backend::ImageRole::Library,
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(IMAGE + 0x1010))
@@ -251,6 +253,7 @@ fn runtime_address_refuses_an_image_whose_known_uuid_differs()
         path: "/nonexistent/ferros-uuid-image".into(),
         load_address: Address::new(0x10_0000),
         build_id: uuid.map(BuildId::from).into(),
+        role: crate::backend::ImageRole::Library,
     };
     let mock = MockBackend::new()
         .with_thread(T1, regs_at(0x10_1010))

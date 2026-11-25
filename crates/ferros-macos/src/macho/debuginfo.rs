@@ -63,7 +63,7 @@ fn has_dwarf(file: &object::File<'_>) -> bool
 // Mach-O's <mach-o/stab.h> defines N_LIB alongside N_OSO.
 const N_LIB: macho::SymbolStab = macho::SymbolStab(0x68);
 
-fn has_debug_map(file: &object::File<'_>) -> bool
+pub(crate) fn has_debug_map(file: &object::File<'_>) -> bool
 {
     fn is_debug_map_entry(entry: &impl Nlist) -> bool
     {
@@ -152,19 +152,43 @@ fn companion(path: &Path, uuid: [u8; 16], architecture: object::Architecture) ->
     matching_slice(&bytes, uuid, architecture).map(<[u8]>::to_vec)
 }
 
-/// Returns the actual bytes containing DWARF; executable metadata stays with the caller.
-pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOptions) -> Result<Vec<u8>>
+/// Identity of the validated executable slice whose companion we are looking for.
+#[derive(Clone, Copy)]
+pub(crate) struct CompanionSearch
 {
-    let file = object::File::parse(executable)
-        .map_err(|error| DebuggerError::InvalidArgument(format!("failed to parse {}: {error}", path.display())))?;
-    if has_dwarf(&file) {
-        return Ok(executable.to_vec());
+    uuid: [u8; 16],
+    architecture: object::Architecture,
+}
+
+impl CompanionSearch
+{
+    /// Embedded DWARF takes precedence over a companion.
+    pub(crate) fn for_executable(path: &Path, file: &object::File<'_>) -> Result<Option<Self>>
+    {
+        if has_dwarf(file) {
+            return Ok(None);
+        }
+        let uuid = file
+            .mach_uuid()
+            .map_err(|error| no_debug_info(path, format!("cannot read executable UUID: {error}")))?
+            .ok_or_else(|| no_debug_info(path, "executable has no Mach-O UUID for companion lookup"))?;
+        Ok(Some(Self {
+            uuid,
+            architecture: file.architecture(),
+        }))
     }
-    let uuid = file
-        .mach_uuid()
-        .map_err(|error| no_debug_info(path, format!("cannot read executable UUID: {error}")))?
-        .ok_or_else(|| no_debug_info(path, "executable has no Mach-O UUID for companion lookup"))?;
-    let architecture = file.architecture();
+}
+
+/// Find the matching companion. The executable's debug map is needed only to
+/// decide whether generation is possible after both companion lookups miss.
+pub(crate) fn discover_companion(
+    path: &Path,
+    search: CompanionSearch,
+    options: &DebugInfoOptions,
+    has_map: impl FnOnce() -> bool,
+) -> Result<Vec<u8>>
+{
+    let CompanionSearch { uuid, architecture } = search;
 
     if let Ok(entries) = fs::read_dir(dwarf_directory(path)) {
         // UUID and architecture, not the DWARF member's name, establish identity.
@@ -180,7 +204,7 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
     if let Some(bytes) = companion(&cache_path, uuid, architecture) {
         return Ok(bytes);
     }
-    if !has_debug_map(&file) {
+    if !has_map() {
         return Err(no_debug_info(path, "executable slice has no debug map for dsymutil"));
     }
     let tool = options
@@ -247,7 +271,7 @@ pub(crate) fn discover(path: &Path, executable: &[u8], options: &DebugInfoOption
     Ok(bytes)
 }
 
-/// The files [`discover`] and the image parse read for the image at `path`, in a stable
+/// The files [`discover_companion`] and the image parse read for the image at `path`, in a stable
 /// order: the image, its `.dSYM` bundle's DWARF directory and members, and the debug
 /// cache directory.
 pub(crate) fn load_inputs(path: &Path, options: &DebugInfoOptions) -> Vec<PathBuf>
@@ -373,6 +397,15 @@ mod tests
             cache_directory: root.join("cache"),
             dsymutil: None,
             tool_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn discover(path: &Path, executable: &[u8], options: &DebugInfoOptions) -> Result<Vec<u8>>
+    {
+        let file = object::File::parse(executable).unwrap();
+        match CompanionSearch::for_executable(path, &file)? {
+            None => Ok(executable.to_vec()),
+            Some(search) => discover_companion(path, search, options, || has_debug_map(&file)),
         }
     }
 

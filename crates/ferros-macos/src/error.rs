@@ -161,12 +161,44 @@ impl From<MachError> for ferros_core::DebuggerError
     }
 }
 
+/// Classify a failed VM read while its `kern_return_t` and address are still known.
+///
+/// - `KERN_INVALID_ADDRESS` (the range is not mapped) -> [`BackendError::NotFound`]
+/// - `KERN_PROTECTION_FAILURE` (mapped but not readable) -> [`BackendError::PermissionDenied`]
+/// - any other code -> [`BackendError::Os`] with that code, the operation, and the address
+///
+/// The code is never formatted into text first, so a caller sees the same category
+/// whichever read path (cached or uncached) met the failure.
+///
+/// [`BackendError::NotFound`]: ferros_core::BackendError::NotFound
+/// [`BackendError::PermissionDenied`]: ferros_core::BackendError::PermissionDenied
+/// [`BackendError::Os`]: ferros_core::BackendError::Os
+pub(crate) fn vm_read_error(
+    operation: &'static str,
+    at: ferros_core::Address,
+    code: libc::kern_return_t,
+) -> ferros_core::BackendError
+{
+    use ferros_core::BackendError;
+
+    match code {
+        libc::KERN_INVALID_ADDRESS => BackendError::NotFound(format!("{operation}: address {at} is not mapped")),
+        libc::KERN_PROTECTION_FAILURE => {
+            BackendError::PermissionDenied(format!("{operation}: memory at {at} is not readable"))
+        }
+        _ => BackendError::Os {
+            code: i64::from(code),
+            message: format!("{operation} at {at}: {}", MachError::from(code)),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
-    use ferros_core::DebuggerError;
+    use ferros_core::{Address, BackendError, DebuggerError};
 
-    use super::MachError;
+    use super::{MachError, vm_read_error};
 
     #[test]
     fn protection_failure_maps_to_permission_denied()
@@ -214,6 +246,40 @@ mod tests
             DebuggerError::Os { code, message } => {
                 assert_eq!(code, i64::from(kr));
                 assert_eq!(message, MachError::Unknown(kr).to_string());
+            }
+            other => panic!("expected Os, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_read_of_an_unmapped_address_is_not_found()
+    {
+        let err = vm_read_error("mach_vm_read_overwrite", Address::from(0x10u64), libc::KERN_INVALID_ADDRESS);
+        assert!(
+            matches!(err, BackendError::NotFound(ref m) if m.contains("0x0000000000000010")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn vm_read_of_a_protected_address_is_permission_denied()
+    {
+        let err = vm_read_error(
+            "mach_vm_read_overwrite",
+            Address::from(0x10u64),
+            libc::KERN_PROTECTION_FAILURE,
+        );
+        assert!(matches!(err, BackendError::PermissionDenied(_)), "{err:?}");
+    }
+
+    #[test]
+    fn vm_read_of_another_failure_keeps_the_code_and_address()
+    {
+        let err = vm_read_error("mach_vm_read_overwrite", Address::from(0x10u64), libc::KERN_MEMORY_ERROR);
+        match err {
+            BackendError::Os { code, message } => {
+                assert_eq!(code, i64::from(libc::KERN_MEMORY_ERROR));
+                assert!(message.contains("0x0000000000000010"), "{message}");
             }
             other => panic!("expected Os, got {other:?}"),
         }

@@ -33,11 +33,33 @@ fn main() {
 }
 ```
 
+### File logging for a session
+
+The `ferros` CLI logs to a file only, never to the terminal:
+
+```rust
+use ferros_utils::{LogFormat, start_file_logging};
+
+fn main() {
+    // Hold the session until `main` returns: it owns the background worker that
+    // writes the file, and dropping it flushes the records written just before exit.
+    let _logging = start_file_logging(None, LogFormat::Pretty).ok();
+    tracing::info!("Application started");
+}
+```
+
+- The file is `YYYY-MM-DD-ferros.log` in `log_directory()`.
+- `log_directory()` is `~/.ferros` when `HOME` is set and not empty, otherwise the OS temporary directory. It is always absolute: an empty `TMPDIR` means `/tmp`, and a relative one is joined onto the working directory. `ferros find-logs` prints this path's raw bytes.
+- The flush on drop is bounded (about 100 ms to queue the shutdown, then up to about one second to drain). A worker still behind after that, for example behind a blocked file, is abandoned with its remaining records, so exit never hangs.
+- `init_logging_to_file` and `init_logging_for_tui` write the same kind of file synchronously, for callers that cannot hold a `LoggingSession`; nothing needs flushing at exit.
+- Each initializer installs the tracing subscriber, then forwards `log` records to it. If another `log` logger is already installed, that logger keeps the `log` records and tracing still works.
+
 ### Environment Variables
 
 - `RUST_LOG`: Set log level filter (e.g., `debug`, `ferros_core=debug,ferros=info`)
 - `FERROS_LOG_FORMAT`: Set output format (`json` or `pretty`, default: `pretty`)
-- `FERROS_LOG_FILE`: Optional path to log file (if not set, logs only to console)
+- `FERROS_LOG_FILE`: Optional path to log file for `init_logging` (if not set, logs only to console)
+- `FERROS_TEST_LOG_WRITE_DELAY_MS`: Test-only. Slows each write of the `start_file_logging` worker, so the exit tests can prove the last record is still queued when `main` returns.
 
 ### Examples
 
@@ -63,7 +85,7 @@ init_logging_with_level(LogLevel::Info, LogFormat::Json)
 - Structured logging with spans and fields
 - Environment variable configuration
 - Multiple output formats (pretty/JSON)
-- File logging to a path chosen at initialization (`FERROS_LOG_FILE`, or a dated file under `~/.ferros` from `init_logging_to_file`)
+- File logging to a path chosen at initialization (`FERROS_LOG_FILE`, or a dated file in `log_directory()` from `start_file_logging`, `init_logging_to_file`, or `init_logging_for_tui`)
 
 ## License
 

@@ -287,6 +287,7 @@ impl MultiSiteImage
                 path: path.clone(),
                 load_address: IMAGE_BASE,
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         (Self(path), mock)
     }
@@ -1081,6 +1082,52 @@ fn signal_of_a_refused_resume_is_passed_by_the_next_resume_with_signal()
     assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
 }
 
+/// A fault holds no signal: a forwarding continue after a fault on one thread passes
+/// only the signal still held for its peer, and a fault the thread raises again (the
+/// instruction is retried) is reported again without any signal (#219).
+#[test]
+fn forwarding_continue_after_a_fault_passes_only_the_peers_signal()
+{
+    use ferros_core::FaultKind;
+
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers())
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let held = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 30,
+    };
+    let fault = StopEvent::Fault {
+        thread: THREAD,
+        kind: FaultKind::MemoryAccess,
+        detail: "scripted".into(),
+    };
+    assert_eq!(fault.deliverable_signal(), None);
+    mock.script(MockStop::new(held.clone()).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("run to the signal");
+    assert_eq!(session.wait(None).expect("wait"), Some(held));
+    // The peer's signal is carried: the fault races the forwarding resume.
+    mock.stop_before_next_resume(std::iter::once(MockStop::new(fault.clone())));
+    session.resume_with_signal().expect("a fault raced the resume");
+    assert_eq!(session.wait(None).expect("wait"), Some(fault.clone()));
+    let _ = mock.take_calls();
+
+    mock.script(MockStop::new(fault.clone()));
+    session.resume_with_signal().expect("continue after the fault");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 30)]
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(fault));
+
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    session.resume_with_signal().expect("continue after the repeated fault");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
 /// #150 review: a source step's final continue (which passes no signal) refused for a
 /// late stop keeps a signal already carried for a suspended thread, from an earlier
 /// step-over that another stop cut short; the next `resume_with_signal` passes it.
@@ -1235,15 +1282,15 @@ fn refused_step_over_keeps_a_stopped_handlers_rendezvous()
 }
 
 /// #150 review: an instruction step that fails to start ran nothing, so the stepping
-/// thread's carried signal is still held and the next `resume_with_signal` passes it.
+/// thread's carried signal is still held, as is a peer's, and the next
+/// `resume_with_signal` passes both.
 #[test]
 fn failed_step_instruction_keeps_the_threads_carried_signal()
 {
-    let mock = MockBackend::new().with_thread(THREAD, arm64_registers()).with_region(
-        Address::new(0x1_0000_0000),
-        "r-x",
-        vec![0x1F; 64],
-    );
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers())
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
     let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let signal = StopEvent::Signal {
@@ -1254,10 +1301,14 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
     session.resume().expect("run to the signal");
     assert_eq!(session.wait(None).expect("wait"), Some(signal));
     // The signal is carried: a late stop refuses the resume that would pass it.
-    let late = StopEvent::Interrupted { thread: Some(THREAD) };
+    let late = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 6,
+    };
     mock.stop_before_next_resume(std::iter::once(MockStop::new(late.clone())));
     session.resume_with_signal().expect("a stop raced the resume");
     assert_eq!(session.wait(None).expect("wait"), Some(late));
+    let _ = mock.take_calls();
 
     mock.fail_next(
         MockCallKind::Resume,
@@ -1266,13 +1317,23 @@ fn failed_step_instruction_keeps_the_threads_carried_signal()
             message: "step failed".into(),
         },
     );
-    assert!(session.step_instruction(THREAD).is_err());
+    assert!(matches!(
+        session.step_instruction(THREAD),
+        Err(ferros_core::DebuggerError::Backend(BackendError::Os { code: 5, .. }))
+    ));
     assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
 
-    let _ = mock.take_calls();
     mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
-    session.resume_with_signal().expect("pass the carried signal");
-    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all().with_signal(THREAD, 30)]);
+    session.resume_with_signal().expect("pass both carried signals");
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all()
+                .with_signal(THREAD, 30)
+                .with_signal(SIGNAL_THREAD, 6)
+        ]
+    );
 }
 
 /// The thread whose signal handler stops in the `handler_stopped_*` tests.
@@ -2309,6 +2370,7 @@ fn handler_stopped_with_long_jump() -> MockBackend
             path: format!("/usr/lib/{EXIT_IMAGE}").into(),
             load_address: LONG_JUMP_IMAGE,
             build_id: ferros_core::types::BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::Library,
         })
 }
 
@@ -2780,6 +2842,7 @@ fn step_out_arms_the_replacement_exit_images_entry()
         path: format!("/usr/lib/{EXIT_IMAGE}").into(),
         load_address: Address::new(BASE),
         build_id: uuid.map(ferros_core::types::BuildId::from).into(),
+        role: ferros_core::backend::ImageRole::Library,
     };
     let mock = returning_to_breakpoint()
         .with_region(Address::new(BASE), "r-x", image)
@@ -2895,6 +2958,7 @@ fn build_image(build_id: ferros_core::BuildIdentity) -> ferros_core::backend::Lo
         path: "/nonexistent/ferros-build-id-image".into(),
         load_address: Address::new(BUILD_IMAGE),
         build_id,
+        role: ferros_core::backend::ImageRole::MainExecutable,
     }
 }
 
@@ -3039,6 +3103,7 @@ fn a_frame_is_named_through_the_injected_object_format()
                 path: "/nonexistent/ferros-mock-format-image".into(),
                 load_address: Address::new(BASE),
                 build_id: ferros_core::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(Box::new(mock), format);
         session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
@@ -3085,6 +3150,7 @@ fn step_out_traps_the_exit_entries_the_runtime_names()
                 path: format!("/usr/lib/{EXIT_IMAGE}").into(),
                 load_address: Address::new(BASE),
                 build_id: ferros_core::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::Library,
             })
     };
     let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
@@ -3180,4 +3246,865 @@ fn a_backtrace_restores_the_frame_the_runtimes_signal_trampoline_interrupted()
     let unaware = pcs(None);
     assert_eq!(unaware, [CODE, TRAMPOLINE + 0x44, CODE + 0xaa0, CODE + 0x200]);
     assert!(!unaware.contains(&INTERRUPTED_PC), "{unaware:x?}");
+}
+
+const SIGNAL_THREAD: ThreadId = ThreadId(2);
+
+/// Leave the second signal stop deferred so the first signal must be carried.
+fn defer_simultaneous_signal_stops() -> (MockBackend, Session, StopEvent)
+{
+    let mut registers = arm64_registers();
+    registers.pc = BREAKPOINT;
+    let mut peer_registers = registers.clone();
+    peer_registers.pc = BREAKPOINT + 4;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_thread(SIGNAL_THREAD, peer_registers)
+        .with_region(Address::new(0x1_0000_0000), "r-x", vec![0x1F; 64]);
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let first = StopEvent::Signal {
+        thread: THREAD,
+        signal: 5,
+    };
+    let second = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 6,
+    };
+    mock.script_simultaneous(vec![MockStop::new(first.clone()), MockStop::new(second.clone())]);
+    session.resume().expect("run to both signal stops");
+    assert_eq!(session.wait(None).expect("wait"), Some(first));
+    let _ = mock.take_calls();
+    session.resume_with_signal().expect("defer for the second signal");
+    assert_eq!(resumes(&mock), Vec::<ResumeRequest>::new());
+    (mock, session, second)
+}
+
+#[test]
+fn pre_start_failure_still_delivers_both_held_signals()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    mock.fail_next(MockCallKind::Wait, BackendError::Unsupported("drain failed".into()));
+    assert!(matches!(
+        session.resume_with_signal(),
+        Err(ferros_core::DebuggerError::Backend(BackendError::Unsupported(message))) if message == "drain failed"
+    ));
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(
+        resumes(&mock),
+        Vec::<ResumeRequest>::new(),
+        "the failed drain attempted no resume"
+    );
+
+    let next = StopEvent::Interrupted { thread: None };
+    mock.script(MockStop::new(next.clone()));
+    session.resume_with_signal().expect("retry with both held signals");
+    let both = ResumeRequest::continue_all()
+        .with_signal(THREAD, 5)
+        .with_signal(SIGNAL_THREAD, 6);
+    assert_eq!(resumes(&mock), vec![both]);
+    assert_eq!(session.wait(None).expect("wait"), Some(next));
+    session.resume_with_signal().expect("continue after delivery");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+#[test]
+fn invalid_second_resume_keeps_held_signals_during_a_deferred_stop()
+{
+    for invalid_resume in [Session::resume, Session::resume_with_signal] {
+        let (mock, mut session, second) = defer_simultaneous_signal_stops();
+        assert!(matches!(
+            invalid_resume(&mut session),
+            Err(ferros_core::DebuggerError::NotStopped)
+        ));
+        assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+        session.resume_with_signal().expect("deliver both held signals");
+        let both = ResumeRequest::continue_all()
+            .with_signal(THREAD, 5)
+            .with_signal(SIGNAL_THREAD, 6);
+        assert_eq!(resumes(&mock), vec![both]);
+    }
+}
+
+#[test]
+fn failed_plain_resume_drops_held_signals()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second.clone()));
+    mock.fail_next(MockCallKind::Resume, BackendError::Unsupported("resume failed".into()));
+    assert!(session.resume().is_err());
+    assert_eq!(session.last_stop(), Some(&second));
+    assert_eq!(mock.state(), MockState::Stopped);
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+
+    session.resume_with_signal().expect("continue after suppression");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+#[test]
+fn source_step_register_failure_still_delivers_the_signal()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .select_thread(THREAD)
+        .expect("select the thread with the carried signal");
+    mock.fail_next(
+        MockCallKind::ReadRegisters,
+        BackendError::Unsupported("register read failed".into()),
+    );
+    assert!(session.step_over().is_err());
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(resumes(&mock), Vec::<ResumeRequest>::new());
+
+    session.resume_with_signal().expect("deliver both held signals");
+    let both = ResumeRequest::continue_all()
+        .with_signal(THREAD, 5)
+        .with_signal(SIGNAL_THREAD, 6);
+    assert_eq!(resumes(&mock), vec![both]);
+}
+
+#[test]
+fn failed_final_continue_retries_only_the_signal_for_the_suspended_thread()
+{
+    use ferros_core::BreakpointRequest;
+    use ferros_core::backend::ThreadAction;
+
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at the first thread's pc");
+    session.resume_with_signal().expect("start the first thread's handler");
+    let handler = ResumeRequest::all(ThreadAction::Suspend)
+        .with_thread(THREAD, ThreadAction::Continue)
+        .with_signal(THREAD, 5);
+    assert_eq!(resumes(&mock), vec![handler]);
+
+    mock.script(MockStop::new(StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: BREAKPOINT,
+    }));
+    assert_eq!(session.wait(Some(Duration::ZERO)).expect("wait for the handler return"), None);
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
+    mock.script(MockStop::new(StopEvent::SingleStep { thread: THREAD }).set_pc(THREAD, BREAKPOINT + 4));
+    mock.fail_next(
+        MockCallKind::Resume,
+        BackendError::Unsupported("final continue failed".into()),
+    );
+    assert!(session.wait(None).is_err());
+    assert_eq!(session.state(), SessionState::Stopped);
+    let peer_only = ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6);
+    assert_eq!(resumes(&mock).as_slice(), std::slice::from_ref(&peer_only));
+
+    session.resume_with_signal().expect("retry the final continue");
+    assert_eq!(resumes(&mock), vec![peer_only]);
+}
+
+#[test]
+fn deferred_plain_resume_suppresses_signals_when_the_handler_continue_runs()
+{
+    let mock = handler_stopped_process();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session
+        .launch(&LaunchSpec::new("scripted-deferred-suppression"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+    let signal = StopEvent::Signal {
+        thread: THREAD,
+        signal: 31,
+    };
+    mock.script_simultaneous(vec![MockStop::new(signal.clone()), handler_return(&registers)]);
+    session.resume_with_signal().expect("let the handler return");
+    assert_eq!(session.wait(None).expect("wait"), Some(signal));
+    let _ = mock.take_calls();
+
+    session.resume().expect("defer for the queued handler return");
+    assert_eq!(resumes(&mock), Vec::<ResumeRequest>::new());
+    let next = StopEvent::Interrupted { thread: None };
+    mock.script(handler_step_off());
+    mock.script(MockStop::new(next.clone()).expect_resume(ResumeRequest::continue_all()));
+    assert_eq!(session.wait(None).expect("wait"), Some(next));
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::step(HANDLER), ResumeRequest::continue_all()]
+    );
+
+    session.resume_with_signal().expect("continue after suppression");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+/// Stop on the first signal, leaving the second queued in the backend.
+fn queued_signal_stops() -> (MockBackend, Session, StopEvent)
+{
+    let mock = MockBackend::new()
+        .with_thread(THREAD, arm64_registers())
+        .with_thread(SIGNAL_THREAD, arm64_registers());
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let first = StopEvent::Signal {
+        thread: THREAD,
+        signal: 5,
+    };
+    let second = StopEvent::Signal {
+        thread: SIGNAL_THREAD,
+        signal: 6,
+    };
+    mock.script_simultaneous(vec![MockStop::new(first.clone()), MockStop::new(second.clone())]);
+    session.resume().expect("run to both signal stops");
+    assert_eq!(session.wait(None).expect("wait"), Some(first));
+    let _ = mock.take_calls();
+    (mock, session, second)
+}
+
+#[test]
+fn deferred_plain_resume_drops_the_reported_signal()
+{
+    let (mock, mut session, second) = queued_signal_stops();
+    session.resume().expect("defer for the second signal");
+    assert!(resumes(&mock).is_empty(), "the deferred resume ran nothing");
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+    session.resume_with_signal().expect("deliver the second signal");
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::continue_all().with_signal(SIGNAL_THREAD, 6)]
+    );
+}
+
+#[test]
+fn plain_resume_drops_the_suspended_peers_signal_before_step_over()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at the first thread's pc");
+    let interrupted = StopEvent::Interrupted { thread: Some(THREAD) };
+    mock.script(
+        MockStop::new(interrupted.clone())
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    session.resume().expect("start the step-over");
+    assert_eq!(session.wait(None).expect("wait"), Some(interrupted));
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(THREAD)]);
+
+    session.resume_with_signal().expect("continue after suppression");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+/// A step deferred by a queued stop ran nothing, so the selected thread's signal is
+/// still held, like a peer's (#150): a step drops it only once the step starts.
+#[test]
+fn deferred_steps_keep_the_selected_threads_signal()
+{
+    let steps: [fn(&mut Session) -> ferros_core::Result<()>; 4] = [
+        |session| session.step_instruction(THREAD),
+        Session::step_over,
+        Session::step_into,
+        Session::step_out,
+    ];
+    for step in steps {
+        let (mock, mut session, second) = queued_signal_stops();
+        step(&mut session).expect("defer the step for the second signal");
+        assert!(resumes(&mock).is_empty(), "the deferred step ran nothing");
+        assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+        session.resume_with_signal().expect("deliver both held signals");
+        assert_eq!(
+            resumes(&mock),
+            vec![
+                ResumeRequest::continue_all()
+                    .with_signal(THREAD, 5)
+                    .with_signal(SIGNAL_THREAD, 6)
+            ]
+        );
+    }
+}
+
+#[test]
+fn forwarding_discards_the_signal_of_a_departed_thread()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+    session
+        .add_breakpoint(ferros_core::BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint at the first thread's pc");
+    let stop = StopEvent::Interrupted { thread: Some(THREAD) };
+    mock.script(
+        MockStop::new(stop.clone())
+            .set_pc(THREAD, BREAKPOINT + 4)
+            .remove_thread(SIGNAL_THREAD),
+    );
+    session.resume_with_signal().expect("start the first thread's handler");
+    assert_eq!(session.wait(None).expect("wait"), Some(stop));
+    let _ = mock.take_calls();
+
+    session.resume_with_signal().expect("continue the surviving thread");
+    assert_eq!(resumes(&mock), vec![ResumeRequest::continue_all()]);
+}
+
+#[test]
+fn thread_listing_failure_keeps_held_signals()
+{
+    let (mock, mut session, second) = defer_simultaneous_signal_stops();
+    mock.fail_next(
+        MockCallKind::Threads,
+        BackendError::Unsupported("thread listing failed".into()),
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(second));
+
+    session.resume_with_signal().expect("deliver both held signals");
+    assert_eq!(
+        resumes(&mock),
+        vec![
+            ResumeRequest::continue_all()
+                .with_signal(THREAD, 5)
+                .with_signal(SIGNAL_THREAD, 6)
+        ]
+    );
+}
+
+/// A synthetic image in the neutral `MockObjectFormat` mapped at `base` (no slide), whose
+/// DWARF holds one four-byte subprogram per `(name, address)`. Returns the file to remove
+/// and the mapped bytes.
+fn named_functions_image(prefix: &str, base: Address, functions: &[(&str, Address)]) -> (std::path::PathBuf, Vec<u8>)
+{
+    use ferros_core::objfile::SectionId;
+    use ferros_core::objfile::mock::MockObjectFile;
+
+    let (mut image, path) = ferros_tests::scratch::create_file(prefix, "");
+    // DWARF 4, as in `MultiSiteImage`: subprograms with name, low_pc and a data4 high_pc.
+    let abbrev = vec![1, 0x11, 1, 0, 0, 2, 0x2e, 0, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 0];
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&[4, 0, 0, 0, 0, 0, 8, 1]);
+    for (name, address) in functions {
+        info.push(2);
+        info.extend_from_slice(name.as_bytes());
+        info.push(0);
+        info.extend_from_slice(&address.value().to_le_bytes());
+        info.extend_from_slice(&4_u32.to_le_bytes());
+    }
+    info.push(0);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    let file = MockObjectFile::new(base.value(), 0x2000)
+        .with_dwarf(SectionId::DebugInfo, &info)
+        .with_dwarf(SectionId::DebugAbbrev, &abbrev)
+        .with_dwarf(SectionId::DebugLine, &[0]);
+    std::io::Write::write_all(&mut image, &file.to_bytes()).expect("write synthetic image");
+    drop(image);
+    let mut bytes = MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(base.value(), 0x2000)
+        .header_bytes();
+    bytes.resize(0x2000, 0x1F);
+    (path, bytes)
+}
+
+/// Files removed when a test ends, pass or fail.
+struct RemoveOnDrop(Vec<std::path::PathBuf>);
+
+impl Drop for RemoveOnDrop
+{
+    fn drop(&mut self)
+    {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[test]
+fn library_listed_first_is_not_the_breakpoint_target()
+{
+    // Issue #220: the loader lists a library ahead of the program. File and function
+    // breakpoints resolve in the image the backend marks as the main executable, wherever
+    // it is listed, and a list that marks none does not fall back to a library.
+    use ferros_core::DebuggerError;
+    use ferros_core::backend::{ImageRole, LoadedImage};
+
+    const LIBRARY: Address = Address::new(0x2_0000_0000);
+    const EXECUTABLE: Address = Address::new(0x3_0000_0000);
+    let (library_path, library) = named_functions_image("ferros-mock-library", LIBRARY, &[("lib_only", LIBRARY + 0x1000)]);
+    let (executable_path, executable) =
+        named_functions_image("ferros-mock-executable", EXECUTABLE, &[("main_only", EXECUTABLE + 0x1000)]);
+    let _files = RemoveOnDrop(vec![library_path.clone(), executable_path.clone()]);
+    let listed = |path: &std::path::Path, load_address: Address, role: ImageRole| LoadedImage {
+        path: path.to_path_buf(),
+        load_address,
+        build_id: ferros_core::types::BuildIdentity::Unknown,
+        role,
+    };
+    let mut registers = arm64_registers();
+    registers.pc = EXECUTABLE + 0x1000;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(LIBRARY, "r-x", library)
+        .with_region(EXECUTABLE, "r-x", executable)
+        .with_image(listed(&library_path, LIBRARY, ImageRole::Library))
+        .with_image(listed(&executable_path, EXECUTABLE, ImageRole::MainExecutable));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    let id = session
+        .set_breakpoint(BreakpointLocation::Function("main_only".into()))
+        .expect("main_only resolves in the executable listed second");
+    let sites = &session
+        .logical_breakpoints()
+        .iter()
+        .find(|breakpoint| breakpoint.id == id)
+        .expect("the logical breakpoint")
+        .sites;
+    assert_eq!(sites.len(), 1);
+    let address = sites[0].address;
+    assert!(
+        (EXECUTABLE.value()..EXECUTABLE.value() + 0x2000).contains(&address.value()),
+        "site {address} is outside the executable's mapping"
+    );
+
+    // Libraries only: the library's own function is not a site, and the error is the
+    // existing unresolved one.
+    mock.set_images(vec![
+        listed(&library_path, LIBRARY, ImageRole::Library),
+        listed(&executable_path, EXECUTABLE, ImageRole::Library),
+    ]);
+    let locations = vec![
+        BreakpointLocation::Function("lib_only".into()),
+        BreakpointLocation::Function("main_only".into()),
+        BreakpointLocation::Line {
+            file: "main.rs".into(),
+            line: 1,
+        },
+    ];
+    for location in locations {
+        match session.set_breakpoint(location.clone()) {
+            Err(DebuggerError::InvalidArgument(_)) => {}
+            other => panic!("{location} with no main executable: expected InvalidArgument, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_multi_site_breakpoint_enumerates_images_once()
+{
+    // Issue #220: resolving a location and naming each of its sites share one refreshed
+    // image list, so N sites cost one loader enumeration, not N + 1.
+    let (_image, mock) = MultiSiteImage::new();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let _ = mock.take_calls();
+    let id = session
+        .set_breakpoint(BreakpointLocation::Function("multi".into()))
+        .expect("multi-site breakpoint");
+    let breakpoint = session
+        .logical_breakpoints()
+        .iter()
+        .find(|breakpoint| breakpoint.id == id)
+        .expect("the logical breakpoint");
+    let sites = breakpoint.sites.clone();
+    assert_eq!(sites.len(), 2);
+    let enumerations = mock
+        .take_calls()
+        .iter()
+        .filter(|call| matches!(call, MockCall::Images))
+        .count();
+    assert_eq!(enumerations, 1, "one image enumeration for two sites");
+    // Positioning a site within the resolving request reports what a separate lookup does.
+    for site in sites {
+        assert_eq!(session.source_position(site.address).expect("source position"), site.position);
+    }
+}
+
+/// #214: a signal that lands on a function's first instruction is named for that function.
+/// The interrupted frame is not at a return address, so symbol-table naming looks up its
+/// pc itself; a pc four bytes into the previous function would name the wrong one. An
+/// ordinary caller whose return address is the same address is named from its call
+/// instruction, which is the previous function's last.
+#[test]
+fn signal_at_function_entry_is_not_named_as_the_previous_function()
+{
+    use ferros_core::backend::{ImageRole, LoadedImage};
+    use ferros_core::types::SymbolSource;
+
+    const BASE: u64 = 0x5_0000_0000;
+    const TRAMPOLINE: u64 = 0x6_0000_0000;
+    const PREVIOUS: u64 = BASE + 0x1000;
+    const ENTRY: u64 = BASE + 0x1080;
+    const STACK_BASE: u64 = 0x1000;
+    const HANDLER_FP: u64 = 0x1000;
+    const TRAMPOLINE_FP: u64 = 0x1100;
+    const CONTEXT: u64 = TRAMPOLINE_FP + MockRuntime::CONTEXT_OFFSET;
+    const INTERRUPTED_SP: u64 = 0x2000;
+    const INTERRUPTED_FP: u64 = 0x2100;
+
+    let symbols = MockObjectImage::new(PREVIOUS..PREVIOUS + 0x100, BASE + 0x4000, BASE + 0x5000)
+        .with_symbol(PREVIOUS, "previous_fn")
+        .with_symbol(ENTRY, "entry_fn");
+
+    let mut stack = vec![0u8; 0x2000];
+    let mut put = |at: u64, value: u64| {
+        let offset = usize::try_from(at - STACK_BASE).expect("offset");
+        stack[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    // The handler's frame record returns into the trampoline.
+    put(HANDLER_FP, TRAMPOLINE_FP);
+    put(HANDLER_FP + 8, TRAMPOLINE + 0x44);
+    put(TRAMPOLINE_FP, INTERRUPTED_FP);
+    put(TRAMPOLINE_FP + 8, PREVIOUS + 0x10);
+    // The interrupted frame is on the first instruction of `entry_fn`.
+    for index in 0..MockRuntime::GENERAL_WORDS {
+        put(CONTEXT + 8 * index, 0x100 + index);
+    }
+    put(CONTEXT + MockRuntime::FP, INTERRUPTED_FP);
+    put(CONTEXT + MockRuntime::LR, PREVIOUS + 0x10);
+    put(CONTEXT + MockRuntime::SP, INTERRUPTED_SP);
+    put(CONTEXT + MockRuntime::PC, ENTRY);
+    // Its caller's return address is also `ENTRY`: the call was the last instruction of
+    // `previous_fn`.
+    put(INTERRUPTED_FP, 0);
+    put(INTERRUPTED_FP + 8, ENTRY);
+
+    let mut registers = arm64_registers();
+    registers.pc = Address::new(PREVIOUS + 0x40);
+    registers.sp = Address::new(0xf00);
+    registers.fp = Address::new(HANDLER_FP);
+    registers.general[29] = HANDLER_FP;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(Address::new(BASE), "r-x", symbols.header_bytes())
+        .with_region(Address::new(PREVIOUS), "r-x", vec![0x1F; 0x100])
+        .with_region(Address::new(BASE + 0x4000), "r--", symbols.table_bytes())
+        .with_region(Address::new(BASE + 0x5000), "r--", symbols.name_bytes())
+        .with_region(Address::new(TRAMPOLINE), "r-x", vec![0x1F; 0x100])
+        .with_region(Address::new(0), "rw-", vec![0; 0x1000])
+        .with_region(Address::new(STACK_BASE), "rw-", stack)
+        .with_image(LoadedImage {
+            path: "/nonexistent/ferros-entry-image".into(),
+            load_address: Address::new(BASE),
+            build_id: ferros_core::BuildIdentity::Unknown,
+            role: ImageRole::MainExecutable,
+        });
+    let runtime = MockRuntime::new()
+        .with_signal_trampoline(TRAMPOLINE..TRAMPOLINE + 0x100)
+        .into_shared();
+    let mut session = Session::new(Box::new(mock), MockObjectFormat::shared()).with_runtime(runtime);
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    let frames = session.stack_trace(16).expect("stack trace");
+    let pcs: Vec<u64> = frames.iter().map(|frame| frame.pc.value()).collect();
+    assert_eq!(pcs, [PREVIOUS + 0x40, TRAMPOLINE + 0x44, ENTRY, ENTRY], "{frames:#?}");
+    let name = |index: usize| {
+        let symbol = frames[index].symbol.as_ref();
+        symbol.map(|symbol| {
+            assert_eq!(symbol.source(), SymbolSource::SymbolTable);
+            symbol.display_name().to_owned()
+        })
+    };
+    assert_eq!(name(0).as_deref(), Some("previous_fn"));
+    assert_eq!(
+        name(2).as_deref(),
+        Some("entry_fn"),
+        "the interrupted frame is named from its pc"
+    );
+    assert_eq!(
+        name(3).as_deref(),
+        Some("previous_fn"),
+        "an ordinary caller is named from its call instruction"
+    );
+}
+
+/// Load address of the images in the late build id tests below (no slide).
+const LATE_ID_IMAGE: Address = Address::new(0x6_0000_0000);
+/// Where the late build id tests' images name their one function and hint it.
+const LATE_ID_FUNCTION: Address = Address::new(0x6_0000_1000);
+/// Executable memory outside the image, the link register of the late build id tests.
+const LATE_ID_CALLER: Address = Address::new(0x7_0000_0000);
+
+/// The file of an image at `LATE_ID_IMAGE` recording `build_id`, whose DWARF names one
+/// four-byte function `name` at `LATE_ID_FUNCTION` and whose own unwind hint calls that
+/// function a frameless leaf.
+fn late_id_file(name: &str, build_id: &[u8]) -> Vec<u8>
+{
+    use ferros_core::objfile::mock::MockObjectFile;
+    use ferros_core::objfile::{SectionId, UnwindHint};
+
+    // DWARF 4: a compile unit covering the function (low_pc, data4 high_pc), so an address
+    // lookup finds it, and one subprogram with name, low_pc and a data4 high_pc.
+    let abbrev = vec![
+        1, 0x11, 1, 0x11, 1, 0x12, 6, 0, 0, 2, 0x2e, 0, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 0,
+    ];
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&[4, 0, 0, 0, 0, 0, 8, 1]);
+    info.extend_from_slice(&LATE_ID_FUNCTION.value().to_le_bytes());
+    info.extend_from_slice(&4_u32.to_le_bytes());
+    info.push(2);
+    info.extend_from_slice(name.as_bytes());
+    info.push(0);
+    info.extend_from_slice(&LATE_ID_FUNCTION.value().to_le_bytes());
+    info.extend_from_slice(&4_u32.to_le_bytes());
+    info.push(0);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    MockObjectFile::new(LATE_ID_IMAGE.value(), 0x2000)
+        .with_dwarf(SectionId::DebugInfo, &info)
+        .with_dwarf(SectionId::DebugAbbrev, &abbrev)
+        .with_dwarf(SectionId::DebugLine, &[0])
+        .with_hint(LATE_ID_FUNCTION.value(), UnwindHint::Leaf { stack_size: 0 })
+        .with_build_id(ferros_core::BuildId::new(build_id).expect("build id"))
+        .to_bytes()
+}
+
+/// A process stopped on the first instruction of `LATE_ID_FUNCTION`, with its caller in the
+/// link register and no frame pointer: only the image file's leaf hint finds the caller.
+/// The image at `path` is reported with `build_id`.
+fn late_id_process(path: &std::path::Path, build_id: ferros_core::BuildIdentity) -> MockBackend
+{
+    let mut mapped = MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(LATE_ID_IMAGE.value(), 0x2000)
+        .header_bytes();
+    mapped.resize(0x2000, 0x1F);
+    let mut registers = arm64_registers();
+    registers.pc = LATE_ID_FUNCTION;
+    registers.sp = Address::new(0x7_FFF0_0000);
+    registers.general[30] = LATE_ID_CALLER.value();
+    MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(LATE_ID_IMAGE, "r-x", mapped)
+        .with_region(LATE_ID_CALLER, "r-x", vec![0x1F; 0x100])
+        .with_image(late_id_listed(path, build_id))
+}
+
+fn late_id_listed(path: &std::path::Path, build_id: ferros_core::BuildIdentity) -> ferros_core::backend::LoadedImage
+{
+    ferros_core::backend::LoadedImage {
+        path: path.to_path_buf(),
+        load_address: LATE_ID_IMAGE,
+        build_id,
+        role: ferros_core::backend::ImageRole::MainExecutable,
+    }
+}
+
+/// The function DWARF names at `LATE_ID_FUNCTION`, or why the session has none.
+fn late_id_name(session: &mut Session) -> Result<Option<String>, ferros_core::DebuggerError>
+{
+    Ok(session.symbolicate(LATE_ID_FUNCTION)?.and_then(|symbolication| {
+        symbolication
+            .frames
+            .last()
+            .map(|frame| frame.symbol.display_name().to_owned())
+    }))
+}
+
+/// The pcs of the stopped thread's frames.
+fn late_id_pcs(session: &mut Session) -> Vec<Address>
+{
+    session
+        .stack_trace(8)
+        .expect("stack trace")
+        .iter()
+        .map(|frame| frame.pc)
+        .collect()
+}
+
+/// The name the stopped thread's innermost frame is given.
+fn late_id_top_name(session: &mut Session) -> Option<String>
+{
+    session
+        .stack_trace(8)
+        .expect("stack trace")
+        .first()
+        .and_then(|frame| frame.symbol.as_ref().map(|symbol| symbol.display_name().to_owned()))
+}
+
+/// #221: an image file opened while the mapped build id was unknown is served only while
+/// no known id contradicts it. Once the loader reports another build than the file
+/// records, the session stops unwinding with the file's unwind hints (the executable half)
+/// and naming code from its DWARF (the debug half), and reads the file again: the old file
+/// is refused as another build, and a file of the mapped build is loaded once it appears.
+#[test]
+fn contradictory_build_id_stops_serving_the_old_file()
+{
+    let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-late-build-id", "");
+    std::io::Write::write_all(&mut file, &late_id_file("old_build", &[0xA1; 16])).expect("write image");
+    drop(file);
+    let _files = RemoveOnDrop(vec![path.clone()]);
+    let mock = late_id_process(&path, ferros_core::BuildIdentity::Unknown);
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    assert_eq!(late_id_name(&mut session).expect("symbolicate").as_deref(), Some("old_build"));
+    assert_eq!(
+        late_id_pcs(&mut session),
+        vec![LATE_ID_FUNCTION, LATE_ID_CALLER],
+        "the file's leaf hint finds the caller"
+    );
+
+    // The loader now reads the mapped id, and it is not the build the file records.
+    mock.set_images(vec![late_id_listed(&path, known(&[0xB2; 16]))]);
+    match late_id_name(&mut session) {
+        Err(ferros_core::DebuggerError::SymbolLoad { .. }) => {}
+        other => panic!("the old file's DWARF is still served: {other:?}"),
+    }
+    assert_ne!(
+        late_id_top_name(&mut session).as_deref(),
+        Some("old_build"),
+        "the stack trace still names the frame from the old file's DWARF"
+    );
+    assert_eq!(
+        late_id_pcs(&mut session),
+        vec![LATE_ID_FUNCTION],
+        "the old file's unwind hint is still served"
+    );
+
+    // A file of the mapped build replaces it; the next request loads both halves from it.
+    std::fs::write(&path, late_id_file("new_build_fn", &[0xB2; 16])).expect("rewrite image");
+    assert_eq!(
+        late_id_name(&mut session).expect("symbolicate").as_deref(),
+        Some("new_build_fn")
+    );
+    assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+}
+
+/// [`MockObjectFormat`], counting how often it opens an image file.
+struct CountingOpens(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ferros_core::objfile::ObjectFormat for CountingOpens
+{
+    fn mapped_symbols(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> Result<std::sync::Arc<dyn ferros_core::objfile::MappedSymbols>, String>
+    {
+        ferros_core::objfile::ObjectFormat::mapped_symbols(&MockObjectFormat, memory, load_address)
+    }
+
+    fn map_image(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> ferros_core::objfile::MappedImage
+    {
+        ferros_core::objfile::ObjectFormat::map_image(&MockObjectFormat, memory, load_address)
+    }
+
+    fn open_image(
+        &self,
+        path: &std::path::Path,
+        load_address: u64,
+        slice: Option<&ferros_core::objfile::ImageSlice>,
+    ) -> ferros_core::Result<ferros_core::objfile::ImageContents>
+    {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ferros_core::objfile::ObjectFormat::open_image(&MockObjectFormat, path, load_address, slice)
+    }
+}
+
+/// #221: a late build id that matches the file opened while it was unknown keeps that
+/// file: both halves are served without opening it again.
+#[test]
+fn a_matching_late_build_id_reuses_the_open_file()
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-late-build-id-match", "");
+    std::io::Write::write_all(&mut file, &late_id_file("same_build", &[0xC4; 16])).expect("write image");
+    drop(file);
+    let _files = RemoveOnDrop(vec![path.clone()]);
+    let mock = late_id_process(&path, ferros_core::BuildIdentity::Unknown);
+    let opens = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut session = Session::new(Box::new(mock.clone()), std::sync::Arc::new(CountingOpens(opens.clone())));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    assert_eq!(
+        late_id_name(&mut session).expect("symbolicate").as_deref(),
+        Some("same_build")
+    );
+    assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    mock.set_images(vec![late_id_listed(&path, known(&[0xC4; 16]))]);
+    assert_eq!(
+        late_id_name(&mut session).expect("symbolicate").as_deref(),
+        Some("same_build")
+    );
+    assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+    assert_eq!(opens.load(Ordering::SeqCst), 1, "a matching late id reopened the file");
+}
+
+/// [`MockObjectFormat`] whose mapped header never yields a slice: the format cannot tell
+/// which build is mapped, so only the session can carry the build id the loader reports
+/// to the file it opens.
+struct NoSlice;
+
+impl ferros_core::objfile::ObjectFormat for NoSlice
+{
+    fn mapped_symbols(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> Result<std::sync::Arc<dyn ferros_core::objfile::MappedSymbols>, String>
+    {
+        ferros_core::objfile::ObjectFormat::mapped_symbols(&MockObjectFormat, memory, load_address)
+    }
+
+    fn map_image(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> ferros_core::objfile::MappedImage
+    {
+        let mapped = ferros_core::objfile::ObjectFormat::map_image(&MockObjectFormat, memory, load_address);
+        ferros_core::objfile::MappedImage {
+            mapping: mapped.mapping,
+            slice: None,
+        }
+    }
+
+    fn open_image(
+        &self,
+        path: &std::path::Path,
+        load_address: u64,
+        slice: Option<&ferros_core::objfile::ImageSlice>,
+    ) -> ferros_core::Result<ferros_core::objfile::ImageContents>
+    {
+        ferros_core::objfile::ObjectFormat::open_image(&MockObjectFormat, path, load_address, slice)
+    }
+}
+
+/// #221: when the mapped header gives no slice, the format cannot refuse a file of another
+/// build by itself. Once a late build id contradicts the opened file, opening the same
+/// unchanged file again must not serve it for the mapped build.
+#[test]
+fn a_contradicted_file_is_refused_when_reopened_without_a_slice()
+{
+    let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-late-build-id-no-slice", "");
+    std::io::Write::write_all(&mut file, &late_id_file("old_build", &[0xD5; 16])).expect("write image");
+    drop(file);
+    let _files = RemoveOnDrop(vec![path.clone()]);
+    let mock = late_id_process(&path, ferros_core::BuildIdentity::Unknown);
+    let mut session = Session::new(Box::new(mock.clone()), std::sync::Arc::new(NoSlice));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    assert_eq!(late_id_name(&mut session).expect("symbolicate").as_deref(), Some("old_build"));
+    assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+
+    mock.set_images(vec![late_id_listed(&path, known(&[0xE6; 16]))]);
+    match late_id_name(&mut session) {
+        Err(ferros_core::DebuggerError::SymbolLoad { .. }) => {}
+        other => panic!("the reopened old file is served for the mapped build: {other:?}"),
+    }
+    assert_eq!(
+        late_id_pcs(&mut session),
+        vec![LATE_ID_FUNCTION],
+        "the reopened old file's unwind hint is served for the mapped build"
+    );
+
+    std::fs::write(&path, late_id_file("new_build_fn", &[0xE6; 16])).expect("rewrite image");
+    assert_eq!(
+        late_id_name(&mut session).expect("symbolicate").as_deref(),
+        Some("new_build_fn")
+    );
 }

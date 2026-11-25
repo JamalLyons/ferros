@@ -114,7 +114,10 @@ mod types;
 use std::time::Duration;
 
 pub use error::{BackendError, BackendResult};
-pub use types::{Environment, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent, ThreadAction};
+pub use types::{
+    Environment, FaultKind, ImageRole, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent,
+    ThreadAction,
+};
 
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 
@@ -243,6 +246,8 @@ pub trait Backend: Send
     ///   the target is stopped with nothing pending (it would block forever).
     /// - [`BackendError::Os`] if waiting on the OS fails, or an exception reply from
     ///   the previous resume failed. The backend state is unchanged by that error.
+    /// - An error from delivering a signal the previous resume forwarded, when that resume
+    ///   had already let the target run: the target keeps running.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>;
 
     /// Resume the target as described by `request`; the backend becomes *Running*.
@@ -273,7 +278,10 @@ pub trait Backend: Send
     ///   expressed on this OS, a signal is named for a thread whose action is `Suspend`,
     ///   or a signal cannot be delivered (see [`ResumeRequest::signals`]).
     /// - [`BackendError::Os`] if the OS fails to resume a thread; the target is left
-    ///   *Stopped*.
+    ///   *Stopped*, and a signal named in `request` is still held and not delivered.
+    ///
+    /// A backend that can only deliver a forwarded signal once the target runs may
+    /// return `Ok` and report a delivery failure from the next [`wait`](Self::wait).
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>;
 
     /// Ask a running target to stop; returns immediately.
@@ -390,6 +398,10 @@ pub trait Backend: Send
     fn memory_regions(&mut self) -> BackendResult<Vec<MemoryRegion>>;
 
     /// List the main executable and loaded libraries with their runtime load addresses.
+    ///
+    /// The adapter marks the main executable with [`ImageRole::MainExecutable`] when it
+    /// knows which image that is, and marks every other image [`ImageRole::Library`]. The
+    /// list order is the adapter's; the session does not infer the program from it.
     ///
     /// # Preconditions
     ///
@@ -588,6 +600,15 @@ mod tests
             ),
             (StopEvent::SingleStep { thread: t }, Some(t), false),
             (StopEvent::Signal { thread: t, signal: 11 }, Some(t), false),
+            (
+                StopEvent::Fault {
+                    thread: t,
+                    kind: FaultKind::MemoryAccess,
+                    detail: "x".into(),
+                },
+                Some(t),
+                false,
+            ),
             (StopEvent::Interrupted { thread: Some(t) }, Some(t), false),
             (StopEvent::Interrupted { thread: None }, None, false),
             (
@@ -604,6 +625,11 @@ mod tests
         for (event, thread, terminal) in cases {
             assert_eq!(event.thread(), thread, "{event:?}");
             assert_eq!(event.is_terminal(), terminal, "{event:?}");
+            let deliverable = match event {
+                StopEvent::Signal { thread, signal } => Some((thread, signal)),
+                _ => None,
+            };
+            assert_eq!(event.deliverable_signal(), deliverable, "{event:?}");
         }
     }
 

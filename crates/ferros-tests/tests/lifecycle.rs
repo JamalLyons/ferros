@@ -1086,6 +1086,97 @@ fn early_reply_and_task_resume_failures_are_reported_once_each()
     });
 }
 
+/// #242: a failed `task_resume` leaves the signal held and unsent. A retry can deliver it
+/// once or suppress it, and a later held signal still forwards.
+#[test]
+fn held_signal_survives_a_forwarding_resume_whose_task_resume_fails()
+{
+    harness::run(|t| {
+        let fixture = fixture!("signal_handler");
+        let file = format!("{}.rs", fixture.name());
+        let backend = MacOSBackend::new().expect("backend");
+        let faults = backend.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &["--interrupt"], backend);
+        let spin = d
+            .set_breakpoint(BreakpointLocation::Line {
+                file: file.clone(),
+                line: fixture.marker_line("spin_line"),
+            })
+            .expect("break in spin");
+        d.resume().expect("run to spin");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("spin stop"),
+            Some(StopEvent::Breakpoint { .. })
+        ));
+        d.delete_breakpoint(spin).expect("remove the spin breakpoint");
+        let handler = d
+            .set_breakpoint(BreakpointLocation::Line {
+                file,
+                line: fixture.marker_line("in_handler"),
+            })
+            .expect("break in the handler");
+
+        for forward in [true, false] {
+            // Sent while stopped; the spinning thread takes it once resumed.
+            signal(d.pid().0, "-USR1");
+            d.resume().expect("resume into the signal");
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("signal stop"),
+                Some(StopEvent::Signal { signal: SIGUSR1, .. })
+            ));
+
+            faults.fail_next_task_resume();
+            let failed = d.resume_with_signal().expect_err("injected task_resume failure");
+            assert!(failed.to_string().contains("task_resume"), "{failed}");
+            assert_eq!(d.state(), SessionState::Stopped);
+
+            if forward {
+                d.resume_with_signal().expect("the signal is still held");
+                assert!(matches!(
+                    d.wait(Some(TIMEOUT)).expect("handler stop"),
+                    Some(StopEvent::Breakpoint { .. })
+                ));
+                d.resume().expect("continue from the handler");
+            } else {
+                d.resume().expect("suppress the held signal");
+            }
+            // A duplicate or already-queued delivery would hit the handler again.
+            assert_eq!(
+                d.wait(Some(Duration::from_millis(500))).expect("no second handler stop"),
+                None
+            );
+            d.interrupt().expect("interrupt");
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("interrupt stop"),
+                Some(StopEvent::Interrupted { .. })
+            ));
+        }
+        let hits = |d: &Session| {
+            d.logical_breakpoints()
+                .iter()
+                .find(|bp| bp.id == handler)
+                .expect("handler breakpoint")
+                .hit_count
+        };
+        assert_eq!(hits(&d), 1, "the handler ran once");
+
+        // After the recovery a new held signal is still forwarded.
+        signal(d.pid().0, "-USR1");
+        d.resume().expect("resume into the next signal");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("next signal stop"),
+            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+        ));
+        d.resume_with_signal().expect("a later forwarding continue is accepted");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("second handler stop"),
+            Some(StopEvent::Breakpoint { .. })
+        ));
+        assert_eq!(hits(&d), 2, "the forwarded signal ran the handler");
+        d.kill().expect("kill");
+    });
+}
+
 /// #58 L-3/L-5: an error after teardown must still clear the Session, and the
 /// target's actual exception handlers must be restored by the safe injection hook.
 #[test]

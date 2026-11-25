@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use ferros_core::backend::{ProcessGroup, StdioSpec};
 use ferros_core::{LaunchSpec, ProcessId};
-use ferros_utils::{LogFormat, LogLevel, info, init_logging_to_file};
+use ferros_utils::{LogFormat, LogLevel, info, log_directory, start_file_logging};
 
 use crate::platform::create_session;
 use crate::repl::jobs::JobControl;
@@ -102,12 +102,17 @@ impl Script
     }
 }
 
-fn log_directory() -> PathBuf
+fn main() -> ExitCode
 {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), |home| PathBuf::from(home).join(".ferros"))
+    // The logging session owns the log worker. It lives until `main` returns, so the
+    // records written just before exit (the last one is below) reach the file.
+    let mut logging = None;
+    let code = run(&mut logging);
+    info!("ferros exiting");
+    code
 }
 
-fn main() -> ExitCode
+fn run(logging: &mut Option<ferros_utils::LoggingSession>) -> ExitCode
 {
     let cli = Cli::parse();
 
@@ -133,10 +138,7 @@ fn main() -> ExitCode
     };
 
     let (script, mut target, stdin_file, give_terminal) = match cli.command {
-        Commands::FindLogs => {
-            println!("{}", log_directory().display());
-            return ExitCode::SUCCESS;
-        }
+        Commands::FindLogs => return print_log_directory(),
         Commands::Launch {
             script,
             stdin,
@@ -153,8 +155,9 @@ fn main() -> ExitCode
     };
 
     // Logs go to a file so the session output stays deterministic (no timestamps, no colour).
-    if let Err(error) = init_logging_to_file(level, format) {
-        eprintln!("warning: logging is disabled: {error}");
+    match start_file_logging(level, format) {
+        Ok(session) => *logging = Some(session),
+        Err(error) => eprintln!("warning: logging is disabled: {error}"),
     }
 
     let lines = match script.lines() {
@@ -190,6 +193,27 @@ fn main() -> ExitCode
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Print [`log_directory`], the directory the logger opens, followed by a newline.
+///
+/// The OS bytes are written unchanged (`Path::display` would replace bytes that are
+/// not UTF-8), so the printed path names the directory the logger actually opened.
+fn print_log_directory() -> ExitCode
+{
+    let directory = log_directory();
+    let mut out = io::stdout().lock();
+    let written = out
+        .write_all(directory.as_os_str().as_encoded_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    match written {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

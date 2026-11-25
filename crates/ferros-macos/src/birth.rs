@@ -75,6 +75,25 @@ struct BirthSite
     entry: bool,
 }
 
+/// What an engine write makes of one covered birth site, applied only after the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BirthSiteUpdate
+{
+    address: u64,
+    original: [u8; 4],
+    /// The covered word is the engine's own `brk`, planted for a client breakpoint.
+    client_breakpoint: bool,
+}
+
+/// An engine write that covers armed birth traps, planned without side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BirthWrite
+{
+    /// The bytes to store. Armed traps stay in the target's memory.
+    pub(crate) bytes: Vec<u8>,
+    sites: Vec<BirthSiteUpdate>,
+}
+
 /// Traps and holds for threads created while the default action is `Suspend`.
 #[derive(Debug, Default)]
 pub(crate) struct BirthPolicy
@@ -198,30 +217,62 @@ impl BirthPolicy
         }
     }
 
-    /// An engine write of `data` at `address` that covers an armed trap.
+    /// Plan an engine write of `data` at `address` that covers an armed trap, without
+    /// changing any site.
     ///
     /// The covered bytes become the instruction that trap stands for: a `brk` marks an
-    /// engine breakpoint, anything else is the new original. Returns the bytes to write
-    /// instead, with every armed trap kept, or `None` when no trap is covered.
-    pub(crate) fn filter_engine_write(&mut self, address: u64, data: &[u8]) -> Option<Vec<u8>>
+    /// engine breakpoint, anything else is the new original. The plan holds the bytes to
+    /// write instead, with every armed trap kept, and the site updates that
+    /// [`commit_engine_write`](Self::commit_engine_write) applies once those bytes are
+    /// stored. `None` when no trap is covered.
+    pub(crate) fn plan_engine_write(&self, address: u64, data: &[u8]) -> Option<BirthWrite>
     {
-        let mut written = None;
-        for site in self.sites.iter_mut().filter(|site| site.armed) {
+        let mut planned: Option<BirthWrite> = None;
+        for site in self.sites.iter().filter(|site| site.armed) {
             let Some((at, from, len)) = overlap(address, data.len(), site.address) else {
                 continue;
             };
             let mut word = if site.client_breakpoint { BRK } else { site.original };
             word[from..from + len].copy_from_slice(&data[at..at + len]);
-            if word == BRK {
-                site.client_breakpoint = true;
+            let update = if word == BRK {
+                BirthSiteUpdate {
+                    address: site.address,
+                    original: site.original,
+                    client_breakpoint: true,
+                }
             } else {
-                site.client_breakpoint = false;
-                site.original = word;
-            }
-            let bytes = written.get_or_insert_with(|| data.to_vec());
-            bytes[at..at + len].copy_from_slice(&BRK[from..from + len]);
+                BirthSiteUpdate {
+                    address: site.address,
+                    original: word,
+                    client_breakpoint: false,
+                }
+            };
+            let write = planned.get_or_insert_with(|| BirthWrite {
+                bytes: data.to_vec(),
+                sites: Vec::new(),
+            });
+            write.bytes[at..at + len].copy_from_slice(&BRK[from..from + len]);
+            write.sites.push(update);
         }
-        written
+        planned
+    }
+
+    /// Record the site updates of `write` once its bytes are in the target.
+    ///
+    /// Call only after the store of [`BirthWrite::bytes`] succeeded, under the same lock
+    /// the plan was made under, so no site changed in between.
+    pub(crate) fn commit_engine_write(&mut self, write: BirthWrite)
+    {
+        for update in write.sites {
+            if let Some(site) = self
+                .sites
+                .iter_mut()
+                .find(|site| site.armed && site.address == update.address)
+            {
+                site.original = update.original;
+                site.client_breakpoint = update.client_breakpoint;
+            }
+        }
     }
 
     fn matching_entry(&self, event: &StopEvent, client_breakpoint: bool) -> bool
@@ -951,6 +1002,15 @@ mod tests
         assert_eq!(tail, STP_XZR_XZR_PREDEC[2..]);
     }
 
+    /// Plan and commit one engine write, as the backend does once the store succeeds.
+    fn store(policy: &mut BirthPolicy, address: u64, data: &[u8]) -> Option<Vec<u8>>
+    {
+        let write = policy.plan_engine_write(address, data)?;
+        let bytes = write.bytes.clone();
+        policy.commit_engine_write(write);
+        Some(bytes)
+    }
+
     #[test]
     fn writes_over_a_trap_keep_it_and_track_the_engine()
     {
@@ -958,14 +1018,47 @@ mod tests
             sites: vec![armed_site(0x1000)],
             ..BirthPolicy::default()
         };
-        assert_eq!(policy.filter_engine_write(0x1000, &BRK).as_deref(), Some(&BRK[..]));
+        assert_eq!(store(&mut policy, 0x1000, &BRK).as_deref(), Some(&BRK[..]));
         assert!(policy.sites[0].client_breakpoint);
         let mut cover = vec![0x22; 2];
         cover.extend_from_slice(&STP_XZR_XZR_PREDEC);
-        assert_eq!(policy.filter_engine_write(0x0ffe, &cover).expect("covered")[2..], BRK);
+        assert_eq!(store(&mut policy, 0x0ffe, &cover).expect("covered")[2..], BRK);
         assert!(!policy.sites[0].client_breakpoint);
         assert_eq!(policy.sites[0].original, STP_XZR_XZR_PREDEC);
-        assert!(policy.filter_engine_write(0x1004, &[0; 4]).is_none());
+        assert!(policy.plan_engine_write(0x1004, &[0; 4]).is_none());
+    }
+
+    /// A plan whose store fails is dropped: no site changes until the commit.
+    #[test]
+    fn a_planned_write_changes_no_site_before_its_commit()
+    {
+        const NOP: [u8; 4] = [0x1f, 0x20, 0x03, 0xd5];
+        let mut policy = BirthPolicy {
+            sites: vec![armed_site(0x1000), armed_site(0x1008)],
+            ..BirthPolicy::default()
+        };
+        let mut data = [0x33; 12];
+        data[..4].copy_from_slice(&NOP);
+        data[8..].copy_from_slice(&BRK);
+        let write = policy.plan_engine_write(0x1000, &data).expect("covered");
+        assert_eq!(write.bytes[..4], BRK);
+        assert_eq!(write.bytes[4..8], [0x33; 4]);
+        assert_eq!(write.bytes[8..], BRK);
+        for site in &policy.sites {
+            assert_eq!(site.original, STP_XZR_XZR_PREDEC);
+            assert!(!site.client_breakpoint);
+        }
+        let mut read = [0; 12];
+        read[..4].copy_from_slice(&BRK);
+        read[8..].copy_from_slice(&BRK);
+        policy.mask_read(0x1000, &mut read);
+        assert_eq!(read[..4], STP_XZR_XZR_PREDEC);
+        assert_eq!(read[8..], STP_XZR_XZR_PREDEC);
+        policy.commit_engine_write(write);
+        assert_eq!(policy.sites[0].original, NOP);
+        assert!(!policy.sites[0].client_breakpoint);
+        assert_eq!(policy.sites[1].original, STP_XZR_XZR_PREDEC);
+        assert!(policy.sites[1].client_breakpoint);
     }
 
     #[test]

@@ -45,6 +45,21 @@ pub enum StopEvent
         signal: i32,
     },
 
+    /// A thread raised a synchronous fault, such as a bad memory access.
+    ///
+    /// No signal is held for a fault, so a forwarding resume has nothing to deliver for
+    /// it: the thread continues and, unless something changed, retries the faulting
+    /// instruction and stops again at the same pc.
+    Fault
+    {
+        /// Thread that faulted.
+        thread: ThreadId,
+        /// Portable category of the fault. Callers match on this, not on `detail`.
+        kind: FaultKind,
+        /// The operating system's raw description, for logs and diagnostics.
+        detail: String,
+    },
+
     /// The target stopped because [`Backend::interrupt`](super::Backend::interrupt) was called.
     Interrupted
     {
@@ -84,9 +99,23 @@ impl StopEvent
     pub fn thread(&self) -> Option<ThreadId>
     {
         match self {
-            Self::Breakpoint { thread, .. } | Self::SingleStep { thread } | Self::Signal { thread, .. } => Some(*thread),
+            Self::Breakpoint { thread, .. }
+            | Self::SingleStep { thread }
+            | Self::Signal { thread, .. }
+            | Self::Fault { thread, .. } => Some(*thread),
             Self::Interrupted { thread } | Self::Other { thread, .. } => *thread,
             Self::Exited { .. } | Self::Killed { .. } => None,
+        }
+    }
+
+    /// The signal a forwarding resume would deliver for this stop: `Some` only for
+    /// [`Signal`](Self::Signal). A [`Fault`](Self::Fault) holds no signal and returns `None`.
+    #[must_use]
+    pub fn deliverable_signal(&self) -> Option<(ThreadId, i32)>
+    {
+        match *self {
+            Self::Signal { thread, signal } => Some((thread, signal)),
+            _ => None,
         }
     }
 
@@ -96,6 +125,37 @@ impl StopEvent
     pub fn is_terminal(&self) -> bool
     {
         matches!(self, Self::Exited { .. } | Self::Killed { .. })
+    }
+}
+
+/// Portable category of a [`StopEvent::Fault`].
+///
+/// A platform adapter maps its native fault reasons onto these; the category carries no
+/// native exception code or signal number.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FaultKind
+{
+    /// An access to memory that is unmapped or lacks the needed permission.
+    MemoryAccess,
+    /// An instruction the processor cannot execute.
+    IllegalInstruction,
+    /// An arithmetic fault, such as an integer division by zero where it traps.
+    Arithmetic,
+    /// A synchronous fault the adapter does not classify further.
+    Other,
+}
+
+impl std::fmt::Display for FaultKind
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        f.write_str(match self {
+            Self::MemoryAccess => "memory access fault",
+            Self::IllegalInstruction => "illegal instruction",
+            Self::Arithmetic => "arithmetic fault",
+            Self::Other => "fault",
+        })
     }
 }
 
@@ -405,4 +465,18 @@ pub struct LoadedImage
     /// [`BuildIdentity::Unknown`] is no evidence either way; [`BuildIdentity::Absent`]
     /// is no evidence across stops, so such an image is read again once per stop.
     pub build_id: BuildIdentity,
+    /// Whether the adapter knows this image is the main executable. File and function
+    /// breakpoints resolve in the image marked [`ImageRole::MainExecutable`], wherever
+    /// it appears in the list; a list without one resolves none.
+    pub role: ImageRole,
+}
+
+/// What an image is to the process, as the adapter enumerating it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageRole
+{
+    /// The program the process runs. An adapter marks at most one image this way.
+    MainExecutable,
+    /// A library, the program loader, or an image the adapter cannot tell is the program.
+    Library,
 }

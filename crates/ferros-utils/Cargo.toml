@@ -16,7 +16,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "registry", "chrono"] }
 tracing-appender = "0.2"
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 chrono = "0.4.42"
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [lints.clippy]
 # Allow multiple crate versions (needed for tracing-appender which uses thiserror 1.0)

@@ -7,7 +7,7 @@
 //! thread-specific breakpoints.
 
 use crate::breakpoints::{BreakpointRequest, WatchpointAccess};
-use crate::error::Result;
+use crate::error::{DebuggerError, Result};
 use crate::session::Session;
 use crate::types::{Address, Registers, ThreadId};
 
@@ -19,8 +19,9 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 
 /// Builder for configuring breakpoints before installation.
 ///
-/// This builder allows you to configure advanced breakpoint features
-/// like conditions, hit counts, and thread-specific breakpoints.
+/// The builder records conditions, hit counts, thread filters, and commands,
+/// but [`install`](Self::install) cannot honor any of them yet. It refuses
+/// a builder with one set instead of planting a breakpoint that ignores it.
 ///
 /// ## Example
 ///
@@ -30,10 +31,13 @@ pub type BreakpointCondition = Box<dyn Fn(&Registers) -> bool + Send + Sync>;
 /// use ferros_core::types::Address;
 /// # fn example(session: &mut Session) -> ferros_core::Result<()> {
 ///
-/// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
-///     .with_hit_count(5) // Break after 5 hits
-///     .with_condition(|regs| regs.pc.value() > 0x2000) // Only break if PC > 0x2000
-///     .install(session)?;
+/// let bp_id = BreakpointBuilder::software(Address::from(0x1000)).install(session)?;
+///
+/// // A hit count, condition, thread filter, or command is rejected.
+/// let refused = BreakpointBuilder::software(Address::from(0x2000))
+///     .with_hit_count(5)
+///     .install(session);
+/// assert!(refused.is_err());
 /// # Ok(())
 /// # }
 /// ```
@@ -142,8 +146,9 @@ impl BreakpointBuilder
 
     /// Set the hit count threshold.
     ///
-    /// The breakpoint will only trigger after it has been hit `count` times.
-    /// This is useful for debugging loops or frequently-called functions.
+    /// The breakpoint should only trigger after it has been hit `count` times.
+    /// Hit counts are not implemented: [`install`](Self::install) returns an
+    /// error while one is set.
     ///
     /// ## Parameters
     ///
@@ -189,9 +194,8 @@ impl BreakpointBuilder
     ///
     /// ## Note
     ///
-    /// Conditional breakpoints are not yet fully implemented. This method
-    /// stores the condition but it may not be evaluated until full support
-    /// is added.
+    /// Conditional breakpoints are not implemented. This method stores the
+    /// condition, and [`install`](Self::install) returns an error while one is set.
     pub fn with_condition<F>(mut self, condition: F) -> Self
     where
         F: Fn(&crate::types::Registers) -> bool + Send + Sync + 'static,
@@ -221,9 +225,8 @@ impl BreakpointBuilder
     ///
     /// ## Note
     ///
-    /// Thread-specific breakpoints are not yet fully implemented. This method
-    /// stores the thread ID but it may not be enforced until full support
-    /// is added.
+    /// Thread-specific breakpoints are not implemented. This method stores the
+    /// thread ID, and [`install`](Self::install) returns an error while one is set.
     pub fn for_thread(mut self, thread_id: ThreadId) -> Self
     {
         self.thread_id = Some(thread_id);
@@ -253,8 +256,8 @@ impl BreakpointBuilder
     ///
     /// ## Note
     ///
-    /// Breakpoint commands are not yet fully implemented. This method stores
-    /// the command but it may not be executed until full support is added.
+    /// Breakpoint commands are not implemented. This method stores the
+    /// command, and [`install`](Self::install) returns an error while one is set.
     pub fn with_command(mut self, command: impl Into<String>) -> Self
     {
         self.commands.push(command.into());
@@ -265,6 +268,11 @@ impl BreakpointBuilder
     ///
     /// This method creates the breakpoint request and installs it with
     /// [`Session::add_breakpoint`].
+    ///
+    /// A hit count, condition, thread filter, or command is not honored by the
+    /// breakpoint hit handler yet. If any is set, this returns an error before
+    /// anything is written to the target, instead of planting a breakpoint that
+    /// stops on every hit.
     ///
     /// ## Parameters
     ///
@@ -277,6 +285,8 @@ impl BreakpointBuilder
     /// ## Errors
     ///
     /// Returns an error if:
+    /// - A hit count, condition, thread filter, or command is set
+    ///   ([`DebuggerError::InvalidArgument`] naming the option)
     /// - The session has no stopped process
     /// - The request is a hardware breakpoint or watchpoint, which `Session` does not
     ///   support yet
@@ -291,18 +301,24 @@ impl BreakpointBuilder
     /// # fn example(session: &mut Session) -> ferros_core::Result<()> {
     ///
     /// # session.attach(ferros_core::types::ProcessId::from(12345))?;
-    /// let bp_id = BreakpointBuilder::software(Address::from(0x1000))
-    ///     .with_hit_count(5)
-    ///     .install(session)?;
+    /// let bp_id = BreakpointBuilder::software(Address::from(0x1000)).install(session)?;
     /// println!("Installed breakpoint with ID: {}", bp_id.raw());
     /// # Ok(())
     /// # }
     /// ```
     pub fn install(self, session: &mut Session) -> Result<crate::breakpoints::BreakpointId>
     {
-        // For now, we just install the basic breakpoint.
-        // Advanced features (hit count, conditions, commands) will be
-        // implemented when the breakpoint hit handler supports them.
+        let unsupported = [
+            ("hit count", self.hit_count.is_some()),
+            ("condition", self.condition.is_some()),
+            ("thread filter", self.thread_id.is_some()),
+            ("commands", !self.commands.is_empty()),
+        ];
+        if let Some((option, _)) = unsupported.iter().find(|(_, set)| *set) {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "breakpoint {option} is not supported yet; install would ignore it"
+            )));
+        }
         session.add_breakpoint(self.request)
     }
 

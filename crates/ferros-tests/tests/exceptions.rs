@@ -69,50 +69,88 @@ fn interrupt(d: &mut Debuggee)
     d.interrupt().expect("interrupt");
 }
 
-/// How many launches the simultaneous-stop test tries before giving up.
-const SIMULTANEOUS_TRIALS: usize = 20;
-
-/// Two threads of `threads` leave a barrier together and run into the same breakpoint.
-/// When both trap before the debugger has stopped the task, both stops are reported with
-/// no resume in between: the second by a zero-timeout `wait` after the first.
-///
-/// Whether the second thread reaches the trap before the task is suspended is a race, so
-/// the test launches the fixture up to [`SIMULTANEOUS_TRIALS`] times and passes on the
-/// first launch that shows both stops. Without queued stops, the second message stays
-/// in the port until the next resume, so no launch ever does.
+/// Both workers trap before the debugger suspends the task. Both stops must then
+/// be available in the same batch, with no resume between them.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn simultaneous_breakpoints_on_two_threads_are_both_reported()
 {
     let _ipc = shared();
-    harness::run_with_timeout(Duration::from_secs(120), |t| {
-        let fixture = fixture!("threads");
-        let mut outcomes = Vec::new();
-        for trial in 1..=SIMULTANEOUS_TRIALS {
-            let mut d = t.launch(&fixture);
-            let address = marker_address(&mut d, &fixture, "worker_body");
-            let id = d
-                .add_breakpoint(BreakpointRequest::Software { address })
-                .expect("add_breakpoint at worker_body");
-            d.resume().expect("resume");
+    harness::run(|t| {
+        use std::time::Instant;
 
-            let first = expect_breakpoint(&mut d, address, "the first worker's stop");
-            // No resume: anything reported now belongs to the same stop.
-            let second = d.wait(Some(Duration::ZERO)).expect("wait(0) after the first stop");
-            // Only the simultaneous stop matters here: remove the breakpoint before going on.
-            d.remove_breakpoint(id).expect("remove_breakpoint");
-            match second {
-                Some(StopEvent::Breakpoint { thread, pc }) => {
-                    assert_eq!(pc, address, "the second stop is at another pc");
-                    assert_ne!(thread, first, "both stops name the same thread");
-                    assert_eq!(d.state(), SessionState::Stopped);
-                    eprintln!("both workers' stops reported on launch {trial} of {SIMULTANEOUS_TRIALS}");
-                    return;
-                }
-                None => outcomes.push("only one stop"),
-                other => panic!("expected the second worker's breakpoint stop or nothing, got {other:?}"),
+        use ferros_macos::exception::ReplyFaultInjector;
+        use ferros_macos::registers::read_registers_arm64;
+
+        // Release the loop on unwind, even if the first trap has yet to arrive.
+        struct ReleasePublication(ReplyFaultInjector);
+        impl Drop for ReleasePublication
+        {
+            fn drop(&mut self)
+            {
+                self.0.cancel_stop_publication();
             }
         }
-        panic!("no launch out of {SIMULTANEOUS_TRIALS} reported both workers' stops without a resume: {outcomes:?}");
+
+        let control = ControlDir::new();
+        let fixture = fixture!("threads");
+        let backend = MacOSBackend::new().expect("backend");
+        let faults = backend.reply_fault_injector();
+        let gate = format!("--gate={}", control.path().display());
+        let mut d = t.launch_with_backend(&fixture, &[&gate], backend);
+        let address = marker_address(&mut d, &fixture, "worker_body");
+        let id = d
+            .add_breakpoint(BreakpointRequest::Software { address })
+            .expect("add_breakpoint at worker_body");
+
+        d.resume().expect("start the workers");
+        control.wait("ready-1");
+        control.wait("ready-2");
+        interrupt(&mut d);
+        expect_interrupted(&mut d, "snapshot the gated threads");
+        let threads = d.threads().expect("gated threads");
+
+        // The first kernel request parks the loop before task_suspend. The other
+        // worker can then trap even if it was descheduled when the gate opened.
+        let _release = ReleasePublication(faults.clone());
+        faults.set_stop_publication_deadline(STOP_TIMEOUT * 2);
+        faults.pause_next_stop_publication();
+        d.resume().expect("resume to the gate");
+        control.release("run");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        let trapped = loop {
+            let trapped: Vec<_> = threads
+                .iter()
+                .copied()
+                .filter(|&thread| {
+                    let port = u32::try_from(thread.raw()).expect("thread port");
+                    // Sample the PC first. A worker seen at the trap and then waiting
+                    // in the kernel cannot have just been asleep at the fixture gate.
+                    read_registers_arm64(port).expect("registers while publication is held").pc == address
+                        && diagnostics::thread_is_waiting(thread).expect("Mach thread state")
+                })
+                .collect();
+            if trapped.len() == 2 && faults.stop_publication_is_paused() {
+                break trapped;
+            }
+            assert!(Instant::now() < deadline, "both workers did not trap: {trapped:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        faults.release_stop_publication();
+
+        let first = expect_breakpoint(&mut d, address, "the first worker's stop");
+        let second = d.wait(Some(Duration::ZERO)).expect("wait(0) after the first stop");
+        let Some(StopEvent::Breakpoint { thread, pc }) = second else {
+            panic!("expected the second worker's breakpoint stop, got {second:?}");
+        };
+        assert_eq!(pc, address, "the second stop is at another pc");
+        assert_ne!(thread, first, "both stops name the same thread");
+        assert!(
+            trapped.contains(&first) && trapped.contains(&thread),
+            "stops: {first:?}, {thread:?}"
+        );
+        assert_eq!(d.state(), SessionState::Stopped);
+        d.remove_breakpoint(id).expect("remove_breakpoint");
     });
 }
 

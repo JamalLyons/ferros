@@ -261,8 +261,42 @@ fn stack_trace_and_symbolicate_enumerate_images_once_per_call()
 {
     // Issue #244 (from #220): each public stack request uses one refreshed image list for
     // all of its frames, however many images it loads. The list is not kept between
-    // calls (see `Session::stack_trace`), so each call enumerates once.
-    let (_image, mock) = MultiSiteImage::new();
+    // calls (see `Session::stack_trace`), so each call enumerates once. The call chain
+    // spans two images, so "once" cannot hold by a single image being the only one read.
+    use ferros_core::backend::ImageRole;
+
+    const LIBRARY_IMAGE: Address = Address::new(0x2_0000_0000);
+    const EXE_IMAGE: Address = Address::new(0x3_0000_0000);
+    const STACK_AT: Address = Address::new(0x7_0000_0000);
+    // `line_table_image` names each row's function `line_fn<row index>`: the caller's
+    // image has a row before its call site, so the two images name their frames apart.
+    let library_pc = LIBRARY_IMAGE + 0x1000;
+    let call_site = EXE_IMAGE + 0x1000;
+    let (library_path, library_bytes) =
+        line_table_image("ferros-mock-chain-library", LIBRARY_IMAGE, "callee.rs", &[(3, &[library_pc])]);
+    let (exe_path, exe_bytes) = line_table_image(
+        "ferros-mock-chain-exe",
+        EXE_IMAGE,
+        "caller.rs",
+        &[(4, &[EXE_IMAGE + 0x800]), (5, &[call_site])],
+    );
+    let _files = RemoveOnDrop(vec![library_path.clone(), exe_path.clone()]);
+    // The callee is stopped on its first instruction, so its caller is the link register: a
+    // return address one instruction past the call in the caller's image. The frame record
+    // at fp ends the chain (saved fp 0, saved lr 0).
+    let stack = vec![0u8; 32];
+    let mut registers = arm64_registers();
+    registers.pc = library_pc;
+    registers.fp = STACK_AT;
+    registers.sp = STACK_AT;
+    registers.general[30] = (call_site + 4).value();
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(LIBRARY_IMAGE, "r-x", library_bytes)
+        .with_region(EXE_IMAGE, "r-x", exe_bytes)
+        .with_region(STACK_AT, "rw-", stack)
+        .with_image(listed_image(&library_path, LIBRARY_IMAGE, ImageRole::Library))
+        .with_image(listed_image(&exe_path, EXE_IMAGE, ImageRole::MainExecutable));
     let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
     let enumerations = |mock: &MockBackend| {
@@ -274,10 +308,23 @@ fn stack_trace_and_symbolicate_enumerate_images_once_per_call()
     let _ = enumerations(&mock);
 
     let frames = session.stack_trace(16).expect("stack trace");
-    assert!(!frames.is_empty());
-    assert_eq!(enumerations(&mock), 1, "one image enumeration for a stack trace");
-    for address in [BREAKPOINT, SECOND_SITE] {
-        let _ = session.symbolicate(address).expect("symbolicate");
+    assert_eq!(enumerations(&mock), 1, "one image enumeration for a two-image stack trace");
+    assert_eq!(frames.len(), 2, "{frames:#?}");
+    let names: Vec<Option<&str>> = frames
+        .iter()
+        .map(|frame| frame.symbol.as_ref().map(ferros_core::SymbolName::display_name))
+        .collect();
+    assert_eq!(names, [Some("line_fn0"), Some("line_fn1")], "{frames:#?}");
+    assert_eq!(frames[0].pc, library_pc);
+    assert_eq!(frames[1].pc, call_site + 4);
+
+    for (address, name) in [(library_pc, "line_fn0"), (call_site, "line_fn1")] {
+        let found = session
+            .symbolicate(address)
+            .expect("symbolicate")
+            .unwrap_or_else(|| panic!("no symbolication for {address}"));
+        let innermost = found.frames.last().unwrap_or_else(|| panic!("no frames for {address}"));
+        assert_eq!(innermost.symbol.display_name(), name, "{address}");
         assert_eq!(enumerations(&mock), 1, "one image enumeration for symbolicating {address}");
     }
 }

@@ -65,7 +65,11 @@ fn test_fixture_loop_counter()
     assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("final count: 3"), "unexpected stdout: {stdout}");
+    // A whole line: `contains("final count: 3")` would also accept `final count: 30`.
+    assert!(
+        stdout.lines().any(|line| line == "final count: 3"),
+        "unexpected stdout: {stdout}"
+    );
 
     let loop_call = fix.marker_line("loop_call");
     let tick_body = fix.marker_line("tick_body");
@@ -93,7 +97,11 @@ fn test_fixture_nested_calls()
     assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("nested result:"), "unexpected stdout: {stdout}");
+    // `level_a(40)` adds 1 + 2 + 3 along the chain (`level_a`, `level_b`, `level_c`).
+    assert!(
+        stdout.lines().any(|line| line == "nested result: 46"),
+        "unexpected stdout: {stdout}"
+    );
 
     let in_a = fix.marker_line("in_a");
     let in_b = fix.marker_line("in_b");

@@ -1,5 +1,7 @@
 //! Test-only fault injection for the exception loop.
 
+use std::time::Duration;
+
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -32,9 +34,7 @@ pub struct ReplyFaultInjector
     pub(crate) other_exit_reaper: Arc<AtomicBool>,
     pub(crate) handshake_requeue: Arc<AtomicBool>,
     pub(crate) detach_handshake: Arc<AtomicBool>,
-    /// Detach's private stop: 0 normal, 1 SIGCONT before the reply, 2 never observe
-    /// the stop. Tests only (#149).
-    pub(crate) detach_stop_wait: Arc<AtomicU8>,
+    detach_stop_wait: Arc<Mutex<Option<DetachStopWait>>>,
     pub(super) detach_suspend_probe: Arc<Mutex<Option<DetachSuspendProbe>>>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     pub(super) birth_step_off_hold: Arc<AtomicU8>,
@@ -83,6 +83,16 @@ pub struct ReplyFaultInjector
     pub(crate) resume_partway: Arc<AtomicBool>,
 }
 
+/// Overrides the next detach's private stop waits. Tests only (#149, #282).
+#[derive(Debug)]
+pub(crate) struct DetachStopWait
+{
+    pub(crate) recheck: Duration,
+    /// If set, hide the stop from detach but report whether it really landed before
+    /// SIGCONT. Otherwise, force the first wait to expire before the reply.
+    pub(crate) before_continue: Option<(Duration, mpsc::Sender<bool>)>,
+}
+
 #[derive(Debug)]
 pub(super) struct DetachSuspendProbe
 {
@@ -121,17 +131,33 @@ impl ReplyFaultInjector
 
     /// Make the next detach behave as if its wait for the private SIGSTOP timed out:
     /// its SIGCONT is sent before the stop is even answered, so the stop lands after
-    /// it, as for a target not scheduled for over a second. Tests only (#149).
-    pub fn expire_next_detach_stop_wait(&self)
+    /// it, as for a target not scheduled for over a second. `recheck` bounds the
+    /// subsequent wait for the late stop. Tests only (#149).
+    pub fn expire_next_detach_stop_wait(&self, recheck: Duration)
     {
-        self.detach_stop_wait.store(1, Ordering::SeqCst);
+        *self.detach_stop_wait.lock().unwrap_or_else(PoisonError::into_inner) = Some(DetachStopWait {
+            recheck,
+            before_continue: None,
+        });
     }
 
     /// Make the next detach never observe its private SIGSTOP taking effect, so it
-    /// must report that the released process may stay stopped. Tests only (#149).
-    pub fn hide_next_detach_stop(&self)
+    /// must report that the released process may stay stopped. Skip both detach waits
+    /// and independently report whether the real stop took effect before SIGCONT,
+    /// polling for up to `probe_timeout`. Tests only (#149, #282).
+    pub fn hide_next_detach_stop(&self, probe_timeout: Duration) -> mpsc::Receiver<bool>
     {
-        self.detach_stop_wait.store(2, Ordering::SeqCst);
+        let (probe, result) = mpsc::channel();
+        *self.detach_stop_wait.lock().unwrap_or_else(PoisonError::into_inner) = Some(DetachStopWait {
+            recheck: Duration::ZERO,
+            before_continue: Some((probe_timeout, probe)),
+        });
+        result
+    }
+
+    pub(crate) fn take_detach_stop_wait(&self) -> Option<DetachStopWait>
+    {
+        self.detach_stop_wait.lock().unwrap_or_else(PoisonError::into_inner).take()
     }
 
     /// Sample the given tracee thread's Mach suspend count before the next detach

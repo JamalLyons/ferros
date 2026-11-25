@@ -439,14 +439,11 @@ impl MacOSBackend
         };
         self.exit_watcher = None;
         self.child_cleanup.detach(self.traced);
-        let stop_fault = self
-            .reply_faults
-            .detach_stop_wait
-            .swap(0, std::sync::atomic::Ordering::SeqCst);
-        let hide_stop = stop_fault == 2;
+        let stop_fault = self.reply_faults.take_detach_stop_wait();
+        let hide_stop = stop_fault.as_ref().is_some_and(|fault| fault.before_continue.is_some());
         // Test hook: send the SIGCONT of a timed-out wait before the private SIGSTOP is
         // even answered, so the stop is certain to land after it.
-        let expire_wait = stop_fault == 1 && private_stop_sent && !self.traced;
+        let expire_wait = stop_fault.is_some() && !hide_stop && private_stop_sent && !self.traced;
         if expire_wait {
             self.send_detach_sigcont();
         }
@@ -466,14 +463,24 @@ impl MacOSBackend
             // (#149). Keep watching for a bounded time and continue it again once the
             // stop lands; if it is never seen, report that it may stay stopped.
             let pid = self.pid.0 as libc::pid_t;
-            let landed = |task| !hide_stop && crate::lifecycle::job_control_stop_has_taken_effect(pid, task);
+            let real_stop = || crate::lifecycle::job_control_stop_has_taken_effect(pid, self.task);
+            let landed = || !hide_stop && real_stop();
+            let stop_timeout = if stop_fault.is_some() {
+                Duration::ZERO
+            } else {
+                DETACH_STOP_TIMEOUT
+            };
+            let stop_recheck = stop_fault.as_ref().map_or(DETACH_STOP_RECHECK, |fault| fault.recheck);
             let mut observed = false;
             if !expire_wait {
-                observed = wait_until(DETACH_STOP_TIMEOUT, || landed(self.task));
+                observed = wait_until(stop_timeout, landed);
+                if let Some((timeout, probe)) = stop_fault.and_then(|fault| fault.before_continue) {
+                    let _ = probe.send(wait_until(timeout, real_stop));
+                }
                 self.send_detach_sigcont();
             }
             if !observed {
-                observed = wait_until(DETACH_STOP_RECHECK, || landed(self.task));
+                observed = wait_until(stop_recheck, landed);
                 if observed {
                     self.send_detach_sigcont();
                 }
@@ -484,7 +491,7 @@ impl MacOSBackend
                     code: -1,
                     message: format!(
                         "detach did not see its private SIGSTOP take effect within {:?}; process {} may stay stopped",
-                        DETACH_STOP_TIMEOUT + DETACH_STOP_RECHECK,
+                        stop_timeout + stop_recheck,
                         self.pid.0
                     ),
                 });

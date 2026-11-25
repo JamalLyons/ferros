@@ -723,15 +723,29 @@ fn process_state(pid: u32) -> String
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// How long a released `--progress` fixture may print nothing before
-/// [`Grandchild::ran_to_completion`] treats it as stuck. One tick takes about 10 ms
-/// unloaded and about 110 ms under a background scheduling clamp.
-const RELEASE_STALL: Duration = Duration::from_secs(10);
+/// Removes captured output or a fixture exit gate on unwind.
+struct ReleaseFile(std::path::PathBuf);
 
-/// Removes captured output even if spawning or PID discovery panics.
-struct ReleaseOutput(std::path::PathBuf);
+impl ReleaseFile
+{
+    fn exit_gate() -> Self
+    {
+        let (_, path) = scratch::create_file("ferros-release", ".gate");
+        Self(path)
+    }
 
-impl Drop for ReleaseOutput
+    fn gate_args(&self) -> [&str; 3]
+    {
+        ["0", "--exit-gate", self.0.to_str().expect("exit gate path must be UTF-8")]
+    }
+
+    fn open_gate(&self)
+    {
+        fs::write(&self.0, b"exit\n").expect("open exit gate");
+    }
+}
+
+impl Drop for ReleaseFile
 {
     fn drop(&mut self)
     {
@@ -750,24 +764,26 @@ struct Grandchild
     tag: harness::Tag,
     shell: std::process::Child,
     pid: u32,
-    output_path: ReleaseOutput,
+    output_path: ReleaseFile,
+    exit_gate: ReleaseFile,
 }
 
 impl Grandchild
 {
-    fn spawn(t: &harness::TestContext, args: &[&str]) -> Self
+    fn spawn(t: &harness::TestContext) -> Self
     {
         let tag = t.tag();
+        let exit_gate = ReleaseFile::exit_gate();
         // Files cannot fill a pipe and delay the very completion being measured.
         let (output, output_path) = scratch::create_file("ferros-release", ".log");
-        let output_path = ReleaseOutput(output_path);
+        let output_path = ReleaseFile(output_path);
         let shell = Command::new("/bin/sh")
             .arg("-c")
             // Not just `"$@"`: the shell would exec the fixture instead of waiting for it.
             .arg("\"$@\"; status=$?; exit $status")
             .arg("sh")
             .arg(fixture!("loop_counter").path())
-            .args(args)
+            .args(exit_gate.gate_args())
             // Both the shell and the fixture carry the tag in their argument lists.
             .arg(tag.as_str())
             .stdin(std::process::Stdio::null())
@@ -782,6 +798,7 @@ impl Grandchild
             shell,
             pid: 0,
             output_path,
+            exit_gate,
         };
         let deadline = Instant::now() + TIMEOUT;
         let pid = loop {
@@ -823,20 +840,28 @@ impl Grandchild
         snapshot
     }
 
-    /// The fixture's exit status once it (and so the shell) exits by itself, or `None`
-    /// if its `--progress` output stops growing for `stall` or it is still running after
-    /// `cap`.
-    ///
-    /// A stalled fixture is the failure these tests look for: one left stopped prints
-    /// nothing more. A plain deadline is not enough (#206): under a background scheduling
-    /// clamp, `loop_counter`'s 10 ms sleeps take 100 ms or more, so a released process
-    /// that runs normally can still miss a deadline sized for an unloaded machine.
-    fn ran_to_completion(&mut self, stall: Duration, cap: Duration) -> Option<std::process::ExitStatus>
+    /// Sample across the release window while the fixture is still gated. `ps` state
+    /// is reliable for this target because it was not launched suspended.
+    fn assert_not_stopped(&self, case: &str)
     {
-        let output_len = || fs::metadata(&self.output_path.0).map_or(0, |meta| meta.len());
-        let start = Instant::now();
-        let mut last_len = output_len();
-        let mut last_progress = start;
+        for sample in 0..5 {
+            if sample != 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let stat = process_state(self.pid);
+            assert!(
+                !stat.starts_with('T'),
+                "{case}: the released process is stopped (state {stat}); {}",
+                self.diagnostics()
+            );
+        }
+    }
+
+    /// Ask the fixture to exit and wait for the shell to return its status.
+    fn open_gate_and_wait(&mut self) -> Option<std::process::ExitStatus>
+    {
+        self.exit_gate.open_gate();
+        let deadline = Instant::now() + TIMEOUT;
         loop {
             if let Some(status) = self
                 .shell
@@ -845,13 +870,7 @@ impl Grandchild
             {
                 return Some(status);
             }
-            let now = Instant::now();
-            let len = output_len();
-            if len != last_len {
-                last_len = len;
-                last_progress = now;
-            }
-            if now.duration_since(last_progress) >= stall || now.duration_since(start) >= cap {
+            if Instant::now() >= deadline {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -863,7 +882,7 @@ impl Drop for Grandchild
 {
     fn drop(&mut self)
     {
-        // Kill by tag, never by pid: once `ran_to_completion` has reaped the shell, and the
+        // Kill by tag, never by pid: once `open_gate_and_wait` has reaped the shell, and the
         // shell the fixture, both pids may belong to unrelated processes. The tag matches
         // only live processes that still carry it.
         let _ = harness::kill_tagged(self.tag.as_str());
@@ -877,15 +896,13 @@ impl Drop for Grandchild
 /// private SIGSTOP that ends tracing, and a user signal held when it is released is
 /// discarded, not delivered.
 ///
-/// The released process must not be in state `T`, and `loop_counter 100` must run its
-/// second or so to completion and exit 0 (a delivered SIGUSR1 would kill it). The
+/// The released process must not be in state `T`, and `loop_counter` must exit 0 when
+/// the test opens its exit gate (a delivered SIGUSR1 would kill it). The
 /// target's parent is a shell, as for a process started from a terminal (see
 /// [`Grandchild`]).
 #[test]
 fn released_processes_run_to_completion()
 {
-    const SHORT_LOOP: &str = "100";
-    const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
     /// How the attached process is released.
     const CASES: &[&str] = &[
         "detach after inspecting",
@@ -896,78 +913,74 @@ fn released_processes_run_to_completion()
         "detach with held signal",
     ];
 
-    harness::run_with_timeout(Duration::from_secs(420), |t| {
-        for &case in CASES {
-            let mut target = Grandchild::spawn(t, &[SHORT_LOOP, "--progress"]);
-            let pid = ProcessId::from(target.pid);
-            let mut session = ferros_macos::new_session().expect("backend");
-            let started = Instant::now();
-            session.attach(pid).expect("attach");
-            match case {
-                "detach" => session.detach().expect("detach"),
-                "detach after inspecting" => {
-                    // What `ferros attach --headless` does before it detaches.
-                    session.threads().expect("threads");
-                    session.memory_regions().expect("memory_regions");
-                    session.detach().expect("detach");
+    harness::run(|t| {
+        // A released fixture can be checked while the next case attaches its own target.
+        std::thread::scope(|scope| {
+            for &case in CASES {
+                let mut target = Grandchild::spawn(t);
+                let pid = ProcessId::from(target.pid);
+                let mut session = ferros_macos::new_session().expect("backend");
+                let started = Instant::now();
+                session.attach(pid).expect("attach");
+                match case {
+                    "detach" => session.detach().expect("detach"),
+                    "detach after inspecting" => {
+                        // What `ferros attach --headless` does before it detaches.
+                        session.threads().expect("threads");
+                        session.memory_regions().expect("memory_regions");
+                        session.detach().expect("detach");
+                    }
+                    "drop stopped" => drop(session),
+                    "drop running" => {
+                        session.resume().expect("resume");
+                        drop(session);
+                    }
+                    "backend drop" => {
+                        session.detach().expect("detach the session");
+                        let mut backend = MacOSBackend::new().expect("backend");
+                        backend.attach(pid).expect("attach the bare backend");
+                        drop(backend);
+                    }
+                    "detach with held signal" => {
+                        session.resume().expect("resume");
+                        signal(target.pid, "-USR1");
+                        assert!(matches!(
+                            session.wait(Some(TIMEOUT)).expect("signal stop"),
+                            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+                        ));
+                        // Detach discards the held signal (SIGUSR1 would terminate it).
+                        session.detach().expect("detach with a held signal");
+                    }
+                    _ => unreachable!(),
                 }
-                "drop stopped" => drop(session),
-                "drop running" => {
-                    session.resume().expect("resume");
-                    drop(session);
-                }
-                "backend drop" => {
-                    session.detach().expect("detach the session");
-                    let mut backend = MacOSBackend::new().expect("backend");
-                    backend.attach(pid).expect("attach the bare backend");
-                    drop(backend);
-                }
-                "detach with held signal" => {
-                    session.resume().expect("resume");
-                    signal(target.pid, "-USR1");
-                    assert!(matches!(
-                        session.wait(Some(TIMEOUT)).expect("signal stop"),
-                        Some(StopEvent::Signal { signal: SIGUSR1, .. })
-                    ));
-                    // Detach discards the held signal (SIGUSR1 would terminate it).
-                    session.detach().expect("detach with a held signal");
-                }
-                _ => unreachable!(),
+                let released = Instant::now();
+                eprintln!("{case}: attach/release took {:?}", released.duration_since(started));
+                scope.spawn(move || {
+                    target.assert_not_stopped(case);
+                    let status = target.open_gate_and_wait().unwrap_or_else(|| {
+                        panic!(
+                            "{case}: no completion after {:?}; {}",
+                            released.elapsed(),
+                            target.diagnostics()
+                        )
+                    });
+                    eprintln!("{case}: completed {:?} after release", released.elapsed());
+                    assert!(
+                        status.success(),
+                        "{case}: the released process exited with {status}; {}",
+                        target.diagnostics()
+                    );
+                });
             }
-            let released = Instant::now();
-            eprintln!("{case}: attach/release took {:?}", released.duration_since(started));
-            // Not left job-control stopped. (`ps` state is reliable here: the target
-            // was not launched suspended.) The shell would not show it: it continues a
-            // stopped child itself.
-            for _ in 0..5 {
-                let stat = process_state(target.pid);
-                assert!(
-                    !stat.starts_with('T'),
-                    "{case}: the released process is stopped (state {stat}); {}",
-                    target.diagnostics()
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let status = target.ran_to_completion(RELEASE_STALL, EXIT_TIMEOUT).unwrap_or_else(|| {
-                panic!(
-                    "{case}: no completion after {:?}; {}",
-                    released.elapsed(),
-                    target.diagnostics()
-                )
-            });
-            eprintln!("{case}: completed {:?} after release", released.elapsed());
-            assert!(
-                status.success(),
-                "{case}: the released process exited with {status}; {}",
-                target.diagnostics()
-            );
-        }
+        });
 
         // A launched process released with detach also runs to completion.
-        let mut d = t.launch_with_args(&fixture!("loop_counter"), &[SHORT_LOOP]);
+        let exit_gate = ReleaseFile::exit_gate();
+        let mut d = t.launch_with_args(&fixture!("loop_counter"), &exit_gate.gate_args());
         d.detach().expect("detach a launched process");
+        exit_gate.open_gate();
         assert!(
-            d.wait_for_stdout("final count: 100", EXIT_TIMEOUT),
+            d.wait_for_stdout("final count: 0", TIMEOUT),
             "the detached launched process did not run to completion: state/Mach={:?}, stdout/stderr={:?}",
             (process_state(d.pid().0), diagnostics::process_suspend_counts(d.pid())),
             (d.stdout(), d.stderr())
@@ -982,23 +995,17 @@ fn released_processes_run_to_completion()
 #[test]
 fn detach_continues_a_private_stop_that_lands_after_its_wait()
 {
-    harness::run_with_timeout(Duration::from_secs(90), |t| {
-        let mut target = Grandchild::spawn(t, &["100", "--progress"]);
+    harness::run(|t| {
+        let mut target = Grandchild::spawn(t);
         let mut backend = MacOSBackend::new().expect("backend");
         backend.attach(ProcessId::from(target.pid)).expect("attach");
-        backend.reply_fault_injector().expire_next_detach_stop_wait();
+        backend
+            .reply_fault_injector()
+            .expire_next_detach_stop_wait(Duration::from_millis(500));
         backend.detach().expect("detach after a late private stop");
-        for _ in 0..5 {
-            let stat = process_state(target.pid);
-            assert!(
-                !stat.starts_with('T'),
-                "the released process is stopped (state {stat}); {}",
-                target.diagnostics()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        target.assert_not_stopped("detach after a late private stop");
         let status = target
-            .ran_to_completion(RELEASE_STALL, Duration::from_secs(60))
+            .open_gate_and_wait()
             .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
         assert!(status.success(), "the released process exited with {status}");
     });
@@ -1009,21 +1016,24 @@ fn detach_continues_a_private_stop_that_lands_after_its_wait()
 #[test]
 fn detach_reports_a_private_stop_it_never_saw()
 {
-    harness::run_with_timeout(Duration::from_secs(180), |t| {
-        // Long enough to outlive the whole bounded wait.
-        let mut target = Grandchild::spawn(t, &["600", "--progress"]);
+    harness::run(|t| {
+        let mut target = Grandchild::spawn(t);
         let mut backend = MacOSBackend::new().expect("backend");
         backend.attach(ProcessId::from(target.pid)).expect("attach");
-        backend.reply_fault_injector().hide_next_detach_stop();
+        let real_stop = backend.reply_fault_injector().hide_next_detach_stop(TIMEOUT);
         let error = backend.detach().expect_err("an unseen private stop is reported");
         assert!(
             matches!(error, BackendError::DetachCleanup(ref message) if message.contains("may stay stopped")),
             "{error:?}"
         );
-        // The stop did land, so the late SIGCONT still released the process.
-        // Throttled, 600 ticks take over a minute (#206).
+        assert_eq!(
+            real_stop.try_recv(),
+            Ok(true),
+            "the real private stop must take effect before SIGCONT; {}",
+            target.diagnostics()
+        );
         let status = target
-            .ran_to_completion(RELEASE_STALL, Duration::from_secs(150))
+            .open_gate_and_wait()
             .unwrap_or_else(|| panic!("no completion after detach; {}", target.diagnostics()));
         assert!(status.success(), "the released process exited with {status}");
     });

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 
+use ferros_core::BackendError;
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::types::{Address, MemoryRegion, MemoryRegionId};
 use libc::{c_int, mach_port_t, vm_address_t, vm_map_t, vm_offset_t};
@@ -47,6 +48,7 @@ use mach2::vm_statistics::{
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 use once_cell::sync::Lazy;
 
+use crate::error::{MachError, vm_read_error};
 use crate::{constants, ffi};
 
 // Use constants from the centralized constants module
@@ -155,9 +157,10 @@ impl MemoryCache
 
             if page_offset + chunk > page.len() {
                 // Page shorter than expected; fall back to direct read.
+                // `read_memory` is all or nothing, so `bytes` always fills `chunk`.
                 let bytes = read_memory(task, Address::from(absolute), chunk)?;
-                output[copied..copied + bytes.len()].copy_from_slice(&bytes);
-                copied += bytes.len();
+                output[copied..copied + chunk].copy_from_slice(&bytes);
+                copied += chunk;
                 continue;
             }
 
@@ -203,15 +206,16 @@ impl MemoryCache
 ///
 /// ## Returns
 ///
-/// A `Vec<u8>` containing the read bytes. The actual number of bytes read may be less
-/// than requested if the address range is not fully accessible.
+/// A `Vec<u8>` of exactly `len` bytes. The read is all or nothing.
 ///
 /// ## Errors
 ///
-/// Returns an `Io` error if:
-/// - The address is invalid or not accessible
-/// - Insufficient permissions to read the memory
-/// - The memory region is not readable
+/// The error wraps a [`BackendError`](ferros_core::BackendError), classified while the
+/// kernel's answer is still known:
+/// - `NotFound` if any byte of the range is unmapped
+/// - `PermissionDenied` (as [`DebuggerError::PermissionDenied`]) if a byte is mapped but
+///   not readable
+/// - `Os` with the native code and the address for any other failure
 ///
 /// ## Safety
 ///
@@ -579,7 +583,7 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
         return Ok(0);
     }
 
-    ensure_readable_range(task, addr, dst.len())?;
+    ensure_readable_span(task, addr, dst.len())?;
 
     let mut total = 0usize;
     let mut cursor = addr.value();
@@ -599,14 +603,20 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
         };
 
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(Error::other(format!(
-                "mach_vm_read_overwrite failed: {}",
-                result
-            ))));
+            return Err(vm_read_error("mach_vm_read_overwrite", Address::from(cursor), result).into());
         }
 
-        if actual == 0 {
-            break;
+        // Every byte was checked readable above, so the kernel stopping short means the
+        // map changed under the read. Report it rather than return a short buffer (or,
+        // for zero bytes, loop forever).
+        if actual == 0 || actual > chunk_len as mach_vm_size_t {
+            return Err(BackendError::NotFound(format!(
+                "mach_vm_read_overwrite read {} of {} bytes at {}",
+                total as u64 + actual,
+                dst.len(),
+                addr
+            ))
+            .into());
         }
 
         total += actual as usize;
@@ -918,9 +928,33 @@ struct RegionInfo
     max_protection: u32,
 }
 
-fn ensure_readable_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
+/// Check that every byte of `[addr, addr + len)` is mapped and readable.
+///
+/// The range may span several adjacent regions. A hole is `NotFound` and an unreadable
+/// region is `PermissionDenied`, whichever part of the range it falls in, so a read that
+/// runs off the end of a mapping fails the same way as one that starts outside it.
+fn ensure_readable_span(task: mach_port_t, addr: Address, len: usize) -> Result<()>
 {
-    ensure_range_with_permissions(task, addr, len, Some(libc::VM_PROT_READ as u32))
+    let end = addr.value().checked_add(len as u64).ok_or_else(|| {
+        DebuggerError::from(BackendError::NotFound(format!(
+            "range of {len} bytes at {addr} runs past the end of the address space"
+        )))
+    })?;
+    let mut cursor = addr.value();
+    while cursor < end {
+        let at = Address::from(cursor);
+        let info = region_for_address(task, at)?
+            .ok_or_else(|| DebuggerError::from(BackendError::NotFound(format!("address {at} is not mapped"))))?;
+        if (info.protection & libc::VM_PROT_READ as u32) == 0 {
+            return Err(BackendError::PermissionDenied(format!("memory at {at} is not readable")).into());
+        }
+        let next = info.start.saturating_add(info.size);
+        if next <= cursor {
+            return Err(BackendError::NotFound(format!("address {at} is not mapped")).into());
+        }
+        cursor = next;
+    }
+    Ok(())
 }
 
 fn ensure_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionInfo>
@@ -986,10 +1020,11 @@ fn region_for_address(task: mach_port_t, addr: Address) -> Result<Option<RegionI
                 return Ok(None);
             }
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::Io(Error::other(format!(
-                    "mach_vm_region_recurse failed: {}",
-                    result
-                ))));
+                return Err(BackendError::Os {
+                    code: i64::from(result),
+                    message: format!("mach_vm_region_recurse at {addr}: {}", MachError::from(result)),
+                }
+                .into());
             }
 
             if target > addr.value() {

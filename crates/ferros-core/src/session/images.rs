@@ -463,7 +463,7 @@ impl Session
             }
             (previous, failed) => self
                 .symbols
-                .load_executable(image.descriptor.clone(), image.slice.as_ref(), previous)
+                .load_executable(image.descriptor.clone(), image.slice.as_ref(), image.build_id, previous)
                 .map(Some)
                 .or_else(|error| {
                     // Reopening a changed file can fail while the live mapping and its

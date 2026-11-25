@@ -3811,6 +3811,16 @@ fn late_id_pcs(session: &mut Session) -> Vec<Address>
         .collect()
 }
 
+/// The name the stopped thread's innermost frame is given.
+fn late_id_top_name(session: &mut Session) -> Option<String>
+{
+    session
+        .stack_trace(8)
+        .expect("stack trace")
+        .first()
+        .and_then(|frame| frame.symbol.as_ref().map(|symbol| symbol.display_name().to_owned()))
+}
+
 /// #221: an image file opened while the mapped build id was unknown is served only while
 /// no known id contradicts it. Once the loader reports another build than the file
 /// records, the session stops unwinding with the file's unwind hints (the executable half)
@@ -3840,6 +3850,11 @@ fn contradictory_build_id_stops_serving_the_old_file()
         Err(ferros_core::DebuggerError::SymbolLoad { .. }) => {}
         other => panic!("the old file's DWARF is still served: {other:?}"),
     }
+    assert_ne!(
+        late_id_top_name(&mut session).as_deref(),
+        Some("old_build"),
+        "the stack trace still names the frame from the old file's DWARF"
+    );
     assert_eq!(
         late_id_pcs(&mut session),
         vec![LATE_ID_FUNCTION],
@@ -3920,4 +3935,78 @@ fn a_matching_late_build_id_reuses_the_open_file()
     );
     assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
     assert_eq!(opens.load(Ordering::SeqCst), 1, "a matching late id reopened the file");
+}
+
+/// [`MockObjectFormat`] whose mapped header never yields a slice: the format cannot tell
+/// which build is mapped, so only the session can carry the build id the loader reports
+/// to the file it opens.
+struct NoSlice;
+
+impl ferros_core::objfile::ObjectFormat for NoSlice
+{
+    fn mapped_symbols(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> Result<std::sync::Arc<dyn ferros_core::objfile::MappedSymbols>, String>
+    {
+        ferros_core::objfile::ObjectFormat::mapped_symbols(&MockObjectFormat, memory, load_address)
+    }
+
+    fn map_image(
+        &self,
+        memory: &mut dyn ferros_core::objfile::TargetMemory,
+        load_address: Address,
+    ) -> ferros_core::objfile::MappedImage
+    {
+        let mapped = ferros_core::objfile::ObjectFormat::map_image(&MockObjectFormat, memory, load_address);
+        ferros_core::objfile::MappedImage {
+            mapping: mapped.mapping,
+            slice: None,
+        }
+    }
+
+    fn open_image(
+        &self,
+        path: &std::path::Path,
+        load_address: u64,
+        slice: Option<&ferros_core::objfile::ImageSlice>,
+    ) -> ferros_core::Result<ferros_core::objfile::ImageContents>
+    {
+        ferros_core::objfile::ObjectFormat::open_image(&MockObjectFormat, path, load_address, slice)
+    }
+}
+
+/// #221: when the mapped header gives no slice, the format cannot refuse a file of another
+/// build by itself. Once a late build id contradicts the opened file, opening the same
+/// unchanged file again must not serve it for the mapped build.
+#[test]
+fn a_contradicted_file_is_refused_when_reopened_without_a_slice()
+{
+    let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-late-build-id-no-slice", "");
+    std::io::Write::write_all(&mut file, &late_id_file("old_build", &[0xD5; 16])).expect("write image");
+    drop(file);
+    let _files = RemoveOnDrop(vec![path.clone()]);
+    let mock = late_id_process(&path, ferros_core::BuildIdentity::Unknown);
+    let mut session = Session::new(Box::new(mock.clone()), std::sync::Arc::new(NoSlice));
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    assert_eq!(late_id_name(&mut session).expect("symbolicate").as_deref(), Some("old_build"));
+    assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+
+    mock.set_images(vec![late_id_listed(&path, known(&[0xE6; 16]))]);
+    match late_id_name(&mut session) {
+        Err(ferros_core::DebuggerError::SymbolLoad { .. }) => {}
+        other => panic!("the reopened old file is served for the mapped build: {other:?}"),
+    }
+    assert_eq!(
+        late_id_pcs(&mut session),
+        vec![LATE_ID_FUNCTION],
+        "the reopened old file's unwind hint is served for the mapped build"
+    );
+
+    std::fs::write(&path, late_id_file("new_build_fn", &[0xE6; 16])).expect("rewrite image");
+    assert_eq!(
+        late_id_name(&mut session).expect("symbolicate").as_deref(),
+        Some("new_build_fn")
+    );
 }

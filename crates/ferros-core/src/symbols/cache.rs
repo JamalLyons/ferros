@@ -51,7 +51,7 @@ use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use super::load_inputs::LoadInputs;
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageSlice, ObjectFormat};
-use crate::types::{Address, BuildIdentity, FunctionParameter, SourceLocation, SymbolName};
+use crate::types::{Address, BuildIdentity, FunctionParameter, SourceLocation, SymbolName, same_build};
 
 /// Cached symbol metadata for a given address.
 ///
@@ -259,13 +259,21 @@ impl SymbolCache
     /// without debug information. When refreshing a cached image, keep the previous entry
     /// until its replacement's executable has been read successfully.
     ///
+    /// `mapped` is the build identity the loader reports for the mapping. A file that
+    /// records another build is refused even when `slice` could not carry that identity to
+    /// the format, so a file opened again after a late build id contradicted it is never
+    /// cached for the wrong build (#221).
+    ///
     /// # Errors
     /// An error of [`ObjectFormat::open_image`]: the file cannot be read, does not parse,
     /// is another build, or the format cannot tell which part of it is mapped.
+    /// [`DebuggerError::InvalidArgument`] when `mapped` is known and the file records
+    /// another build or none.
     pub(crate) fn load_executable(
         &mut self,
         mut descriptor: ImageDescriptor,
         slice: Option<&ImageSlice>,
+        mapped: BuildIdentity,
         replacing: Option<ImageId>,
     ) -> Result<Arc<BinaryImage>>
     {
@@ -276,7 +284,14 @@ impl SymbolCache
         {
             return Ok(existing.clone());
         }
+        let path = descriptor.path.clone();
         let (image, build_id) = self.read_image(descriptor, slice)?;
+        if mapped.known().is_some() && !same_build(build_id, mapped) {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "{} is another build ({build_id:?}) than the mapped image ({mapped:?})",
+                path.display()
+            )));
+        }
         if let Some(previous) = replacing.filter(|&previous| previous != id) {
             self.images.remove(&previous);
             self.file_builds.remove(&previous);

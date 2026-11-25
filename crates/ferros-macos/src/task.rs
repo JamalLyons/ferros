@@ -103,6 +103,7 @@ use crate::error::MachError;
 use crate::exception::{
     self, ExceptionLoopCommand, ExceptionSharedState, LoopEvent, ReplyFaultInjector, SavedExceptionPorts, lock_shared,
 };
+use crate::guards::ThreadSuspendGuard;
 use crate::memory::{MemoryCache, get_memory_regions, write_memory_all_or_nothing};
 #[cfg(target_arch = "aarch64")]
 use crate::registers::{read_registers_arm64, write_registers_arm64};
@@ -1146,6 +1147,28 @@ impl MacOSBackend
         }
     }
 
+    /// Balance the suspends owned by this resume. If it fails, put back those
+    /// already balanced so the caller can restore the backend's stopped state.
+    fn resume_task(&self, count: u32) -> BackendResult<()>
+    {
+        for done in 0..count {
+            let kr = if self.reply_faults.resume.swap(false, Ordering::SeqCst) {
+                mach2::kern_return::KERN_FAILURE
+            } else {
+                // SAFETY: the backend owns this task right and suspend.
+                unsafe { task_resume(self.task) }
+            };
+            if kr != KERN_SUCCESS {
+                for _ in 0..done {
+                    // SAFETY: restore the suspends balanced above, if the task is still alive.
+                    let _ = unsafe { task_suspend(self.task) };
+                }
+                return Err(mach_error(kr, "task_resume failed"));
+            }
+        }
+        Ok(())
+    }
+
     /// Deallocate the task and thread ports and forget the process.
     ///
     /// Thread suspends and single-step bits still recorded are balanced first, while the
@@ -1299,7 +1322,13 @@ impl MacOSBackend
         } else {
             None
         };
-        if requeue {
+        if reply_pending {
+            // Private handshakes and failed early suppressions still own a reply. Update
+            // it before queuing a new signal, so a failed update never leaves a signal
+            // queued in the kernel that no record tracks (#242).
+            self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, if requeue { 0 } else { signal })?;
+        }
+        if let Some(queued) = queued {
             // The original was suppressed before its early reply. Queue the chosen
             // signal on the same thread so XNU evaluates its properties afresh.
             // Track SIGKILL too: thread-directed delivery can raise a soft exception.
@@ -1307,12 +1336,6 @@ impl MacOSBackend
             if unsafe { ffi::__pthread_kill(port, signal) } != 0 {
                 return Err(backend_error(DebuggerError::Io(std::io::Error::last_os_error())));
             }
-        }
-        if reply_pending {
-            // Private handshakes and failed early suppressions still own a reply.
-            self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, if requeue { 0 } else { signal })?;
-        }
-        if let Some(queued) = queued {
             shared.requeued_signals.push(queued);
         }
         Ok(())
@@ -2006,19 +2029,20 @@ impl Backend for MacOSBackend
     ///
     /// 1. `thread_suspend` every thread whose action is `Suspend` and set the single-step
     ///    bit (`MDSCR_EL1.SS`) of every thread whose action is `Step`;
-    /// 2. requeue runnable threads' selected signals and release their stop records;
-    ///    suspended threads retain their records and signal decisions;
-    /// 3. `task_resume` once per suspend the backend holds.
+    /// 2. release runnable threads' stop records and `task_resume` once per suspend the
+    ///    backend holds. When forwarding signals, hold their threads suspended and keep
+    ///    their stop records until `task_resume` succeeds, then select the signals before
+    ///    letting those threads run. Selectively suspended threads keep their records.
     ///
     /// A step that completes is reported by `wait` as [`StopEvent::SingleStep`]. Whatever
     /// stop `wait` reports next, the `thread_suspend`s are then balanced and every
     /// single-step bit set here is cleared (see `deliver`).
     ///
-    /// A reply that fails does not fail the resume: the next `wait` reports it. If any
-    /// other step fails, what was done is undone (`thread_resume`, single-step bits
-    /// cleared, the suspend count restored) and the target stays *Stopped*.
-    /// If both a reply and `task_resume` fail, resume returns the latter error while the
-    /// reply error stays queued for `wait` (or the session's next resume) exactly once.
+    /// The next `wait` reports failed replies and signal selection failures after the
+    /// task resumes. If a step before that fails, what was done is undone (`thread_resume`,
+    /// single-step bits cleared, the suspend count restored) and the target stays *Stopped*.
+    /// A reply error already queued when `task_resume` fails is still reported once by
+    /// `wait` (or the session's next resume).
     ///
     /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
     /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
@@ -2046,7 +2070,7 @@ impl Backend for MacOSBackend
         // means a stop is either fully visible here (and the resume is refused) or has
         // not happened yet.
         let shared_state = Arc::clone(&self.exception_state);
-        let (count, pending, held) = {
+        let (count, pending, held, signal_threads) = {
             let mut shared = lock_shared(&shared_state);
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
@@ -2056,34 +2080,76 @@ impl Backend for MacOSBackend
                 drop(shared);
                 return Err(self.publish_held_batch());
             }
+            let mut signal_threads: Vec<_> = shared
+                .soft_signals
+                .iter()
+                .map(|&(port, _)| port)
+                .filter(|&port| {
+                    request
+                        .signal_for(ThreadId::from(u64::from(port)))
+                        .is_some_and(|signal| signal != 0)
+                })
+                .collect();
+            signal_threads.sort_unstable();
+            signal_threads.dedup();
             shared.preparing_resume = true;
             (
                 std::mem::take(&mut shared.suspends),
                 shared.pending_exception,
                 !shared.held.is_empty(),
+                signal_threads,
             )
         };
         self.reply_faults.publish_resume_race();
-        let restore = |backend: &mut Self, count: u32| {
+        let restore = |backend: &mut Self| {
             backend.undo_thread_actions();
             backend.rearm_birth_if_active();
             let mut shared = lock_shared(&backend.exception_state);
             shared.suspends += count;
             shared.preparing_resume = false;
         };
+        let resume_failed = |backend: &mut Self, err| {
+            // The task can become inactive before its port becomes a dead name or
+            // NOTE_EXIT is published. Give the watcher a bounded chance to confirm.
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                if lock_shared(&backend.exception_state).dead || crate::lifecycle::task_is_dead(backend.task) {
+                    backend.state = BackendState::Running;
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            restore(backend);
+            Err(err)
+        };
+        let events = self.events_tx.clone();
+        let report_error = |err| {
+            if let Some(events) = &events {
+                let _ = events.send(Err(err));
+            }
+        };
+        let forwarding = !signal_threads.is_empty();
 
         // Traps go in before any thread can run. A failure here leaves the snapshot
         // policy unused: the resume returns and the target stays stopped.
         if let Err(err) = self.sync_birth_policy(request) {
-            restore(self, count);
+            restore(self);
             return Err(err);
         }
 
         // Suspend and arm the threads before any of them can run.
         if let Err(err) = self.apply_thread_actions(&suspend, &step) {
-            restore(self, count);
+            restore(self);
             return Err(err);
         }
+        if forwarding && let Err(err) = self.prepare_birth_step_off(&suspend) {
+            restore(self);
+            return Err(err);
+        }
+        self.memory_cache.clear();
 
         {
             // G8 (#57): the task remains physically suspended, but the exception
@@ -2096,13 +2162,37 @@ impl Backend for MacOSBackend
             if let Some(event) = self.try_next_event() {
                 self.peeked = Some(event);
                 drop(shared);
-                restore(self, count);
+                restore(self);
                 return Err(BackendError::StopPending);
             }
             if shared.held_unsuspended {
                 drop(shared);
-                restore(self, count);
+                restore(self);
                 return Err(self.publish_held_batch());
+            }
+            // A thread receiving a signal must stay at its stop until the signal is
+            // selected. Its held record keeps the thread right alive until Continue.
+            let signal_suspends = signal_threads
+                .into_iter()
+                .map(ThreadSuspendGuard::new)
+                .collect::<Result<Vec<_>>>();
+            let signal_suspends = match signal_suspends {
+                Ok(suspends) => suspends,
+                Err(err) => {
+                    drop(shared);
+                    restore(self);
+                    return Err(backend_error(err));
+                }
+            };
+            if forwarding {
+                // Once these suspends are balanced, the loop must not use them to
+                // answer deferred exceptions, even if Continue has not arrived yet.
+                shared.preparing_resume = false;
+                if let Err(err) = self.resume_task(count) {
+                    shared.preparing_resume = true;
+                    drop(shared);
+                    return resume_failed(self, err);
+                }
             }
             if pending || held {
                 // A selectively suspended thread retains its logical signal decision
@@ -2111,18 +2201,24 @@ impl Backend for MacOSBackend
                 for (port, original) in signals.into_iter().filter(|(port, _)| !suspend.contains(port)) {
                     let signal = request.signal_for(ThreadId::from(u64::from(port))).unwrap_or(0);
                     if let Err(err) = self.select_resumed_signal(&mut shared, port, original, signal) {
-                        drop(shared);
-                        restore(self, count);
-                        return Err(err);
+                        if forwarding {
+                            report_error(err);
+                        } else {
+                            drop(shared);
+                            restore(self);
+                            return Err(err);
+                        }
                     }
                 }
             }
-            if !pending && held {
+            drop(signal_suspends);
+            if !pending
+                && held
+                && let Some(events) = &events
+            {
                 // Only retained stop records remain; the loop is receiving rather
                 // than awaiting Continue, so their replies are owned here.
-                if let Some(events) = self.events_tx.clone() {
-                    exception::answer_held_exceptions(&mut shared, &suspend, &self.reply_faults, &events, self.task);
-                }
+                exception::answer_held_exceptions(&mut shared, &suspend, &self.reply_faults, events, self.task);
             }
         }
         if pending {
@@ -2147,57 +2243,30 @@ impl Backend for MacOSBackend
                 Err("the exception handler is not running")
             };
             if let Err(message) = replied {
-                restore(self, count);
-                return Err(BackendError::Os {
+                let err = BackendError::Os {
                     code: -1,
                     message: format!("failed to reply to the Mach exception: {message}"),
-                });
+                };
+                if forwarding {
+                    report_error(err);
+                } else {
+                    restore(self);
+                    return Err(err);
+                }
             }
         }
 
-        if let Err(err) = self.prepare_birth_step_off(&suspend) {
-            restore(self, count);
-            return Err(err);
-        }
-
-        // Continue has been acknowledged before any actual task_resume. The loop
-        // can no longer use these in-flight suspends to answer deferred signals.
-        lock_shared(&self.exception_state).preparing_resume = false;
-        self.memory_cache.clear();
-        for done in 0..count {
-            let kr = if self.reply_faults.resume.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                mach2::kern_return::KERN_FAILURE
-            } else {
-                unsafe { task_resume(self.task) }
-            };
-            if kr != KERN_SUCCESS {
-                // Delivering a fatal soft signal can destroy the task as soon as its
-                // exception is answered, before task_resume reaches the kernel. Resume
-                // succeeded; wait owns the pending terminal event.
-                // The task can be inactive before its port becomes a dead name or
-                // NOTE_EXIT is published. Give the watcher a bounded chance to confirm.
-                let deadline = Instant::now() + Duration::from_millis(200);
-                loop {
-                    if lock_shared(&self.exception_state).dead || crate::lifecycle::task_is_dead(self.task) {
-                        self.state = BackendState::Running;
-                        return Ok(());
-                    }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-                // Re-suspend what was already resumed so the target stays stopped.
-                for _ in 0..done {
-                    unsafe {
-                        let _ = task_suspend(self.task);
-                    }
-                }
-                restore(self, count);
-                return Err(mach_error(kr, "task_resume failed"));
+        if !forwarding {
+            if let Err(err) = self.prepare_birth_step_off(&suspend) {
+                restore(self);
+                return Err(err);
+            }
+            // The loop can no longer use these in-flight suspends to answer deferred signals.
+            lock_shared(&self.exception_state).preparing_resume = false;
+            if let Err(err) = self.resume_task(count) {
+                return resume_failed(self, err);
             }
         }
-
         self.state = BackendState::Running;
         info!("Resumed process {}", self.pid.0);
         Ok(())

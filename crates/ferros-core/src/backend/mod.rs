@@ -246,6 +246,8 @@ pub trait Backend: Send
     ///   the target is stopped with nothing pending (it would block forever).
     /// - [`BackendError::Os`] if waiting on the OS fails, or an exception reply from
     ///   the previous resume failed. The backend state is unchanged by that error.
+    /// - An error from delivering a signal the previous resume forwarded, when that resume
+    ///   had already let the target run: the target keeps running.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>;
 
     /// Resume the target as described by `request`; the backend becomes *Running*.
@@ -276,7 +278,10 @@ pub trait Backend: Send
     ///   expressed on this OS, a signal is named for a thread whose action is `Suspend`,
     ///   or a signal cannot be delivered (see [`ResumeRequest::signals`]).
     /// - [`BackendError::Os`] if the OS fails to resume a thread; the target is left
-    ///   *Stopped*.
+    ///   *Stopped*, and a signal named in `request` is still held and not delivered.
+    ///
+    /// A backend that can only deliver a forwarded signal once the target runs may
+    /// return `Ok` and report a delivery failure from the next [`wait`](Self::wait).
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>;
 
     /// Ask a running target to stop; returns immediately.

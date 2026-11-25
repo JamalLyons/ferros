@@ -35,7 +35,7 @@ the tests do not omit a legitimate drain.
 
 ## Fix
 
-`run_exception_loop` (`crates/ferros-macos/src/exception.rs`): when no stop is
+`run_exception_loop` (`crates/ferros-macos/src/exception/run.rs`): when no stop is
 pending, the backend holds suspends, no resume is being prepared and no private
 handshake is active, a client soft signal is handled like one arriving during a
 reported stop. It is suppressed and answered early, its logical stop is deferred,

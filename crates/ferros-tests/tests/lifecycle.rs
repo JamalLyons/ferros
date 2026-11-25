@@ -1177,6 +1177,165 @@ fn held_signal_survives_a_forwarding_resume_whose_task_resume_fails()
     });
 }
 
+/// Run the `signal_handler --interrupt` fixture to a held SIGUSR1 stop in `spin`, with a
+/// breakpoint in the handler. Returns the session, its fault injector and that breakpoint.
+fn held_sigusr1(
+    t: &harness::TestContext,
+) -> (
+    harness::Debuggee,
+    ferros_macos::exception::ReplyFaultInjector,
+    ferros_core::LogicalBreakpointId,
+)
+{
+    let fixture = fixture!("signal_handler");
+    let file = format!("{}.rs", fixture.name());
+    let backend = MacOSBackend::new().expect("backend");
+    let faults = backend.reply_fault_injector();
+    let mut d = t.launch_with_backend(&fixture, &["--interrupt"], backend);
+    let spin = d
+        .set_breakpoint(BreakpointLocation::Line {
+            file: file.clone(),
+            line: fixture.marker_line("spin_line"),
+        })
+        .expect("break in spin");
+    d.resume().expect("run to spin");
+    assert!(matches!(
+        d.wait(Some(TIMEOUT)).expect("spin stop"),
+        Some(StopEvent::Breakpoint { .. })
+    ));
+    d.delete_breakpoint(spin).expect("remove the spin breakpoint");
+    let handler = d
+        .set_breakpoint(BreakpointLocation::Line {
+            file,
+            line: fixture.marker_line("in_handler"),
+        })
+        .expect("break in the handler");
+    // Sent while stopped; the spinning thread takes it once resumed.
+    signal(d.pid().0, "-USR1");
+    d.resume().expect("resume into the signal");
+    assert!(matches!(
+        d.wait(Some(TIMEOUT)).expect("signal stop"),
+        Some(StopEvent::Signal { signal: SIGUSR1, .. })
+    ));
+    (d, faults, handler)
+}
+
+/// #250 W8: on a forwarding resume, signal selection runs after `task_resume`. Its
+/// failure cannot roll the target back: the resume succeeds and `wait` reports the
+/// error exactly once while the target runs.
+#[test]
+fn forwarding_resume_reports_a_signal_selection_failure_once_from_wait()
+{
+    harness::run(|t| {
+        let (mut d, faults, _) = held_sigusr1(t);
+        faults.fail_next_signal_selection();
+        d.resume_with_signal().expect("the failure is reported by wait");
+        assert_eq!(d.state(), SessionState::Running);
+        let error = d.wait(Some(TIMEOUT)).expect_err("routed selection failure");
+        assert!(error.to_string().contains("injected signal selection failure"), "{error}");
+        assert_eq!(d.state(), SessionState::Running);
+        // Reported once: nothing else is queued, and the target still runs.
+        assert_eq!(d.wait(Some(Duration::from_millis(500))).expect("no second error"), None);
+        d.interrupt().expect("interrupt");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("interrupt stop"),
+            Some(StopEvent::Interrupted { .. })
+        ));
+        d.kill().expect("kill");
+    });
+}
+
+/// #250 W9: a Continue the exception loop never acknowledges makes a forwarding resume
+/// wait out the reply timeout and return `Ok` with the target running; `wait` reports
+/// the timeout once. The loop still handled the command, so the signal is delivered.
+#[test]
+fn forwarding_resume_reports_an_unacknowledged_continue_once_from_wait()
+{
+    harness::run(|t| {
+        let (mut d, faults, handler) = held_sigusr1(t);
+        faults.drop_next_continue_ack();
+        let started = Instant::now();
+        d.resume_with_signal().expect("the timeout is reported by wait");
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "resume returned before the reply timeout"
+        );
+        assert_eq!(d.state(), SessionState::Running);
+        // The handler stop and the timeout reach `wait` in either order.
+        let (mut errors, mut hits) = (0, 0);
+        while errors + hits < 2 {
+            match d.wait(Some(TIMEOUT)) {
+                Err(error) => {
+                    assert!(error.to_string().contains("did not answer"), "{error}");
+                    errors += 1;
+                }
+                Ok(Some(StopEvent::Breakpoint { .. })) => hits += 1,
+                other => panic!("expected the handler stop or the timeout, got {other:?}"),
+            }
+        }
+        assert_eq!((errors, hits), (1, 1));
+        let count = d
+            .logical_breakpoints()
+            .iter()
+            .find(|bp| bp.id == handler)
+            .expect("handler breakpoint")
+            .hit_count;
+        assert_eq!(count, 1, "the forwarded signal ran the handler once");
+        d.resume().expect("continue from the handler");
+        assert_eq!(d.wait(Some(Duration::from_millis(500))).expect("no second error"), None);
+        d.kill().expect("kill");
+    });
+}
+
+/// #250 W11: when `task_resume` fails after the task is already running and the
+/// suspends cannot be put back, the backend must not report Stopped. The resume
+/// succeeds, `wait` reports the failure once, and an interrupt stops the target.
+#[test]
+fn partial_task_resume_failure_leaves_the_target_running()
+{
+    harness::run(|t| {
+        let (mut d, faults, _) = held_sigusr1(t);
+        for forward in [true, false] {
+            faults.fail_next_task_resume_partway();
+            if forward {
+                d.resume_with_signal().expect("forwarding resume");
+            } else {
+                d.resume().expect("plain resume");
+            }
+            assert_eq!(d.state(), SessionState::Running);
+            let mut errors = 0;
+            loop {
+                match d.wait(Some(Duration::from_millis(500))) {
+                    Err(error) => {
+                        assert!(error.to_string().contains("after the task resumed"), "{error}");
+                        errors += 1;
+                    }
+                    // The forwarded signal reaches the handler breakpoint.
+                    Ok(Some(StopEvent::Breakpoint { .. })) => d.resume().expect("continue from the handler"),
+                    Ok(None) => break,
+                    Ok(other) => panic!("unexpected stop {other:?}"),
+                }
+            }
+            assert_eq!(errors, 1, "the failure is reported once");
+            d.interrupt().expect("interrupt a running target");
+            assert!(matches!(
+                d.wait(Some(TIMEOUT)).expect("interrupt stop"),
+                Some(StopEvent::Interrupted { .. })
+            ));
+            if forward {
+                // Hold a new signal for the plain resume.
+                signal(d.pid().0, "-USR1");
+                d.resume().expect("resume into the next signal");
+                assert!(matches!(
+                    d.wait(Some(TIMEOUT)).expect("signal stop"),
+                    Some(StopEvent::Signal { signal: SIGUSR1, .. })
+                ));
+            }
+        }
+        d.kill().expect("kill");
+    });
+}
+
 /// #58 L-3/L-5: an error after teardown must still clear the Session, and the
 /// target's actual exception handlers must be restored by the safe injection hook.
 #[test]

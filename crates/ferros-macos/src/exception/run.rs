@@ -132,7 +132,12 @@ pub(crate) fn run_exception_loop(
                 answer_held_exceptions(&mut state, &keep, &faults, &events, task);
                 state.pending_exception = false;
                 faults.pending_stop.store(false, Ordering::SeqCst);
-                let _ = ack.send(());
+                if faults.continue_ack.swap(false, Ordering::SeqCst) {
+                    // Keep the sender alive: the resume waits out its reply timeout.
+                    *faults.withheld_ack.lock().unwrap_or_else(PoisonError::into_inner) = Some(ack);
+                } else {
+                    let _ = ack.send(());
+                }
                 continue;
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {

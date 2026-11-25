@@ -114,6 +114,18 @@ use crate::{ffi, images, launch, threads};
 /// How long `resume` waits for the exception loop to confirm its reply.
 const EXCEPTION_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Why [`MacOSBackend::resume_task`] failed.
+enum ResumeTaskError
+{
+    /// Every suspend was put back; the task is stopped as before.
+    Restored(BackendError),
+    /// Some suspends could not be put back, so the task may run; `held` suspends remain.
+    Partial
+    {
+        error: BackendError, held: u32
+    },
+}
+
 /// How long detach waits for the private SIGSTOP to take effect before continuing the
 /// released process.
 const DETACH_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1149,21 +1161,53 @@ impl MacOSBackend
 
     /// Balance the suspends owned by this resume. If it fails, put back those
     /// already balanced so the caller can restore the backend's stopped state.
-    fn resume_task(&self, count: u32) -> BackendResult<()>
+    ///
+    /// When putting them back fails too, the task may already run: the error is
+    /// [`ResumeTaskError::Partial`] with the suspends the backend still holds, and the
+    /// caller must treat the target as running (#250 W11).
+    fn resume_task(&self, count: u32) -> std::result::Result<(), ResumeTaskError>
     {
-        for done in 0..count {
+        // Test hook (#250): one extra suspend, so the last `task_resume` below runs the
+        // task before its failure is reported, and the suspends cannot be put back.
+        // SAFETY: the backend owns this task right.
+        let partway = self.reply_faults.resume_partway.swap(false, Ordering::SeqCst)
+            && unsafe { task_suspend(self.task) } == KERN_SUCCESS;
+        let total = count + u32::from(partway);
+        for done in 0..total {
             let kr = if self.reply_faults.resume.swap(false, Ordering::SeqCst) {
                 mach2::kern_return::KERN_FAILURE
             } else {
                 // SAFETY: the backend owns this task right and suspend.
-                unsafe { task_resume(self.task) }
+                let kr = unsafe { task_resume(self.task) };
+                if partway && done + 1 == total && kr == KERN_SUCCESS {
+                    return Err(ResumeTaskError::Partial {
+                        error: BackendError::Os {
+                            code: -1,
+                            message: "injected task_resume failed after the task resumed".into(),
+                        },
+                        held: 0,
+                    });
+                }
+                kr
             };
             if kr != KERN_SUCCESS {
+                let error = mach_error(kr, "task_resume failed");
+                // The suspends not yet balanced are still held, plus those put back.
+                let mut held = total - done;
+                let mut restored = true;
                 for _ in 0..done {
                     // SAFETY: restore the suspends balanced above, if the task is still alive.
-                    let _ = unsafe { task_suspend(self.task) };
+                    if unsafe { task_suspend(self.task) } == KERN_SUCCESS {
+                        held += 1;
+                    } else {
+                        restored = false;
+                    }
                 }
-                return Err(mach_error(kr, "task_resume failed"));
+                return Err(if restored {
+                    ResumeTaskError::Restored(error)
+                } else {
+                    ResumeTaskError::Partial { error, held }
+                });
             }
         }
         Ok(())
@@ -1315,6 +1359,12 @@ impl MacOSBackend
         signal: c_int,
     ) -> BackendResult<()>
     {
+        if self.reply_faults.signal_selection.swap(false, Ordering::SeqCst) {
+            return Err(BackendError::Os {
+                code: -1,
+                message: "injected signal selection failure".into(),
+            });
+        }
         let reply_pending = shared.has_signal_reply(port);
         let requeue = signal != 0 && (!reply_pending || signal != original);
         let queued = if requeue {
@@ -1326,6 +1376,18 @@ impl MacOSBackend
             // Private handshakes and failed early suppressions still own a reply. Update
             // it before queuing a new signal, so a failed update never leaves a signal
             // queued in the kernel that no record tracks (#242).
+            //
+            // On a forwarding resume this runs while other threads run (#250 W10). It
+            // cannot race another thread's signal for the per-process `p_xstat`: in XNU
+            // `bsd/kern/kern_sig.c` (apple-oss-distributions/xnu f6217f891ac0),
+            // `issignal_locked` sets `p->sigwait` before the waiting thread raises its
+            // `EXC_SOFT_SIGNAL` and clears it only after the reply, under `proc_lock`,
+            // right before it reads `p_xstat`. Every other thread entering
+            // `issignal_locked` blocks in `sig_try_locked` while `p->sigwait` is set, so
+            // the thread owing this reply is the only one that can stop for the
+            // debugger; `psignal_internal` sends a traced process's signals to that
+            // path without touching `p_xstat`, and `PT_THUPDATE` (`mach_process.c`)
+            // writes it under `proc_lock`.
             self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, if requeue { 0 } else { signal })?;
         }
         if let Some(queued) = queued {
@@ -2044,6 +2106,20 @@ impl Backend for MacOSBackend
     /// A reply error already queued when `task_resume` fails is still reported once by
     /// `wait` (or the session's next resume).
     ///
+    /// When forwarding signals, `task_resume` comes before signal selection and the
+    /// exception loop's Continue, so their failures cannot be undone: the resume returns
+    /// `Ok`, the target is *Running*, and the next `wait` reports each failure once. A
+    /// Continue the loop does not acknowledge within `EXCEPTION_REPLY_TIMEOUT` (5 s) is
+    /// such a failure: the resume blocks for that long, then returns `Ok` with the target
+    /// running. The command stays queued, so the loop still answers the records of
+    /// runnable threads when it takes it; until then those threads may stay at their
+    /// exceptions (#250 W9).
+    ///
+    /// If `task_resume` fails partway and the suspends already balanced cannot be put
+    /// back, the task may run: the resume returns `Ok`, the target is *Running* (still
+    /// suspended if the backend holds suspends; `interrupt` then stops it), and the next
+    /// `wait` reports the error (#250 W11).
+    ///
     /// Held Unix signals are suppressed unless named in `request.signals`. A signal named
     /// for a thread whose action is `Suspend`, or for a thread without a held soft-signal
     /// exception, returns [`BackendError::Unsupported`]; so does `Step` on x86-64.
@@ -2188,10 +2264,17 @@ impl Backend for MacOSBackend
                 // Once these suspends are balanced, the loop must not use them to
                 // answer deferred exceptions, even if Continue has not arrived yet.
                 shared.preparing_resume = false;
-                if let Err(err) = self.resume_task(count) {
-                    shared.preparing_resume = true;
-                    drop(shared);
-                    return resume_failed(self, err);
+                match self.resume_task(count) {
+                    Ok(()) => {}
+                    Err(ResumeTaskError::Restored(err)) => {
+                        shared.preparing_resume = true;
+                        drop(shared);
+                        return resume_failed(self, err);
+                    }
+                    Err(ResumeTaskError::Partial { error, held }) => {
+                        shared.suspends += held;
+                        report_error(error);
+                    }
                 }
             }
             if pending || held {
@@ -2263,8 +2346,13 @@ impl Backend for MacOSBackend
             }
             // The loop can no longer use these in-flight suspends to answer deferred signals.
             lock_shared(&self.exception_state).preparing_resume = false;
-            if let Err(err) = self.resume_task(count) {
-                return resume_failed(self, err);
+            match self.resume_task(count) {
+                Ok(()) => {}
+                Err(ResumeTaskError::Restored(err)) => return resume_failed(self, err),
+                Err(ResumeTaskError::Partial { error, held }) => {
+                    lock_shared(&self.exception_state).suspends += held;
+                    report_error(error);
+                }
             }
         }
         self.state = BackendState::Running;

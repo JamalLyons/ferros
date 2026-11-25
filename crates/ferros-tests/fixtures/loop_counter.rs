@@ -8,7 +8,8 @@
 //! - `tick_body`
 //! - `loop_call`
 //!
-//! Pass `0 --exit-gate <file>` to wait for the test to write to the file before exiting.
+//! Pass `<count> --exit-gate <file>` (any count) to wait for the test to write to the file
+//! before exiting.
 
 #[inline(never)]
 fn tick(counter: u64) -> u64

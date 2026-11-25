@@ -1001,7 +1001,8 @@ fn detach_continues_a_private_stop_that_lands_after_its_wait()
         backend.attach(ProcessId::from(target.pid)).expect("attach");
         backend
             .reply_fault_injector()
-            .expire_next_detach_stop_wait(Duration::from_millis(500));
+            // The recheck returns as soon as the stop lands; a long bound only adds margin.
+            .expire_next_detach_stop_wait(TIMEOUT);
         backend.detach().expect("detach after a late private stop");
         target.assert_not_stopped("detach after a late private stop");
         let status = target

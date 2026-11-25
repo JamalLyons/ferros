@@ -84,6 +84,35 @@ fn run_to_trap(d: &mut Debuggee, address: Address) -> (ThreadId, Vec<ThreadId>)
     (first, others)
 }
 
+/// Run the `threads` fixture to a trap at `worker_body`, which both of its workers call,
+/// and return the worker that stopped first and the other one, both stopped at the trap.
+///
+/// `run_to_trap` drains only the peer stops published by then. The other worker's hit
+/// can still be in flight and surface at a later `wait`, in place of the stop a test
+/// asserts (#253). So, with the trap still armed and the first worker suspended, resume
+/// the rest until that hit arrives. The trap stays planted; the caller restores it.
+fn run_to_both_workers(d: &mut Debuggee, worker_body: Address) -> (ThreadId, ThreadId)
+{
+    let (first, other_hits) = run_to_trap(d, worker_body);
+    let second = match other_hits.as_slice() {
+        [thread] => *thread,
+        [] => {
+            let continue_others = ResumeRequest::continue_all().with_thread(first, ThreadAction::Suspend);
+            match backend(d).resume(&continue_others) {
+                Ok(()) | Err(BackendError::StopPending) => {}
+                Err(err) => panic!("continue to the second worker: {err}"),
+            }
+            match backend(d).wait(Some(STOP_TIMEOUT)).expect("wait for the second worker") {
+                Some(StopEvent::Breakpoint { thread, pc }) if pc == worker_body => thread,
+                other => panic!("expected the second worker's breakpoint, got {other:?}"),
+            }
+        }
+        _ => panic!("expected exactly two workers, got additional hits {other_hits:?}"),
+    };
+    assert_ne!(first, second, "expected both workers to hit the trap");
+    (first, second)
+}
+
 /// Resume with `thread` stepping and every other thread suspended, and wait for the stop.
 fn step(d: &mut Debuggee, thread: ThreadId) -> StopEvent
 {
@@ -155,6 +184,7 @@ fn function_address_resolves_a_fixture_function()
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         assert_eq!(pc_of(&mut d, thread), tick, "the stopped thread's pc is not the trap");
         backend(&mut d).write_memory(tick, &original).expect("restore");
@@ -171,6 +201,7 @@ fn step_executes_one_instruction_at_a_time()
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)
@@ -212,6 +243,7 @@ fn back_to_back_steps_do_not_wait_for_the_exception_loop_poll()
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)
@@ -238,7 +270,8 @@ fn stepping_one_thread_keeps_the_others_suspended()
         let mut d = t.launch(&fixture);
         let worker_body = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, worker_body);
-        let (stepped, _) = run_to_trap(&mut d, worker_body);
+        // The other worker stops at the trap too and holds that stop while `stepped` steps.
+        let (stepped, _) = run_to_both_workers(&mut d, worker_body);
         backend(&mut d)
             .write_memory(worker_body, &original)
             .expect("restore the original bytes");
@@ -293,7 +326,7 @@ fn stepping_an_exited_thread_is_not_found()
         let pid = d.pid().0;
         let worker_body = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, worker_body);
-        let (worker, _) = run_to_trap(&mut d, worker_body);
+        let (worker, _) = run_to_both_workers(&mut d, worker_body);
         backend(&mut d)
             .write_memory(worker_body, &original)
             .expect("restore the original bytes");
@@ -385,7 +418,7 @@ fn kill_after_a_step_leaves_no_process()
             let pid = d.pid().0;
             let worker_body = function_address(&mut d, &fixture, "worker_body");
             let original = plant_trap(&mut d, worker_body);
-            let (stepped, _) = run_to_trap(&mut d, worker_body);
+            let (stepped, _) = run_to_both_workers(&mut d, worker_body);
             backend(&mut d).write_memory(worker_body, &original).expect("restore");
             if in_flight {
                 // The session's drop kills the target while the backend runs the step.
@@ -415,25 +448,8 @@ fn held_signal_of_a_suspended_thread_survives_a_step_of_another()
         let mut d = t.launch(&fixture);
         let worker_body = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, worker_body);
-        let (stepped, other_hits) = run_to_trap(&mut d, worker_body);
+        let (stepped, signalled) = run_to_both_workers(&mut d, worker_body);
         let continue_others = ResumeRequest::continue_all().with_thread(stepped, ThreadAction::Suspend);
-        // Both workers call worker_body. The second hit can be deferred until resume,
-        // so collect it with the trap still armed and the first worker suspended.
-        let signalled = match other_hits.as_slice() {
-            [thread] => *thread,
-            [] => {
-                match backend(&mut d).resume(&continue_others) {
-                    Ok(()) | Err(BackendError::StopPending) => {}
-                    Err(err) => panic!("continue to the second worker: {err}"),
-                }
-                match backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the second worker") {
-                    Some(StopEvent::Breakpoint { thread, pc }) if pc == worker_body => thread,
-                    other => panic!("expected the second worker's breakpoint, got {other:?}"),
-                }
-            }
-            _ => panic!("expected exactly two workers, got additional hits {other_hits:?}"),
-        };
-        assert_ne!(stepped, signalled, "expected both workers to hit the trap");
         backend(&mut d).write_memory(worker_body, &original).expect("restore");
 
         // Queue SIGUSR1 while stopped and keep the other worker at worker_body until its step.
@@ -538,6 +554,7 @@ fn stop_before_second_thread(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, 
 {
     let address = function_address(d, fixture, "spawn_later");
     let original = plant_trap(d, address);
+    // Only the main thread calls spawn_later, once, so no peer can reach this trap.
     let (creator, _) = run_to_trap(d, address);
     backend(d).write_memory(address, &original).expect("restore");
     let images = backend(d).images().expect("images");
@@ -747,6 +764,7 @@ fn failed_exception_suspend_keeps_a_completed_step()
         let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)
@@ -790,6 +808,7 @@ fn interrupt_reports_a_step_held_by_a_failing_exception_suspend()
         let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)
@@ -847,6 +866,7 @@ fn interrupt_reports_a_step_held_by_a_failing_exception_suspend()
         ));
         // The resume really let the target run: it calls `tick` again.
         plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (again, _) = run_to_trap(&mut d, tick);
         assert_eq!(again, thread, "another thread reached tick");
     });
@@ -868,6 +888,7 @@ fn resume_after_an_interrupt_is_refused_while_a_step_is_held()
         let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)
@@ -935,6 +956,7 @@ fn resume_after_an_interrupt_is_refused_while_a_step_is_held()
             Some(StopEvent::Interrupted { .. })
         ));
         plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (again, _) = run_to_trap(&mut d, tick);
         assert_eq!(again, thread, "another thread reached tick");
     });
@@ -1017,6 +1039,7 @@ fn stop_before_second_spawn(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, V
     let address = function_address(d, fixture, "spawn_later");
     let second = function_address(d, fixture, "spawn_second");
     let original = plant_trap(d, address);
+    // Only the main thread calls spawn_later, once, so no peer can reach this trap.
     let (creator, _) = run_to_trap(d, address);
     backend(d).write_memory(address, &original).expect("restore spawn_later");
     let second_original = plant_trap(d, second);
@@ -1436,6 +1459,7 @@ fn reused_workqueue_thread_with_explicit_continue_runs()
         let mut d = t.launch(&fixture);
         let address = function_address(&mut d, &fixture, "submit_second");
         let original = plant_trap(&mut d, address);
+        // Only the main thread calls submit_second, once, so no peer can reach this trap.
         let (creator, _) = run_to_trap(&mut d, address);
         backend(&mut d).write_memory(address, &original).expect("restore");
         let mut request = ResumeRequest::all(ThreadAction::Suspend);
@@ -1826,7 +1850,8 @@ fn interrupt_precedes_a_real_instruction_step()
         let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
         let tick = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, tick);
-        let (thread, _) = run_to_trap(&mut d, tick);
+        // The other worker stops at the trap too and holds that stop through the step.
+        let (thread, _) = run_to_both_workers(&mut d, tick);
         backend(&mut d).write_memory(tick, &original).expect("restore");
         let threads = backend(&mut d).threads().expect("threads");
         let _release = ReleasePublication(faults.clone());
@@ -1867,7 +1892,8 @@ fn breakpoint_cancels_a_real_step_without_a_stray_step_stop()
         let mut d = t.launch_with_args(&fixture, &[LONG_LOOP]);
         let tick = function_address(&mut d, &fixture, "worker_body");
         let original = plant_trap(&mut d, tick);
-        let (thread, _) = run_to_trap(&mut d, tick);
+        // The other worker stops at the trap too, so its hit cannot replace the step's stop.
+        let (thread, _) = run_to_both_workers(&mut d, tick);
         let threads = backend(&mut d).threads().expect("threads");
         // Leave the real brk at pc: the step executes it instead of the original.
         assert_eq!(step(&mut d, thread), StopEvent::Breakpoint { thread, pc: tick });
@@ -1902,6 +1928,8 @@ fn signal_cancels_a_real_step_without_a_stray_step_stop()
         let original = plant_trap(&mut d, svc);
         assert_eq!(original, 0xd400_1001_u32.to_le_bytes(), "expected svc #0x80");
         control.release("run-0");
+        // Only worker 0 runs to the trap: worker 1 waits for `run-1`, released only after
+        // the syscall is restored, and the main thread never calls the read helper.
         let (stepped, others) = run_to_trap(&mut d, svc);
         assert!(others.is_empty(), "only worker 0 was released");
         backend(&mut d).write_memory(svc, &original).expect("restore the syscall");
@@ -2338,6 +2366,7 @@ fn publication_guard_disarms_an_armed_hook()
         let mut d = t.launch_with_backend(&fixture, &[LONG_LOOP], debugger);
         let tick = function_address(&mut d, &fixture, "tick");
         let original = plant_trap(&mut d, tick);
+        // Only loop_counter's main thread calls tick, so no peer can reach this trap.
         let (thread, _) = run_to_trap(&mut d, tick);
         backend(&mut d)
             .write_memory(tick, &original)

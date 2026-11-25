@@ -327,6 +327,16 @@ pub struct ReplyFaultInjector
     /// 0 idle, 1 requested by a teardown, 2 parked at the top of a loop pass, 3 released.
     /// Tests only (#198).
     loop_park: Arc<AtomicU8>,
+    /// Fail the next signal selection of a resume before it touches the kernel. Tests only (#250).
+    pub(crate) signal_selection: Arc<AtomicBool>,
+    /// Drop the acknowledgement of the next Continue the loop handles, after handling it.
+    /// Tests only (#250).
+    continue_ack: Arc<AtomicBool>,
+    /// The acknowledgement withheld by `continue_ack`, kept so the resume times out.
+    withheld_ack: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    /// The next resume takes one extra task suspend, its last `task_resume` resumes the
+    /// task and then reports failure, and the re-suspend fails. Tests only (#250).
+    pub(crate) resume_partway: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -408,6 +418,28 @@ impl ReplyFaultInjector
     pub fn race_next_private_stop(&self, separate: bool)
     {
         self.private_stop_race.store(if separate { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Fail the next signal selection of a resume (`PT_THUPDATE` or the re-queued
+    /// signal) before it reaches the kernel. Tests only (#250).
+    pub fn fail_next_signal_selection(&self)
+    {
+        self.signal_selection.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the exception loop handle the next Continue but never acknowledge it, as if
+    /// the acknowledgement had not arrived within the reply timeout. Tests only (#250).
+    pub fn drop_next_continue_ack(&self)
+    {
+        self.continue_ack.store(true, Ordering::SeqCst);
+    }
+
+    /// Make the next resume fail partway, after the task is running again: the backend
+    /// takes one extra task suspend, its last `task_resume` resumes the task and then
+    /// reports failure, and putting back the suspends already balanced fails. Tests only (#250).
+    pub fn fail_next_task_resume_partway(&self)
+    {
+        self.resume_partway.store(true, Ordering::SeqCst);
     }
 
     /// Simulate an exited recipient when replaying the next handshake signal. Tests only.
@@ -1581,7 +1613,12 @@ pub(crate) fn run_exception_loop(
                 answer_held_exceptions(&mut state, &keep, &faults, &events, task);
                 state.pending_exception = false;
                 faults.pending_stop.store(false, Ordering::SeqCst);
-                let _ = ack.send(());
+                if faults.continue_ack.swap(false, Ordering::SeqCst) {
+                    // Keep the sender alive: the resume waits out its reply timeout.
+                    *faults.withheld_ack.lock().unwrap_or_else(PoisonError::into_inner) = Some(ack);
+                } else {
+                    let _ = ack.send(());
+                }
                 continue;
             }
             Ok(ExceptionLoopCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => {

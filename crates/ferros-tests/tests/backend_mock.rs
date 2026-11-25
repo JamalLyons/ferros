@@ -4379,3 +4379,52 @@ fn pending_line_breakpoint_resolves_in_the_main_executable_listed_after_a_librar
         "the site is in the executable, not the library listed first"
     );
 }
+
+#[test]
+fn two_images_marked_main_executable_are_reported()
+{
+    // Issue #244 (from #220): a backend that marks two images as the main executable
+    // breaks the `ImageRole` contract. Breakpoints are not resolved in whichever is listed
+    // first: the location fails with an error naming both, and so does a pending one at
+    // launch (it stays pending with that reason).
+    use ferros_core::DebuggerError;
+    use ferros_core::backend::ImageRole;
+
+    const FIRST: Address = Address::new(0x2_0000_0000);
+    const SECOND: Address = Address::new(0x3_0000_0000);
+    let (first_path, first) = line_table_image("ferros-mock-two-main-a", FIRST, "main.rs", &[(3, &[FIRST + 0x1000])]);
+    let (second_path, second) = line_table_image("ferros-mock-two-main-b", SECOND, "main.rs", &[(3, &[SECOND + 0x1000])]);
+    let _files = RemoveOnDrop(vec![first_path.clone(), second_path.clone()]);
+    let mut registers = arm64_registers();
+    registers.pc = FIRST + 0x1000;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(FIRST, "r-x", first)
+        .with_region(SECOND, "r-x", second)
+        .with_image(listed_image(&first_path, FIRST, ImageRole::MainExecutable))
+        .with_image(listed_image(&second_path, SECOND, ImageRole::MainExecutable));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    let location = BreakpointLocation::Line {
+        file: "main.rs".into(),
+        line: 3,
+    };
+    let pending = session.set_breakpoint(location.clone()).expect("pending breakpoint");
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    let reason = session
+        .logical_breakpoints()
+        .iter()
+        .find(|breakpoint| breakpoint.id == pending)
+        .and_then(|breakpoint| breakpoint.pending.clone())
+        .expect("still pending");
+    assert!(reason.contains("more than one image"), "{reason}");
+    match session.set_breakpoint(location) {
+        Err(DebuggerError::InvalidArgument(message)) => {
+            assert!(
+                message.contains(&first_path.display().to_string()) && message.contains(&second_path.display().to_string()),
+                "{message}"
+            );
+        }
+        other => panic!("expected InvalidArgument naming both images, got {other:?}"),
+    }
+}

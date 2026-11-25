@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, Backend, ResumeRequest, StopEvent, ThreadAction};
+use ferros_core::{Address, Backend, BackendError, ResumeRequest, StopEvent, ThreadAction};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::TRAP;
 use ferros_tests::harness::{self, Debuggee};
@@ -23,7 +23,7 @@ use ferros_tests::{Fixture, fixture};
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spinning threads in `hot_loop`, main included.
-const THREADS: u64 = 8;
+const THREADS: usize = 8;
 
 /// Plant cycles. Without the cache flush nearly every cycle fails.
 const ROUNDS: usize = 100;
@@ -44,80 +44,104 @@ fn interrupt(d: &mut Debuggee)
     }
 }
 
-/// Interrupt the running target and drain every stop until it is stopped with nothing
-/// pending, accepting a breakpoint at `site` that raced the interrupt (issue #122).
-///
-/// A thread can execute the `brk` planted at `site` in one round without its exception
-/// reaching the backend before that round's drain. The exception is then delivered
-/// after the next resume, as `Breakpoint` at `site`, and the interrupt loses the race
-/// to it. That thread really executed the planted trap, so the stop is not an error.
-/// Any other stop still fails the test.
-fn interrupt_racing_trap(d: &mut Debuggee, site: Address, round: usize)
+/// The address `hot_loop` printed for its array of worker counters.
+fn calls_address(d: &Debuggee) -> Address
 {
-    backend(d).interrupt().expect("interrupt");
-    let mut stop = backend(d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt");
-    assert!(
-        stop.is_some(),
-        "round {round}: no stop within {STOP_TIMEOUT:?} of the interrupt"
-    );
-    while let Some(event) = stop {
-        assert!(
-            matches!(event, StopEvent::Interrupted { .. })
-                || matches!(event, StopEvent::Breakpoint { pc, .. } if pc == site),
-            "round {round}: expected the interrupt or a breakpoint at {site}, got {event:?}"
-        );
-        stop = backend(d).wait(Some(Duration::ZERO)).expect("drain");
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        if let Some(hex) = d
+            .stdout()
+            .split_inclusive('\n')
+            .find_map(|line| line.strip_prefix("calls=0x")?.strip_suffix('\n'))
+        {
+            return Address::from(u64::from_str_radix(hex, 16).expect("a hex address"));
+        }
+        assert!(Instant::now() < deadline, "hot_loop did not print its counters");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
-/// The address `hot_loop` printed for its call counter.
-fn calls_address(d: &Debuggee) -> Address
+fn read_calls(d: &mut Debuggee, address: Address) -> [u64; THREADS]
 {
-    assert!(
-        d.wait_for_stdout("calls=", STOP_TIMEOUT),
-        "hot_loop did not print its counter"
-    );
-    let stdout = d.stdout();
-    let hex = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("calls=0x"))
-        .expect("the counter line");
-    Address::from(u64::from_str_radix(hex.trim(), 16).expect("a hex address"))
+    let bytes = backend(d)
+        .read_memory(address, THREADS * size_of::<u64>())
+        .expect("read the worker counters");
+    let (words, _) = bytes.as_chunks::<{ size_of::<u64>() }>();
+    std::array::from_fn(|index| u64::from_le_bytes(words[index]))
 }
 
-fn read_u64(d: &mut Debuggee, address: Address) -> u64
+/// Let each worker execute both restored entry points before planting the next trap.
+/// Two increments require a fresh call even if a worker was already inside either
+/// function when the round started. A worker whose previous trap is still waiting
+/// for a kernel reply cannot advance its counter.
+fn run_original(d: &mut Debuggee, calls: Address, previous: Option<Address>, round: usize) -> [u64; THREADS]
 {
-    let bytes = backend(d).read_memory(address, 8).expect("read the counter");
-    u64::from_le_bytes(bytes.try_into().expect("eight bytes"))
+    let baseline = read_calls(d, calls);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        let mut stop = match backend(d).resume(&ResumeRequest::continue_all()) {
+            Ok(()) => {
+                let stop = backend(d)
+                    .wait(Some(Duration::from_millis(1)))
+                    .expect("wait while running the original");
+                if stop.is_some() {
+                    stop
+                } else {
+                    backend(d).interrupt().expect("interrupt the original");
+                    backend(d).wait(Some(STOP_TIMEOUT)).expect("wait for the interrupt")
+                }
+            }
+            Err(BackendError::StopPending) => backend(d).wait(Some(Duration::ZERO)).expect("take the pending stop"),
+            Err(err) => panic!("round {round}: resume the original: {err}"),
+        };
+        assert!(stop.is_some(), "round {round}: no stop while running the original");
+        // A worker that trapped in the previous round can publish late (#122).
+        // Drain those stops and keep running until every worker has passed both sites.
+        while let Some(event) = stop {
+            assert!(
+                matches!(event, StopEvent::Interrupted { .. })
+                    || matches!(event, StopEvent::Breakpoint { pc, .. } if Some(pc) == previous),
+                "round {round}: expected an interrupt or a late trap at {previous:?}, got {event:?}"
+            );
+            stop = backend(d).wait(Some(Duration::ZERO)).expect("drain");
+        }
+        let current = read_calls(d, calls);
+        if current.iter().zip(baseline).all(|(&now, before)| now - before >= 2) {
+            return current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "round {round}: workers did not all advance through original code: {baseline:?} -> {current:?}"
+        );
+    }
 }
 
 /// A `brk` written while the target is stopped is executed as soon as it runs: no thread
 /// completes another call through the instruction it replaced.
 ///
 /// Each running thread can finish at most the one call it was inside when the target
-/// stopped. A thread that keeps calling `spin_site` after the resume executed a stale
-/// copy of its first instruction.
+/// stopped. A thread that keeps calling either function after the resume executed a
+/// stale copy of the replaced instruction.
 #[test]
 fn planted_trap_is_executed_once_the_target_runs()
 {
     harness::run(|t| {
         let fixture = fixture!("hot_loop");
-        let mut d = t.launch_with_args(&fixture, &[&THREADS.to_string()]);
-        let site = function_address(d.session_mut(), &fixture, "spin_site");
+        let mut d = t.launch_with_args(&fixture, &[&THREADS.to_string(), "--code-writes"]);
+        let sites = ["counted_site", "counted_site_alternate"].map(|name| function_address(d.session_mut(), &fixture, name));
+        assert_ne!(sites[0], sites[1]);
+        let originals = sites.map(|site| backend(&mut d).read_memory(site, TRAP.len()).expect("read the original"));
         backend(&mut d)
             .resume(&ResumeRequest::continue_all())
             .expect("start the threads");
         let calls = calls_address(&d);
         interrupt(&mut d);
-        let original = backend(&mut d).read_memory(site, TRAP.len()).expect("read spin_site");
+        let mut previous = None;
         for round in 0..ROUNDS {
-            // Let every thread spin through the original again, so it is cached.
-            backend(&mut d)
-                .resume(&ResumeRequest::continue_all())
-                .expect("run the original");
-            std::thread::sleep(Duration::from_millis(2));
-            interrupt_racing_trap(&mut d, site, round);
-            let before = read_u64(&mut d, calls);
+            let slot = round % sites.len();
+            let site = sites[slot];
+            let before = run_original(&mut d, calls, previous, round);
+            // A late exception from the previous plant has a different PC.
             backend(&mut d).write_memory(site, &TRAP).expect("plant the trap");
             backend(&mut d)
                 .resume(&ResumeRequest::continue_all())
@@ -126,11 +150,13 @@ fn planted_trap_is_executed_once_the_target_runs()
                 Some(StopEvent::Breakpoint { pc, .. }) if pc == site => {}
                 other => panic!("round {round}: expected a breakpoint at {site}, got {other:?}"),
             }
-            let ran = read_u64(&mut d, calls) - before;
-            assert!(
-                ran <= THREADS,
-                "round {round}: {ran} calls ran through the instruction replaced at {site}"
-            );
+            for (worker, (after, before)) in read_calls(&mut d, calls).into_iter().zip(before).enumerate() {
+                let ran = after - before;
+                assert!(
+                    ran <= 1,
+                    "round {round}: worker {worker} made {ran} calls through the replaced instruction"
+                );
+            }
             // Threads that trapped in the same batch are reported with no resume between.
             while let Some(event) = backend(&mut d).wait(Some(Duration::ZERO)).expect("drain") {
                 assert!(
@@ -138,7 +164,10 @@ fn planted_trap_is_executed_once_the_target_runs()
                     "round {round}: unexpected stop {event:?}"
                 );
             }
-            backend(&mut d).write_memory(site, &original).expect("restore spin_site");
+            backend(&mut d)
+                .write_memory(site, &originals[slot])
+                .expect("restore the original");
+            previous = Some(site);
         }
     });
 }

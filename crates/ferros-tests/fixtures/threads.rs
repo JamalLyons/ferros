@@ -4,6 +4,8 @@
 //! workers have exited (default 0), for tests that need a live process whose worker
 //! threads are gone. A second optional argument sets the worker sleep in milliseconds
 //! (default 50), for tests that need workers alive during attach.
+//! With `--gate=<directory>`, each worker acknowledges readiness after the barrier
+//! and waits for the directory's `run` file before calling `worker_body`.
 //!
 //! Functions:
 //! - `main`
@@ -13,6 +15,7 @@
 //! - `worker_body`
 //! - `after_join`
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -28,18 +31,32 @@ fn worker_body(id: u64) -> u64
     std::hint::black_box(input.wrapping_mul(10))
 }
 
+fn wait_for_gate(directory: Option<&Path>, id: u64)
+{
+    if let Some(directory) = directory {
+        let gate = directory.join("run");
+        std::fs::write(directory.join(format!("ready-{id}")), b"ready").expect("acknowledge worker readiness");
+        while !gate.exists() {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 fn main()
 {
     if let Some(ms) = std::env::args().nth(2).and_then(|arg| arg.parse::<u64>().ok()) {
         WORKER_SLEEP_MS.store(ms, Ordering::Relaxed);
     }
     let barrier = Arc::new(Barrier::new(2));
+    let gate = std::env::args().find_map(|arg| arg.strip_prefix("--gate=").map(PathBuf::from));
 
     let b1 = Arc::clone(&barrier);
+    let gate1 = gate.clone();
     let handle1 = thread::Builder::new()
         .name("fixture-worker-1".to_string())
         .spawn(move || {
             b1.wait();
+            wait_for_gate(gate1.as_deref(), 1);
             worker_body(1)
         })
         .expect("failed to spawn fixture-worker-1");
@@ -49,6 +66,7 @@ fn main()
         .name("fixture-worker-2".to_string())
         .spawn(move || {
             b2.wait();
+            wait_for_gate(gate.as_deref(), 2);
             worker_body(2)
         })
         .expect("failed to spawn fixture-worker-2");

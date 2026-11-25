@@ -4,8 +4,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,6 +17,7 @@ use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, DebuggerError, LaunchSpec, Session, StopEvent, SymbolCache, ThreadId,
 };
 use ferros_macos::{DebugInfoOptions, MacOSBackend, MacOSRuntime, MachOFormat};
+use ferros_tests::stripped::StrippedFixture;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 
 /// [`MockObjectFormat`], counting how often it opens an image file.
@@ -99,48 +99,11 @@ fn cache_does_not_reread_an_unchanged_image_without_debug_info()
     });
 }
 
-/// `frameless_stack` copied without its dSYM and with its debug map stripped (`strip -S`),
-/// so its main executable has no source debug information. The copy lives under the test
-/// target directory, where `just kill-fixtures` finds a leaked process.
-struct StrippedFixture
+/// `frameless_stack` copied without its dSYM and with its debug map stripped, so its
+/// main executable has no source debug information.
+fn stripped_frameless_stack() -> StrippedFixture
 {
-    directory: PathBuf,
-    fixture: Fixture,
-}
-
-impl StrippedFixture
-{
-    fn new(tag: &str) -> Self
-    {
-        let built = fixture!("frameless_stack");
-        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ferros-no-debug-{tag}"));
-        fs::create_dir_all(&directory).expect("create stripped fixture directory");
-        let executable = directory.join(built.path().file_name().expect("fixture file name"));
-        fs::copy(built.path(), &executable).expect("copy executable without its dSYM");
-        let status = Command::new("strip").arg("-S").arg(&executable).status().expect("run strip");
-        assert!(status.success(), "strip -S failed: {status}");
-        // `strip` invalidates the ad-hoc signature arm64 macOS requires to run the copy.
-        let status = Command::new("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&executable)
-            .status()
-            .expect("run codesign");
-        assert!(status.success(), "codesign failed: {status}");
-        let fixture = Fixture::from_built(
-            "frameless_stack",
-            Box::leak(executable.to_str().expect("UTF-8 path").to_owned().into_boxed_str()),
-        );
-        assert!(!fixture.dsym_path().exists(), "the copy has no dSYM");
-        Self { directory, fixture }
-    }
-}
-
-impl Drop for StrippedFixture
-{
-    fn drop(&mut self)
-    {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
+    StrippedFixture::new(&fixture!("frameless_stack"), Path::new(env!("CARGO_TARGET_TMPDIR")))
 }
 
 /// Launch `fixture` with debug-info discovery confined to `cache` and no `dsymutil`.
@@ -194,7 +157,7 @@ fn line_breakpoint_in_an_image_without_debug_info_reports_no_debug_info()
 {
     harness::run(|t| {
         let tag = t.tag();
-        let stripped = StrippedFixture::new(tag.as_str());
+        let stripped = stripped_frameless_stack();
         let cache = stripped.directory.join("cache");
         let mut d = launch(&stripped.fixture, tag.as_str(), &cache);
         let line = fixture!("frameless_stack").marker_line("frameless_done");
@@ -222,7 +185,7 @@ fn source_step_in_an_image_without_debug_info_steps_one_instruction()
 {
     harness::run(|t| {
         let tag = t.tag();
-        let stripped = StrippedFixture::new(tag.as_str());
+        let stripped = stripped_frameless_stack();
         let cache = stripped.directory.join("cache");
         let mut d = launch(&stripped.fixture, tag.as_str(), &cache);
         let (stop, thread) = stop_in_stripped_code(&mut d, &stripped.fixture);

@@ -10,6 +10,8 @@ pub mod scratch;
 #[cfg(target_os = "macos")]
 mod staging;
 #[cfg(target_os = "macos")]
+pub mod stripped;
+#[cfg(target_os = "macos")]
 pub mod symbols;
 #[cfg(target_os = "macos")]
 pub mod transcript;

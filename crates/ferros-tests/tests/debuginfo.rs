@@ -15,6 +15,7 @@ use ferros_core::{
     ThreadId,
 };
 use ferros_macos::{DebugInfoOptions, MacOSBackend, MacOSRuntime, MachOFormat};
+use ferros_tests::stripped::StrippedFixture;
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
@@ -941,56 +942,11 @@ fn cargo_built_fixture_contains_debug_map_stabs()
     });
 }
 
-/// A launch of `frameless_stack` copied without its dSYM and with its debug map stripped
-/// (`strip -S`), so no source debug information can be found for the main executable.
-/// Its `__eh_frame`, `__unwind_info` and symbol table stay. The copy lives under the
-/// test target directory, where `just kill-fixtures` finds a leaked process.
-struct StrippedFixture
+/// `frameless_stack` copied without its dSYM and with its debug map stripped, so no
+/// source debug information can be found for the main executable.
+fn stripped_frameless_stack() -> StrippedFixture
 {
-    directory: PathBuf,
-    fixture: Fixture,
-}
-
-impl StrippedFixture
-{
-    fn new() -> Self
-    {
-        let built = fixture!("frameless_stack");
-        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "ferros-stripped-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&directory).expect("create stripped fixture directory");
-        let file_name = built.path().file_name().expect("fixture file name");
-        let executable = directory.join(file_name);
-        fs::copy(built.path(), &executable).expect("copy executable without its dSYM");
-        let status = Command::new("strip").arg("-S").arg(&executable).status().expect("run strip");
-        assert!(status.success(), "strip -S failed: {status}");
-        // `strip` invalidates the ad-hoc signature arm64 macOS requires to run the copy.
-        let status = Command::new("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&executable)
-            .status()
-            .expect("run codesign");
-        assert!(status.success(), "codesign failed: {status}");
-        let fixture = Fixture::from_built(
-            "frameless_stack",
-            Box::leak(executable.to_str().expect("UTF-8 path").to_owned().into_boxed_str()),
-        );
-        Self { directory, fixture }
-    }
-}
-
-impl Drop for StrippedFixture
-{
-    fn drop(&mut self)
-    {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
+    StrippedFixture::new(&fixture!("frameless_stack"), Path::new(env!("CARGO_TARGET_TMPDIR")))
 }
 
 /// The first instruction at or after `from` that is `insn`, within 64 instructions.
@@ -1057,7 +1013,7 @@ fn launch_with_debug_options(fixture: &Fixture, tag: &str, options: DebugInfoOpt
 fn stripped_executable_still_unwinds_its_caller()
 {
     harness::run(|t| {
-        let stripped = StrippedFixture::new();
+        let stripped = stripped_frameless_stack();
         let fixture = &stripped.fixture;
         assert!(!fixture.dsym_path().exists(), "the copy has no dSYM");
         let scratch = Scratch::new();
@@ -1111,7 +1067,7 @@ fn corrupt_debug_info_offset(mut bytes: Vec<u8>) -> Vec<u8>
 fn failed_debug_retry_keeps_unwind_data_for_live_executable()
 {
     harness::run(|t| {
-        let stripped = StrippedFixture::new();
+        let stripped = stripped_frameless_stack();
         let fixture = &stripped.fixture;
         let original = fixture!("frameless_stack");
         let directory = fixture.dsym_path().join("Contents/Resources/DWARF");
@@ -1185,7 +1141,7 @@ fn failed_debug_retry_keeps_unwind_data_for_live_executable()
 fn failed_public_loads_leave_symbol_cache_untouched()
 {
     harness::run(|_| {
-        let stripped = StrippedFixture::new();
+        let stripped = stripped_frameless_stack();
         let fixture = fixture!("frameless_stack");
         let scratch = Scratch::new();
         let stripped_load = Address::new(0x2_0000_0000);

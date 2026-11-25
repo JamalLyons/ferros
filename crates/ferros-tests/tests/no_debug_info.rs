@@ -209,3 +209,72 @@ fn source_step_in_an_image_without_debug_info_steps_one_instruction()
         );
     });
 }
+
+/// A format that cannot open any image: it counts opens and reports
+/// [`DebuggerError::NoDebugInfo`] from `open_image` itself, as a format does when it
+/// cannot tell which part of a file the target mapped.
+struct NoDebugAtOpen(Arc<AtomicUsize>);
+
+impl ObjectFormat for NoDebugAtOpen
+{
+    fn mapped_symbols(&self, memory: &mut dyn TargetMemory, load_address: Address)
+    -> Result<Arc<dyn MappedSymbols>, String>
+    {
+        MockObjectFormat.mapped_symbols(memory, load_address)
+    }
+
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+    {
+        MockObjectFormat.map_image(memory, load_address)
+    }
+
+    fn open_image(&self, path: &Path, _: u64, _: Option<&ImageSlice>) -> ferros_core::Result<ImageContents>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(DebuggerError::NoDebugInfo {
+            path: path.to_path_buf(),
+            detail: "the mapped part of the file is unknown".into(),
+        })
+    }
+}
+
+/// `NoDebugInfo` reported by `ObjectFormat::open_image` itself is kept like missing
+/// DWARF: a repeated request for the unchanged file does not open it again, and a
+/// changed file is opened again (issue #244).
+#[test]
+fn cache_does_not_reopen_an_unchanged_image_whose_open_reports_no_debug_info()
+{
+    harness::run(|_| {
+        let directory = scratch::create_dir("ferros-no-debug-at-open");
+        let path = directory.join("image.mock");
+        fs::write(&path, MockObjectFile::new(0x1000, 0x1000).to_bytes()).expect("write image");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut cache = SymbolCache::new(Arc::new(NoDebugAtOpen(opens.clone())));
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x2_0000_0000,
+        };
+
+        for _ in 0..3 {
+            let Err(error) = cache.load_image(descriptor.clone()) else {
+                panic!("unexpected debug info");
+            };
+            assert!(
+                matches!(&error, DebuggerError::NoDebugInfo { detail, .. } if detail.contains("mapped part")),
+                "{error}"
+            );
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "an unchanged image was opened again");
+
+        // A changed file (another size) is opened again.
+        fs::write(&path, MockObjectFile::new(0x1000, 0x2000).to_bytes()).expect("rewrite image");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"more"))
+            .expect("grow the image");
+        assert!(matches!(cache.load_image(descriptor), Err(DebuggerError::NoDebugInfo { .. })));
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "a changed image was not opened again");
+        let _ = fs::remove_dir_all(directory);
+    });
+}

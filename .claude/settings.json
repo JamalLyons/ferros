@@ -1,0 +1,59 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(just build:*)",
+      "Bash(just test)",
+      "Bash(just test-integration)",
+      "Bash(just test-crate:*)",
+      "Bash(just lint)",
+      "Bash(just fmt)",
+      "Bash(just fmt-check)",
+      "Bash(just check-boundary)",
+      "Bash(just kill-fixtures)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(pgrep -fl ferros-fixture-)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch --show-current)",
+      "Bash(git branch --list:*)",
+      "Bash(git branch -a)",
+      "Bash(git branch -vv)",
+      "Bash(git rev-parse:*)",
+      "Bash(git worktree list)",
+      "Bash(gh issue view:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/hooks/rustfmt-edited.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && just kill-fixtures"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -62,14 +62,27 @@ fn unmapped_read_is_not_found_on_both_paths()
         let mut d = t.launch(&fixture);
         let end = end_before_hole(&regions(&mut d));
 
-        // Starts mapped then runs into the hole, and starts in the hole.
+        // Starts mapped then runs into the hole, and starts in the hole. Each is read with
+        // a cold cache, then again after a nearby successful read has filled the cache.
         for at in [Address::from(end.value() - SPAN as u64 / 2), end] {
-            let (cached, uncached) = read_both_ways(&mut d, at);
-            assert!(matches!(cached, BackendError::NotFound(_)), "cached read at {at}: {cached:?}");
-            assert!(
-                matches!(uncached, DebuggerError::Backend(BackendError::NotFound(_))),
-                "uncached read at {at}: {uncached:?}"
-            );
+            for warm in [false, true] {
+                if warm {
+                    let nearby = Address::from(end.value() - SPAN as u64);
+                    d.session_mut()
+                        .backend_mut()
+                        .read_memory(nearby, SPAN)
+                        .expect("nearby mapped bytes read through the cache");
+                }
+                let (cached, uncached) = read_both_ways(&mut d, at);
+                assert!(
+                    matches!(cached, BackendError::NotFound(_)),
+                    "cached read at {at} (warm: {warm}): {cached:?}"
+                );
+                assert!(
+                    matches!(uncached, DebuggerError::Backend(BackendError::NotFound(_))),
+                    "uncached read at {at} (warm: {warm}): {uncached:?}"
+                );
+            }
         }
     });
 }

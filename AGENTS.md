@@ -81,7 +81,7 @@ Every engine change lands with an integration test in `crates/ferros-tests` that
 One test file per area in `crates/ferros-tests/tests/`, gated with `#![cfg(target_os = "macos")]`. Run every test body inside `harness::run(|t| { ... })`. Resolve fixtures with `fixture!("name")` and breakpoint lines with `fixture.marker_line("<name>")`. Never hard-code line numbers or `target/...` paths. Full example and API: `crates/ferros-tests/README.md`.
 
 Exceptions (tests that launch no fixture):
-- `tests/backend_mock.rs` (in-memory `MockBackend`), `tests/unwind_eh_frame.rs` (synthetic image in `MockObjectFormat`, fake memory), and `tests/platform_boundary.rs` (reads source files and `cargo metadata`) use neither the macOS gate nor the harness.
+- `tests/backend_mock/` (in-memory `MockBackend`), `tests/unwind_eh_frame.rs` (synthetic image in `MockObjectFormat`, fake memory), and `tests/platform_boundary.rs` (reads source files and `cargo metadata`) use neither the macOS gate nor the harness.
 - A test that launches nothing (for example attaching to a pid that has already exited, in `tests/macos_crate.rs`) may skip `harness::run`; it keeps the macOS gate and says why in a comment.
 
 ## Leaked processes

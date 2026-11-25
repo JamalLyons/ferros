@@ -13,7 +13,7 @@
 //! `unwind_with_eh_frame_hdr` to the runtime lookup address and to a table based at the
 //! slid `eh_frame_hdr` address.
 //!
-//! Like `backend_mock.rs`, this launches no process: it needs no `harness::run`, no fixture
+//! Like `backend_mock/`, this launches no process: it needs no `harness::run`, no fixture
 //! and no debugger entitlement, and is not limited to macOS.
 
 use std::collections::HashMap;

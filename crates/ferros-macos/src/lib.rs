@@ -35,7 +35,8 @@
 //!   event. Threads that raised exceptions at the same moment are reported together: one
 //!   event each, queued for `wait` before the target runs again. `EXC_BREAKPOINT` is
 //!   reported as `StopEvent::Breakpoint` with the raw pc, or as `StopEvent::SingleStep`
-//!   when its codes are those of a completed hardware step; faults become
+//!   when its codes are those of a completed hardware step. Bad access, bad instruction
+//!   and arithmetic exceptions become `StopEvent::Fault`, and a held soft signal becomes
 //!   `StopEvent::Signal`. A failed exception reply is returned by the next `wait` as
 //!   `BackendError::Os`, and stops keep being reported.
 //! - **Resume** honours every `ThreadAction`. `Step` sets the arm64 hardware single-step

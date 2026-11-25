@@ -1387,6 +1387,11 @@ fn access_fault_continue_is_not_rejected_as_a_signal()
 
         d.resume().expect("run into the fault");
         let fault = d.wait(Some(STOP_TIMEOUT)).expect("wait for the fault");
+        // Forward first: on a backend that reports the fault as a signal it never held,
+        // this continue is the call that was rejected.
+        let pc = d.read_registers_for(thread).expect("registers at the fault").pc;
+        d.resume_with_signal()
+            .expect("a forwarding continue after a fault is not rejected as signal injection");
         let Some(StopEvent::Fault {
             thread: faulted, kind, ..
         }) = fault.clone()
@@ -1395,10 +1400,7 @@ fn access_fault_continue_is_not_rejected_as_a_signal()
         };
         assert_eq!(faulted, thread, "the fault names another thread");
         assert_eq!(kind, FaultKind::MemoryAccess, "{fault:?}");
-        let pc = d.read_registers_for(thread).expect("registers at the fault").pc;
 
-        d.resume_with_signal()
-            .expect("a forwarding continue after a fault is not rejected as signal injection");
         let again = d.wait(Some(STOP_TIMEOUT)).expect("wait for the retried fault");
         assert!(
             matches!(again, Some(StopEvent::Fault { thread: t, kind: FaultKind::MemoryAccess, .. }) if t == thread),

@@ -1086,10 +1086,10 @@ fn early_reply_and_task_resume_failures_are_reported_once_each()
     });
 }
 
-/// #242: a failed `task_resume` leaves the signal held. A retry can deliver it once
-/// or suppress it, and a later forwarding continue still works.
+/// #242: a failed `task_resume` leaves the signal held and unsent. A retry can deliver it
+/// once or suppress it, and a later held signal still forwards.
 #[test]
-fn held_signal_survives_a_task_resume_failure_after_it_was_selected()
+fn held_signal_survives_a_forwarding_resume_whose_task_resume_fails()
 {
     harness::run(|t| {
         let fixture = fixture!("signal_handler");
@@ -1136,7 +1136,7 @@ fn held_signal_survives_a_task_resume_failure_after_it_was_selected()
                     d.wait(Some(TIMEOUT)).expect("handler stop"),
                     Some(StopEvent::Breakpoint { .. })
                 ));
-                d.resume_with_signal().expect("a later forwarding continue is accepted");
+                d.resume().expect("continue from the handler");
             } else {
                 d.resume().expect("suppress the held signal");
             }
@@ -1151,13 +1151,28 @@ fn held_signal_survives_a_task_resume_failure_after_it_was_selected()
                 Some(StopEvent::Interrupted { .. })
             ));
         }
-        let hits = d
-            .logical_breakpoints()
-            .iter()
-            .find(|bp| bp.id == handler)
-            .expect("handler breakpoint")
-            .hit_count;
-        assert_eq!(hits, 1, "the handler ran once");
+        let hits = |d: &Session| {
+            d.logical_breakpoints()
+                .iter()
+                .find(|bp| bp.id == handler)
+                .expect("handler breakpoint")
+                .hit_count
+        };
+        assert_eq!(hits(&d), 1, "the handler ran once");
+
+        // After the recovery a new held signal is still forwarded.
+        signal(d.pid().0, "-USR1");
+        d.resume().expect("resume into the next signal");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("next signal stop"),
+            Some(StopEvent::Signal { signal: SIGUSR1, .. })
+        ));
+        d.resume_with_signal().expect("a later forwarding continue is accepted");
+        assert!(matches!(
+            d.wait(Some(TIMEOUT)).expect("second handler stop"),
+            Some(StopEvent::Breakpoint { .. })
+        ));
+        assert_eq!(hits(&d), 2, "the forwarded signal ran the handler");
         d.kill().expect("kill");
     });
 }

@@ -1323,7 +1323,9 @@ impl MacOSBackend
             None
         };
         if reply_pending {
-            // Private handshakes and failed early suppressions still own a reply.
+            // Private handshakes and failed early suppressions still own a reply. Update
+            // it before queuing a new signal, so a failed update never leaves a signal
+            // queued in the kernel that no record tracks (#242).
             self.ptrace(ffi::ptrace_requests::PT_THUPDATE, port, if requeue { 0 } else { signal })?;
         }
         if let Some(queued) = queued {

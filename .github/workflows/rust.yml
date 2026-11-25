@@ -5,6 +5,9 @@ on:
     branches: [ "trunk" ]
     paths:
       - '**.rs'
+      # Native fixture sources that crates/ferros-tests/build.rs compiles.
+      - 'crates/ferros-tests/fixtures/**.c'
+      - 'crates/ferros-tests/fixtures/**.s'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/rust.yml'
@@ -18,6 +21,9 @@ on:
     branches: [ "trunk" ]
     paths:
       - '**.rs'
+      # Native fixture sources that crates/ferros-tests/build.rs compiles.
+      - 'crates/ferros-tests/fixtures/**.c'
+      - 'crates/ferros-tests/fixtures/**.s'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/rust.yml'

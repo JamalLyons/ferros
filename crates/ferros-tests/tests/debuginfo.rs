@@ -139,6 +139,16 @@ fn expect_no_debug_info(result: ferros_core::Result<std::sync::Arc<BinaryImage>>
     assert!(message.contains("dsymutil"), "{message}");
 }
 
+fn dwarf_member(fixture: &Fixture) -> PathBuf
+{
+    fs::read_dir(fixture.dsym_path().join("Contents/Resources/DWARF"))
+        .expect("fixture dSYM")
+        .next()
+        .expect("DWARF member")
+        .expect("directory entry")
+        .path()
+}
+
 #[test]
 fn packed_fixture_discovers_uuid_matching_dsym()
 {
@@ -168,13 +178,7 @@ fn mismatched_dsym_is_rejected_and_no_tool_has_actionable_typed_error()
 
         let directory = scratch.0.join("program.dSYM/Contents/Resources/DWARF");
         fs::create_dir_all(&directory).expect("create adjacent bundle");
-        let wrong_fixture = fixture!("nested_calls");
-        let wrong_member = fs::read_dir(wrong_fixture.dsym_path().join("Contents/Resources/DWARF"))
-            .expect("wrong bundle")
-            .next()
-            .expect("DWARF member")
-            .expect("directory entry")
-            .path();
+        let wrong_member = dwarf_member(&fixture!("nested_calls"));
         fs::copy(wrong_member, directory.join("arbitrary-name")).expect("copy mismatched DWARF");
         expect_no_debug_info(cache.load_image(descriptor(&executable, 0x2_0000_0000)));
     });
@@ -225,8 +229,9 @@ fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
             .load_image(descriptor(&executable, 0x3_0000_0000))
             .expect("dsymutil fallback");
         assert_source_line(&image, &executable, &fixture);
-        let entries: Vec<_> = fs::read_dir(scratch.0.join("cache")).expect("cache").collect();
-        assert_eq!(entries.len(), 1, "only validated output is published");
+        let mut entries = fs::read_dir(scratch.0.join("cache")).expect("cache");
+        let entry = entries.next().expect("validated output").expect("cache entry").path();
+        assert!(entries.next().is_none(), "only one cache entry is published");
 
         // A new resolver with no tool can use the persisted artifact at another slide.
         let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
@@ -234,14 +239,19 @@ fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
             .load_image(descriptor(&executable, 0x4_0000_0000))
             .expect("UUID cache hit");
         assert_source_line(&image, &executable, &fixture);
-        // Poison the cache with another UUID: a cache filename is not proof of identity.
-        let entry = fs::read_dir(scratch.0.join("cache"))
-            .expect("cache")
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        fs::copy(fixture!("nested_calls").path(), entry).expect("replace cache with wrong UUID");
+        // The foreign dSYM passes the architecture and DWARF checks. Its UUID must reject it.
+        let foreign_bytes = fs::read(dwarf_member(&fixture!("nested_calls"))).expect("read foreign DWARF");
+        let foreign = object::File::parse(&*foreign_bytes).expect("parse foreign DWARF");
+        assert_eq!(foreign.architecture(), file.architecture());
+        for name in [".debug_info", ".debug_abbrev", ".debug_line"] {
+            assert!(
+                foreign.section_by_name(name).is_some_and(|section| section.size() > 0),
+                "{name}"
+            );
+        }
+        let uuid = |object: &object::File<'_>| object.mach_uuid().expect("read LC_UUID").expect("has LC_UUID");
+        assert_ne!(uuid(&foreign), uuid(&file), "foreign dSYM must have a different UUID");
+        fs::write(entry, foreign_bytes).expect("replace cache with foreign DWARF");
         let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
         expect_no_debug_info(cache.load_image(descriptor(&executable, 0x3_0000_0000)));
     });

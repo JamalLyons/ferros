@@ -1,9 +1,7 @@
 //! Source line lookups (`file:line` <-> address) against fixture dSYMs, for issue #35.
 //!
 //! These tests read fixture executables and their dSYM bundles only. They launch no
-//! process and need no debugger entitlement, so they skip `harness::run` (the exception
-//! AGENTS.md allows for tests that launch nothing); they still pass when the runner signs
-//! without the entitlement (`FERROS_TEST_UNSIGNED=1`).
+//! process and need no debugger entitlement.
 #![cfg(target_os = "macos")]
 
 use std::collections::BTreeSet;
@@ -12,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat};
+use ferros_core::objfile::{DWARF_SECTIONS, SectionId};
 use ferros_core::symbols::{BinaryImage, FunctionAddress, ImageDescriptor, SourceLookupError};
 use ferros_core::{Address, SymbolCache};
 use ferros_macos::{DebugInfoOptions, MachOFormat};
-use ferros_tests::{Fixture, fixture, scratch};
+use ferros_tests::{Fixture, fixture, harness, scratch};
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 
 /// Every fixture binary. `fixture!` needs a literal name, so the table is written out;
@@ -710,30 +710,59 @@ fn function_lookups_after_first_load_take_under_a_second()
     }
 }
 
-/// A copy of the `symbols` fixture executable and its dSYM in a scratch directory, where
-/// the last compilation unit of the dSYM's `.debug_info` no longer parses: its unit header
-/// is intact, so every unit can still be located, and the abbreviation code of its root
-/// entry is overwritten with one no abbreviation table has. Returns the image and the
-/// `.debug_info` offset of the corrupted unit.
-///
-/// The last unit, not the first: how rustc splits the fixture into units depends on the
-/// build (with incremental compilation off, as on a fresh CI build, the first unit holds
-/// all of the fixture's own code), while the last unit is always one of the standard
-/// library's, so the fixture's code stays readable in every layout.
-fn load_with_corrupt_last_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<BinaryImage>, u64)
+fn dwarf_member(fixture: &Fixture) -> PathBuf
 {
-    let mut corrupted = 0;
-    let image = load_with_corrupt_dwarf(fixture, scratch, |dwarf| {
-        let (info, info_end) = section_range(dwarf, ".debug_info");
-        let last = *unit_starts(dwarf, info, info_end).last().expect("a unit");
-        // After the length: 2-byte version, then 5 more bytes in version 4 and 6 more in
-        // version 5. The root entry's abbreviation code follows.
-        let version = u16::from_le_bytes([dwarf[last + 4], dwarf[last + 5]]);
-        let root = last + if version >= 5 { 12 } else { 11 };
-        // ULEB128 0x1f_ffff: far more abbreviations than any unit declares.
-        dwarf[root..root + 3].copy_from_slice(&[0xff, 0xff, 0x7f]);
-        corrupted = u64::try_from(last - info).expect("unit offset");
-    });
+    fs::read_dir(fixture.dsym_path().join("Contents/Resources/DWARF"))
+        .expect("fixture dSYM")
+        .next()
+        .expect("DWARF file in the fixture dSYM")
+        .expect("dSYM entry")
+        .path()
+}
+
+/// Append a unit with a valid header and an undefined root abbreviation to the fixture's
+/// real DWARF. The number and order of rustc's own units vary with codegen settings.
+/// The mock object keeps their original section offsets and executable addresses.
+fn load_with_unreadable_unit(fixture: &Fixture, scratch: &Scratch) -> (Arc<BinaryImage>, u64)
+{
+    let executable = fs::read(fixture.path()).expect("read executable");
+    let file = object::File::parse(&*executable).expect("parse executable");
+    let text = file
+        .segments()
+        .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
+        .expect("__TEXT segment");
+
+    let bytes = fs::read(dwarf_member(fixture)).expect("read fixture DWARF");
+    let companion = object::File::parse(&*bytes).expect("parse fixture DWARF");
+    let mut info = companion
+        .section_by_name(SectionId::DebugInfo.name())
+        .expect("fixture .debug_info")
+        .data()
+        .expect("read .debug_info")
+        .to_vec();
+    let corrupted = u64::try_from(info.len()).expect("unit offset");
+    info.extend([
+        10, 0, 0, 0, // DWARF32 unit length
+        4, 0, // version
+        0, 0, 0, 0, // abbreviation table offset
+        8, // address size
+        0xff, 0xff, 0x7f, // root abbreviation code 0x1f_ffff (ULEB128)
+    ]);
+
+    let mut object = MockObjectFile::new(text.address(), text.size()).with_dwarf(SectionId::DebugInfo, &info);
+    for &id in DWARF_SECTIONS.iter().filter(|&&id| id != SectionId::DebugInfo) {
+        if let Some(section) = companion.section_by_name(id.name()) {
+            object = object.with_dwarf(id, section.data().expect("read fixture DWARF section"));
+        }
+    }
+    let path = scratch.0.join("unreadable-unit");
+    fs::write(&path, object.to_bytes()).expect("write fixture DWARF with unreadable unit");
+    let image = SymbolCache::new(MockObjectFormat::shared())
+        .load_image(ImageDescriptor {
+            path,
+            load_address: text.address(),
+        })
+        .expect("image with one unreadable unit");
     (image, corrupted)
 }
 
@@ -776,11 +805,7 @@ fn load_with_corrupt_dwarf(fixture: &Fixture, scratch: &Scratch, corrupt: impl F
     fs::copy(fixture.path(), &executable).expect("copy executable");
     let dwarf_dir = PathBuf::from(format!("{}.dSYM", executable.display())).join("Contents/Resources/DWARF");
     fs::create_dir_all(&dwarf_dir).expect("create dSYM directory");
-    let companion = fs::read_dir(fixture.dsym_path().join("Contents/Resources/DWARF"))
-        .expect("fixture dSYM")
-        .map(|entry| entry.expect("dSYM entry").path())
-        .next()
-        .expect("DWARF file in the fixture dSYM");
+    let companion = dwarf_member(fixture);
     let mut dwarf = fs::read(&companion).expect("read DWARF file");
     corrupt(&mut dwarf);
     fs::write(dwarf_dir.join(companion.file_name().expect("DWARF file name")), dwarf).expect("write DWARF file");
@@ -803,70 +828,55 @@ fn load_with_corrupt_dwarf(fixture: &Fixture, scratch: &Scratch, corrupt: impl F
 /// Functions of the `symbols` fixture looked up by `one_unreadable_unit_does_not_hide_the_others`.
 const FUNCTIONS: &[&str] = &["main", "area", "bump", "generic_identity", "one_line_identity"];
 
-/// Issue #88: one compilation unit that cannot be parsed is skipped and reported, and
-/// lines and functions of every other unit still resolve to the addresses they have in
-/// the intact image.
+/// Issue #88: one unreadable compilation unit is skipped and reported while the
+/// fixture's own code, in unaffected units, retains all of its line and function sites.
 #[test]
 fn one_unreadable_unit_does_not_hide_the_others()
 {
-    let fixture = fixture!("symbols");
-    let intact = load(&fixture);
-    assert_eq!(
-        intact.skipped_debug_info(),
-        Ok(Vec::new()),
-        "the fixture dSYM parses completely"
-    );
+    harness::run(|_| {
+        let fixture = fixture!("symbols");
+        let intact = load(&fixture);
+        assert_eq!(
+            intact.skipped_debug_info(),
+            Ok(Vec::new()),
+            "the fixture dSYM parses completely"
+        );
 
-    let scratch = Scratch::new();
-    let (image, corrupted) = load_with_corrupt_last_unit(&fixture, &scratch);
-    let skipped = image.skipped_debug_info().expect("indexes build from the readable units");
-    assert!(
-        skipped.iter().any(|skip| skip.unit_offset == Some(corrupted)),
-        "the unit at .debug_info offset {corrupted:#x} is reported: {skipped:?}"
-    );
+        let scratch = Scratch::new();
+        let (image, corrupted) = load_with_unreadable_unit(&fixture, &scratch);
+        let skipped = image.skipped_debug_info().expect("indexes build from the readable units");
+        assert!(
+            !skipped.is_empty() && skipped.iter().all(|skip| skip.unit_offset == Some(corrupted)),
+            "only the unit at .debug_info offset {corrupted:#x} is reported: {skipped:?}"
+        );
 
-    let text = source(&fixture);
-    let query = source_query(&fixture);
-    let mut resolved = 0;
-    for marker in markers(&text) {
-        let line = fixture.marker_line(&marker);
-        let expected = intact.line_addresses(&query, line).expect("intact marker");
-        match image.line_addresses(&query, line) {
-            Ok(found) => {
-                // A line in the skipped unit resolves to a later line or to fewer copies.
-                if found.line == line {
-                    assert!(
-                        found.addresses.iter().all(|address| expected.addresses.contains(address)),
-                        "{marker}: {found:?} is not part of {expected:?}"
-                    );
-                    resolved += 1;
-                }
-            }
-            Err(error) => assert!(
-                matches!(
-                    error,
-                    SourceLookupError::UnknownFile { .. } | SourceLookupError::NoCodeAtOrAfterLine { .. }
-                ),
-                "{marker}: a line in the skipped unit is a typed miss, not {error:?}"
-            ),
+        let query = source_query(&fixture);
+        let line = fixture.marker_line("one_line_generic");
+        // Each instantiation starts on this one line. The executable's symbol table
+        // gives both first statement addresses independently of either DWARF index.
+        let mut entries = ["u32", "u64"].map(|ty| {
+            let name = format!("ferros_fixture_symbols::one_line_identity::<{ty}>");
+            Address::new(text_symbol(&fixture, &name))
+        });
+        entries.sort_unstable();
+        assert!(entries[0] < entries[1], "the instantiations have distinct entries");
+        let found = image.line_addresses(&query, line).expect("one-line generic marker");
+        assert_eq!(found.line, line);
+        assert_eq!(found.addresses, entries, "one line site per instantiation");
+
+        for marker in markers(&source(&fixture)) {
+            let line = fixture.marker_line(&marker);
+            let expected = intact.line_addresses(&query, line).expect("intact marker");
+            let found = image.line_addresses(&query, line).expect("unaffected marker");
+            assert_eq!(found.line, line, "{marker}");
+            assert_eq!(found, expected, "{marker}");
         }
-    }
-    assert!(resolved > 0, "no marker resolved from the readable units");
-
-    let found = FUNCTIONS
-        .iter()
-        .filter(
-            |name| match (image.function_addresses(name), intact.function_addresses(name)) {
-                (Ok(found), Ok(expected)) => {
-                    assert!(found.iter().all(|function| expected.contains(function)), "{name}: {found:?}");
-                    !found.is_empty()
-                }
-                (Err(SourceLookupError::UnknownFunction { .. }), _) => false,
-                (found, expected) => panic!("{name}: {found:?} (intact: {expected:?})"),
-            },
-        )
-        .count();
-    assert!(found > 0, "no function resolved from the readable units");
+        for &name in FUNCTIONS {
+            let expected = intact.function_addresses(name).expect("intact function");
+            let found = image.function_addresses(name).expect("unaffected function");
+            assert_eq!(found, expected, "{name}");
+        }
+    });
 }
 
 /// Issue #93: when no line-program header of the dSYM parses (every `.debug_line` program

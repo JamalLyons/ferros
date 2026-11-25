@@ -643,3 +643,48 @@ fn open_without_unwind_sections_has_no_hints_or_eh_frame()
     assert!(image.eh_frame.is_none());
     assert!(image.eh_frame_hdr.is_none());
 }
+
+/// A file whose UUID cannot be read: its `LC_UUID` command is too short to hold a UUID
+/// and its load command list ends early, so `mach_uuid` fails while the segments before
+/// the break still parse.
+fn slice_with_unreadable_uuid() -> Vec<u8>
+{
+    let mut bytes = slice(ARM64, ARM64E, [0; 16], 0x1_0000_0000);
+    let word = |bytes: &mut [u8], offset: usize, value: u32| bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    // `LC_UUID` with `cmdsize` 16, then an empty 8-byte command in the rest of its 24
+    // bytes, then the two segments, then a fifth command past `sizeofcmds`.
+    word(&mut bytes, 16, 5);
+    word(&mut bytes, 36, 16);
+    word(&mut bytes, 48, 0);
+    word(&mut bytes, 52, 8);
+    bytes
+}
+
+/// #249: a file whose UUID command cannot be read is not the mapped build. Its build id is
+/// `Absent`, which never matches a known mapped id, so a late id always contradicts it;
+/// opened for a known mapped UUID it is refused as another build. While the mapped UUID is
+/// unknown it is still read.
+#[test]
+fn an_unreadable_uuid_is_another_build_than_a_known_mapped_one()
+{
+    let bytes = slice_with_unreadable_uuid();
+    let file = object::File::parse(&*bytes).expect("the file still parses");
+    assert!(file.mach_uuid().is_err(), "the fixture's UUID must not be readable");
+    let mapped = slice(ARM64, ARM64E, [4; 16], 0x1_0000_0000);
+    let target = SliceIdentity::from_header(&mapped).unwrap();
+    let path = write("unreadable-uuid", &bytes);
+    let unknown = parse(&path, None);
+    let known = parse(&path, Some(&target));
+    let _ = fs::remove_file(&path);
+
+    let unknown = unknown.expect("read while the mapped UUID is unknown");
+    assert_eq!(unknown.build_id, ferros_core::types::BuildIdentity::Absent);
+    assert_eq!(text(&unknown), Some(0x1_0000_0000));
+    assert!(!ferros_core::types::same_build(
+        unknown.build_id,
+        target.to_image_slice().build_id()
+    ));
+    let error = known.expect_err("another build than the mapped UUID");
+    assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+    assert!(error.to_string().contains("another build"), "{error}");
+}

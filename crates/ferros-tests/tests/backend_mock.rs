@@ -4108,3 +4108,76 @@ fn a_contradicted_file_is_refused_when_reopened_without_a_slice()
         Some("new_build_fn")
     );
 }
+
+/// `path` spelled relative to the current directory, resolving to the same file.
+fn late_id_relative(path: &std::path::Path) -> std::path::PathBuf
+{
+    let here = std::env::current_dir()
+        .expect("current directory")
+        .canonicalize()
+        .expect("canonical current directory");
+    let mut relative = std::path::PathBuf::new();
+    for _ in here.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(path.strip_prefix("/").expect("absolute path"));
+    assert!(relative.is_relative());
+    relative
+}
+
+/// #249: the loader lists one mapping twice, under a relative and an absolute spelling of
+/// one file, so both listings share the symbol cache's entry for that file. When only one
+/// listing reports a late build id that contradicts the file, neither listing may keep the
+/// old file served: not its DWARF, not its unwind hint. Checked with the contradicting id
+/// on either listing.
+#[test]
+fn a_contradicting_late_id_on_one_alias_stops_serving_the_old_file_for_both()
+{
+    use ferros_core::backend::ImageRole;
+
+    for contradicted in [0_usize, 1] {
+        let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-late-build-id-alias", "");
+        std::io::Write::write_all(&mut file, &late_id_file("old_build", &[0xF1; 16])).expect("write image");
+        drop(file);
+        let _files = RemoveOnDrop(vec![path.clone()]);
+        let absolute = path.canonicalize().expect("canonical image path");
+        let relative = late_id_relative(&absolute);
+        assert_eq!(relative.canonicalize().expect("relative spelling resolves"), absolute);
+        let listings = |relative_id, absolute_id| {
+            let mut relative = late_id_listed(&relative, relative_id);
+            relative.role = ImageRole::Library;
+            vec![relative, late_id_listed(&absolute, absolute_id)]
+        };
+        let mock = late_id_process(&absolute, ferros_core::BuildIdentity::Unknown);
+        let unknown = ferros_core::BuildIdentity::Unknown;
+        mock.set_images(listings(unknown, unknown));
+        let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+        assert_eq!(late_id_name(&mut session).expect("symbolicate").as_deref(), Some("old_build"));
+        assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+
+        // Only one listing learns the mapped id, and it is not the file's build.
+        let late = known(&[0xF2; 16]);
+        mock.set_images(if contradicted == 0 {
+            listings(late, unknown)
+        } else {
+            listings(unknown, late)
+        });
+        match late_id_name(&mut session) {
+            Err(ferros_core::DebuggerError::SymbolLoad { .. }) => {}
+            other => panic!("listing {contradicted} contradicted: the old file's DWARF is still served: {other:?}"),
+        }
+        assert_eq!(
+            late_id_pcs(&mut session),
+            vec![LATE_ID_FUNCTION],
+            "listing {contradicted} contradicted: the old file's unwind hint is still served"
+        );
+
+        std::fs::write(&path, late_id_file("new_build_fn", &[0xF2; 16])).expect("rewrite image");
+        assert_eq!(
+            late_id_name(&mut session).expect("symbolicate").as_deref(),
+            Some("new_build_fn")
+        );
+        assert_eq!(late_id_pcs(&mut session), vec![LATE_ID_FUNCTION, LATE_ID_CALLER]);
+    }
+}

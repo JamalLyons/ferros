@@ -260,6 +260,14 @@ impl Session
     /// unchanged and its build identity can be the same build ([`same_build`]). Otherwise a
     /// fresh image starts, and its DWARF cache id is then absent from the set passed to
     /// [`SymbolCache::retain_ids`].
+    ///
+    /// A build id is a property of the header mapped at a load address, not of the path the
+    /// loader lists it under, so a listing whose id is unknown takes the id another listing
+    /// reports at the same load address (#249). Two spellings of one mapping, such as a
+    /// relative and an absolute path, resolve to one [`SymbolCache`] entry; when only one of
+    /// them reports an id that contradicts the opened file, both learn it, both stop
+    /// serving that file ([`Self::forget_contradicted_file`]), and `retain_ids` drops the
+    /// entry.
     pub(super) fn load_images(&mut self) -> Result<()>
     {
         let images = match self.backend.images() {
@@ -267,32 +275,39 @@ impl Session
             Err(BackendError::Unsupported(_)) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        let mut mapped_ids = HashMap::new();
+        for image in &images {
+            if let Some(id) = image.build_id.known() {
+                mapped_ids.entry(image.load_address.value()).or_insert(id);
+            }
+        }
         let mut previous = std::mem::take(&mut self.loaded_images);
         for image in images {
             let descriptor = ImageDescriptor {
                 path: image.path,
                 load_address: image.load_address.value(),
             };
+            let build_id = image
+                .build_id
+                .or_later(BuildIdentity::from(mapped_ids.get(&descriptor.load_address).copied()));
             if let Some(index) = previous.iter().position(|entry| {
                 entry.descriptor.path == descriptor.path
                     && entry.descriptor.load_address == descriptor.load_address
-                    && same_image(entry.build_id, entry.generation, image.build_id, self.stop_generation)
+                    && same_image(entry.build_id, entry.generation, build_id, self.stop_generation)
             }) {
                 let mut kept = previous.swap_remove(index);
-                kept.build_id = kept.build_id.or_later(image.build_id);
+                kept.build_id = kept.build_id.or_later(build_id);
                 kept.role = image.role;
                 kept.slice = kept.slice.map(|slice| slice.or_later(kept.build_id));
                 self.forget_contradicted_file(&mut kept);
                 self.loaded_images.push(kept);
             } else {
-                let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, image.build_id);
+                let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
                     role: image.role,
                     generation: self.stop_generation,
-                    build_id: image
-                        .build_id
-                        .or_later(slice.as_ref().map_or(BuildIdentity::Unknown, ImageSlice::build_id)),
+                    build_id: build_id.or_later(slice.as_ref().map_or(BuildIdentity::Unknown, ImageSlice::build_id)),
                     mapping,
                     slice,
                     symbols: None,

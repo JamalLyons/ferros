@@ -713,6 +713,11 @@ pub(crate) fn loaded_images_with(
     if let Some(index) = images.iter().position(|image| is_executable_header(task, image.load_address)) {
         images[index].role = ImageRole::MainExecutable;
         images.swap(0, index);
+    } else if let Some(first) = images.first_mut() {
+        // No readable `MH_EXECUTE` header at this stop (for example its page was made
+        // unreadable). dyld lists the main executable first, so keep resolving there
+        // rather than report a process with no program.
+        first.role = ImageRole::MainExecutable;
     }
     images.extend(dyld_image(task, &infos, &images));
     // UUID reads run before the stability check, as #170 required: a list that changes

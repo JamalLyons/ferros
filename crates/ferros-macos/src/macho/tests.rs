@@ -94,7 +94,7 @@ fn image_at(path: &str, address: u64) -> LoadedImage
         path: format!("/nonexistent/{path}").into(),
         load_address: Address::new(address),
         build_id: BuildIdentity::Unknown,
-        role: ferros_core::backend::ImageRole::MainExecutable,
+        role: ferros_core::backend::ImageRole::Library,
     }
 }
 

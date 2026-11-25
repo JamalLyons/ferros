@@ -4428,3 +4428,29 @@ fn two_images_marked_main_executable_are_reported()
         other => panic!("expected InvalidArgument naming both images, got {other:?}"),
     }
 }
+
+#[test]
+fn stack_trace_and_symbolicate_enumerate_images_once_per_call()
+{
+    // Issue #244 (from #220): each public stack request uses one refreshed image list for
+    // all of its frames, however many images it loads. The list is not kept between
+    // calls (see `Session::stack_trace`), so each call enumerates once.
+    let (_image, mock) = MultiSiteImage::new();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let enumerations = |mock: &MockBackend| {
+        mock.take_calls()
+            .iter()
+            .filter(|call| matches!(call, MockCall::Images))
+            .count()
+    };
+    let _ = enumerations(&mock);
+
+    let frames = session.stack_trace(16).expect("stack trace");
+    assert!(!frames.is_empty());
+    assert_eq!(enumerations(&mock), 1, "one image enumeration for a stack trace");
+    for address in [BREAKPOINT, SECOND_SITE] {
+        let _ = session.symbolicate(address).expect("symbolicate");
+        assert_eq!(enumerations(&mock), 1, "one image enumeration for symbolicating {address}");
+    }
+}

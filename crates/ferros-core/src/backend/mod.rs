@@ -114,7 +114,9 @@ mod types;
 use std::time::Duration;
 
 pub use error::{BackendError, BackendResult};
-pub use types::{Environment, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent, ThreadAction};
+pub use types::{
+    Environment, FaultKind, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent, ThreadAction,
+};
 
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 
@@ -588,6 +590,15 @@ mod tests
             ),
             (StopEvent::SingleStep { thread: t }, Some(t), false),
             (StopEvent::Signal { thread: t, signal: 11 }, Some(t), false),
+            (
+                StopEvent::Fault {
+                    thread: t,
+                    kind: FaultKind::MemoryAccess,
+                    detail: "x".into(),
+                },
+                Some(t),
+                false,
+            ),
             (StopEvent::Interrupted { thread: Some(t) }, Some(t), false),
             (StopEvent::Interrupted { thread: None }, None, false),
             (
@@ -604,6 +615,11 @@ mod tests
         for (event, thread, terminal) in cases {
             assert_eq!(event.thread(), thread, "{event:?}");
             assert_eq!(event.is_terminal(), terminal, "{event:?}");
+            let deliverable = match event {
+                StopEvent::Signal { thread, signal } => Some((thread, signal)),
+                _ => None,
+            };
+            assert_eq!(event.deliverable_signal(), deliverable, "{event:?}");
         }
     }
 

@@ -71,6 +71,10 @@ pub fn describe_stop(session: &mut Session, event: &StopEvent) -> String
             Err(_) => format!("stopped: step (thread {})", thread.raw()),
         },
         StopEvent::Signal { thread, signal } => format!("stopped: signal {signal} (thread {})", thread.raw()),
+        StopEvent::Fault { thread, kind, .. } => match session.read_registers_for(*thread) {
+            Ok(registers) => format!("stopped: {kind} at {:#x} (thread {})", registers.pc.value(), thread.raw()),
+            Err(_) => format!("stopped: {kind} (thread {})", thread.raw()),
+        },
         StopEvent::Interrupted { thread } => match thread {
             Some(thread) => format!("stopped: interrupted (thread {})", thread.raw()),
             None => "stopped: interrupted".to_owned(),

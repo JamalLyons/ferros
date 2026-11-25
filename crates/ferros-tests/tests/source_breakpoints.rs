@@ -12,8 +12,10 @@ use std::time::Duration;
 use ferros_core::backend::StdioSpec;
 use ferros_core::symbols::SourceLookupError;
 use ferros_core::{
-    BreakpointHit, BreakpointLocation, DebuggerError, LaunchSpec, LogicalBreakpointId, Session, SessionState, StopEvent,
+    Address, BreakpointHit, BreakpointLocation, DebuggerError, LaunchSpec, LogicalBreakpointId, Session, SessionState,
+    StopEvent,
 };
+use ferros_tests::arm64::TRAP;
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::symbols::function_address;
 use ferros_tests::transcript::{self, Interactive, normalize};
@@ -77,6 +79,16 @@ fn sites(session: &Session, id: LogicalBreakpointId) -> Vec<ferros_core::Breakpo
         .expect("the breakpoint")
         .sites
         .clone()
+}
+
+/// The raw bytes of the instruction at `address`, traps included.
+/// `Session::read_memory` hides traps; the backend does not.
+fn raw_bytes(session: &mut Session, address: Address) -> Vec<u8>
+{
+    session
+        .backend_mut()
+        .read_memory(address, 4)
+        .unwrap_or_else(|err| panic!("raw read at {address}: {err}"))
 }
 
 /// Whether a lookup error is the expected variant.
@@ -479,8 +491,33 @@ fn shared_site_is_released_by_the_last_delete()
         let by_path = set(&mut d, function(&qualified(&fixture, "level_c")));
         assert_eq!(sites(&d, by_name), sites(&d, by_path));
         assert_eq!(d.breakpoints().len(), 1);
+        let [site] = sites(&d, by_name).try_into().expect("one site");
+        let original = d.read_memory(site.address, 4).expect("session read before disabling");
+        assert_eq!(raw_bytes(&mut d, site.address), TRAP, "armed trap");
         d.disable_logical_breakpoint(by_name).expect("disable");
+        // The other owner still wants the trap: it stays enabled and the raw bytes stay armed.
+        let enabled = |d: &Session, id| {
+            d.logical_breakpoints()
+                .iter()
+                .find(|breakpoint| breakpoint.id == id)
+                .expect("the breakpoint")
+                .enabled
+        };
+        assert!(!enabled(&d, by_name), "the disabled owner");
+        assert!(enabled(&d, by_path), "the other owner stays enabled");
+        assert_eq!(
+            raw_bytes(&mut d, site.address),
+            TRAP,
+            "trap released while another owner is enabled"
+        );
+        assert_eq!(d.breakpoints().len(), 1, "the shared trap entry stays");
         d.disable_logical_breakpoint(by_path).expect("disable");
+        assert_ne!(
+            raw_bytes(&mut d, site.address),
+            TRAP,
+            "trap left after the last owner disabled"
+        );
+        assert_eq!(raw_bytes(&mut d, site.address), original, "original instruction restored");
         d.delete_breakpoint(by_name).expect("delete");
         d.delete_breakpoint(by_path).expect("delete");
         assert_eq!(d.breakpoints().len(), 0);

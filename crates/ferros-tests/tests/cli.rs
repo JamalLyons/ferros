@@ -145,15 +145,43 @@ fn source_steps_name_the_line_they_stop_on()
                 .find(|reply| reply.starts_with(&format!("{command}\n")))
                 .unwrap_or_else(|| panic!("no reply to {command}: {run:?}"))
         };
-        let step = reply("step");
-        assert!(step.contains("stopped: step at "), "{step:?}");
-        assert!(step.contains("level_a at "), "step enters level_a: {step:?}");
-        assert!(step.contains(&file("in_a")), "{step:?}");
-        let finish = reply("finish");
-        assert!(finish.contains("main at "), "finish returns to main: {finish:?}");
-        assert!(finish.contains(&file("call_a")), "{finish:?}");
-        let next = reply("next");
-        assert!(next.contains(&file("after_calls")), "{next:?}");
+        // Each reply is `stopped: step at <pc> (thread <id>)`, the function and `file:line`,
+        // and the source line itself. Check the whole location line and the whole source
+        // line, not a substring of either.
+        let check = |command: &str, function: &str, marker: &str, source: &str| {
+            // The last reply is followed by ferros's `killed process` line.
+            let lines: Vec<&str> = reply(command).lines().take(4).collect();
+            let [_echo, header, location, text] = lines[..] else {
+                panic!("expected the echo and three lines for `{command}`, got {lines:?}");
+            };
+            assert!(header.starts_with("stopped: step at 0x"), "{command}: {header:?}");
+            let expected = format!("  ferros_fixture_nested_calls::{function} at ");
+            assert!(
+                location
+                    .strip_prefix(expected.as_str())
+                    .is_some_and(|path| path.ends_with(file(marker).trim_end())),
+                "{command}: {location:?}"
+            );
+            let line = fixture.marker_line(marker).to_string();
+            let shown = text
+                .trim_start()
+                .strip_prefix(line.as_str())
+                .unwrap_or_else(|| panic!("{command}: source line is not line {line}: {text:?}"));
+            assert_eq!(shown.trim(), source, "{command}: {text:?}");
+        };
+        check(
+            "step",
+            "level_a",
+            "in_a",
+            "let input = std::hint::black_box(val); // BREAK: in_a",
+        );
+        check("finish", "main", "call_a", "let res = level_a(40); // BREAK: call_a");
+        check(
+            "next",
+            "main",
+            "after_calls",
+            "let final_res = std::hint::black_box(res); // BREAK: after_calls",
+        );
         assert_eq!(harness::tagged_pids(tag.as_str()), Vec::<u32>::new());
     });
 }

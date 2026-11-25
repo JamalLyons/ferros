@@ -249,6 +249,18 @@ impl Session
 
     /// The process's exit images, read from their symbol tables in the target's memory.
     /// Cached while the source and load address match and the build can be the same (#170).
+    ///
+    /// A late build id that contradicts an opened image file (#221, #249) needs no refresh
+    /// here. That contradiction is between the file on disk and the mapping, and nothing
+    /// in an [`ExitImage`] comes from a file: `code` is the format's
+    /// [`mapped_symbols`](crate::objfile::ObjectFormat::mapped_symbols) of the header
+    /// mapped at `load_address`, and `entries` are read from that symbol table in the
+    /// target's memory ([`read_exit_image`](Self::read_exit_image)), never through
+    /// [`SymbolCache`](crate::symbols::SymbolCache). The id that completes an unknown
+    /// `build_id` here describes that same mapping, which is what was read. A late id
+    /// that differs from a known cached one fails [`same_image`] and the image is read
+    /// again from memory. The ids come from [`load_images`](Self::load_images), which this
+    /// calls first, so they are the session's current ones.
     fn exit_images(&mut self) -> Vec<ExitImage>
     {
         if let Err(error) = self.load_images() {

@@ -311,15 +311,26 @@ pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option
 }
 
 /// A single-architecture file is read as it is, unless `target` knows the mapped UUID and
-/// the file has another (or none): then it is another build than the mapped one (#170).
-/// A file that does not parse is left to the caller's parse, which reports it.
+/// the file has another, none, or load commands too malformed to read one: then it is
+/// another build than the mapped one (#170, #249). A file that does not parse is left to
+/// the caller's parse, which reports it.
 fn single_image<'data>(path: &Path, bytes: &'data [u8], target: Option<&SliceIdentity>) -> Result<&'data [u8]>
 {
     let Some(uuid) = target.and_then(|target| target.uuid) else {
         return Ok(bytes);
     };
-    let Ok(found) = object::File::parse(bytes).and_then(|file| file.mach_uuid()) else {
+    let Ok(file) = object::File::parse(bytes) else {
         return Ok(bytes);
+    };
+    let found = match file.mach_uuid() {
+        Ok(found) => found,
+        Err(error) => {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "{} is another build than the mapped image (UUID {}): its UUID cannot be read: {error}",
+                path.display(),
+                hex(&uuid)
+            )));
+        }
     };
     if found == Some(uuid) {
         return Ok(bytes);
@@ -401,11 +412,15 @@ pub(crate) fn open(
     };
 
     // A file that records no `LC_UUID` is `Absent`: a mapped image whose id is known is
-    // then another build. A UUID command that does not parse says nothing either way.
+    // then another build. So is a file whose load commands are too malformed to read the
+    // UUID from (#249): the mapped header's UUID was read from well-formed load commands,
+    // so a file whose commands do not parse is not the bytes the loader mapped. Recording
+    // `Unknown` instead would let `same_build` accept the file for any mapped id, and a
+    // late id contradicting it would never be noticed. While the mapped id is unknown the
+    // file is still served: no known id contradicts it.
     let build_id = match file.mach_uuid() {
         Ok(Some(uuid)) => BuildIdentity::Known(BuildId::from(uuid)),
-        Ok(None) => BuildIdentity::Absent,
-        Err(_) => BuildIdentity::Unknown,
+        Ok(None) | Err(_) => BuildIdentity::Absent,
     };
     let mapping = mapping_from_file(&file, load_address)?;
     let unwind_hints = section_data(&file, &["__unwind_info"])?

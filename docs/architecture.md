@@ -156,7 +156,7 @@ ferros-core/src/
 ferros-macos/src/       # macOS implementation (the only crate with OS code)
 ├── lib.rs
 ├── task.rs             # MacOSBackend: impl Backend
-├── exception.rs        # Mach exception port loop, stop events
+├── exception/          # Mach exception port loop, stop events
 ├── launch.rs           # posix_spawn with LaunchSpec
 ├── images.rs           # Backend::images (target dyld image list)
 ├── runtime.rs          # MacOSRuntime: libunwind/__longjmp exit hooks, _sigtramp frame

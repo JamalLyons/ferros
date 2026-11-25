@@ -131,7 +131,7 @@ impl Drop for NonExecutable
 #[test]
 fn failed_launches_are_typed_and_leave_no_process()
 {
-    harness::run(|_| {
+    harness::run(|t| {
         let path = NonExecutable(scratch::unique_path("ferros-fixture-nonexec", ""));
         let tag = path.0.file_name().expect("file name").to_string_lossy().into_owned();
         let mut backend = MacOSBackend::new().expect("backend");
@@ -147,8 +147,9 @@ fn failed_launches_are_typed_and_leave_no_process()
         ));
         assert_eq!(harness::tagged_pids(&tag), Vec::<u32>::new());
         // The same backend remains usable after both failures.
+        let launch_tag = t.tag();
         let pid = backend
-            .launch(&LaunchSpec::new(fixture!("hello").path()))
+            .launch(&LaunchSpec::new(fixture!("hello").path()).arg(launch_tag.as_str()))
             .expect("valid launch");
         backend.kill().expect("kill");
         assert_reaped(pid.0);
@@ -601,8 +602,9 @@ fn backend_drop_is_an_ownership_safety_net()
 {
     harness::run(|t| {
         let mut backend = MacOSBackend::new().expect("backend");
+        let launch_tag = t.tag();
         let pid = backend
-            .launch(&LaunchSpec::new(fixture!("loop_counter").path()))
+            .launch(&LaunchSpec::new(fixture!("loop_counter").path()).arg(launch_tag.as_str()))
             .expect("launch");
         drop(backend);
         assert_reaped(pid.0);
@@ -743,6 +745,9 @@ impl Drop for ReleaseOutput
 /// fixture does.
 struct Grandchild
 {
+    /// Reserved first so every process carrying it dies with this value, and on the test's
+    /// deadline even if this value is never dropped.
+    tag: harness::Tag,
     shell: std::process::Child,
     pid: u32,
     output_path: ReleaseOutput,
@@ -750,8 +755,9 @@ struct Grandchild
 
 impl Grandchild
 {
-    fn spawn(args: &[&str]) -> Self
+    fn spawn(t: &harness::TestContext, args: &[&str]) -> Self
     {
+        let tag = t.tag();
         // Files cannot fill a pipe and delay the very completion being measured.
         let (output, output_path) = scratch::create_file("ferros-release", ".log");
         let output_path = ReleaseOutput(output_path);
@@ -762,6 +768,8 @@ impl Grandchild
             .arg("sh")
             .arg(fixture!("loop_counter").path())
             .args(args)
+            // Both the shell and the fixture carry the tag in their argument lists.
+            .arg(tag.as_str())
             .stdin(std::process::Stdio::null())
             .stdout(output.try_clone().expect("clone release output"))
             .stderr(output)
@@ -770,6 +778,7 @@ impl Grandchild
         // Install cleanup before PID discovery can fail. Zero means undiscovered;
         // Drop then finds children by this shell's PID rather than signalling PID 0.
         let mut target = Self {
+            tag,
             shell,
             pid: 0,
             output_path,
@@ -854,13 +863,11 @@ impl Drop for Grandchild
 {
     fn drop(&mut self)
     {
-        if self.pid == 0 {
-            let _ = Command::new("/usr/bin/pkill")
-                .args(["-KILL", "-P", &self.shell.id().to_string()])
-                .status();
-        } else {
-            let _ = Command::new("/bin/kill").args(["-9", &self.pid.to_string()]).status();
-        }
+        // Kill by tag, never by pid: once `ran_to_completion` has reaped the shell, and the
+        // shell the fixture, both pids may belong to unrelated processes. The tag matches
+        // only live processes that still carry it.
+        let _ = harness::kill_tagged(self.tag.as_str());
+        // `Child::kill` and `wait` never signal a pid this `Child` already reaped.
         let _ = self.shell.kill();
         let _ = self.shell.wait();
     }
@@ -891,7 +898,7 @@ fn released_processes_run_to_completion()
 
     harness::run_with_timeout(Duration::from_secs(420), |t| {
         for &case in CASES {
-            let mut target = Grandchild::spawn(&[SHORT_LOOP, "--progress"]);
+            let mut target = Grandchild::spawn(t, &[SHORT_LOOP, "--progress"]);
             let pid = ProcessId::from(target.pid);
             let mut session = ferros_macos::new_session().expect("backend");
             let started = Instant::now();
@@ -975,8 +982,8 @@ fn released_processes_run_to_completion()
 #[test]
 fn detach_continues_a_private_stop_that_lands_after_its_wait()
 {
-    harness::run_with_timeout(Duration::from_secs(90), |_| {
-        let mut target = Grandchild::spawn(&["100", "--progress"]);
+    harness::run_with_timeout(Duration::from_secs(90), |t| {
+        let mut target = Grandchild::spawn(t, &["100", "--progress"]);
         let mut backend = MacOSBackend::new().expect("backend");
         backend.attach(ProcessId::from(target.pid)).expect("attach");
         backend.reply_fault_injector().expire_next_detach_stop_wait();
@@ -1002,9 +1009,9 @@ fn detach_continues_a_private_stop_that_lands_after_its_wait()
 #[test]
 fn detach_reports_a_private_stop_it_never_saw()
 {
-    harness::run_with_timeout(Duration::from_secs(180), |_| {
+    harness::run_with_timeout(Duration::from_secs(180), |t| {
         // Long enough to outlive the whole bounded wait.
-        let mut target = Grandchild::spawn(&["600", "--progress"]);
+        let mut target = Grandchild::spawn(t, &["600", "--progress"]);
         let mut backend = MacOSBackend::new().expect("backend");
         backend.attach(ProcessId::from(target.pid)).expect("attach");
         backend.reply_fault_injector().hide_next_detach_stop();

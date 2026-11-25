@@ -309,6 +309,7 @@ fn session_preserves_typed_missing_debug_info_but_returns_raw_stack_frames()
                 path: executable,
                 load_address: Address::new(0x2_0000_0000),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(
             Box::new(mock),
@@ -355,6 +356,7 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
                 path: executable.clone(),
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(
             Box::new(mock),
@@ -415,6 +417,7 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
                 path: executable.clone(),
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(
             Box::new(mock),
@@ -475,6 +478,7 @@ fn session_symbolicates_the_replacement_build_at_the_same_address()
             path: executable.clone(),
             load_address,
             build_id: uuid.map(ferros_core::BuildId::from).into(),
+            role: ferros_core::backend::ImageRole::MainExecutable,
         };
         let header_and_uuid = |fixture: &Fixture| {
             let mut bytes = fs::read(fixture.path()).expect("read executable");
@@ -565,6 +569,7 @@ fn session_refuses_a_rebuilt_file_while_the_old_build_is_mapped()
                 path: executable.clone(),
                 load_address,
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(
             Box::new(mock),
@@ -618,6 +623,7 @@ fn session_refreshes_unloaded_and_relocated_images()
             path: fixture.path().to_path_buf(),
             load_address: Address::new(0x2_0000_0000),
             build_id: ferros_core::types::BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::MainExecutable,
         };
         let second = LoadedImage {
             load_address: Address::new(0x3_0000_0000),
@@ -659,6 +665,7 @@ fn relative_image_paths_keep_symbols_across_refreshes()
             path: relative.clone(),
             load_address: Address::new(0x2_0000_0000),
             build_id: ferros_core::types::BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::MainExecutable,
         };
         let (file, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
         let address = ferros_macos::macho::file_mapping(&relative, image.load_address.value())
@@ -702,6 +709,7 @@ fn relative_image_keeps_symbols_after_its_path_stops_resolving()
                 path: relative.clone(),
                 load_address: Address::new(load_address),
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(
             Box::new(mock),

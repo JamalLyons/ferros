@@ -115,7 +115,8 @@ use std::time::Duration;
 
 pub use error::{BackendError, BackendResult};
 pub use types::{
-    Environment, FaultKind, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent, ThreadAction,
+    Environment, FaultKind, ImageRole, LaunchSpec, LoadedImage, ProcessGroup, ResumeRequest, StdioSpec, StopEvent,
+    ThreadAction,
 };
 
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
@@ -392,6 +393,10 @@ pub trait Backend: Send
     fn memory_regions(&mut self) -> BackendResult<Vec<MemoryRegion>>;
 
     /// List the main executable and loaded libraries with their runtime load addresses.
+    ///
+    /// The adapter marks the main executable with [`ImageRole::MainExecutable`] when it
+    /// knows which image that is, and marks every other image [`ImageRole::Library`]. The
+    /// list order is the adapter's; the session does not infer the program from it.
     ///
     /// # Preconditions
     ///

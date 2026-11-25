@@ -287,6 +287,7 @@ impl MultiSiteImage
                 path: path.clone(),
                 load_address: IMAGE_BASE,
                 build_id: ferros_core::types::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         (Self(path), mock)
     }
@@ -2369,6 +2370,7 @@ fn handler_stopped_with_long_jump() -> MockBackend
             path: format!("/usr/lib/{EXIT_IMAGE}").into(),
             load_address: LONG_JUMP_IMAGE,
             build_id: ferros_core::types::BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::Library,
         })
 }
 
@@ -2840,6 +2842,7 @@ fn step_out_arms_the_replacement_exit_images_entry()
         path: format!("/usr/lib/{EXIT_IMAGE}").into(),
         load_address: Address::new(BASE),
         build_id: uuid.map(ferros_core::types::BuildId::from).into(),
+        role: ferros_core::backend::ImageRole::Library,
     };
     let mock = returning_to_breakpoint()
         .with_region(Address::new(BASE), "r-x", image)
@@ -2955,6 +2958,7 @@ fn build_image(build_id: ferros_core::BuildIdentity) -> ferros_core::backend::Lo
         path: "/nonexistent/ferros-build-id-image".into(),
         load_address: Address::new(BUILD_IMAGE),
         build_id,
+        role: ferros_core::backend::ImageRole::MainExecutable,
     }
 }
 
@@ -3099,6 +3103,7 @@ fn a_frame_is_named_through_the_injected_object_format()
                 path: "/nonexistent/ferros-mock-format-image".into(),
                 load_address: Address::new(BASE),
                 build_id: ferros_core::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::MainExecutable,
             });
         let mut session = Session::new(Box::new(mock), format);
         session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
@@ -3145,6 +3150,7 @@ fn step_out_traps_the_exit_entries_the_runtime_names()
                 path: format!("/usr/lib/{EXIT_IMAGE}").into(),
                 load_address: Address::new(BASE),
                 build_id: ferros_core::BuildIdentity::Unknown,
+                role: ferros_core::backend::ImageRole::Library,
             })
     };
     let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
@@ -3560,4 +3566,154 @@ fn thread_listing_failure_keeps_held_signals()
                 .with_signal(SIGNAL_THREAD, 6)
         ]
     );
+}
+
+/// A synthetic image in the neutral `MockObjectFormat` mapped at `base` (no slide), whose
+/// DWARF holds one four-byte subprogram per `(name, address)`. Returns the file to remove
+/// and the mapped bytes.
+fn named_functions_image(prefix: &str, base: Address, functions: &[(&str, Address)]) -> (std::path::PathBuf, Vec<u8>)
+{
+    use ferros_core::objfile::SectionId;
+    use ferros_core::objfile::mock::MockObjectFile;
+
+    let (mut image, path) = ferros_tests::scratch::create_file(prefix, "");
+    // DWARF 4, as in `MultiSiteImage`: subprograms with name, low_pc and a data4 high_pc.
+    let abbrev = vec![1, 0x11, 1, 0, 0, 2, 0x2e, 0, 3, 8, 0x11, 1, 0x12, 6, 0, 0, 0];
+    let mut info = vec![0; 4];
+    info.extend_from_slice(&[4, 0, 0, 0, 0, 0, 8, 1]);
+    for (name, address) in functions {
+        info.push(2);
+        info.extend_from_slice(name.as_bytes());
+        info.push(0);
+        info.extend_from_slice(&address.value().to_le_bytes());
+        info.extend_from_slice(&4_u32.to_le_bytes());
+    }
+    info.push(0);
+    let length = u32::try_from(info.len() - 4).unwrap();
+    info[..4].copy_from_slice(&length.to_le_bytes());
+    let file = MockObjectFile::new(base.value(), 0x2000)
+        .with_dwarf(SectionId::DebugInfo, &info)
+        .with_dwarf(SectionId::DebugAbbrev, &abbrev)
+        .with_dwarf(SectionId::DebugLine, &[0]);
+    std::io::Write::write_all(&mut image, &file.to_bytes()).expect("write synthetic image");
+    drop(image);
+    let mut bytes = MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(base.value(), 0x2000)
+        .header_bytes();
+    bytes.resize(0x2000, 0x1F);
+    (path, bytes)
+}
+
+/// Files removed when a test ends, pass or fail.
+struct RemoveOnDrop(Vec<std::path::PathBuf>);
+
+impl Drop for RemoveOnDrop
+{
+    fn drop(&mut self)
+    {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[test]
+fn library_listed_first_is_not_the_breakpoint_target()
+{
+    // Issue #220: the loader lists a library ahead of the program. File and function
+    // breakpoints resolve in the image the backend marks as the main executable, wherever
+    // it is listed, and a list that marks none does not fall back to a library.
+    use ferros_core::DebuggerError;
+    use ferros_core::backend::{ImageRole, LoadedImage};
+
+    const LIBRARY: Address = Address::new(0x2_0000_0000);
+    const EXECUTABLE: Address = Address::new(0x3_0000_0000);
+    let (library_path, library) = named_functions_image("ferros-mock-library", LIBRARY, &[("lib_only", LIBRARY + 0x1000)]);
+    let (executable_path, executable) =
+        named_functions_image("ferros-mock-executable", EXECUTABLE, &[("main_only", EXECUTABLE + 0x1000)]);
+    let _files = RemoveOnDrop(vec![library_path.clone(), executable_path.clone()]);
+    let listed = |path: &std::path::Path, load_address: Address, role: ImageRole| LoadedImage {
+        path: path.to_path_buf(),
+        load_address,
+        build_id: ferros_core::types::BuildIdentity::Unknown,
+        role,
+    };
+    let mut registers = arm64_registers();
+    registers.pc = EXECUTABLE + 0x1000;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(LIBRARY, "r-x", library)
+        .with_region(EXECUTABLE, "r-x", executable)
+        .with_image(listed(&library_path, LIBRARY, ImageRole::Library))
+        .with_image(listed(&executable_path, EXECUTABLE, ImageRole::MainExecutable));
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+
+    let id = session
+        .set_breakpoint(BreakpointLocation::Function("main_only".into()))
+        .expect("main_only resolves in the executable listed second");
+    let sites = &session
+        .logical_breakpoints()
+        .iter()
+        .find(|breakpoint| breakpoint.id == id)
+        .expect("the logical breakpoint")
+        .sites;
+    assert_eq!(sites.len(), 1);
+    let address = sites[0].address;
+    assert!(
+        (EXECUTABLE.value()..EXECUTABLE.value() + 0x2000).contains(&address.value()),
+        "site {address} is outside the executable's mapping"
+    );
+
+    // Libraries only: the library's own function is not a site, and the error is the
+    // existing unresolved one.
+    mock.set_images(vec![
+        listed(&library_path, LIBRARY, ImageRole::Library),
+        listed(&executable_path, EXECUTABLE, ImageRole::Library),
+    ]);
+    let locations = vec![
+        BreakpointLocation::Function("lib_only".into()),
+        BreakpointLocation::Function("main_only".into()),
+        BreakpointLocation::Line {
+            file: "main.rs".into(),
+            line: 1,
+        },
+    ];
+    for location in locations {
+        match session.set_breakpoint(location.clone()) {
+            Err(DebuggerError::InvalidArgument(_)) => {}
+            other => panic!("{location} with no main executable: expected InvalidArgument, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_multi_site_breakpoint_enumerates_images_once()
+{
+    // Issue #220: resolving a location and naming each of its sites share one refreshed
+    // image list, so N sites cost one loader enumeration, not N + 1.
+    let (_image, mock) = MultiSiteImage::new();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let _ = mock.take_calls();
+    let id = session
+        .set_breakpoint(BreakpointLocation::Function("multi".into()))
+        .expect("multi-site breakpoint");
+    let breakpoint = session
+        .logical_breakpoints()
+        .iter()
+        .find(|breakpoint| breakpoint.id == id)
+        .expect("the logical breakpoint");
+    let sites = breakpoint.sites.clone();
+    assert_eq!(sites.len(), 2);
+    let enumerations = mock
+        .take_calls()
+        .iter()
+        .filter(|call| matches!(call, MockCall::Images))
+        .count();
+    assert_eq!(enumerations, 1, "one image enumeration for two sites");
+    // Positioning a site within the resolving request reports what a separate lookup does.
+    for site in sites {
+        assert_eq!(session.source_position(site.address).expect("source position"), site.position);
+    }
 }

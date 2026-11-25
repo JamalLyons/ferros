@@ -1185,6 +1185,7 @@ mod tests
                 path: "/bin/prog".into(),
                 load_address: Address::new(CODE),
                 build_id: crate::types::BuildIdentity::Unknown,
+                role: crate::backend::ImageRole::MainExecutable,
             })
     }
 
@@ -1402,6 +1403,7 @@ mod tests
                 path: "/bin/prog".into(),
                 load_address: Address::new(CODE),
                 build_id: crate::types::BuildIdentity::Unknown,
+                role: crate::backend::ImageRole::MainExecutable,
             }])
         );
     }

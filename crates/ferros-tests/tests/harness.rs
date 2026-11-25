@@ -4,7 +4,7 @@
 use std::mem::DropGuard;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,68 @@ fn deadline_kills_debuggee_and_reports_timeout()
     assert!(elapsed < Duration::from_secs(10), "timeout took {elapsed:?}");
     let (pid, tag) = seen_debuggee(&seen);
     assert_no_process(pid, &tag);
+}
+
+#[test]
+fn deadline_reaps_a_spawned_child()
+{
+    let fixture = fixture!("loop_counter");
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        harness::run_with_timeout(Duration::from_secs(2), move |t| {
+            let child = t.spawn(&fixture, &["3000"]);
+            pid_tx.send(child.pid().0).expect("send child's pid");
+            let _ = release_rx.recv();
+            drop(child);
+            let _ = dropped_tx.send(());
+        });
+    }));
+
+    let payload = result.expect_err("a body that outlives its deadline must fail");
+    let message = panic_message(&*payload);
+    assert!(message.contains("timed out"), "unexpected timeout message: {message}");
+    let pid = pid_rx.try_recv().expect("the body never spawned its fixture");
+    // Inspect the process table while the timed-out worker still holds the guard. A
+    // tag search misses zombies because they have no command line.
+    let output = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .expect("read child's process state");
+    drop(release_tx);
+    dropped_rx.recv_timeout(Duration::from_secs(5)).expect("drop spawned guard");
+    let state = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        state.trim().is_empty(),
+        "child {pid} survived the deadline in state {state:?}"
+    );
+}
+
+#[test]
+fn deadline_reaps_a_detached_debuggee()
+{
+    let seen = Seen::default();
+    let slot = Arc::clone(&seen);
+    let (release, released) = mpsc::channel::<()>();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        harness::run_with_timeout(Duration::from_secs(2), move |t| {
+            let mut d = t.launch_with_args(&fixture!("loop_counter"), &["3000"]);
+            d.detach().expect("detach");
+            *slot.lock().expect("slot lock") = Some((d.pid().0, d.tag().to_owned()));
+            let _ = released.recv();
+            drop(d);
+        });
+    }));
+
+    let payload = result.expect_err("a body that outlives its deadline must fail");
+    let message = panic_message(&*payload);
+    assert!(message.contains("timed out"), "unexpected timeout message: {message}");
+    let (pid, tag) = seen_debuggee(&seen);
+    assert!(harness::process_is_gone(pid), "detached debuggee was not reaped");
+    assert!(harness::tagged_pids(&tag).is_empty(), "detached debuggee survived");
+    drop(release);
 }
 
 #[test]

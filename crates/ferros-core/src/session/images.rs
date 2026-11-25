@@ -234,15 +234,25 @@ impl Session
     ///
     /// # Errors
     /// [`DebuggerError::ImageMapping`] when the main image's mapped header could not be read.
+    /// [`DebuggerError::InvalidArgument`] when the backend marks more than one image, which
+    /// breaks the [`ImageRole`] contract: picking one would resolve breakpoints in a
+    /// program chosen by list order.
     pub(super) fn main_load_address(&self) -> Result<Option<Address>>
     {
-        let Some(main) = self
+        let mut mains = self
             .loaded_images
             .iter()
-            .find(|image| image.role == ImageRole::MainExecutable)
-        else {
+            .filter(|image| image.role == ImageRole::MainExecutable);
+        let Some(main) = mains.next() else {
             return Ok(None);
         };
+        if let Some(second) = mains.next() {
+            return Err(DebuggerError::InvalidArgument(format!(
+                "the backend marks more than one image as the main executable ({} and {})",
+                main.descriptor.path.display(),
+                second.descriptor.path.display()
+            )));
+        }
         match &main.mapping {
             Ok(_) => Ok(Some(Address::new(main.descriptor.load_address))),
             Err(detail) => Err(DebuggerError::ImageMapping {

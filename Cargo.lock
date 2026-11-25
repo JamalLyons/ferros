@@ -444,6 +444,7 @@ dependencies = [
  "dispatch2",
  "ferros-core",
  "ferros-macos",
+ "gimli",
  "object",
  "portable-pty",
  "rustc-demangle",

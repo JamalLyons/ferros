@@ -4,8 +4,7 @@
 #![cfg(target_os = "macos")]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,6 +17,7 @@ use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, DebuggerError, LaunchSpec, Session, StopEvent, SymbolCache, ThreadId,
 };
 use ferros_macos::{DebugInfoOptions, MacOSBackend, MacOSRuntime, MachOFormat};
+use ferros_tests::stripped::StrippedFixture;
 use ferros_tests::{Fixture, fixture, harness, scratch};
 
 /// [`MockObjectFormat`], counting how often it opens an image file.
@@ -99,48 +99,11 @@ fn cache_does_not_reread_an_unchanged_image_without_debug_info()
     });
 }
 
-/// `frameless_stack` copied without its dSYM and with its debug map stripped (`strip -S`),
-/// so its main executable has no source debug information. The copy lives under the test
-/// target directory, where `just kill-fixtures` finds a leaked process.
-struct StrippedFixture
+/// `frameless_stack` copied without its dSYM and with its debug map stripped, so its
+/// main executable has no source debug information.
+fn stripped_frameless_stack() -> StrippedFixture
 {
-    directory: PathBuf,
-    fixture: Fixture,
-}
-
-impl StrippedFixture
-{
-    fn new(tag: &str) -> Self
-    {
-        let built = fixture!("frameless_stack");
-        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ferros-no-debug-{tag}"));
-        fs::create_dir_all(&directory).expect("create stripped fixture directory");
-        let executable = directory.join(built.path().file_name().expect("fixture file name"));
-        fs::copy(built.path(), &executable).expect("copy executable without its dSYM");
-        let status = Command::new("strip").arg("-S").arg(&executable).status().expect("run strip");
-        assert!(status.success(), "strip -S failed: {status}");
-        // `strip` invalidates the ad-hoc signature arm64 macOS requires to run the copy.
-        let status = Command::new("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&executable)
-            .status()
-            .expect("run codesign");
-        assert!(status.success(), "codesign failed: {status}");
-        let fixture = Fixture::from_built(
-            "frameless_stack",
-            Box::leak(executable.to_str().expect("UTF-8 path").to_owned().into_boxed_str()),
-        );
-        assert!(!fixture.dsym_path().exists(), "the copy has no dSYM");
-        Self { directory, fixture }
-    }
-}
-
-impl Drop for StrippedFixture
-{
-    fn drop(&mut self)
-    {
-        let _ = fs::remove_dir_all(&self.directory);
-    }
+    StrippedFixture::new(&fixture!("frameless_stack"), Path::new(env!("CARGO_TARGET_TMPDIR")))
 }
 
 /// Launch `fixture` with debug-info discovery confined to `cache` and no `dsymutil`.
@@ -194,7 +157,7 @@ fn line_breakpoint_in_an_image_without_debug_info_reports_no_debug_info()
 {
     harness::run(|t| {
         let tag = t.tag();
-        let stripped = StrippedFixture::new(tag.as_str());
+        let stripped = stripped_frameless_stack();
         let cache = stripped.directory.join("cache");
         let mut d = launch(&stripped.fixture, tag.as_str(), &cache);
         let line = fixture!("frameless_stack").marker_line("frameless_done");
@@ -222,7 +185,7 @@ fn source_step_in_an_image_without_debug_info_steps_one_instruction()
 {
     harness::run(|t| {
         let tag = t.tag();
-        let stripped = StrippedFixture::new(tag.as_str());
+        let stripped = stripped_frameless_stack();
         let cache = stripped.directory.join("cache");
         let mut d = launch(&stripped.fixture, tag.as_str(), &cache);
         let (stop, thread) = stop_in_stripped_code(&mut d, &stripped.fixture);
@@ -244,5 +207,74 @@ fn source_step_in_an_image_without_debug_info_steps_one_instruction()
             matches!(&error, DebuggerError::NoDebugInfo { path, .. } if path == stripped.fixture.path()),
             "{error}"
         );
+    });
+}
+
+/// A format that cannot open any image: it counts opens and reports
+/// [`DebuggerError::NoDebugInfo`] from `open_image` itself, as a format does when it
+/// cannot tell which part of a file the target mapped.
+struct NoDebugAtOpen(Arc<AtomicUsize>);
+
+impl ObjectFormat for NoDebugAtOpen
+{
+    fn mapped_symbols(&self, memory: &mut dyn TargetMemory, load_address: Address)
+    -> Result<Arc<dyn MappedSymbols>, String>
+    {
+        MockObjectFormat.mapped_symbols(memory, load_address)
+    }
+
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+    {
+        MockObjectFormat.map_image(memory, load_address)
+    }
+
+    fn open_image(&self, path: &Path, _: u64, _: Option<&ImageSlice>) -> ferros_core::Result<ImageContents>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(DebuggerError::NoDebugInfo {
+            path: path.to_path_buf(),
+            detail: "the mapped part of the file is unknown".into(),
+        })
+    }
+}
+
+/// `NoDebugInfo` reported by `ObjectFormat::open_image` itself is kept like missing
+/// DWARF: a repeated request for the unchanged file does not open it again, and a
+/// changed file is opened again (issue #244).
+#[test]
+fn cache_does_not_reopen_an_unchanged_image_whose_open_reports_no_debug_info()
+{
+    harness::run(|_| {
+        let directory = scratch::create_dir("ferros-no-debug-at-open");
+        let path = directory.join("image.mock");
+        fs::write(&path, MockObjectFile::new(0x1000, 0x1000).to_bytes()).expect("write image");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut cache = SymbolCache::new(Arc::new(NoDebugAtOpen(opens.clone())));
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x2_0000_0000,
+        };
+
+        for _ in 0..3 {
+            let Err(error) = cache.load_image(descriptor.clone()) else {
+                panic!("unexpected debug info");
+            };
+            assert!(
+                matches!(&error, DebuggerError::NoDebugInfo { detail, .. } if detail.contains("mapped part")),
+                "{error}"
+            );
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "an unchanged image was opened again");
+
+        // A changed file (another size) is opened again.
+        fs::write(&path, MockObjectFile::new(0x1000, 0x2000).to_bytes()).expect("rewrite image");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"more"))
+            .expect("grow the image");
+        assert!(matches!(cache.load_image(descriptor), Err(DebuggerError::NoDebugInfo { .. })));
+        assert_eq!(opens.load(Ordering::SeqCst), 2, "a changed image was not opened again");
+        let _ = fs::remove_dir_all(directory);
     });
 }

@@ -1393,7 +1393,12 @@ pub(crate) fn thread_state_flavor_for_arch(architecture: Architecture) -> c_int
 ///   These are synchronous faults, not held Unix signals: XNU keeps no soft-signal
 ///   decision for them, so a resume has no signal to deliver and the thread retries
 ///   the faulting instruction.
-/// - `EXC_SOFTWARE/EXC_SOFT_SIGNAL` -> the held Unix signal; other software exceptions -> SIGTRAP
+/// - `EXC_SOFTWARE/EXC_SOFT_SIGNAL` -> `StopEvent::Signal`, the held Unix signal
+/// - any other `EXC_SOFTWARE` -> `StopEvent::Other`, which holds no signal. XNU raises
+///   `EXC_SOFTWARE` itself only with `EXC_SOFT_SIGNAL`, but any holder of a send right
+///   to the task's exception port can raise one with other codes (the
+///   `EXC_UNIX_*` codes of `<mach/exception_types.h>`, or its own), and nothing is
+///   held for such a stop: reporting it as a signal made a forwarding resume fail.
 /// - anything else (or a breakpoint whose pc cannot be read) -> `StopEvent::Other`
 ///
 /// See: [Mach Exception Types](https://developer.apple.com/documentation/kernel/1402149-exception_types/)
@@ -1426,7 +1431,13 @@ pub(crate) fn stop_event_from_exception(
         EXC_BAD_INSTRUCTION => fault(FaultKind::IllegalInstruction, "EXC_BAD_INSTRUCTION"),
         EXC_ARITHMETIC => fault(FaultKind::Arithmetic, "EXC_ARITHMETIC"),
         EXC_SOFTWARE if codes[0] == EXC_SOFT_SIGNAL => signal(codes[1] as c_int),
-        EXC_SOFTWARE => signal(libc::SIGTRAP),
+        // Not a held Unix signal: XNU keeps a soft-signal decision only for
+        // `EXC_SOFT_SIGNAL`, so a `Signal` here would be one a forwarding resume is
+        // refused for (`check_resume_request`).
+        EXC_SOFTWARE => StopEvent::Other {
+            thread: Some(thread),
+            reason: format!("EXC_SOFTWARE, codes {codes:?}"),
+        },
         other => StopEvent::Other {
             thread: Some(thread),
             reason: format!("Mach exception {other}, codes {codes:?}"),
@@ -3194,5 +3205,23 @@ mod tests
                 signal: libc::SIGUSR1
             }
         );
+    }
+
+    #[test]
+    fn software_exception_other_than_a_soft_signal_holds_no_signal()
+    {
+        // Issue #244: these used to decode as `Signal(SIGTRAP)`, which no soft-signal
+        // exception backs, so a forwarding continue was refused.
+        let thread = ThreadId::from(THREAD);
+        // `EXC_UNIX_BAD_SYSCALL`, `EXC_UNIX_BAD_PIPE`, `EXC_UNIX_ABORT`, and a code of no
+        // known meaning.
+        for code in [0x10000, 0x10001, 0x10002, 7] {
+            let stop = event(EXC_SOFTWARE, None, [code, 0]);
+            assert!(
+                matches!(&stop, StopEvent::Other { thread: Some(t), reason } if *t == thread && reason.contains("EXC_SOFTWARE")),
+                "code {code:#x}: {stop:?}"
+            );
+            assert_eq!(stop.deliverable_signal(), None, "code {code:#x}");
+        }
     }
 }

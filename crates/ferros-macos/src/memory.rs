@@ -138,39 +138,39 @@ impl MemoryCache
     }
 
     /// Reads a range, using cached pages when available.
+    ///
+    /// A cache page can be larger than a VM page (see [`with_page_size`](Self::with_page_size)),
+    /// so the cache page around readable bytes can include an unmapped or unreadable VM
+    /// page that the requested range does not touch. When a cache page cannot be read,
+    /// the part of the range in it is read exactly instead, and nothing is cached for it;
+    /// that exact read's error is the one reported.
+    ///
+    /// # Errors
+    /// The errors of [`read_memory`] for the bytes of the range itself.
     pub fn read(&self, task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u8>>
     {
         if len == 0 {
             return Ok(Vec::new());
         }
+        range_end(addr, len)?;
 
-        let mut output = vec![0u8; len];
-        let mut copied = 0usize;
-        let page_size = self.page_size as u64;
-        while copied < len {
-            let absolute = addr.value().saturating_add(copied as u64);
+        // Grown chunk by chunk rather than allocated up front: a length no mapping can
+        // hold (`usize::MAX`) then fails at its first unreadable page without trying to
+        // allocate it.
+        let mut output = Vec::new();
+        while output.len() < len {
+            let absolute = addr.value() + output.len() as u64;
             let page_base = page_align_down(absolute, self.page_size);
             let page_offset = (absolute - page_base) as usize;
-            let remaining = len - copied;
-            let chunk = remaining.min(self.page_size - page_offset);
-            let page = self.fetch_page(task, page_base)?;
-
-            if page_offset + chunk > page.len() {
-                // Page shorter than expected; fall back to direct read.
-                // `read_memory` is all or nothing, so `bytes` always fills `chunk`.
-                let bytes = read_memory(task, Address::from(absolute), chunk)?;
-                output[copied..copied + chunk].copy_from_slice(&bytes);
-                copied += chunk;
-                continue;
-            }
-
-            output[copied..copied + chunk].copy_from_slice(&page[page_offset..page_offset + chunk]);
-            copied += chunk;
-            if chunk == 0 {
-                break;
-            }
-            if (page_base + page_size) <= absolute {
-                break;
+            // Never zero: `page_offset < page_size` and `output.len() < len`.
+            let chunk = (len - output.len()).min(self.page_size - page_offset);
+            match self.fetch_page(task, page_base) {
+                Ok(page) if page_offset + chunk <= page.len() => {
+                    output.extend_from_slice(&page[page_offset..page_offset + chunk]);
+                }
+                // `read_memory` is all or nothing, so a page is never short; an exact read
+                // of the chunk covers that case and a page that could not be read whole.
+                Ok(_) | Err(_) => output.extend(read_memory(task, Address::from(absolute), chunk)?),
             }
         }
 
@@ -217,6 +217,16 @@ impl MemoryCache
 ///   not readable
 /// - `Os` with the native code and the address for any other failure
 ///
+/// ## No `Io` compatibility adapter
+///
+/// Before issue #216 these failures were `DebuggerError::Io` with an
+/// [`ErrorKind`](std::io::ErrorKind). They are not mapped back to `Io` for older callers,
+/// and no adapter that does so is provided: the `Backend` boundary turned an `Io` read
+/// error into `Os { code: -1 }`, losing the category every caller needs, and every caller
+/// in the workspace matches the typed errors above. The crate is unpublished (`0.0.0`),
+/// so there are no outside callers to keep. The same holds for [`read_memory_into`],
+/// [`MemoryCache::read`] and `diagnostics::raw_memory`.
+///
 /// ## Safety
 ///
 /// This function is marked `unsafe` internally because it calls the Mach API `vm_read()`.
@@ -240,10 +250,13 @@ pub fn read_memory(task: mach_port_t, addr: Address, len: usize) -> Result<Vec<u
     if len == 0 {
         return Ok(Vec::new());
     }
+    // Every byte is checked before the buffer is allocated, so a length no mapping can
+    // hold (`usize::MAX`, or one running past the end of the address space) fails as
+    // `NotFound` without trying to allocate it.
+    ensure_readable_span(task, addr, len)?;
 
     let mut buffer = vec![0u8; len];
-    let bytes_read = read_memory_into(task, addr, &mut buffer)?;
-    buffer.truncate(bytes_read);
+    read_checked_span(addr, &mut buffer, |cursor, dst| read_overwrite(task, cursor, dst))?;
     Ok(buffer)
 }
 
@@ -577,6 +590,8 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
 }
 
 /// Read memory directly into an existing buffer without allocating an intermediate Mach buffer.
+///
+/// All or nothing, like [`read_memory`], with the same errors; returns `dst.len()`.
 pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Result<usize>
 {
     if dst.is_empty() {
@@ -584,23 +599,48 @@ pub fn read_memory_into(task: mach_port_t, addr: Address, dst: &mut [u8]) -> Res
     }
 
     ensure_readable_span(task, addr, dst.len())?;
+    read_checked_span(addr, dst, |cursor, dst| read_overwrite(task, cursor, dst))
+}
 
+/// One `mach_vm_read_overwrite` of `dst.len()` bytes at `cursor` into `dst`: the kernel's
+/// result and the byte count it reports.
+fn read_overwrite(task: mach_port_t, cursor: u64, dst: &mut [u8]) -> (libc::kern_return_t, mach_vm_size_t)
+{
+    let mut actual: mach_vm_size_t = 0;
+    // SAFETY: `dst` is valid for `dst.len()` writable bytes in this process, which is all
+    // the kernel writes; `actual` is a valid out-parameter.
+    let result = unsafe {
+        mach_vm_read_overwrite(
+            task as vm_map_t,
+            cursor,
+            dst.len() as mach_vm_size_t,
+            dst.as_mut_ptr() as mach_vm_address_t,
+            &mut actual,
+        )
+    };
+    (result, actual)
+}
+
+/// Fill `dst` from `addr` in chunks of at most [`constants::MAX_VM_READ_CHUNK`] bytes,
+/// after the caller checked that every byte is mapped and readable.
+///
+/// `read_chunk` is one `mach_vm_read_overwrite` (a seam so tests can make the kernel
+/// answer what only a map changing under the read produces). A failed chunk is
+/// classified by [`vm_read_error`]; a chunk that reads zero bytes, or more than asked,
+/// is `NotFound` rather than a short buffer or an endless loop. A short chunk is
+/// continued from where it stopped.
+fn read_checked_span(
+    addr: Address,
+    dst: &mut [u8],
+    mut read_chunk: impl FnMut(u64, &mut [u8]) -> (libc::kern_return_t, mach_vm_size_t),
+) -> Result<usize>
+{
     let mut total = 0usize;
     let mut cursor = addr.value();
 
     while total < dst.len() {
         let chunk_len = min(constants::MAX_VM_READ_CHUNK, dst.len() - total);
-        let mut actual: mach_vm_size_t = 0;
-
-        let result = unsafe {
-            mach_vm_read_overwrite(
-                task as vm_map_t,
-                cursor,
-                chunk_len as mach_vm_size_t,
-                dst[total..].as_mut_ptr() as mach_vm_address_t,
-                &mut actual,
-            )
-        };
+        let (result, actual) = read_chunk(cursor, &mut dst[total..total + chunk_len]);
 
         if result != KERN_SUCCESS {
             return Err(vm_read_error("mach_vm_read_overwrite", Address::from(cursor), result).into());
@@ -928,6 +968,17 @@ struct RegionInfo
     max_protection: u32,
 }
 
+/// The end of `[addr, addr + len)`, or `NotFound` when it runs past the end of the
+/// address space, where no byte can be mapped.
+fn range_end(addr: Address, len: usize) -> Result<u64>
+{
+    addr.value().checked_add(len as u64).ok_or_else(|| {
+        DebuggerError::from(BackendError::NotFound(format!(
+            "range of {len} bytes at {addr} runs past the end of the address space"
+        )))
+    })
+}
+
 /// Check that every byte of `[addr, addr + len)` is mapped and readable.
 ///
 /// The range may span several adjacent regions. A hole is `NotFound` and an unreadable
@@ -935,11 +986,7 @@ struct RegionInfo
 /// runs off the end of a mapping fails the same way as one that starts outside it.
 fn ensure_readable_span(task: mach_port_t, addr: Address, len: usize) -> Result<()>
 {
-    let end = addr.value().checked_add(len as u64).ok_or_else(|| {
-        DebuggerError::from(BackendError::NotFound(format!(
-            "range of {len} bytes at {addr} runs past the end of the address space"
-        )))
-    })?;
+    let end = range_end(addr, len)?;
     let mut cursor = addr.value();
     while cursor < end {
         let at = Address::from(cursor);
@@ -1387,5 +1434,191 @@ mod tests
         let addr = target.address();
         write_memory_all_or_nothing(task(), addr, &[5, 6, 7, 8]).unwrap();
         assert_eq!(target.bytes(), [5, 6, 7, 8]);
+    }
+
+    // Issue #244: the read failures that only a map changing between the range check and
+    // `mach_vm_read_overwrite` produces. No real process can be made to unmap memory in
+    // that window deterministically (the target is suspended while the debugger reads, and
+    // racing an unmap from another thread here would make a flaky test), so these drive
+    // `read_checked_span` through its `read_chunk` seam with the kernel's answers.
+
+    #[test]
+    fn invalid_address_after_the_range_check_is_not_found_at_the_failing_chunk()
+    {
+        let mut dst = vec![0u8; constants::MAX_VM_READ_CHUNK + 8];
+        let mut calls = Vec::new();
+        let error = read_checked_span(Address::from(0x1000u64), &mut dst, |cursor, chunk| {
+            calls.push((cursor, chunk.len()));
+            if calls.len() == 1 {
+                chunk.fill(7);
+                (KERN_SUCCESS, chunk.len() as mach_vm_size_t)
+            } else {
+                (libc::KERN_INVALID_ADDRESS, 0)
+            }
+        })
+        .expect_err("a chunk the kernel refused");
+        let failed_at = 0x1000 + constants::MAX_VM_READ_CHUNK as u64;
+        assert_eq!(calls, [(0x1000, constants::MAX_VM_READ_CHUNK), (failed_at, 8)]);
+        assert!(
+            matches!(&error, DebuggerError::Backend(BackendError::NotFound(message))
+                if message.contains(&Address::from(failed_at).to_string())),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn short_read_then_zero_bytes_is_not_found_and_does_not_loop()
+    {
+        let mut dst = [0u8; 16];
+        let mut calls = Vec::new();
+        let error = read_checked_span(Address::from(0x2000u64), &mut dst, |cursor, chunk| {
+            calls.push((cursor, chunk.len()));
+            match calls.len() {
+                1 => {
+                    chunk[..4].fill(9);
+                    (KERN_SUCCESS, 4)
+                }
+                2 => (KERN_SUCCESS, 0),
+                _ => panic!("read again after the kernel read nothing"),
+            }
+        })
+        .expect_err("a read the kernel stopped short");
+        // The short read is continued from where it stopped, then the empty one fails.
+        assert_eq!(calls, [(0x2000, 16), (0x2004, 12)]);
+        assert!(
+            matches!(&error, DebuggerError::Backend(BackendError::NotFound(message))
+                if message.contains("read 4 of 16 bytes")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn short_reads_that_complete_the_range_succeed()
+    {
+        let mut dst = [0u8; 8];
+        let mut next = 0u8;
+        let read = read_checked_span(Address::from(0x3000u64), &mut dst, |_, chunk| {
+            let count = chunk.len().min(3);
+            for byte in &mut chunk[..count] {
+                *byte = next;
+                next += 1;
+            }
+            (KERN_SUCCESS, count as mach_vm_size_t)
+        })
+        .expect("short reads that fill the buffer");
+        assert_eq!(read, 8);
+        assert_eq!(dst, [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn read_longer_than_the_address_space_is_not_found_without_allocating()
+    {
+        // Without the check first, both paths try to allocate `usize::MAX` bytes, which
+        // panics (capacity overflow) instead of returning an error.
+        let target = Target::new();
+        for error in [
+            read_memory(task(), target.address(), usize::MAX).expect_err("uncached read of usize::MAX bytes"),
+            MemoryCache::new()
+                .read(task(), target.address(), usize::MAX)
+                .expect_err("cached read of usize::MAX bytes"),
+        ] {
+            assert!(
+                matches!(error, DebuggerError::Backend(BackendError::NotFound(_))),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// Two adjacent VM pages of this process, aligned to their combined size, whose second
+    /// page is mapped but unreadable (`PROT_NONE`): one cache page of two VM pages around
+    /// bytes that are readable.
+    ///
+    /// The second page is not unmapped: tests run in parallel, and another test's `mmap`
+    /// could take the freed page before this one reads it. A mapped, unreadable page stays
+    /// a hole for the read, and the cache falls back the same way whatever error the page
+    /// read returned.
+    struct HalfReadablePair
+    {
+        base: *mut libc::c_void,
+        page: usize,
+    }
+
+    impl HalfReadablePair
+    {
+        fn new() -> Self
+        {
+            let page = *SYSTEM_PAGE_SIZE;
+            // Map four pages so that two of them start on a two-page boundary, then keep
+            // only those.
+            // SAFETY: a fresh anonymous private mapping; nothing else refers to it.
+            let raw = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(raw, libc::MAP_FAILED);
+            let start = raw as usize;
+            let base = (start + 2 * page - 1) & !(2 * page - 1);
+            // SAFETY: every range unmapped or protected here lies in the mapping above,
+            // which only this value uses.
+            unsafe {
+                if base > start {
+                    assert_eq!(libc::munmap(raw, base - start), 0);
+                }
+                let tail = base + 2 * page;
+                if tail < start + 4 * page {
+                    assert_eq!(libc::munmap(tail as *mut libc::c_void, start + 4 * page - tail), 0);
+                }
+                (base as *mut [u8; 4]).write_volatile([1, 2, 3, 4]);
+                assert_eq!(libc::mprotect((base + page) as *mut libc::c_void, page, libc::PROT_NONE), 0);
+            }
+            Self {
+                base: base as *mut libc::c_void,
+                page,
+            }
+        }
+
+        fn first(&self) -> Address
+        {
+            Address::from(self.base as u64)
+        }
+
+        fn second(&self) -> Address
+        {
+            Address::from(self.base as u64 + self.page as u64)
+        }
+    }
+
+    impl Drop for HalfReadablePair
+    {
+        fn drop(&mut self)
+        {
+            // SAFETY: unmaps the two pages this value kept.
+            unsafe { libc::munmap(self.base, 2 * self.page) };
+        }
+    }
+
+    #[test]
+    fn cache_page_larger_than_a_vm_page_reads_readable_bytes_next_to_a_hole()
+    {
+        let pair = HalfReadablePair::new();
+        let cache = MemoryCache::with_page_size(2 * *SYSTEM_PAGE_SIZE);
+        // Before the fix the whole cache page was read, which fails on the second VM page.
+        let bytes = cache
+            .read(task(), pair.first(), 4)
+            .unwrap_or_else(|err| panic!("readable bytes next to an unreadable page: {err:?}"));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+
+        // The bytes of the hole itself still fail with their own category, and so does a
+        // read that runs from readable bytes into it.
+        for at in [pair.second(), Address::from(pair.second().value() - 2)] {
+            let error = cache.read(task(), at, 4).expect_err("read of the unreadable page");
+            assert!(matches!(error, DebuggerError::PermissionDenied(_)), "at {at}: {error:?}");
+        }
     }
 }

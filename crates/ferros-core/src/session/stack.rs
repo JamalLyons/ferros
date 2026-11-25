@@ -108,6 +108,19 @@ impl Session
     /// while running, [`DebuggerError::NoThreadSelected`] if the process has no
     /// thread, [`DebuggerError::Backend`] with `Unsupported` for an architecture without
     /// an [`Arch`](crate::arch::Arch), or an error from the backend.
+    ///
+    /// # Image list
+    ///
+    /// Each call refreshes the image list once ([`Backend::images`]) and uses that list
+    /// for every frame of the trace; [`symbolicate`](Self::symbolicate) does the same per
+    /// call. The list is deliberately not kept from one public call to the next, even
+    /// within one stop: a backend may report images loaded or unloaded while the process
+    /// is stopped (an attach, a mock that changes its list, a loader that another task
+    /// drives), and a kept list would then resolve addresses against images that are gone.
+    /// A caller that symbolicates many addresses of one stop pays one enumeration per call,
+    /// and the symbol cache keeps each image's parsed symbols across those calls (#244).
+    ///
+    /// [`Backend::images`]: crate::backend::Backend::images
     pub fn stack_trace(&mut self, max_frames: usize) -> Result<Vec<StackFrame>>
     {
         self.require_stopped()?;
@@ -301,6 +314,8 @@ impl Session
     /// [`DebuggerError::SymbolLoad`] without reading the image again; once one of them
     /// appears, disappears or changes, the next call loads the image again. A file
     /// rewritten in place with the same size and timestamps is not noticed.
+    ///
+    /// Like [`stack_trace`](Self::stack_trace), each call refreshes the image list once.
     pub fn symbolicate(&mut self, address: Address) -> Result<Option<Symbolication>>
     {
         self.require_stopped()?;

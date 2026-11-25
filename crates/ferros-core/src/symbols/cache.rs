@@ -222,7 +222,9 @@ impl SymbolCache
     ///
     /// A file that was read but has no usable debug information is not read again while
     /// the files the load read are unchanged ([`load_inputs`](Self::load_inputs)): the
-    /// same error is returned after a few `stat` calls (#236).
+    /// same error is returned after a few `stat` calls (#236). So is a file for which
+    /// [`ObjectFormat::open_image`](crate::objfile::ObjectFormat::open_image) itself
+    /// reports [`DebuggerError::NoDebugInfo`] (#244). Any other error is not kept.
     fn load_mapped_image(&mut self, mut descriptor: ImageDescriptor, slice: Option<&ImageSlice>)
     -> Result<Arc<BinaryImage>>
     {
@@ -238,6 +240,14 @@ impl SymbolCache
         let image = self.read_image(descriptor, slice);
         let (image, build_id) = match image {
             Ok(image) => image,
+            // The format found no debug information without loading the image (for
+            // example it cannot tell which part of the file is mapped): kept like missing
+            // DWARF, since rereading unchanged files gives the same answer (#244).
+            Err(error @ DebuggerError::NoDebugInfo { .. }) => {
+                let reported = error.duplicate();
+                self.missing_debug.insert(id, MissingDebug { inputs, error });
+                return Err(reported);
+            }
             Err(error) => {
                 self.missing_debug.remove(&id);
                 return Err(error);

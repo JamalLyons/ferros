@@ -113,3 +113,32 @@ fn unreadable_read_is_permission_denied_on_both_paths()
         );
     });
 }
+
+/// A length no mapping can hold fails as `NotFound` on both paths, without allocating
+/// it (issue #244). Both paths used to allocate the whole buffer first and abort on
+/// `usize::MAX` (capacity overflow).
+#[test]
+fn read_of_usize_max_bytes_is_not_found_on_both_paths()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch(&fixture);
+        let start = regions(&mut d)
+            .iter()
+            .find(|region| readable(region))
+            .map(|region| region.start)
+            .expect("a readable region");
+        let pid = d.pid();
+        let cached = d
+            .session_mut()
+            .backend_mut()
+            .read_memory(start, usize::MAX)
+            .expect_err("cached read of usize::MAX bytes");
+        assert!(matches!(cached, BackendError::NotFound(_)), "cached: {cached:?}");
+        let uncached = diagnostics::raw_memory(pid, start, usize::MAX).expect_err("uncached read of usize::MAX bytes");
+        assert!(
+            matches!(uncached, DebuggerError::Backend(BackendError::NotFound(_))),
+            "uncached: {uncached:?}"
+        );
+    });
+}

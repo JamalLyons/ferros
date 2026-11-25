@@ -1,17 +1,18 @@
-//! Builds the non-Rust code of three fixtures and links each into its fixture only: the
+//! Builds the non-Rust code of four fixtures and links each into its fixture only: the
 //! arm64 assembly of `frameless_stack` (see `fixtures/asm/frameless_stack.s`) and the C
-//! programs of `long_jump` (see `fixtures/c/long_jump.c`) and `pthread_once` (see
-//! `fixtures/c/pthread_once.c`).
+//! programs of `long_jump` (see `fixtures/c/long_jump.c`), `pthread_once` (see
+//! `fixtures/c/pthread_once.c`) and `soft_faults` (see `fixtures/c/soft_faults.c`).
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `(source, compiler flags, fixture)`.
-static SOURCES: [(&str, &[&str], &str); 3] = [
+static SOURCES: [(&str, &[&str], &str); 4] = [
     ("fixtures/asm/frameless_stack.s", &[], "frameless_stack"),
     ("fixtures/c/long_jump.c", &["-g", "-O0"], "long_jump"),
     ("fixtures/c/pthread_once.c", &["-g", "-O0"], "pthread_once"),
+    ("fixtures/c/soft_faults.c", &["-g", "-O0"], "soft_faults"),
 ];
 
 fn main()

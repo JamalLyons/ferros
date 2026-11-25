@@ -36,6 +36,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("recursion"),
         fixture!("signal_handler"),
         fixture!("signal_tracing"),
+        fixture!("soft_faults"),
         fixture!("spawn_thread"),
         fixture!("step_races"),
         fixture!("step_targets"),

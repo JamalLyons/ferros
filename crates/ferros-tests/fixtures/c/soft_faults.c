@@ -11,11 +11,17 @@
 // Unix signal (code `EXC_UNIX_ABORT`) on its own thread, by sending a
 // `mach_exception_raise` request to the task's `EXC_SOFTWARE` handler (the debugger's
 // exception port), and prints `exception reply: <kern_return_t>` once it is answered.
+//
+// With `--guard-page`, `main` maps two pages, fills the first with 0xa5, makes the
+// second `PROT_NONE`, prints `boundary: 0x<address of the second page>` and sleeps
+// forever, so a debugger can read across a readable-to-protected page boundary.
 
 #include <mach/mach.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 static volatile sig_atomic_t handler_runs;
 
@@ -115,6 +121,20 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "--software-exception") == 0) {
         return raise_software_exception();
     }
-    printf("usage: --null-store | --handler-once | --software-exception\n");
+    if (argc > 1 && strcmp(argv[1], "--guard-page") == 0) {
+        long page = sysconf(_SC_PAGESIZE);
+        unsigned char *pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (pages == MAP_FAILED || mprotect(pages + page, page, PROT_NONE) != 0) {
+            perror("guard page");
+            return 1;
+        }
+        memset(pages, 0xa5, page);
+        printf("boundary: 0x%lx\n", (unsigned long)(pages + page));
+        fflush(stdout);
+        for (;;) {
+            sleep(1);
+        }
+    }
+    printf("usage: --null-store | --handler-once | --software-exception | --guard-page\n");
     return 2;
 }

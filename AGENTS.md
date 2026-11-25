@@ -1,7 +1,7 @@
 # Agent and Contributor Guide
 
 ## What this is
-Ferros is a Rust debugger designed for macOS arm64. The long-form narrative is [`docs/architecture.md`](docs/architecture.md). Architecture decisions that are still open are recorded under [`docs/adr/`](docs/adr/README.md). Ownership, lifetimes, and MIR are goals, not current behavior; the rest of the architecture doc matches the code.
+Ferros is a Rust debugger designed for macOS arm64. The long-form narrative is [`docs/architecture.md`](docs/architecture.md). Architecture decisions that are still open are recorded under [`docs/adr/`](docs/adr/README.md). Ownership, lifetimes, and MIR there are goals, not current behavior; its crate map, `Session`/`Backend` split, image list, stop channel, and `BreakpointStore` description match the code.
 
 `docs/reviews/` is historical, not current guidance. Human setup (worktrees, T3 scripts, troubleshooting) is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

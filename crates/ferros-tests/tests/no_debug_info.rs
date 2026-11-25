@@ -82,7 +82,17 @@ fn cache_does_not_reread_an_unchanged_image_without_debug_info()
         assert_eq!(opens.load(Ordering::SeqCst), 2);
 
         // A changed file (another size) is read again.
+        let before = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("image mtime");
         fs::write(&path, MockObjectFile::new(0x1000, 0x2000).to_bytes()).expect("rewrite image");
+        // Both files have the same length: move the mtime so the change is seen even on a
+        // filesystem with coarse timestamps.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(before + Duration::from_secs(2)))
+            .expect("move the rewritten image's mtime");
         assert!(matches!(cache.load_image(descriptor), Err(DebuggerError::NoDebugInfo { .. })));
         assert_eq!(opens.load(Ordering::SeqCst), 3, "a changed image was not read again");
         let _ = fs::remove_dir_all(directory);

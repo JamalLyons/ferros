@@ -37,7 +37,7 @@ Read before changing engine behavior; module docs carry the contracts. Paths und
 | `TargetRuntime` | `ferros-core/src/runtime/` | Platform runtime knowledge: non-local exit sources, signal-trampoline saved state. Set with `Session::with_runtime`; without one nothing is trapped. `mock.rs`: `MockRuntime` (`test-util`). `ferros_macos::MacOSRuntime` implements it (libunwind, `__longjmp`, xnu `_sigtramp` frame). |
 | Stop channel | `Session::wait` → `StopEvent` (`ferros-core/src/backend/types.rs`) | The event a backend actually returns. |
 | `DebuggerEvent` | `ferros-core/src/events.rs` | Published by no backend. Only parked `ferros-ui` uses it. |
-| `MacOSBackend` | `ferros-macos/src/task.rs` | Mach task ports, exception messages, `posix_spawn`. `Backend::images` is `src/images.rs` (the dyld image list, not only the main executable). |
+| `MacOSBackend` | `ferros-macos/src/task/` | Mach task ports, exception messages, `posix_spawn`. `mod.rs`: the struct and inherent API; `backend.rs`: the `Backend` impl and `Drop`; `handler.rs`, `thread_actions.rs`, `ptrace.rs`, `state.rs`: its helpers. `Backend::images` is `src/images.rs` (the dyld image list, not only the main executable). |
 | Test harness | `ferros-tests` | `harness::run`, `fixture!`, `tests/`. See that crate's README. |
 
 ## Architecture decisions

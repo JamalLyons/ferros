@@ -8,7 +8,7 @@
 
 ## Context
 
-Epic #26 asked for one backend trait so a Linux or Windows crate could be added later without refactoring the engine. That split is in place for process control. `Backend` (`crates/ferros-core/src/backend/mod.rs`) is mechanism only: launch, attach, registers, memory, threads, regions, images, and `StopEvent`. `Session` (`crates/ferros-core/src/session/`) owns breakpoints, stepping, and symbolication. `ferros-core` has no `mach2`, `libproc`, `libc`, `cfg(target_os)`, or `unsafe`. `MacOSBackend` (`crates/ferros-macos/src/task.rs`) and `MockBackend` are the two implementors. `just check-boundary` enforces that OS boundary.
+Epic #26 asked for one backend trait so a Linux or Windows crate could be added later without refactoring the engine. That split is in place for process control. `Backend` (`crates/ferros-core/src/backend/mod.rs`) is mechanism only: launch, attach, registers, memory, threads, regions, images, and `StopEvent`. `Session` (`crates/ferros-core/src/session/`) owns breakpoints, stepping, and symbolication. `ferros-core` has no `mach2`, `libproc`, `libc`, `cfg(target_os)`, or `unsafe`. `MacOSBackend` (`crates/ferros-macos/src/task/`) and `MockBackend` are the two implementors. `just check-boundary` enforces that OS boundary.
 
 The object-file format did not get the same boundary. The engine still assumes a 64-bit Mach-O image in the code that a Linux backend would have to share:
 

@@ -23,8 +23,7 @@
 //!   the fixture's argv. Dropping the [`Debuggee`] (normal return or unwinding) drops its
 //!   session first, then sweeps processes by that argument; a failed launch kills any
 //!   process left behind by the argument; a timeout kills every process the test launched.
-//!   The per-launch directory
-//!   that captures a debuggee's output is removed on the same paths.
+//!   Cleanup also reaps owned children, joins output readers and removes capture directories.
 //! - **Hard deadline.** The body runs on a worker thread. If it does not finish in time the
 //!   test fails with a "timed out" message after its debuggees are killed. Only that test's
 //!   processes are touched, so tests can run in parallel.
@@ -95,7 +94,8 @@ where
 /// resumed on the calling thread with the original payload, so `#[should_panic]` and the
 /// libtest failure message work as usual. When `timeout` passes first, every process launched
 /// through this context is killed and the test fails with a message that says it timed out;
-/// the worker thread is abandoned (it holds no process any more).
+/// the worker thread is abandoned. The controller joins output readers and gives process
+/// cleanup one shared settle window.
 ///
 /// # Panics
 ///
@@ -161,28 +161,126 @@ enum Outcome
     TimedOut,
 }
 
-/// A process launched by one test: its identifying argument and capture directory
-/// (none for a [`Spawned`] process).
 struct Tracked
 {
     tag: String,
-    capture_dir: Option<PathBuf>,
+    process: ProcessCleanup,
+    capture: Mutex<Option<Capture>>,
+}
+
+enum ProcessCleanup
+{
+    Tagged,
+    Spawned(Mutex<Option<Child>>),
+    Launched(ferros_macos::launch::ChildCleanup),
+}
+
+impl Tracked
+{
+    fn spawned_child(&self) -> MutexGuard<'_, Option<Child>>
+    {
+        let ProcessCleanup::Spawned(child) = &self.process else {
+            unreachable!("only a spawned fixture has a Child handle");
+        };
+        child.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn start_readers(&self) -> Option<[OutputBuffer; 2]>
+    {
+        let mut capture = self.capture.lock().unwrap_or_else(PoisonError::into_inner);
+        let capture = capture.as_mut()?;
+        let (stdout, stdout_reader) = OutputBuffer::spawn_reader(capture.dir.stdout_path());
+        let (stderr, stderr_reader) = OutputBuffer::spawn_reader(capture.dir.stderr_path());
+        capture.stdout = Some(stdout_reader);
+        capture.stderr = Some(stderr_reader);
+        Some([stdout, stderr])
+    }
+
+    fn close_capture(&self)
+    {
+        let mut capture = self.capture.lock().unwrap_or_else(PoisonError::into_inner);
+        // Keep the lock through the joins so another cleanup cannot return early.
+        if let Some(Capture { dir, stdout, stderr }) = capture.take() {
+            drop(stdout);
+            drop(stderr);
+            drop(dir);
+        }
+    }
+
+    fn kill_spawned(&self, deadline: Instant) -> Option<u32>
+    {
+        let mut slot = self.spawned_child();
+        let child = slot.as_mut()?;
+        let pid = child.id();
+        let killed = matches!(child.try_wait(), Ok(None)) && child.kill().is_ok();
+        drop(slot);
+
+        // Keep try_wait available to the guard while cleanup polls for exit.
+        while matches!(self.spawned_child().as_mut().map(Child::try_wait), Some(Ok(None))) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                eprintln!("ferros-tests: timed out reaping spawned child {pid}");
+                break;
+            }
+            thread::sleep(Duration::from_millis(5).min(remaining));
+        }
+        killed.then_some(pid)
+    }
+
+    fn clean_process(&self, deadline: Instant) -> Vec<u32>
+    {
+        let mut killed = Vec::new();
+        if let ProcessCleanup::Spawned(_) = &self.process {
+            killed.extend(self.kill_spawned(deadline));
+        }
+        let tagged = signal_tagged(&self.tag);
+        // Traced children are collected by the backend's exit watcher. Detach transfers
+        // the Unix parent's claim to this handle, so collect it before checking the table.
+        if let ProcessCleanup::Launched(child) = &self.process
+            && let Err(err) = child.reap()
+        {
+            eprintln!("ferros-tests: detached child cleanup failed: {err}");
+        }
+        wait_for_killed(&self.tag, &tagged, deadline);
+        killed.extend(tagged);
+        killed
+    }
 }
 
 /// State shared between a test's worker thread, its guards and the controlling thread.
 #[derive(Default)]
 struct Shared
 {
-    tracked: Mutex<Vec<Tracked>>,
+    tracked: Mutex<Vec<Arc<Tracked>>>,
     /// Set when the controller gave up on the test; later launches are refused.
     cancelled: AtomicBool,
 }
 
 impl Shared
 {
-    fn tracked(&self) -> MutexGuard<'_, Vec<Tracked>>
+    fn tracked(&self) -> MutexGuard<'_, Vec<Arc<Tracked>>>
     {
         self.tracked.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn track(&self, tag: String, process: ProcessCleanup, dir: Option<CaptureDir>) -> Arc<Tracked>
+    {
+        let entry = Arc::new(Tracked {
+            tag,
+            process,
+            capture: Mutex::new(dir.map(|dir| Capture {
+                dir,
+                stdout: None,
+                stderr: None,
+            })),
+        });
+        let mut tracked = self.tracked();
+        assert!(
+            !self.cancelled.load(Ordering::SeqCst),
+            "ferros-tests: refusing to track a process after this test failed its deadline"
+        );
+        tracked.push(Arc::clone(&entry));
+        entry
     }
 
     fn forget(&self, tag: &str)
@@ -190,21 +288,49 @@ impl Shared
         self.tracked().retain(|entry| entry.tag != tag);
     }
 
-    /// Kills every process still tracked, removes its capture directory, and returns the
-    /// pids that were targeted.
-    ///
-    /// After a timeout the abandoned worker thread may never drop its [`Debuggee`], so the
-    /// controller removes the capture directories itself.
+    fn finish(&self, entry: &Tracked)
+    {
+        entry.clean_process(Instant::now() + KILL_SETTLE);
+        entry.close_capture();
+        self.forget(&entry.tag);
+    }
+
+    /// Stop capture synchronously. Give all process cleanups one shared settle window
+    /// so an unreapable process cannot delay cleanup of another entry.
     fn kill_all(&self) -> Vec<u32>
     {
         let entries = std::mem::take(&mut *self.tracked());
-        let mut killed = Vec::new();
-        for entry in entries {
-            killed.extend(kill_debuggee(&entry.tag));
-            if let Some(dir) = &entry.capture_dir {
-                let _ = fs::remove_dir_all(dir);
+        let deadline = Instant::now() + KILL_SETTLE;
+        let (done, results) = mpsc::channel();
+        for entry in &entries {
+            let entry = Arc::clone(entry);
+            let done = done.clone();
+            if let Err(err) = thread::Builder::new()
+                .name("ferros-process-cleanup".to_owned())
+                .spawn(move || {
+                    let _ = done.send(entry.clean_process(deadline));
+                })
+            {
+                eprintln!("ferros-tests: could not start process cleanup: {err}");
             }
         }
+        drop(done);
+        for entry in entries {
+            entry.close_capture();
+        }
+        let mut killed = Vec::new();
+        loop {
+            match results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(pids) => killed.extend(pids),
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    eprintln!("ferros-tests: process cleanup did not finish within {KILL_SETTLE:?}");
+                    break;
+                }
+            }
+        }
+        killed.sort_unstable();
+        killed.dedup();
         killed
     }
 }
@@ -312,24 +438,23 @@ impl TestContext
         let child_cleanup = backend.child_cleanup();
         let mut session = ferros_macos::session_with(backend);
 
-        self.shared.tracked().push(Tracked {
-            tag: tag.clone(),
-            capture_dir: Some(capture.path.clone()),
-        });
+        let entry = self
+            .shared
+            .track(tag.clone(), ProcessCleanup::Launched(child_cleanup), Some(capture));
 
         // Watchdog: if launch has not returned by the deadline, it tells the controller (which
         // fails the test) and kills the half-launched process by its tag.
         let events = self.events.clone();
-        let watchdog = LaunchWatchdog::arm(tag.clone(), LAUNCH_DEADLINE, move || {
+        let watchdog = LaunchWatchdog::arm(tag, LAUNCH_DEADLINE, move || {
             let _ = events.send(Event::LaunchStalled);
         });
         let launched = session.launch(&spec);
         if watchdog.disarm() {
             // The launch outlived its deadline and the test is being failed for it. Whatever
             // launch returned in the end, leave no process and report the same reason.
-            kill_debuggee(&tag);
-            self.shared.forget(&tag);
+            signal_tagged(&entry.tag);
             drop(session);
+            self.shared.finish(&entry);
             panic!("{}", launch_stalled_guidance());
         }
 
@@ -338,23 +463,28 @@ impl TestContext
             Err(err) => {
                 // A failed launch can leave a suspended child behind (task_for_pid denied
                 // after posix_spawn). Kill it by its argument before releasing the session.
-                kill_debuggee(&tag);
-                self.shared.forget(&tag);
+                signal_tagged(&entry.tag);
                 drop(session);
+                self.shared.finish(&entry);
                 return Err(err);
             }
         };
 
-        let stdout = OutputBuffer::spawn_reader(capture.stdout_path());
-        let stderr = OutputBuffer::spawn_reader(capture.stderr_path());
+        let Some([stdout, stderr]) = entry.start_readers() else {
+            // The controller closed the capture while launch was in flight.
+            drop(session);
+            self.shared.finish(&entry);
+            panic!(
+                "ferros-tests: launch of '{}' returned after this test already failed its deadline",
+                fixture.name()
+            );
+        };
         let guard = Debuggee {
             session,
-            child_cleanup,
             pid,
-            tag,
             stdout,
             stderr,
-            capture,
+            entry,
             shared: Arc::clone(&self.shared),
         };
 
@@ -379,19 +509,19 @@ impl TestContext
     #[must_use]
     pub fn spawn(&self, fixture: &Fixture, args: &[&str]) -> Spawned
     {
+        let entry = self
+            .shared
+            .track(unique_tag(), ProcessCleanup::Spawned(Mutex::default()), None);
+        // Publish the handle under the same lock the controller uses to kill and reap.
+        let mut slot = entry.spawned_child();
         assert!(
             !self.shared.cancelled.load(Ordering::SeqCst),
             "ferros-tests: refusing to spawn '{}': this test already failed its deadline",
             fixture.name()
         );
-        let tag = unique_tag();
-        self.shared.tracked().push(Tracked {
-            tag: tag.clone(),
-            capture_dir: None,
-        });
         let child = Command::new(fixture.path())
             .args(args)
-            .arg(&tag)
+            .arg(&entry.tag)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -399,15 +529,24 @@ impl TestContext
         let child = match child {
             Ok(child) => child,
             Err(err) => {
-                self.shared.forget(&tag);
+                self.shared.forget(&entry.tag);
                 panic!("ferros-tests: failed to spawn fixture '{}': {err}", fixture.name());
             }
         };
-        Spawned {
-            child,
-            tag,
+        let pid = ProcessId::from(child.id());
+        *slot = Some(child);
+        drop(slot);
+        let guard = Spawned {
+            pid,
+            entry,
             shared: Arc::clone(&self.shared),
-        }
+        };
+        assert!(
+            !self.shared.cancelled.load(Ordering::SeqCst),
+            "ferros-tests: spawn of '{}' returned after this test already failed its deadline",
+            fixture.name()
+        );
+        guard
     }
 
     /// Reserves a fresh identifying argument (see [`TEST_ID_ARG_PREFIX`]) for processes the
@@ -421,17 +560,8 @@ impl TestContext
     #[must_use]
     pub fn tag(&self) -> Tag
     {
-        assert!(
-            !self.shared.cancelled.load(Ordering::SeqCst),
-            "ferros-tests: refusing to reserve a tag: this test already failed its deadline"
-        );
-        let tag = unique_tag();
-        self.shared.tracked().push(Tracked {
-            tag: tag.clone(),
-            capture_dir: None,
-        });
         Tag {
-            tag,
+            entry: self.shared.track(unique_tag(), ProcessCleanup::Tagged, None),
             shared: Arc::clone(&self.shared),
         }
     }
@@ -441,7 +571,7 @@ impl TestContext
 /// process still carrying it.
 pub struct Tag
 {
-    tag: String,
+    entry: Arc<Tracked>,
     shared: Arc<Shared>,
 }
 
@@ -451,7 +581,7 @@ impl Tag
     #[must_use]
     pub fn as_str(&self) -> &str
     {
-        &self.tag
+        &self.entry.tag
     }
 }
 
@@ -459,8 +589,7 @@ impl Drop for Tag
 {
     fn drop(&mut self)
     {
-        kill_debuggee(&self.tag);
-        self.shared.forget(&self.tag);
+        self.shared.finish(&self.entry);
     }
 }
 
@@ -468,8 +597,8 @@ impl Drop for Tag
 /// and reaps the process.
 pub struct Spawned
 {
-    child: Child,
-    tag: String,
+    pid: ProcessId,
+    entry: Arc<Tracked>,
     shared: Arc<Shared>,
 }
 
@@ -479,7 +608,7 @@ impl Spawned
     #[must_use]
     pub fn pid(&self) -> ProcessId
     {
-        ProcessId::from(self.child.id())
+        self.pid
     }
 
     /// Check whether this fixture exited, collecting its status without blocking.
@@ -489,7 +618,11 @@ impl Spawned
     /// Returns the operating-system error if querying the child status fails.
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>
     {
-        self.child.try_wait()
+        self.entry
+            .spawned_child()
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("spawned child was not registered"))?
+            .try_wait()
     }
 }
 
@@ -497,16 +630,7 @@ impl Drop for Spawned
 {
     fn drop(&mut self)
     {
-        // Kill and reap the owned child first. `kill_debuggee` waits for every signalled pid
-        // to leave the process table, and an unreaped child stays there as a zombie until
-        // this handle collects it, so sweeping first always spent the whole `KILL_SETTLE`.
-        // The tag sweep afterwards still catches anything else carrying the tag.
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        kill_debuggee(&self.tag);
-        self.shared.forget(&self.tag);
+        self.shared.finish(&self.entry);
     }
 }
 
@@ -593,13 +717,11 @@ impl LaunchWatchdog
 /// Cleanup logs any process that remains and never panics.
 pub struct Debuggee
 {
-    child_cleanup: ferros_macos::launch::ChildCleanup,
     session: Session,
     pid: ProcessId,
-    tag: String,
     stdout: OutputBuffer,
     stderr: OutputBuffer,
-    capture: CaptureDir,
+    entry: Arc<Tracked>,
     shared: Arc<Shared>,
 }
 
@@ -616,7 +738,7 @@ impl Debuggee
     #[must_use]
     pub fn tag(&self) -> &str
     {
-        &self.tag
+        &self.entry.tag
     }
 
     /// The session debugging this process.
@@ -690,19 +812,10 @@ impl Drop for Debuggee
     {
         let empty = ferros_macos::new_session().expect("empty session");
         drop(std::mem::replace(&mut self.session, empty));
-        kill_debuggee(&self.tag);
-        // Detaching a launched target transfers execution ownership but we are still
-        // its Unix parent. Reap it after the tag sweep, without signalling a stale pid.
-        if let Err(err) = self.child_cleanup.reap() {
-            eprintln!("ferros-tests: detached child cleanup failed: {err}");
-        }
+        self.shared.finish(&self.entry);
         if !process_is_gone(self.pid.0) {
             eprintln!("ferros-tests: cleanup left pid {} present", self.pid.0);
         }
-        self.shared.forget(&self.tag);
-        self.stdout.stop();
-        self.stderr.stop();
-        self.capture.remove();
     }
 }
 
@@ -752,6 +865,13 @@ impl Drop for CaptureDir
     }
 }
 
+struct Capture
+{
+    dir: CaptureDir,
+    stdout: Option<OutputReader>,
+    stderr: Option<OutputReader>,
+}
+
 /// How often an output reader looks for new data after reaching the end of its file.
 const TAIL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -759,15 +879,12 @@ const TAIL_INTERVAL: Duration = Duration::from_millis(10);
 struct OutputBuffer
 {
     bytes: Arc<Mutex<Vec<u8>>>,
-    stop: Arc<AtomicBool>,
-    reader: Option<thread::JoinHandle<()>>,
 }
 
 impl OutputBuffer
 {
-    /// Starts a thread that follows the file at `path` (as `tail -f` would) until
-    /// [`OutputBuffer::stop`] is called.
-    fn spawn_reader(path: PathBuf) -> Self
+    /// Starts a thread that follows `path` until its reader guard is dropped.
+    fn spawn_reader(path: PathBuf) -> (Self, OutputReader)
     {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -777,29 +894,31 @@ impl OutputBuffer
             .name("ferros-output-reader".to_owned())
             .spawn(move || tail_file(&path, &sink, &stop_flag))
             .ok();
-        Self { bytes, stop, reader }
+        (Self { bytes }, OutputReader { stop, reader })
     }
 
     fn snapshot(&self) -> String
     {
         String::from_utf8_lossy(&self.bytes.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
     }
-
-    /// Stops the reader thread and waits for it (at most one [`TAIL_INTERVAL`] plus a read).
-    fn stop(&mut self)
-    {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
 }
 
-impl Drop for OutputBuffer
+/// Control of a reader, kept in the shared capture so the controller can join it.
+struct OutputReader
+{
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for OutputReader
 {
     fn drop(&mut self)
     {
-        self.stop();
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            reader.thread().unpark();
+            let _ = reader.join();
+        }
     }
 }
 
@@ -811,21 +930,24 @@ fn tail_file(path: &Path, sink: &Mutex<Vec<u8>>, stop: &AtomicBool)
     };
     let mut chunk = vec![0_u8; 4096];
     loop {
-        // Read the flag before draining, so data written before `stop` is never missed.
+        // Check between reads so a writer still appending data cannot delay shutdown.
         let stopping = stop.load(Ordering::SeqCst);
-        loop {
-            match file.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => sink
-                    .lock()
+        let at_eof = match file.read(&mut chunk) {
+            Ok(0) => true,
+            Ok(read) => {
+                sink.lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .extend_from_slice(&chunk[..read]),
+                    .extend_from_slice(&chunk[..read]);
+                false
             }
-        }
+            Err(_) => return,
+        };
         if stopping {
             return;
         }
-        thread::sleep(TAIL_INTERVAL);
+        if at_eof {
+            thread::park_timeout(TAIL_INTERVAL);
+        }
     }
 }
 
@@ -917,6 +1039,13 @@ pub fn wait_until_gone(pid: u32, timeout: Duration) -> bool
 /// [`KILL_SETTLE`] for them to disappear. Returns the pids signalled.
 fn kill_debuggee(tag: &str) -> Vec<u32>
 {
+    let targets = signal_tagged(tag);
+    wait_for_killed(tag, &targets, Instant::now() + KILL_SETTLE);
+    targets
+}
+
+fn signal_tagged(tag: &str) -> Vec<u32>
+{
     let targets: Vec<u32> = tagged_pids(tag).into_iter().filter(|&pid| pid > 1).collect();
     if targets.is_empty() {
         return targets;
@@ -929,15 +1058,20 @@ fn kill_debuggee(tag: &str) -> Vec<u32>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    targets
+}
 
-    let deadline = Instant::now() + KILL_SETTLE;
-    while !(targets.iter().all(|&pid| process_is_gone(pid)) && tagged_pids(tag).is_empty()) {
-        if Instant::now() >= deadline {
+fn wait_for_killed(tag: &str, targets: &[u32], deadline: Instant)
+{
+    if targets.is_empty() {
+        return;
+    }
+    while Instant::now() < deadline {
+        if targets.iter().all(|&pid| process_is_gone(pid)) && tagged_pids(tag).is_empty() {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())));
     }
-    targets
 }
 
 fn unique_tag() -> String
@@ -1040,7 +1174,7 @@ mod tests
     use super::*;
 
     /// A long-running stand-in for a half-launched fixture: `yes` repeats its argument forever.
-    fn spawn_tagged(tag: &str) -> DropGuard<Child, impl FnOnce(Child)>
+    fn spawn_tagged(tag: &str) -> DropGuard<Child, impl FnOnce(Child) + use<>>
     {
         let child = Command::new("/usr/bin/yes")
             .arg(tag)
@@ -1053,6 +1187,67 @@ mod tests
             let _ = child.kill();
             let _ = child.wait();
         })
+    }
+
+    #[test]
+    fn deadline_joins_capture_readers()
+    {
+        let tag = unique_tag();
+        let dir = CaptureDir::create(&tag).expect("create capture");
+        let path = dir.path.clone();
+        let (buffers_tx, buffers_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let result = panic::catch_unwind(|| {
+            run_with_timeout(Duration::from_secs(2), move |t| {
+                let entry = t.shared.track(tag, ProcessCleanup::Tagged, Some(dir));
+                let buffers = entry.start_readers().expect("start readers");
+                for buffer in &buffers {
+                    assert_eq!(Arc::strong_count(&buffer.bytes), 2, "reader must be live before timeout");
+                }
+                buffers_tx.send(buffers).expect("send buffers");
+                let _ = released.recv();
+                drop(entry);
+            });
+        });
+
+        assert!(result.is_err(), "a body that outlives its deadline must fail");
+        for buffer in buffers_rx.try_recv().expect("receive buffers") {
+            assert_eq!(Arc::strong_count(&buffer.bytes), 1, "reader kept polling after timeout");
+        }
+        assert!(!path.exists(), "the controller must remove the capture directory");
+        drop(release);
+    }
+
+    #[test]
+    fn deadline_uses_one_settle_window_for_all_tags()
+    {
+        let (children_tx, children_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let timeout = Duration::from_secs(2);
+        let started = Instant::now();
+        let result = panic::catch_unwind(|| {
+            run_with_timeout(timeout, move |t| {
+                let tags = [t.tag(), t.tag(), t.tag()];
+                // Keep the Child handles outside the harness. Each killed process will
+                // remain a zombie for the entire settle window unless this test reaps it.
+                let children = tags.each_ref().map(|tag| spawn_tagged(tag.as_str()));
+                children_tx.send(children).expect("send children");
+                let _ = released.recv();
+                drop(tags);
+            });
+        });
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a body that outlives its deadline must fail");
+        for mut child in children_rx.try_recv().expect("receive children") {
+            let status = child.try_wait().expect("try_wait").expect("tagged child was not killed");
+            assert!(!status.success(), "tagged child should have been killed");
+        }
+        drop(release);
+        assert!(
+            elapsed < timeout + KILL_SETTLE + Duration::from_secs(2),
+            "timeout cleanup took {elapsed:?} including the {timeout:?} deadline"
+        );
     }
 
     #[test]

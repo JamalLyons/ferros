@@ -84,7 +84,7 @@ ferros/
  │   ├─ ferros-tests/     # Integration test suite, harness, and fixture programs
  │   ├─ ferros-ui/        # Terminal User Interface (parked while being rebuilt)
  │   └─ ferros-utils/     # Shared logging (tracing) and utility helpers
- ├─ docs/                 # architecture.md and docs/adr/ (decision records)
+ ├─ docs/                 # architecture.md, docs/adr/ (decisions), docs/reviews/ (historical)
  ├─ scripts/              # CI test runner and platform boundary checker
  ├─ website/              # Ferros landing page and simulation
  ├─ Cargo.toml            # Workspace manifest
@@ -161,6 +161,44 @@ All new code should include tests when applicable. Every engine change should la
   ```
 
 - **Integration test fixtures**: Fixture source files are in `crates/ferros-tests/fixtures/` and integration tests are in `crates/ferros-tests/tests/`.
+
+---
+
+## 🌳 Parallel Worktrees
+
+Agents and contributors can work in parallel git worktrees. [Worktrunk](https://worktrunk.dev) (`brew install worktrunk`, command `wt`) runs the project hooks in `.config/wt.toml`; the first run asks you to approve them.
+
+- Create a worktree with `wt switch -c <branch>`. Its `pre-start` hook clones the primary worktree's `target/` (the only path in `.worktreeinclude`) as an APFS reflink: about 3 s, no extra disk, and the first build reuses compiled dependencies.
+- A worktree made by another tool starts with an empty `target/`. Warm it once with `wt step copy-ignored` before the first build.
+- `wt merge` runs the five checks from the verification checklist as its `pre-merge` hook, after rebasing. Run them alone with `wt hook pre-merge`.
+- `wt remove` kills the worktree's leaked fixtures (`pre-remove`) before deleting it.
+
+### T3 Code project scripts
+
+T3 Code creates its worktrees without `wt`, so these hooks do not run there. Each person adds two project scripts once in their own T3 app (top-right panel, **Add project script**). They are stored per machine, not in the repo, and scripts set through T3's API are ignored:
+
+| Name | Command | Toggles |
+|---|---|---|
+| Warm build cache | `wt step copy-ignored --require-include` | Run automatically on worktree creation; Wait for it to finish before the agent starts |
+| Kill fixtures | `just kill-fixtures` | Run in the thread's worktree when the thread settles |
+
+---
+
+## 🩺 Troubleshooting
+
+If a test fails with "task_for_pid was denied":
+- If not signed: run through `just test-integration` so the cargo runner signs the executable automatically.
+- If signed but denied: check `DevToolsSecurity -status` (Developer Mode must be enabled).
+  ```sh
+  DevToolsSecurity -status
+  ```
+- If the detail says `Session::launch did not return within 5s`: macOS is waiting for a "Developer Tools Access" authorization. In a desktop session, approve the dialog once. On a machine with nobody at the screen (CI), the dialog cannot be answered; the `integration-macos` job in `.github/workflows/rust.yml` shows the machine setup step that removes it. The harness kills the half-launched fixture either way.
+
+Two environment switches are available for diagnostic and harness verification:
+- `FERROS_TEST_UNSIGNED=1`: the runner re-signs the test executable without the entitlement to verify the permission-failure path.
+- `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
+
+Leaked fixtures: after an interrupted run, `pgrep -fl ferros-fixture-` lists orphans (also from other worktrees); `just kill-fixtures` kills only this worktree's. Do not use `pkill -f ferros-fixture-`.
 
 ---
 

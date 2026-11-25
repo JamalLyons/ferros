@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::Session;
 use super::stack::BackendTarget;
-use crate::backend::{BackendError, LoadedImage};
+use crate::backend::{BackendError, ImageRole, LoadedImage};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey};
 use crate::symbols::cache::ImageLoadInputs;
@@ -52,6 +52,8 @@ struct FailedLoad
 pub(super) struct SessionImage
 {
     descriptor: ImageDescriptor,
+    /// Whether the backend marked this image as the main executable at the last refresh.
+    role: ImageRole,
     /// Build identity reported by the backend or read from the mapped header. An unknown
     /// id is replaced once a later report knows it.
     build_id: BuildIdentity,
@@ -226,14 +228,19 @@ impl Session
         }
     }
 
-    /// Load address of the main executable (the first image the backend reports), after
-    /// [`load_images`](Self::load_images). `None` when the backend reports no image.
+    /// Load address of the image the backend marked as the main executable
+    /// ([`ImageRole::MainExecutable`]), after [`load_images`](Self::load_images). `None`
+    /// when no reported image carries that mark, whatever else is listed.
     ///
     /// # Errors
     /// [`DebuggerError::ImageMapping`] when the main image's mapped header could not be read.
     pub(super) fn main_load_address(&self) -> Result<Option<Address>>
     {
-        let Some(main) = self.loaded_images.first() else {
+        let Some(main) = self
+            .loaded_images
+            .iter()
+            .find(|image| image.role == ImageRole::MainExecutable)
+        else {
             return Ok(None);
         };
         match &main.mapping {
@@ -273,12 +280,14 @@ impl Session
             }) {
                 let mut kept = previous.swap_remove(index);
                 kept.build_id = kept.build_id.or_later(image.build_id);
+                kept.role = image.role;
                 kept.slice = kept.slice.map(|slice| slice.or_later(kept.build_id));
                 self.loaded_images.push(kept);
             } else {
                 let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, image.build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
+                    role: image.role,
                     generation: self.stop_generation,
                     build_id: image
                         .build_id

@@ -27,6 +27,7 @@ fn mock() -> MockBackend
             path: "/bin/prog".into(),
             load_address: Address::new(CODE),
             build_id: ferros_core::types::BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::MainExecutable,
         })
 }
 

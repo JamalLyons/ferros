@@ -349,6 +349,7 @@ fn session_unwinds_through_eh_frame_of_an_image_without_dwarf()
             path: path.0.clone(),
             load_address: Address::new(LOAD_ADDRESS),
             build_id: BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::MainExecutable,
         });
     let mut session = Session::new(Box::new(mock), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("mock launch");

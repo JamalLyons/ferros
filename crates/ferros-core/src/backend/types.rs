@@ -465,4 +465,18 @@ pub struct LoadedImage
     /// [`BuildIdentity::Unknown`] is no evidence either way; [`BuildIdentity::Absent`]
     /// is no evidence across stops, so such an image is read again once per stop.
     pub build_id: BuildIdentity,
+    /// Whether the adapter knows this image is the main executable. File and function
+    /// breakpoints resolve in the image marked [`ImageRole::MainExecutable`], wherever
+    /// it appears in the list; a list without one resolves none.
+    pub role: ImageRole,
+}
+
+/// What an image is to the process, as the adapter enumerating it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageRole
+{
+    /// The program the process runs. An adapter marks at most one image this way.
+    MainExecutable,
+    /// A library, the program loader, or an image the adapter cannot tell is the program.
+    Library,
 }

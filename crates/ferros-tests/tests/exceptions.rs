@@ -1413,3 +1413,137 @@ fn access_fault_continue_is_not_rejected_as_a_signal()
         );
     });
 }
+
+/// A line of the `soft_faults` fixture's C source, whose markers are not in its Rust stub.
+fn soft_faults_location(marker: &str) -> ferros_core::BreakpointLocation
+{
+    let fixture = fixture!("soft_faults");
+    let path = fixture.source_path().with_file_name("c").join("soft_faults.c");
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let line = ferros_tests::find_marker(&source, marker).unwrap_or_else(|err| panic!("marker {marker}: {err:?}"));
+    ferros_core::BreakpointLocation::Line {
+        file: "soft_faults.c".into(),
+        line,
+    }
+}
+
+/// `SIGUSR1` on macOS (`<sys/signal.h>`).
+const SIGUSR1: i32 = 30;
+
+/// A store through a null pointer is a memory access fault that holds no signal: a
+/// forwarding continue is not rejected as signal injection, and the store faults again
+/// at the same pc on the same thread (issue #244, the real-fault sibling of
+/// `access_fault_continue_is_not_rejected_as_a_signal`).
+#[test]
+fn null_store_fault_continue_is_not_rejected_as_a_signal()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--null-store"]);
+        d.resume().expect("run into the null store");
+        let fault = d.wait(Some(STOP_TIMEOUT)).expect("wait for the fault");
+        let Some(StopEvent::Fault { thread, kind, .. }) = fault.clone() else {
+            panic!("expected a memory access fault, got {fault:?}");
+        };
+        assert_eq!(kind, FaultKind::MemoryAccess, "{fault:?}");
+        assert_eq!(fault.as_ref().and_then(StopEvent::deliverable_signal), None);
+        let pc = d.read_registers_for(thread).expect("registers at the fault").pc;
+        let store = d
+            .set_breakpoint(soft_faults_location("null_store"))
+            .expect("resolve the null_store line");
+        let sites = d
+            .logical_breakpoints()
+            .iter()
+            .find(|breakpoint| breakpoint.id == store)
+            .map(|breakpoint| breakpoint.sites.clone())
+            .expect("the logical breakpoint");
+        d.delete_breakpoint(store).expect("delete the line breakpoint");
+        let line = sites.first().expect("a site on the null_store line").position.line;
+        assert_eq!(
+            d.source_position(pc).expect("source position of the fault").line,
+            line,
+            "the fault is not on the null_store line"
+        );
+
+        d.resume_with_signal()
+            .expect("a forwarding continue after a null store is not rejected as signal injection");
+        let again = d.wait(Some(STOP_TIMEOUT)).expect("wait for the retried store");
+        assert!(
+            matches!(again, Some(StopEvent::Fault { thread: t, kind: FaultKind::MemoryAccess, .. }) if t == thread),
+            "the retried store did not fault again: {again:?}"
+        );
+        assert_eq!(
+            d.read_registers_for(thread).expect("registers at the retried fault").pc,
+            pc,
+            "the retried fault is at another pc"
+        );
+    });
+}
+
+/// One SIGUSR1, forwarded once, runs its handler exactly once: the handler's
+/// breakpoint is hit once, and the program counts one run before exiting (issue #244).
+#[test]
+fn forwarded_soft_signal_runs_its_handler_once()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--handler-once"]);
+        let handler = d
+            .set_breakpoint(soft_faults_location("in_handler"))
+            .expect("break in the handler");
+        d.resume().expect("run to the signal");
+        let stop = d.wait(Some(STOP_TIMEOUT)).expect("wait for SIGUSR1");
+        assert!(
+            matches!(stop, Some(StopEvent::Signal { signal: SIGUSR1, .. })),
+            "expected the SIGUSR1 stop, got {stop:?}"
+        );
+        d.resume_with_signal().expect("forward SIGUSR1");
+
+        let mut hits = 0;
+        let end = loop {
+            match d.wait(Some(STOP_TIMEOUT)).expect("wait after forwarding") {
+                Some(StopEvent::Breakpoint { .. }) => {
+                    assert_eq!(d.breakpoint_hit().expect("a logical hit").id, handler);
+                    hits += 1;
+                    d.resume().expect("continue from the handler");
+                }
+                other => break other,
+            }
+        };
+        assert!(matches!(end, Some(StopEvent::Exited { code: 0 })), "got {end:?}");
+        assert_eq!(hits, 1, "the handler breakpoint was hit {hits} times");
+        assert!(
+            d.wait_for_stdout("handler runs: 1\n", STOP_TIMEOUT),
+            "the program counted another number of handler runs: {:?}",
+            d.stdout()
+        );
+    });
+}
+
+/// An `EXC_SOFTWARE` exception that is not a Unix signal (here `EXC_UNIX_ABORT`, raised
+/// by the program itself) is reported as a stop holding no signal, so a forwarding
+/// continue answers it instead of being rejected as signal injection (issue #244).
+#[test]
+fn software_exception_that_is_not_a_signal_is_continued_with_signal_forwarding()
+{
+    let _serial = serial();
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--software-exception"]);
+        d.resume().expect("run to the exception");
+        let stop = d.wait(Some(STOP_TIMEOUT)).expect("wait for the software exception");
+        assert!(
+            matches!(&stop, Some(StopEvent::Other { thread: Some(_), reason }) if reason.contains("EXC_SOFTWARE")),
+            "expected a software exception stop holding no signal, got {stop:?}"
+        );
+        assert_eq!(stop.as_ref().and_then(StopEvent::deliverable_signal), None);
+        d.resume_with_signal()
+            .expect("a forwarding continue after a software exception is not rejected as signal injection");
+        let end = d.wait(Some(STOP_TIMEOUT)).expect("wait for the exit");
+        assert!(matches!(end, Some(StopEvent::Exited { code: 0 })), "got {end:?}");
+        assert!(
+            d.wait_for_stdout("exception reply: 0\n", STOP_TIMEOUT),
+            "the exception was not answered with KERN_SUCCESS: {:?}",
+            d.stdout()
+        );
+    });
+}

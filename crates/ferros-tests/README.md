@@ -80,7 +80,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines twenty fixture binaries:
+The crate defines twenty-one fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -152,6 +152,14 @@ The crate defines twenty fixture binaries:
   address of the counter `spin_site` increments (`calls=<address>`) before spinning.
 - `ferros-fixture-workqueue`: Runs two GCD work items in turn, so the second normally reuses the
   first one's parked workqueue thread, which re-enters `_start_wqthread`. It prints whether it did (macOS).
+- `ferros-fixture-soft_faults`: A C program (`fixtures/c/soft_faults.c`, compiled and linked
+  by `build.rs`; `fixtures/soft_faults.rs` is a `#![no_main]` stub) whose markers live in the
+  C source. `--null-store` stores through a null pointer (marker `null_store`).
+  `--handler-once` raises SIGUSR1 once at a counting handler (marker `in_handler`) and
+  prints `handler runs: <count>`. `--software-exception` sends its own thread's
+  `EXC_SOFTWARE` exception with code `EXC_UNIX_ABORT` (not a Unix signal) to the task's
+  exception handler and prints `exception reply: <code>` once answered. Used by
+  `tests/exceptions.rs` (issue #244).
 - `ferros-fixture-read_line`: Reads one line from stdin (marker `read_stdin`) and prints `read: <line>`,
   or `read: <eof>` at end of file. Used by `tests/cli.rs` to check which stdin `ferros launch` gives
   the program (issue #95).

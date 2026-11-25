@@ -140,3 +140,8 @@ test = false
 name = "ferros-fixture-pthread_once"
 path = "fixtures/pthread_once.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-soft_faults"
+path = "fixtures/soft_faults.rs"
+test = false

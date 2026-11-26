@@ -70,7 +70,7 @@
 //! - [XNU Kernel Source](https://github.com/apple-oss-distributions/xnu) (for `task_for_pid` and `task_threads` implementation)
 
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -348,6 +348,10 @@ pub struct MacOSBackend
     drop_next_interrupt: Arc<AtomicBool>,
     /// One-shot integration test fault: the `task_suspend` in `hold_attached_on_drop` fails.
     fail_hold_suspend: Arc<AtomicBool>,
+    /// One-shot integration test fault: the next launch fails to take the spawned
+    /// child's task port. `0` unarmed, `-1` armed, otherwise the pid of the child that
+    /// launch discarded.
+    fail_launch_task: Arc<AtomicI32>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
     events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
@@ -423,6 +427,7 @@ impl MacOSBackend
             fail_memory_store: Arc::default(),
             drop_next_interrupt: Arc::default(),
             fail_hold_suspend: Arc::default(),
+            fail_launch_task: Arc::default(),
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -562,6 +567,23 @@ impl MacOSBackend
     {
         let fail = Arc::clone(&self.fail_hold_suspend);
         move || fail.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next [`Backend::launch`] fail with `PermissionDenied` after
+    /// `posix_spawn` succeeds, as if `task_for_pid` were denied, so launch discards the
+    /// child. The returned function reports that child's pid once the fault fired.
+    /// Tests only.
+    #[doc(hidden)]
+    pub fn launch_task_fault_injector(&self) -> impl Fn() -> Option<ProcessId> + use<>
+    {
+        self.fail_launch_task.store(-1, Ordering::SeqCst);
+        let fault = Arc::clone(&self.fail_launch_task);
+        move || {
+            u32::try_from(fault.load(Ordering::SeqCst))
+                .ok()
+                .filter(|&pid| pid != 0)
+                .map(ProcessId)
+        }
     }
 }
 

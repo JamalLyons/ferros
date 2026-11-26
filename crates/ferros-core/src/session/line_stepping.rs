@@ -129,6 +129,7 @@ impl Session
             }
         }
         self.retry_line_cleanup()?;
+        self.retry_handler_cleanup()?;
         // `stale_step` is kept until a resume of this step starts: an abandoned step's
         // completion can still arrive after the drains (the backend then refuses the
         // resume), and it belongs to no request of this step either.

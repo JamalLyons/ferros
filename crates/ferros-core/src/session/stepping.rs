@@ -228,6 +228,7 @@ impl Session
                 break event;
             }
             self.retry_line_cleanup()?;
+            self.retry_handler_cleanup()?;
             let noted = self.handler_return.as_ref().map(|pending| pending.request.clone());
             let armed = self.handler_exits.is_none();
             self.note_handler_continue(request, signal_policy)?;
@@ -453,6 +454,7 @@ impl Session
                 return self.enter_running();
             }
             self.retry_line_cleanup()?;
+            self.retry_handler_cleanup()?;
             match self.step_thread(thread) {
                 // A stop arrived after the drain and nothing ran: report it, or step again
                 // if it was one `pending_event` drops. If none comes in time the target
@@ -616,16 +618,27 @@ impl Session
     }
 
     /// Remove the exit traps of a pending handler return. They exist only while a continue
-    /// runs; the backend is stopped whenever this is called.
+    /// runs; the backend is stopped whenever this is called. The hooks whose restore fails
+    /// stay in `handler_exits`, for `retry_handler_cleanup` before the next resume (#339).
     fn release_handler_exits(&mut self) -> Result<()>
     {
-        let Some(exits) = self.handler_exits.take() else {
+        let mut exits = self.handler_exits.take();
+        if exits.is_none() {
             return Ok(());
-        };
+        }
         let state = std::mem::replace(&mut self.state, SessionState::Stopped);
-        let result = self.release_exit_hooks(Some(exits));
+        let result = self.restore_exit_hooks(&mut exits);
         self.state = state;
+        self.handler_exits = exits;
         result
+    }
+
+    /// Remove the exit traps a failed release left (see `release_handler_exits`) before
+    /// the process runs again. Requires a stopped session, where no continue is running
+    /// for them: a pending handler return arms its exit traps afresh for the next one.
+    pub(super) fn retry_handler_cleanup(&mut self) -> Result<()>
+    {
+        self.release_handler_exits()
     }
 
     /// Remove the exit traps of a pending handler return, logging a failure.
@@ -735,8 +748,13 @@ impl Session
         let result = self.follow_handler_exit(&mut exits, hit, interrupted_sp).and_then(|follow| {
             if self.handler_return.is_none() {
                 // A given-up rendezvous takes its exit traps with it, before the process
-                // runs again.
-                self.release_exit_hooks(Some(std::mem::replace(&mut exits, ExitHooks::empty(thread))))?;
+                // runs again. The ones whose restore fails are kept for a retry (#339).
+                let mut given_up = Some(std::mem::replace(&mut exits, ExitHooks::empty(thread)));
+                let released = self.restore_exit_hooks(&mut given_up);
+                if let Some(left) = given_up {
+                    exits = left;
+                }
+                released?;
             }
             match follow {
                 Follow::Step => self.retry_refused(|session| session.step_thread(thread)),
@@ -745,7 +763,7 @@ impl Session
             }
         });
         self.state = state;
-        self.handler_exits = self.handler_return.is_some().then_some(exits);
+        self.handler_exits = (self.handler_return.is_some() || exits.armed()).then_some(exits);
         result.map(Some)
     }
 

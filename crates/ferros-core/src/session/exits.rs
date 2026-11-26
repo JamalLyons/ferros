@@ -109,6 +109,12 @@ impl ExitHooks
         self.thread
     }
 
+    /// Whether any trap is still armed.
+    pub(super) fn armed(&self) -> bool
+    {
+        !self.hooks.is_empty()
+    }
+
     /// Whether an exit of the thread is being stepped.
     pub(super) fn leaving(&self) -> bool
     {

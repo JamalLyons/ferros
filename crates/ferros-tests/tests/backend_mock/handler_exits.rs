@@ -600,3 +600,65 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     assert_eq!(session.state(), SessionState::Exited);
     assert_eq!(mock.script_len(), 0);
 }
+
+/// #339: a stopped handler returns to its rendezvous, so the exit trap armed for its
+/// continue is released, and every restore of that trap fails. The trap stays the
+/// session's and is restored before the next resume runs the process; before, the
+/// first failed release dropped it, leaving a private trap in the program.
+#[test]
+fn resume_retries_a_failed_handler_exit_hook_release()
+{
+    use ferros_core::backend::BackendError;
+    use ferros_core::backend::mock::MockCallKind;
+    use ferros_core::{BreakpointKind, DebuggerError};
+
+    let mock = handler_stopped_with_long_jump();
+    let mut session = exit_session(&mock);
+    session
+        .launch(&LaunchSpec::new("scripted-handler-exit-release"))
+        .expect("launch");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+    let original = mock.peek_memory(LONG_JUMP, 4).expect("original bytes");
+
+    mock.script(handler_return(&registers).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("let the handler return");
+    let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(trap.clone()), "the exit is trapped");
+
+    // The rendezvous releases the exit trap, and the cleanup after that error may try
+    // again: fail each restore until the wait returns.
+    let error = BackendError::Os {
+        code: 5,
+        message: "injected exit hook restore failure".into(),
+    };
+    for _ in 0..2 {
+        mock.fail_next(MockCallKind::WriteMemory, error.clone());
+    }
+    assert!(matches!(session.wait(None), Err(DebuggerError::Backend(actual)) if actual == error));
+    mock.clear_failures();
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(trap), "the restore failed");
+
+    mock.script(handler_step_off());
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.resume().expect("retry the exit trap's release, then resume");
+    assert_eq!(
+        mock.peek_memory(LONG_JUMP, 4),
+        Ok(original),
+        "the exit trap was released before the process ran"
+    );
+    assert!(
+        session
+            .breakpoints()
+            .iter()
+            .all(|info| info.address != LONG_JUMP || info.kind != BreakpointKind::Software),
+        "the private exit trap left the table"
+    );
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
+    assert_eq!(
+        resumes(&mock),
+        vec![ResumeRequest::step(HANDLER), ResumeRequest::continue_all()]
+    );
+    assert_eq!(mock.script_len(), 0);
+}

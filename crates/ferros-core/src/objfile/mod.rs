@@ -43,6 +43,7 @@ pub use self::contents::{
     UnwindHint, UnwindHints,
 };
 pub use crate::symbols::image::{ImageMapping, ImageSegment};
+pub use crate::symbols::load_inputs::LoadInputs;
 use crate::types::Address;
 
 /// Reads of the target's memory, for an [`ObjectFormat`].
@@ -143,7 +144,8 @@ pub trait ObjectFormat: Send + Sync
     /// The files [`open_image`](Self::open_image) reads for the image at `path`, `path`
     /// included, in a stable order: companion debug files and any cache directory the
     /// format consults. The session stamps them (size and timestamps) when a read fails
-    /// and reads again only once one of them changes. The default is `path` alone.
+    /// and reads again only once one of them changes. For paths derived from the opened
+    /// image, [`DebugInfoRetry`] can supply additional stamps. The default is `path` alone.
     fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
     {
         vec![path.to_path_buf()]

@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{Backend, BackendError, BackendResult, LaunchSpec, LoadedImage, ResumeRequest, StopEvent, ThreadAction};
+use crate::arch::{Arch, Arm64};
 use crate::types::{Address, Architecture, MemoryRegion, MemoryRegionId, ProcessId, Registers, ThreadId};
 
 /// Arm64 register set with every register zero and the 31 general registers (x0-x30)
@@ -364,6 +365,9 @@ struct Inner
     state: MockState,
     pid: ProcessId,
     architecture: Architecture,
+    /// The configured `arch()`, from [`MockBackend::with_arch`]; `None` means the
+    /// default for `architecture`.
+    arch: Option<Arc<dyn Arch>>,
     threads: BTreeMap<u64, Registers>,
     memory: BTreeMap<u64, Region>,
     images: Vec<LoadedImage>,
@@ -594,6 +598,7 @@ impl MockBackend
                 state: MockState::NoProcess,
                 pid: ProcessId(1),
                 architecture: Architecture::Arm64,
+                arch: None,
                 threads: BTreeMap::new(),
                 memory: BTreeMap::new(),
                 images: Vec::new(),
@@ -627,7 +632,25 @@ impl MockBackend
     #[must_use]
     pub fn with_architecture(self, architecture: Architecture) -> Self
     {
-        self.lock().architecture = architecture;
+        {
+            let mut inner = self.lock();
+            inner.architecture = architecture;
+            inner.arch = None;
+        }
+        self
+    }
+
+    /// Architecture knowledge returned by `arch()`, as a platform backend configures it
+    /// for its target (default: [`Arm64::new`] for arm64, an error otherwise). Also sets
+    /// `architecture()` to `arch.architecture()`.
+    #[must_use]
+    pub fn with_arch(self, arch: impl Arch + 'static) -> Self
+    {
+        {
+            let mut inner = self.lock();
+            inner.architecture = arch.architecture();
+            inner.arch = Some(Arc::new(arch));
+        }
         self
     }
 
@@ -1153,6 +1176,16 @@ impl Backend for MockBackend
     fn architecture(&self) -> Architecture
     {
         self.lock().architecture
+    }
+
+    fn arch(&self) -> BackendResult<Arc<dyn Arch>>
+    {
+        let inner = self.lock();
+        match (&inner.arch, inner.architecture) {
+            (Some(configured), _) => Ok(Arc::clone(configured)),
+            (None, Architecture::Arm64) => Ok(Arc::new(Arm64::new())),
+            (None, other) => Err(BackendError::Unsupported(format!("the mock has no arch for {other}"))),
+        }
     }
 }
 

@@ -159,12 +159,14 @@ docs-build:
 docs-drift:
     @sh scripts/docs-drift.sh
 
-# Run all checks (fmt, clippy, test)
+# Run the five pre-commit checks from AGENTS.md (read-only; use `just fmt` to format)
 check:
     @echo "Running all checks..."
-    @just fmt
+    @just fmt-check
+    @just check-boundary
     @just lint
     @just test
+    @just test-integration
 
 # Clean build artifacts
 clean:

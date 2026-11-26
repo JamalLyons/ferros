@@ -18,6 +18,8 @@ Cargo workspace members under `crates/`, one purpose each:
 
 There is no `ferros-linux` or `ferros-windows` crate.
 
+Per-crate module maps (where each file is, which to open first): [`crates/ferros-core/AGENTS.md`](crates/ferros-core/AGENTS.md), [`crates/ferros-macos/AGENTS.md`](crates/ferros-macos/AGENTS.md), [`crates/ferros-tests/AGENTS.md`](crates/ferros-tests/AGENTS.md). They add no rules; Conventions below stay the contract.
+
 ## Key interfaces
 Read before changing engine behavior; module docs carry the contracts. Paths under `crates/`.
 
@@ -68,9 +70,19 @@ just test-crate ferros-core   # one crate
 just fmt-check
 just lint                     # clippy, warnings denied
 just check-boundary
+just check                    # the five pre-commit checks below, read-only
 ```
 
-Before committing, all five must pass: `just fmt-check`, `just lint`, `just test`, `just test-integration`, `just check-boundary`.
+Before committing, all five must pass: `just fmt-check`, `just lint`, `just test`, `just test-integration`, `just check-boundary`. `just check` runs exactly those five and writes nothing.
+
+Targeted loop while iterating (the `just` recipes take no filter):
+```sh
+cargo test -p ferros-core session::tests::            # one engine module's unit tests
+cargo test -p ferros-tests --test native stepping::   # one integration area
+cargo test -p ferros-tests --test backend_mock        # mock-backend engine tests, any OS
+```
+
+Off macOS (a Linux VM) `ferros-macos` compiles empty and every `#![cfg(target_os = "macos")]` test compiles empty and passes, so a pass proves nothing about them. The loop that does run there: `just test-crate ferros-core`, `just check-boundary`, and `cargo test -p ferros-tests --test backend_mock --test unwind_eh_frame --test platform_boundary`. macOS failures are not reproducible there, and `#![warn(missing_docs)]` failures show only in `just lint` on macOS.
 
 "task_for_pid was denied" or `Session::launch did not return within 5s`: see Troubleshooting in [`CONTRIBUTING.md`](CONTRIBUTING.md). Run integration tests via `just test-integration` so the runner signs them.
 

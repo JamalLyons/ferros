@@ -61,6 +61,13 @@ cargo test -p ferros-tests --test native <area>::               # one area
 just test-integration                                          # all of them
 ```
 
+Off macOS, every `#![cfg(target_os = "macos")]` target compiles empty and passes. Only these
+run there:
+
+```sh
+cargo test -p ferros-tests --test backend_mock --test unwind_eh_frame --test platform_boundary
+```
+
 After any run, check for leaked fixtures. It prints nothing when clean (it also lists other
 worktrees' fixtures). Clean only this worktree's with `just kill-fixtures`; never `pkill -f`.
 

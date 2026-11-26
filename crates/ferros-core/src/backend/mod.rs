@@ -5,7 +5,8 @@
 //! stopped. All *policy* (breakpoint bookkeeping, stepping strategies, symbolication)
 //! lives in portable engine code that takes a backend as a parameter. Architecture
 //! knowledge (trap bytes, which register is the pc, ...) lives separately in
-//! [`crate::arch`].
+//! [`crate::arch`]; the backend chooses the target's configuration of it
+//! ([`Backend::arch`]), since address width and unwind conventions belong to the target.
 //!
 //! The interface is synchronous and deliberately small. Its sufficiency yardstick is the
 //! GDB remote protocol packet set (register and memory read/write, `vCont` continue and
@@ -111,6 +112,7 @@ mod error;
 pub mod mock;
 mod types;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use error::{BackendError, BackendResult};
@@ -119,6 +121,7 @@ pub use types::{
     ThreadAction,
 };
 
+use crate::arch::Arch;
 use crate::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
 
 /// Operating-system mechanism for controlling one target process.
@@ -424,6 +427,22 @@ pub trait Backend: Send
     ///
     /// None; this method is infallible.
     fn architecture(&self) -> Architecture;
+
+    /// Architecture knowledge configured for the target (or the host before a target
+    /// exists): the [`Arch`] of [`architecture`](Self::architecture) with the target's
+    /// own conventions, such as how many address bits a user pointer has and what an
+    /// undefined return-address rule means. The session asks this for every
+    /// architecture decision, so it is the one place those conventions are chosen.
+    ///
+    /// # Preconditions
+    ///
+    /// None; legal in every state.
+    ///
+    /// # Errors
+    ///
+    /// [`BackendError::Unsupported`] when the engine has no [`Arch`] for the
+    /// architecture.
+    fn arch(&self) -> BackendResult<Arc<dyn Arch>>;
 }
 
 #[cfg(test)]
@@ -536,6 +555,11 @@ mod tests
         fn architecture(&self) -> Architecture
         {
             Architecture::Arm64
+        }
+
+        fn arch(&self) -> BackendResult<Arc<dyn Arch>>
+        {
+            Ok(Arc::new(crate::arch::Arm64::new()))
         }
     }
 

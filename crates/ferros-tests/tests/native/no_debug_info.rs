@@ -41,6 +41,13 @@ impl ObjectFormat for CountingFormat
         self.0.fetch_add(1, Ordering::SeqCst);
         MockObjectFormat.open_image(path, load_address, slice)
     }
+
+    fn file_identity_reader(&self) -> Option<ferros_core::objfile::FileIdentityReader>
+    {
+        // The production reader. Dropping it from `MachOFormat` makes the same-size
+        // rewrite below look unchanged.
+        MachOFormat::new().file_identity_reader()
+    }
 }
 
 /// A repeated debug-info request for an image file that has none returns the kept
@@ -100,7 +107,8 @@ fn cache_does_not_reread_an_unchanged_image_without_debug_info()
 }
 
 /// A rewrite in place that keeps the image's size and restores its modification time is
-/// still seen as a change (#346): the status-change time moves, and the file is read again.
+/// still seen as a change (#346): [`MachOFormat`]'s file identity moves, and the file is
+/// read again.
 #[test]
 fn cache_rereads_an_image_rewritten_with_its_size_and_mtime_kept()
 {

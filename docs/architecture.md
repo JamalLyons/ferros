@@ -465,7 +465,7 @@ Two backends exist:
 
 ### Rules
 
-1. `ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`, a platform crate), no `cfg(target_os)` and no `unsafe`. It declares `#![forbid(unsafe_code)]`.
+1. `ferros-core` has no OS dependency (`mach2`, `libproc`, `libc`, a platform crate), no OS `cfg` (`cfg(target_os)`, `cfg(unix)`, `cfg(windows)`, `cfg(target_family)`, including `cfg!` and `cfg_attr`) and no `unsafe`. It declares `#![forbid(unsafe_code)]`.
 2. `unsafe` is allowed only in a platform crate, for raw OS bindings.
 3. The CLI names a platform crate in exactly one module, [`crates/ferros/src/platform.rs`](../crates/ferros/src/platform.rs). That module is also the only `cfg(target_os)` switch outside the platform and test crates.
 4. `ferros-core` names no system library and no kernel signal-frame layout: they come from the platform's `runtime::TargetRuntime` ([#201](https://github.com/JamalLyons/ferros/issues/201)).
@@ -475,7 +475,7 @@ The rules are enforced by `just check-boundary` ([`scripts/check-boundary.sh`](.
 
 ### How to Add a Platform
 
-1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type, `ferros_core::objfile::ObjectFormat` for its object-file format, and `ferros_core::runtime::TargetRuntime` for its system libraries and signal frames. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
+1. Create a new crate, for example `crates/ferros-linux`, that depends on `ferros-core` and implements `Backend` for one type, `ferros_core::objfile::ObjectFormat` for its object-file format, and `ferros_core::runtime::TargetRuntime` for its system libraries and signal frames. `ObjectFormat::file_identity_reader` is where that crate reports the host's file identity, so a rewritten image is re-read when its size and modification time are unchanged. Follow the state machine and error rules documented on the trait: an illegal call returns `BackendError::InvalidState`, an error never changes the state, and memory is returned exactly as it is in the target. Gate the crate with `#![cfg(target_os = "...")]` so it compiles as an empty crate elsewhere, as `ferros-macos` does.
 2. Add the crate as a target-specific dependency of `crates/ferros` and add one arm to the factory:
 
 ```rust

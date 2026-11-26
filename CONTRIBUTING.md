@@ -123,7 +123,7 @@ just check-boundary
 
 ### Safety & Platform Boundary Guidelines
 - **Zero Unsafe in Core**: `unsafe_code = "forbid"` is set across the workspace and `crates/ferros-core` declares `#![forbid(unsafe_code)]`.
-- **Platform Boundary**: `crates/ferros-core` contains no operating-system dependencies (`mach2`, `libproc`, `libc`, platform crates) and no `cfg(target_os)`. OS code belongs exclusively in platform crates (`crates/ferros-macos`).
+- **Platform Boundary**: `crates/ferros-core` contains no operating-system dependencies (`mach2`, `libproc`, `libc`, platform crates) and no OS `cfg` (`cfg(target_os)`, `cfg(unix)`, `cfg(windows)`, `cfg(target_family)`, including `cfg!` and `cfg_attr`). OS code belongs exclusively in platform crates (`crates/ferros-macos`).
 - **Factory Isolation**: The CLI names platform crates only in `crates/ferros/src/platform.rs`.
 - **Documented APIs**: Document public functions with Rustdoc comments (`///`).
 - Keep PRs small and focused.

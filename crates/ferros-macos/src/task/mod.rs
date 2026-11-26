@@ -75,6 +75,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferros_core::arch::{Arch, Arm64, UndefinedReturnAddress};
 use ferros_core::backend::{
     Backend, BackendError, BackendResult, LaunchSpec, LoadedImage, ResumeRequest, StopEvent, ThreadAction,
 };
@@ -207,6 +208,36 @@ fn mach_error(kr: libc::kern_return_t, what: &str) -> BackendError
             message: format!("{what}: {message}"),
         },
         other => other,
+    }
+}
+
+/// Significant bits of an arm64 user pointer on macOS: xnu gives user processes a 47-bit
+/// address space, so pointer-authentication bits are everything at and above bit 47.
+pub const ARM64_ADDRESSABLE_BITS: u8 = 47;
+
+/// What an `Undefined` return-address rule in arm64 call frame information means on
+/// macOS: Apple's toolchain leaves that column undefined in the initial CIE row, so
+/// before a prologue saves it the return address is still in `lr`.
+pub const ARM64_UNDEFINED_RETURN_ADDRESS: UndefinedReturnAddress = UndefinedReturnAddress::LinkRegister;
+
+/// Architecture knowledge for a macOS target of `architecture`, configured with the
+/// platform's conventions ([`ARM64_ADDRESSABLE_BITS`],
+/// [`ARM64_UNDEFINED_RETURN_ADDRESS`]). This is the [`Backend::arch`] of
+/// [`MacOSBackend`].
+///
+/// # Errors
+///
+/// [`BackendError::Unsupported`] for an architecture other than arm64.
+pub fn target_arch(architecture: Architecture) -> BackendResult<Arc<dyn Arch>>
+{
+    match architecture {
+        Architecture::Arm64 => Ok(Arc::new(
+            Arm64::with_addressable_bits(ARM64_ADDRESSABLE_BITS)?
+                .with_undefined_return_address(ARM64_UNDEFINED_RETURN_ADDRESS),
+        )),
+        other => Err(BackendError::Unsupported(format!(
+            "the macOS backend supports arm64 targets only, not {other}"
+        ))),
     }
 }
 

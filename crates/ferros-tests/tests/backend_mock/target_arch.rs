@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use ferros_core::arch::{Arch, Arm64, UndefinedReturnAddress};
 use ferros_core::backend::mock::{MockBackend, MockStop, arm64_registers};
-use ferros_core::backend::{Backend, BackendResult, LaunchSpec, StopEvent};
-use ferros_core::objfile::mock::MockObjectFormat;
-use ferros_core::types::{Address, Architecture, Registers};
+use ferros_core::backend::{Backend, BackendResult, ImageRole, LaunchSpec, LoadedImage, StopEvent};
+use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat, MockObjectImage};
+use ferros_core::types::{Address, Architecture, BuildIdentity, Registers};
 use ferros_core::{BreakpointRequest, Session};
 
 use crate::helpers::*;
@@ -42,61 +42,65 @@ fn configured_address_width_keeps_bit_48_in_a_session_backtrace()
     assert_eq!(pcs, vec![CALLEE, HIGH_RETURN]);
 }
 
-/// Arm64 whose trap is reported one instruction past the `BRK`, so a session that maps
-/// the reported pc through any other `Arch` misses the hit.
+/// Arm64 with a configurable callee-saved mask and traps reported one instruction
+/// past the `BRK`.
 #[derive(Debug)]
-struct TrapReportedPastBrk(Arm64);
+struct ConfiguredArm64
+{
+    base: Arm64,
+    callee_saved_mask: u32,
+}
 
-impl Arch for TrapReportedPastBrk
+impl Arch for ConfiguredArm64
 {
     fn architecture(&self) -> Architecture
     {
-        self.0.architecture()
+        self.base.architecture()
     }
 
     fn trap_instruction(&self) -> &'static [u8]
     {
-        self.0.trap_instruction()
+        self.base.trap_instruction()
     }
 
     fn pc(&self, registers: &Registers) -> Address
     {
-        self.0.pc(registers)
+        self.base.pc(registers)
     }
 
     fn set_pc(&self, registers: &mut Registers, value: Address)
     {
-        self.0.set_pc(registers, value);
+        self.base.set_pc(registers, value);
     }
 
     fn sp(&self, registers: &Registers) -> Address
     {
-        self.0.sp(registers)
+        self.base.sp(registers)
     }
 
     fn set_sp(&self, registers: &mut Registers, value: Address)
     {
-        self.0.set_sp(registers, value);
+        self.base.set_sp(registers, value);
     }
 
     fn fp(&self, registers: &Registers) -> Address
     {
-        self.0.fp(registers)
+        self.base.fp(registers)
     }
 
     fn set_fp(&self, registers: &mut Registers, value: Address)
     {
-        self.0.set_fp(registers, value);
+        self.base.set_fp(registers, value);
     }
 
     fn link_register(&self, registers: &Registers) -> Option<Address>
     {
-        self.0.link_register(registers)
+        self.base.link_register(registers)
     }
 
     fn set_link_register(&self, registers: &mut Registers, value: Address) -> BackendResult<()>
     {
-        self.0.set_link_register(registers, value)
+        self.base.set_link_register(registers, value)
     }
 
     fn pc_after_trap(&self, reported_pc: Address) -> Address
@@ -106,7 +110,12 @@ impl Arch for TrapReportedPastBrk
 
     fn strip_pointer_auth(&self, address: Address) -> Address
     {
-        self.0.strip_pointer_auth(address)
+        self.base.strip_pointer_auth(address)
+    }
+
+    fn callee_saved_register_mask(&self) -> u32
+    {
+        self.callee_saved_mask
     }
 }
 
@@ -115,8 +124,12 @@ impl Arch for TrapReportedPastBrk
 #[test]
 fn breakpoint_stops_use_the_backend_configured_arch()
 {
+    let arm64 = Arm64::new();
     let mock = MockBackend::new()
-        .with_arch(TrapReportedPastBrk(Arm64::new()))
+        .with_arch(ConfiguredArm64 {
+            base: arm64,
+            callee_saved_mask: arm64.callee_saved_register_mask(),
+        })
         .with_thread(THREAD, arm64_registers())
         .with_region(CALLEE, "r-x", vec![0x1F; 64]);
     let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
@@ -140,6 +153,88 @@ fn breakpoint_stops_use_the_backend_configured_arch()
         })
     );
     assert_eq!(session.breakpoint_info(id).expect("breakpoint").hit_count, 1);
+}
+
+/// The first CFI row leaves X3 alone. The caller's row uses it as a return address,
+/// so only a target ABI that preserves X3 can unwind both steps.
+#[test]
+fn session_unwind_uses_the_backend_callee_saved_mask()
+{
+    use gimli::write::{
+        CallFrameInstruction, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
+    };
+    use gimli::{AArch64, Encoding, Format, LittleEndian};
+
+    let pc = CALLEE + 8;
+    let caller = CALLEE + 0x28;
+    let outer = CALLEE + 0x48;
+    let arm64 = Arm64::new();
+    let mut regs = arm64_registers();
+    regs.pc = pc;
+    regs.sp = STACK;
+    arm64.set_link_register(&mut regs, caller).expect("set link register");
+    regs.general[usize::from(AArch64::X3.0)] = outer.value();
+
+    let encoding = Encoding {
+        address_size: 8,
+        format: Format::Dwarf32,
+        version: 1,
+    };
+    let mut cie = CommonInformationEntry::new(encoding, 4, -8, AArch64::X30);
+    cie.add_instruction(CallFrameInstruction::Cfa(AArch64::SP, 16));
+
+    let mut table = FrameTable::default();
+    let cie = table.add_cie(cie);
+    let mut inner_fde = FrameDescriptionEntry::new(gimli::write::Address::Constant(CALLEE.value()), 0x20);
+    inner_fde.add_instruction(0, CallFrameInstruction::SameValue(AArch64::X30));
+    table.add_fde(cie, inner_fde);
+    let mut caller_fde = FrameDescriptionEntry::new(gimli::write::Address::Constant((CALLEE + 0x20).value()), 0x20);
+    caller_fde.add_instruction(0, CallFrameInstruction::Register(AArch64::X30, AArch64::X3));
+    table.add_fde(cie, caller_fde);
+
+    let mut eh_frame = EhFrame::from(EndianVec::new(LittleEndian));
+    table.write_eh_frame(&mut eh_frame).expect("write CFI");
+    let image = MockObjectFile::new(IMAGE_BASE.value(), 0x2000)
+        .with_eh_frame(IMAGE_BASE.value(), eh_frame.slice())
+        .to_bytes();
+    let (mut file, path) = ferros_tests::scratch::create_file("ferros-arch-callee-saved", ".mock");
+    std::io::Write::write_all(&mut file, &image).expect("write synthetic image");
+    drop(file);
+
+    let mut mapped = MockObjectImage::new(0..1, 0, 0)
+        .with_mapping(IMAGE_BASE.value(), 0x2000)
+        .header_bytes();
+    mapped.resize(0x2000, 0x1F);
+    let unwind = |callee_saved_mask| {
+        let mock = MockBackend::new()
+            .with_arch(ConfiguredArm64 {
+                base: arm64,
+                callee_saved_mask,
+            })
+            .with_thread(THREAD, regs.clone())
+            .with_region(IMAGE_BASE, "r-x", mapped.clone())
+            .with_image(LoadedImage {
+                path: path.clone(),
+                load_address: IMAGE_BASE,
+                build_id: BuildIdentity::Unknown,
+                role: ImageRole::MainExecutable,
+            });
+        let mut session = Session::new(Box::new(mock), MockObjectFormat::shared());
+        session.launch(&LaunchSpec::new("/bin/prog")).expect("mock launch");
+        session
+            .stack_trace(8)
+            .expect("stack trace")
+            .into_iter()
+            .map(|frame| frame.pc)
+            .collect::<Vec<_>>()
+    };
+
+    let standard_mask = arm64.callee_saved_register_mask();
+    let standard = unwind(standard_mask);
+    let with_x3_saved = unwind(standard_mask | (1 << AArch64::X3.0));
+    std::fs::remove_file(path).expect("remove synthetic image");
+    assert_eq!(standard, [pc, caller]);
+    assert_eq!(with_x3_saved, [pc, caller, outer]);
 }
 
 /// The macOS backend configures today's conventions explicitly: a 47-bit user address

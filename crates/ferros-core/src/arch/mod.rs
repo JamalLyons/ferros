@@ -176,6 +176,11 @@ pub trait Arch: Send + Sync + std::fmt::Debug
     /// None; infallible (wrapping arithmetic).
     fn pc_after_trap(&self, reported_pc: Address) -> Address;
 
+    /// General registers whose values a call preserves by default under the target ABI.
+    /// Bit `n` corresponds to slot `n` in [`Registers::general`]. The unwinder uses
+    /// this mask when no unwind rule supplies a different value for a register.
+    fn callee_saved_register_mask(&self) -> u32;
+
     /// What a call frame information row whose return-address column is
     /// `Undefined` means for this target.
     ///

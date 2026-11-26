@@ -82,10 +82,9 @@
 //!
 //! ## Registers in caller frames
 //!
-//! A caller frame keeps only what is known about it: the callee-saved `x19`-`x29` the
-//! callee left alone, plus registers its CFI restores. Caller-saved registers (`x0`-`x18`,
-//! and `x30` except through the return-address rule) and registers whose rule is
-//! `Undefined` are unknown and read as zero. Rules that use an unknown register fail.
+//! A caller frame keeps the known callee-saved registers selected by its
+//! [`Arch`] plus registers its CFI restores. Unknown general registers read as zero.
+//! Rules that use an unknown register fail.
 //!
 //! ## Signal handler frames
 //!
@@ -151,7 +150,7 @@ use gimli::{
 };
 
 use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
-use crate::arch::{Arch, UndefinedReturnAddress};
+use crate::arch::{Arch, Arm64, UndefinedReturnAddress};
 use crate::error::Result;
 use crate::objfile::UnwindHint;
 use crate::runtime::{NoRuntime, SignalContext, TargetRuntime, TrampolineFrame};
@@ -210,10 +209,9 @@ static NO_RUNTIME: NoRuntime = NoRuntime;
 struct Cursor
 {
     regs: Registers,
-    /// Bit `n` set: general register `xn` (n < 31) holds this frame's value. All are
-    /// known in the innermost frame; in a caller only the callee-saved registers
-    /// (`x19`-`x29`) and those its callee's CFI restored are. `x30` known means it still
-    /// holds this frame's return address, which is only true before a prologue saved it.
+    /// Bit `n` set means general register slot `n` holds this frame's value. All are
+    /// known in the innermost frame. For callers, the unwind step determines which
+    /// values are known using the target ABI and any register recovery rules.
     known: u32,
     /// Whether this frame's pc is a return address (every frame but the innermost).
     is_caller: bool,
@@ -228,14 +226,9 @@ enum CodeStep
     FrameBuilt,
 }
 
-/// `x0`-`x30`.
-const ALL_GENERAL: u32 = (1 << 31) - 1;
-/// Callee-saved registers under the arm64 Apple ABI: `x19`-`x29` (`x29` is the frame
-/// pointer). Everything else is clobbered by a call, so a caller's value is unknown unless
-/// CFI says where it was saved.
-const CALLEE_SAVED: u32 = ((1 << 30) - 1) & !((1 << 19) - 1);
-/// `x30`, the link register.
-const LINK_REGISTER: u32 = 1 << 30;
+const ALL_GENERAL: u32 = (1 << Arm64::GENERAL_REGISTER_COUNT) - 1;
+const FRAME_POINTER: u32 = 1 << Arm64::FRAME_POINTER_INDEX;
+const LINK_REGISTER: u32 = 1 << Arm64::LINK_REGISTER_INDEX;
 
 /// One unwind step: the caller's registers and how they were found.
 struct UnwindStep
@@ -364,7 +357,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             status = step.status;
             let mut regs = step.next;
             // Unknown registers read as zero rather than as a callee's stale value.
-            for (index, slot) in regs.general.iter_mut().enumerate().take(31) {
+            for (index, slot) in regs.general.iter_mut().enumerate().take(Arm64::GENERAL_REGISTER_COUNT) {
                 if step.known & (1 << index) == 0 {
                     *slot = 0;
                 }
@@ -617,7 +610,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let return_address = self.recover(cursor, &row.register(return_register), cfa, return_register)??;
 
         let mut next = regs.clone();
-        let mut known = cursor.known & CALLEE_SAVED;
+        let mut known = cursor.known & self.arch.callee_saved_register_mask();
         for (register, rule) in row.registers() {
             if *register == return_register {
                 continue;
@@ -697,7 +690,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         next.sp = Address::new(cursor.regs.sp.value().checked_add(stack_size)?);
         Some(UnwindStep {
             next,
-            known: cursor.known & CALLEE_SAVED,
+            known: cursor.known & self.arch.callee_saved_register_mask(),
             status: FrameStatus::CfiFallback,
         })
     }
@@ -714,7 +707,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         next.pc = self.arch.strip_pointer_auth(link);
         Some(UnwindStep {
             next,
-            known: cursor.known & CALLEE_SAVED,
+            known: cursor.known & self.arch.callee_saved_register_mask(),
             status: FrameStatus::CfiFallback,
         })
     }
@@ -768,11 +761,11 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             return None;
         }
         let regs = &cursor.regs;
-        let mut x = [0; 31];
+        let mut x = [0; Arm64::GENERAL_REGISTER_COUNT];
         for (slot, value) in x.iter_mut().zip(&regs.general) {
             *slot = *value;
         }
-        x[29] = regs.fp.value();
+        x[Arm64::FRAME_POINTER_INDEX] = regs.fp.value();
         let current = FrameRegisters {
             x,
             sp: regs.sp.value(),
@@ -795,12 +788,15 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         for (slot, value) in next.general.iter_mut().zip(caller.x) {
             *slot = value;
         }
-        self.arch.set_fp(&mut next, Address::new(caller.x[29]));
+        self.arch
+            .set_fp(&mut next, Address::new(caller.x[Arm64::FRAME_POINTER_INDEX]));
         next.sp = Address::new(caller.sp);
-        next.pc = self.arch.strip_pointer_auth(Address::new(caller.x[30]));
+        next.pc = self
+            .arch
+            .strip_pointer_auth(Address::new(caller.x[Arm64::LINK_REGISTER_INDEX]));
         Some(CodeStep::Caller(UnwindStep {
             next,
-            known: caller.known & CALLEE_SAVED,
+            known: caller.known & self.arch.callee_saved_register_mask(),
             status: FrameStatus::CfiFallback,
         }))
     }
@@ -810,7 +806,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     fn frame_pointer_step(&self, cursor: &Cursor) -> Option<UnwindStep>
     {
         let regs = &cursor.regs;
-        if cursor.known & (1 << 29) == 0 {
+        if cursor.known & FRAME_POINTER == 0 {
             return None;
         }
         let fp = regs.fp.value();
@@ -832,7 +828,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         // reused x19-x28, so they are unknown too.
         Some(UnwindStep {
             next,
-            known: 1 << 29,
+            known: FRAME_POINTER,
             status: FrameStatus::CfiFallback,
         })
     }
@@ -849,7 +845,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             architecture: Architecture::Arm64,
             pc: cursor.regs.pc,
             sp: cursor.regs.sp,
-            fp: (cursor.known & (1 << 29) != 0).then_some(cursor.regs.fp),
+            fp: (cursor.known & FRAME_POINTER != 0).then_some(cursor.regs.fp),
         };
         let context = self.runtime.signal_context(self.memory, &frame)?;
         self.restore_signal_context(cursor, &context)
@@ -858,7 +854,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// The arm64 interrupted frame of `context`, checked as the module documentation says.
     fn restore_signal_context(&self, cursor: &Cursor, context: &SignalContext) -> Option<UnwindStep>
     {
-        if context.general.len() < 29 {
+        if context.general.len() < Arm64::FRAME_POINTER_INDEX {
             return None;
         }
         let sp = context.sp;
@@ -875,11 +871,11 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         };
 
         let mut next = cursor.regs.clone();
-        for (slot, &value) in next.general.iter_mut().zip(&context.general).take(29) {
+        for (slot, &value) in next.general.iter_mut().zip(&context.general).take(Arm64::FRAME_POINTER_INDEX) {
             *slot = value;
         }
         self.arch.set_fp(&mut next, Address::new(context.fp));
-        if let Some(slot) = next.general.get_mut(30) {
+        if let Some(slot) = next.general.get_mut(Arm64::LINK_REGISTER_INDEX) {
             *slot = context.lr;
         }
         next.sp = Address::new(sp);
@@ -929,11 +925,11 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         if self.arch.architecture() != Architecture::Arm64 {
             return;
         }
-        match register.0 {
-            29 => self.arch.set_fp(regs, Address::new(value)),
-            31 => regs.sp = Address::new(value),
-            n @ 0..=30 => {
-                if let Some(slot) = regs.general.get_mut(usize::from(n)) {
+        match usize::from(register.0) {
+            Arm64::FRAME_POINTER_INDEX => self.arch.set_fp(regs, Address::new(value)),
+            Arm64::STACK_POINTER_DWARF_REGISTER => regs.sp = Address::new(value),
+            n @ 0..Arm64::GENERAL_REGISTER_COUNT => {
+                if let Some(slot) = regs.general.get_mut(n) {
                     *slot = value;
                 }
             }
@@ -945,7 +941,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 /// The `known` bit of an arm64 DWARF register number `x0`-`x30`.
 fn general_bit(register: Register) -> Option<u32>
 {
-    (register.0 <= 30).then(|| 1 << register.0)
+    (usize::from(register.0) < Arm64::GENERAL_REGISTER_COUNT).then(|| 1 << register.0)
 }
 
 /// The unwind hint of the function containing `lookup`, if the image has one.
@@ -1018,12 +1014,12 @@ fn append_logical_frames(
 
 fn read_register_value(architecture: Architecture, regs: &Registers, register: Register) -> Option<u64>
 {
-    let reg_num = register.0;
+    let reg_num = usize::from(register.0);
     match architecture {
         Architecture::Arm64 => match reg_num {
-            31 => Some(regs.sp.value()),
-            29 => Some(regs.fp.value()),
-            0..=30 => regs.general.get(usize::from(reg_num)).copied(),
+            Arm64::STACK_POINTER_DWARF_REGISTER => Some(regs.sp.value()),
+            Arm64::FRAME_POINTER_INDEX => Some(regs.fp.value()),
+            0..Arm64::GENERAL_REGISTER_COUNT => regs.general.get(reg_num).copied(),
             _ => None,
         },
         Architecture::X86_64 => match reg_num {
@@ -1032,9 +1028,7 @@ fn read_register_value(architecture: Architecture, regs: &Registers, register: R
             6 => Some(regs.fp.value()),
             0..=15 => {
                 let mapping = [0, 2, 1, 3, 6, 7, 5, 4, 8, 9, 10, 11, 12, 13, 14, 15];
-                mapping
-                    .get(usize::from(reg_num))
-                    .and_then(|&idx| regs.general.get(idx).copied())
+                mapping.get(reg_num).and_then(|&idx| regs.general.get(idx).copied())
             }
             _ => None,
         },
@@ -1046,7 +1040,7 @@ fn return_register(architecture: Architecture) -> Register
 {
     match architecture {
         Architecture::X86_64 => Register(16),
-        _ => Register(30),
+        _ => Register(Arm64::LINK_REGISTER_INDEX as u16),
     }
 }
 
@@ -1056,7 +1050,6 @@ mod tests
     use std::collections::HashMap;
 
     use super::*;
-    use crate::arch::Arm64;
     use crate::backend::mock::arm64_registers;
     use crate::error::DebuggerError;
     use crate::runtime::mock::MockRuntime;
@@ -1224,7 +1217,7 @@ mod tests
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
         let cursor = Cursor {
-            known: CALLEE_SAVED,
+            known: ARCH.callee_saved_register_mask(),
             is_caller: true,
             ..innermost(regs(0x4000_0000, 0xf00, 0x1000, 0x4000_0abc))
         };

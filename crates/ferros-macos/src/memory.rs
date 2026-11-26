@@ -366,9 +366,8 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
 /// longer holds them, they are written back the same way and the original error is
 /// returned.
 ///
-/// The guarantee has two limits, both reported rather than hidden: a range that cannot
-/// be read beforehand gets no rollback, and if the rollback itself fails the error says
-/// that memory may be partly written.
+/// A failed or incomplete snapshot prevents the write. If rollback itself fails, the
+/// error says that memory may be partly written.
 ///
 /// ## Protection restore
 ///
@@ -422,28 +421,65 @@ fn write_restoring(
     task: mach_port_t,
     addr: Address,
     data: &[u8],
+    write: impl FnMut(mach_port_t, Address, &[u8]) -> Result<()>,
+) -> Result<()>
+{
+    write_restoring_using_snapshot(task, addr, data, read_memory, write)
+}
+
+pub(crate) fn write_with_short_snapshot(task: mach_port_t, addr: Address, data: &[u8]) -> Result<()>
+{
+    write_restoring_using_snapshot(
+        task,
+        addr,
+        data,
+        |task, addr, len| read_memory(task, addr, len.saturating_sub(1)),
+        write_with_protection,
+    )
+}
+
+fn write_restoring_using_snapshot(
+    task: mach_port_t,
+    addr: Address,
+    data: &[u8],
+    snapshot: impl FnOnce(mach_port_t, Address, usize) -> Result<Vec<u8>>,
     mut write: impl FnMut(mach_port_t, Address, &[u8]) -> Result<()>,
 ) -> Result<()>
 {
-    let before = read_memory(task, addr, data.len())
-        .ok()
-        .filter(|before| before.len() == data.len());
+    let before = snapshot(task, addr, data.len())?;
+    if before.len() != data.len() {
+        return Err(BackendError::NotFound(format!(
+            "write at {addr} refused because the rollback snapshot read {} of {} bytes",
+            before.len(),
+            data.len()
+        ))
+        .into());
+    }
     let Err(error) = write(task, addr, data) else {
         return Ok(());
     };
-    let Some(before) = before else {
-        return Err(error);
-    };
+    Err(restore_failed_write(task, addr, &before, error, write))
+}
+
+/// Keep the original error and put back changed bytes, reporting any rollback failure.
+pub(crate) fn restore_failed_write(
+    task: mach_port_t,
+    addr: Address,
+    before: &[u8],
+    error: DebuggerError,
+    write: impl FnOnce(mach_port_t, Address, &[u8]) -> Result<()>,
+) -> DebuggerError
+{
     if read_memory(task, addr, before.len()).is_ok_and(|now| now == before) {
-        return Err(error);
+        return error;
     }
-    match write(task, addr, &before) {
+    match write(task, addr, before) {
         Ok(()) => {
             tracing::warn!(
                 "a failed write at 0x{:016x} had changed memory; the original bytes were restored",
                 addr.value()
             );
-            Err(error)
+            error
         }
         // The restore can put the bytes back and still fail, as when the cache flush is
         // what failed the first write too: memory then holds its original bytes.
@@ -453,14 +489,14 @@ fn write_restoring(
                  {rollback}",
                 addr.value()
             );
-            Err(error)
+            error
         }
-        Err(rollback) => Err(DebuggerError::Io(Error::other(format!(
+        Err(rollback) => DebuggerError::Io(Error::other(format!(
             "{error}; restoring the original {} bytes at 0x{:016x} also failed ({rollback}), so that memory may be partly \
              written",
             before.len(),
             addr.value()
-        )))),
+        ))),
     }
 }
 

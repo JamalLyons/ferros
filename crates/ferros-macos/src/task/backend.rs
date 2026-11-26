@@ -22,7 +22,16 @@ impl Backend for MacOSBackend
         let pid = launch::LaunchManager::launch(spec).map_err(backend_error)?;
         debug!("Attaching to spawned process");
         let process_id = ProcessId::from(pid as u32);
-        if let Err(err) = self.attach_task(process_id) {
+        let attached = if self
+            .fail_launch_task
+            .compare_exchange(-1, pid, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Err(DebuggerError::PermissionDenied("injected task_for_pid failure".into()))
+        } else {
+            self.attach_task(process_id)
+        };
+        if let Err(err) = attached {
             Self::discard_child(pid).map_err(|cleanup| BackendError::Os {
                 code: -1,
                 message: format!("launch failed ({err}); child cleanup also failed: {cleanup}"),

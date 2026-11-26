@@ -156,6 +156,33 @@ fn failed_launches_are_typed_and_leave_no_process()
     });
 }
 
+/// A launch whose task acquisition fails after `posix_spawn` succeeded kills and reaps
+/// the suspended child before returning the error: it leaves the process table, not
+/// just the list of live tagged processes.
+#[test]
+fn launch_discards_a_child_whose_task_cannot_be_acquired()
+{
+    harness::run(|t| {
+        let mut backend = MacOSBackend::new().expect("backend");
+        let discarded = backend.launch_task_fault_injector();
+        let tag = t.tag();
+        assert!(matches!(
+            backend.launch(&LaunchSpec::new(fixture!("loop_counter").path()).arg(tag.as_str())),
+            Err(BackendError::PermissionDenied(_))
+        ));
+        let pid = discarded().expect("the fault fired after spawning a child");
+        // Checked before dropping the tag: the backend must do the reaping.
+        assert_reaped(pid.0);
+        // The fault is one-shot and the backend remains usable.
+        let launch_tag = t.tag();
+        let pid = backend
+            .launch(&LaunchSpec::new(fixture!("hello").path()).arg(launch_tag.as_str()))
+            .expect("valid launch");
+        backend.kill().expect("kill");
+        assert_reaped(pid.0);
+    });
+}
+
 #[test]
 fn session_drop_reaps_at_entry_and_while_running()
 {
@@ -271,15 +298,83 @@ fn early_replied_signal_can_be_replaced_with_sigkill()
     });
 }
 
-/// A nonfatal replacement is passed once, without exposing a second signal stop.
+/// Removes a `signal_tracing` acknowledgement directory on unwind.
+struct SignalObserver(std::path::PathBuf);
+
+impl SignalObserver
+{
+    fn new() -> Self
+    {
+        Self(scratch::create_dir("ferros-lifecycle-signals"))
+    }
+
+    fn arg(&self) -> &str
+    {
+        self.0.to_str().expect("observer path must be UTF-8")
+    }
+
+    fn acknowledged(&self, file: &str) -> bool
+    {
+        self.0.join(file).exists()
+    }
+
+    fn progress(&self) -> Option<u64>
+    {
+        fs::read_to_string(self.0.join("progress")).ok()?.parse().ok()
+    }
+
+    fn wait_for(&self, file: &str)
+    {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.acknowledged(file) {
+            assert!(Instant::now() < deadline, "missing {file} acknowledgement");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Wait for the fixture's main loop to write `advances` more progress values, so
+    /// every signal handled before this call has had its acknowledgement written.
+    fn wait_for_progress(&self, advances: u64)
+    {
+        let deadline = Instant::now() + TIMEOUT;
+        let start = loop {
+            if let Some(progress) = self.progress() {
+                break progress;
+            }
+            assert!(Instant::now() < deadline, "no progress acknowledgement");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        while self.progress().is_none_or(|progress| progress < start + advances) {
+            assert!(Instant::now() < deadline, "the fixture stopped making progress");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for SignalObserver
+{
+    fn drop(&mut self)
+    {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A nonfatal replacement is passed once, without exposing a second signal stop: the
+/// target's SIGCONT handler runs, and its SIGUSR1 handler never does.
 #[test]
 fn held_signal_can_be_replaced_with_a_nonfatal_signal()
 {
     harness::run(|t| {
-        let mut d = t.launch_with_args(&fixture!("loop_counter"), &["25"]);
+        let observer = SignalObserver::new();
+        let mut d = t.launch_with_args(&fixture!("signal_tracing"), &[observer.arg()]);
         let pid = d.pid().0;
+        d.resume().expect("run handler setup");
+        observer.wait_for("ready");
+        // Neither handler has run yet, so each later acknowledgement is the replacement's.
+        observer.wait_for_progress(3);
+        assert!(!observer.acknowledged("continued"), "SIGCONT handler ran before any SIGCONT");
+        assert!(!observer.acknowledged("handled"), "SIGUSR1 handler ran before any SIGUSR1");
         signal(pid, "-USR1");
-        d.resume().expect("resume to signal");
         let thread = match d.wait(Some(TIMEOUT)).expect("signal stop") {
             Some(StopEvent::Signal { signal: SIGUSR1, thread }) => thread,
             other => panic!("expected SIGUSR1, got {other:?}"),
@@ -289,11 +384,12 @@ fn held_signal_can_be_replaced_with_a_nonfatal_signal()
             .backend_mut()
             .resume(&ResumeRequest::continue_all().with_signal(thread, 19))
             .expect("replace SIGUSR1 with SIGCONT");
-        assert_eq!(
-            d.wait(Some(TIMEOUT)).expect("exit without duplicate stop"),
-            Some(StopEvent::Exited { code: 0 })
-        );
-        assert!(d.wait_for_stdout("final count: 25", TIMEOUT));
+        observer.wait_for("continued");
+        observer.wait_for_progress(5);
+        assert!(!observer.acknowledged("handled"), "the replaced SIGUSR1 was delivered too");
+        // A second delivery of SIGCONT would stop the traced target again.
+        assert_eq!(d.wait(Some(Duration::from_millis(150))).expect("no duplicate stop"), None);
+        d.kill().expect("kill");
         assert_reaped(pid);
     });
 }
@@ -1381,25 +1477,39 @@ fn restore_failure_is_reported_after_detach_and_session_can_be_reused()
     });
 }
 
+/// Detach continues a target that was already job-control stopped before attach: it
+/// runs again, exits cleanly when asked to, and is not killed.
 #[test]
 fn detach_resumes_a_target_stopped_before_attach()
 {
     harness::run(|t| {
-        let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
-        signal(target.pid().0, "-STOP");
+        let exit_gate = ReleaseFile::exit_gate();
+        let mut target = t.spawn(&fixture!("loop_counter"), &exit_gate.gate_args());
+        let pid = target.pid().0;
+        signal(pid, "-STOP");
         let deadline = Instant::now() + TIMEOUT;
-        while !process_state(target.pid().0).contains('T') {
+        while !process_state(pid).contains('T') {
             assert!(Instant::now() < deadline, "target never stopped");
             std::thread::sleep(Duration::from_millis(10));
         }
         let mut session = ferros_macos::new_session().expect("backend");
         session.attach(target.pid()).expect("attach stopped target");
         session.detach().expect("detach resumes even a previously stopped target");
+        // Only a running process reads the gate opened after detach and exits 0.
+        exit_gate.open_gate();
         let deadline = Instant::now() + TIMEOUT;
-        while process_state(target.pid().0).contains('T') {
-            assert!(Instant::now() < deadline, "detach left target stopped");
+        let status = loop {
+            if let Some(status) = target.try_wait().expect("check target status") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detach left the target unable to exit: state {}",
+                process_state(pid)
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        assert!(status.success(), "the detached target exited with {status}");
     });
 }
 

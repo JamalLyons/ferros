@@ -31,6 +31,24 @@ fn attach_to_exited_pid_returns_not_found()
     assert_eq!(session.state(), SessionState::NotStarted);
 }
 
+#[test]
+fn attach_permission_denial_explains_signing_and_launch()
+{
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.fail_next_task_for_pid();
+        let err = backend.attach(target.pid()).expect_err("task-port request should fail");
+        let BackendError::PermissionDenied(detail) = err else {
+            panic!("expected PermissionDenied, got {err:?}");
+        };
+        assert!(detail.contains("com.apple.security.cs.debugger"), "{detail}");
+        assert!(detail.contains("just sign-debugger"), "{detail}");
+        assert!(detail.contains("ferros launch <program>"), "{detail}");
+        assert!(!detail.contains("sudo ferros"), "{detail}");
+    });
+}
+
 /// The harness launches fixtures through `ferros_macos::MacOSBackend`.
 #[test]
 fn launch_through_macos_crate_reports_target_architecture()

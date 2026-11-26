@@ -33,7 +33,11 @@ impl MacOSBackend
         unsafe {
             let mut task: mach_port_t = 0;
             trace!("Calling task_for_pid for PID {}", pid.0);
-            let result = ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task);
+            let result = if std::mem::take(&mut self.fail_task_for_pid) {
+                libc::KERN_FAILURE
+            } else {
+                ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task)
+            };
 
             if result != KERN_SUCCESS {
                 if result == libc::KERN_FAILURE {
@@ -45,10 +49,11 @@ impl MacOSBackend
 
                     if process_exists {
                         return Err(DebuggerError::PermissionDenied(format!(
-                            "task_for_pid() failed with KERN_FAILURE, but process {} exists. This means insufficient \
-                             permissions.\n\nQuick fix: Run with sudo:\n  sudo ferros attach {}\n\nAlternatively, use \
-                             launch() to spawn processes under debugger control, which doesn't require special permissions.",
-                            pid.0, pid.0
+                            "task_for_pid() failed with KERN_FAILURE, but process {} exists.\n\nFrom the repository root, \
+                             sign the debugger with the `com.apple.security.cs.debugger` entitlement using `just \
+                             sign-debugger <path-to-ferros>`, then retry with the signed binary.\n\nTo start a new process \
+                             under the debugger, use `ferros launch <program>`.",
+                            pid.0
                         )));
                     }
 

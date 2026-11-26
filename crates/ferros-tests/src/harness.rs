@@ -1150,9 +1150,6 @@ fn unique_tag() -> String
 }
 
 /// Builds the failure message for a denied (or stalled) `task_for_pid`.
-///
-/// `detail` is the engine's error text; only its first line is kept, because the rest advises
-/// `sudo`, which tests must not use.
 fn permission_guidance(detail: &str) -> String
 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<test executable>"));
@@ -1194,7 +1191,7 @@ fn permission_guidance(detail: &str) -> String
             message.push_str(authorization_step);
         }
     }
-    let _ = write!(message, "Detail: {}", detail.lines().next().unwrap_or_default());
+    let _ = write!(message, "Detail: {detail}");
     message
 }
 
@@ -1389,11 +1386,11 @@ mod tests
     }
 
     #[test]
-    fn permission_guidance_keeps_only_the_first_detail_line()
+    fn permission_guidance_keeps_all_detail_lines()
     {
-        let message = permission_guidance("task_for_pid() failed with KERN_FAILURE\n\nQuick fix: Run with sudo:\n  sudo x");
-        assert!(message.contains("Detail: task_for_pid() failed with KERN_FAILURE"));
-        assert!(!message.contains("sudo x"), "engine sudo advice leaked into: {message}");
+        let detail = "task_for_pid() failed with KERN_FAILURE\n\nRetry with a signed debugger.";
+        let message = permission_guidance(detail);
+        assert!(message.ends_with(detail));
         assert!(message.contains(DEBUGGER_ENTITLEMENT));
     }
 }

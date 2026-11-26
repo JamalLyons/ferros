@@ -24,6 +24,7 @@ fn all_fixtures() -> Vec<Fixture>
 {
     vec![
         fixture!("caught_panic"),
+        fixture!("dyld_aliases"),
         fixture!("exit_code"),
         fixture!("frameless_stack"),
         fixture!("hello"),

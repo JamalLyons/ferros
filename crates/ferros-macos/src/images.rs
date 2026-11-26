@@ -22,6 +22,8 @@
 //! All spellings returned the same base from
 //! `dladdr` and one row with the resolved path. A separate library with the same
 //! install name and a different UUID had its own row and address in every launch.
+//! The native integration test `dyld_reports_one_image_for_library_path_aliases`
+//! checks the one-row assumption on the macOS CI runner (#347).
 //!
 //! Apple dyld 1378 resolves aliases to existing loaders by path, file identity or
 //! shared-cache index. It skips duplicate startup insertions and publishes one path

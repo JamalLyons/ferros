@@ -147,3 +147,8 @@ test = false
 name = "ferros-fixture-soft_faults"
 path = "fixtures/soft_faults.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-dyld_aliases"
+path = "fixtures/dyld_aliases.rs"
+test = false

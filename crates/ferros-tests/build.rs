@@ -1,25 +1,27 @@
-//! Builds the non-Rust code of four fixtures and links each into its fixture only: the
-//! arm64 assembly of `frameless_stack` (see `fixtures/asm/frameless_stack.s`) and the C
-//! programs of `long_jump` (see `fixtures/c/long_jump.c`), `pthread_once` (see
-//! `fixtures/c/pthread_once.c`) and `soft_faults` (see `fixtures/c/soft_faults.c`).
+//! Builds the assembly and C code linked into individual arm64 macOS fixtures, plus
+//! the dynamic library loaded by the `dyld_aliases` fixture.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `(source, compiler flags, fixture)`.
-static SOURCES: [(&str, &[&str], &str); 4] = [
+static SOURCES: [(&str, &[&str], &str); 5] = [
     ("fixtures/asm/frameless_stack.s", &[], "frameless_stack"),
     ("fixtures/c/long_jump.c", &["-g", "-O0"], "long_jump"),
     ("fixtures/c/pthread_once.c", &["-g", "-O0"], "pthread_once"),
     ("fixtures/c/soft_faults.c", &["-g", "-O0"], "soft_faults"),
+    ("fixtures/c/dyld_aliases.c", &["-g", "-O0"], "dyld_aliases"),
 ];
+
+const ALIAS_LIBRARY_SOURCE: &str = "fixtures/c/alias_library.c";
 
 fn main()
 {
     for (source, _, _) in &SOURCES {
         println!("cargo::rerun-if-changed={source}");
     }
+    println!("cargo::rerun-if-changed={ALIAS_LIBRARY_SOURCE}");
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if os != "macos" || arch != "aarch64" {
@@ -40,4 +42,13 @@ fn main()
         assert!(status.success(), "cc failed to build {source}: {status}");
         println!("cargo::rustc-link-arg-bin=ferros-fixture-{fixture}={}", object.display());
     }
+    let library = out_dir.join("libferros_alias_fixture.dylib");
+    let status = Command::new("cc")
+        .args(["-arch", "arm64", "-dynamiclib"])
+        .arg(ALIAS_LIBRARY_SOURCE)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .expect("run cc to build the dyld alias library");
+    assert!(status.success(), "cc failed to build {ALIAS_LIBRARY_SOURCE}: {status}");
 }

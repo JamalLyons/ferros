@@ -195,8 +195,10 @@ If a test fails with "task_for_pid was denied":
 - If the detail says `Session::launch did not return within 5s`: macOS is waiting for a "Developer Tools Access" authorization. In a desktop session, approve the dialog once. On a machine with nobody at the screen (CI), the dialog cannot be answered; the `integration-macos` job in `.github/workflows/rust.yml` shows the machine setup step that removes it. The harness kills the half-launched fixture either way.
 
 Two environment switches are available for diagnostic and harness verification:
-- `FERROS_TEST_UNSIGNED=1`: the runner re-signs the test executable without the entitlement to verify the permission-failure path.
+- `FERROS_TEST_UNSIGNED=1`: runs without the debugger entitlement to verify the permission-failure path.
 - `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
+
+When the runner needs to change a signature, it executes a cached copy alongside the Cargo artifact. `cargo clean` removes these copies. Use `just sign-debugger` to sign an artifact for direct execution.
 
 Leaked fixtures: after an interrupted run, `pgrep -fl ferros-fixture-` lists orphans (also from other worktrees); `just kill-fixtures` kills only this worktree's. Do not use `pkill -f ferros-fixture-`.
 

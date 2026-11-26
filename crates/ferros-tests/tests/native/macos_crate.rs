@@ -5,8 +5,11 @@
 
 use std::process::Command;
 
-use ferros_core::{BackendError, DebuggerError, ProcessId, SessionState};
+use ferros_core::backend::Backend;
+use ferros_core::{Architecture, BackendError, DebuggerError, LaunchSpec, ProcessId, SessionState};
+use ferros_macos::MacOSBackend;
 use ferros_tests::{fixture, harness};
+use object::macho::CPU_TYPE_X86_64;
 
 /// Attaching to a pid whose process has exited reports the portable `NotFound`.
 ///
@@ -30,16 +33,71 @@ fn attach_to_exited_pid_returns_not_found()
 
 /// The harness launches fixtures through `ferros_macos::MacOSBackend`.
 #[test]
-fn launch_through_macos_crate_reports_host_architecture()
+fn launch_through_macos_crate_reports_target_architecture()
 {
     harness::run(|t| {
         let d = t.launch(&fixture!("hello"));
         assert_eq!(d.state(), SessionState::Stopped, "process should be stopped at entry");
-        #[cfg(target_arch = "aarch64")]
-        assert!(
-            matches!(d.architecture(), ferros_core::Architecture::Arm64),
-            "unexpected architecture {:?}",
-            d.architecture()
+        assert_eq!(d.architecture(), Architecture::Arm64);
+        assert_eq!(
+            d.backend().arch().expect("target architecture").architecture(),
+            Architecture::Arm64
         );
+    });
+}
+
+#[test]
+fn launch_rejects_an_unsupported_target_cpu_type()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hello");
+        let mut backend = MacOSBackend::new().expect("backend");
+        // Exercise rejection on hosts where the kernel cannot launch a translated executable.
+        backend.override_next_target_cpu_type(CPU_TYPE_X86_64.0);
+        let tag = t.tag();
+        let result = backend.launch(&LaunchSpec::new(fixture.path()).arg(tag.as_str()));
+        assert!(
+            matches!(&result, Err(BackendError::Unsupported(message)) if message.contains("x86-64")),
+            "expected unsupported x86-64 target, got {result:?}"
+        );
+        assert!(
+            harness::tagged_pids(tag.as_str()).is_empty(),
+            "rejected child survived launch"
+        );
+
+        let retry = t.tag();
+        backend
+            .launch(&LaunchSpec::new(fixture.path()).arg(retry.as_str()))
+            .expect("retry launch");
+        assert_eq!(
+            backend.arch().expect("target architecture").architecture(),
+            Architecture::Arm64
+        );
+        backend.kill().expect("kill launched target");
+        assert_eq!(backend.architecture(), Architecture::current());
+    });
+}
+
+#[test]
+fn attach_rejects_an_unsupported_target_cpu_type()
+{
+    harness::run(|t| {
+        let target = t.spawn(&fixture!("loop_counter"), &["100000"]);
+        let pid = target.pid();
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.override_next_target_cpu_type(CPU_TYPE_X86_64.0);
+        let result = backend.attach(pid);
+        assert!(
+            matches!(&result, Err(BackendError::Unsupported(message)) if message.contains("x86-64")),
+            "expected unsupported x86-64 target, got {result:?}"
+        );
+
+        backend.attach(pid).expect("retry attach to the same target");
+        assert_eq!(
+            backend.arch().expect("target architecture").architecture(),
+            Architecture::Arm64
+        );
+        backend.detach().expect("detach supported target");
+        assert_eq!(backend.architecture(), Architecture::current());
     });
 }

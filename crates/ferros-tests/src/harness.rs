@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ferros_core::backend::StdioSpec;
 use ferros_core::{DebuggerError, LaunchSpec, ProcessId, Session};
 
-use crate::Fixture;
+use crate::{Fixture, scratch};
 
 /// Deadline applied by [`run`] to a whole test body.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -137,6 +137,7 @@ where
         shared.cancelled.store(true, Ordering::SeqCst);
     }
     let killed = shared.kill_all();
+    shared.remove_scratch();
 
     match outcome {
         Outcome::Finished(Ok(())) => {}
@@ -252,6 +253,8 @@ impl Tracked
 struct Shared
 {
     tracked: Mutex<Vec<Arc<Tracked>>>,
+    /// Scratch paths removed once processes are cleaned up, on every exit path.
+    scratch: Mutex<Vec<PathBuf>>,
     /// Set when the controller gave up on the test; later launches are refused.
     cancelled: AtomicBool,
 }
@@ -281,6 +284,29 @@ impl Shared
         );
         tracked.push(Arc::clone(&entry));
         entry
+    }
+
+    /// Registers `path` for removal; removes it at once if the test already failed its
+    /// deadline, since the final removal pass may have run.
+    fn register_scratch(&self, path: PathBuf)
+    {
+        let mut scratch = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled.load(Ordering::SeqCst) {
+            drop(scratch);
+            remove_scratch_path(&path);
+        } else {
+            scratch.push(path);
+        }
+    }
+
+    /// Removes every registered scratch path. Runs after processes are killed so nothing
+    /// still holds or recreates them.
+    fn remove_scratch(&self)
+    {
+        let paths = std::mem::take(&mut *self.scratch.lock().unwrap_or_else(PoisonError::into_inner));
+        for path in paths {
+            remove_scratch_path(&path);
+        }
     }
 
     fn forget(&self, tag: &str)
@@ -332,6 +358,19 @@ impl Shared
         killed.sort_unstable();
         killed.dedup();
         killed
+    }
+}
+
+/// Removes a file or directory tree, ignoring a path that is already gone.
+fn remove_scratch_path(path: &Path)
+{
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(_) => return,
+    };
+    if let Err(err) = result {
+        eprintln!("ferros-tests: could not remove scratch path {}: {err}", path.display());
     }
 }
 
@@ -547,6 +586,30 @@ impl TestContext
             fixture.name()
         );
         guard
+    }
+
+    /// Registers a file or directory for removal when the test ends: on normal completion,
+    /// on a panic in the body, and when the deadline fires (a deadline cannot unwind the
+    /// abandoned worker, so a drop guard alone would leak it). Removal runs after the test's
+    /// processes are killed and ignores a path that is already gone. Registering after the
+    /// deadline fired removes the path immediately.
+    pub fn remove_on_cleanup(&self, path: impl Into<PathBuf>)
+    {
+        self.shared.register_scratch(path.into());
+    }
+
+    /// Creates a unique empty file with [`scratch::create_file`] and registers it with
+    /// [`TestContext::remove_on_cleanup`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file cannot be created.
+    #[must_use]
+    pub fn scratch_file(&self, stem: &str, suffix: &str) -> (File, PathBuf)
+    {
+        let (file, path) = scratch::create_file(stem, suffix);
+        self.remove_on_cleanup(path.clone());
+        (file, path)
     }
 
     /// Reserves a fresh identifying argument (see [`TEST_ID_ARG_PREFIX`]) for processes the

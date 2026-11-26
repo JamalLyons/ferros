@@ -149,17 +149,30 @@ pub fn raw_memory(pid: ProcessId, address: Address, len: usize) -> Result<Vec<u8
 #[doc(hidden)]
 pub fn emulate_birth_entry_with_fault(pid: ProcessId, thread: u32, fault: BirthEntryWrite) -> Result<()>
 {
+    emulate_birth_entry_with_faults(pid, thread, |write| {
+        if write == fault {
+            return Err(ferros_core::BackendError::Os {
+                code: -1,
+                message: format!("injected {fault:?} write failure"),
+            });
+        }
+        Ok(())
+    })
+}
+
+/// Test hook: inject errors at the write and rollback boundaries of entry emulation.
+#[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
+pub fn emulate_birth_entry_with_faults(
+    pid: ProcessId,
+    thread: u32,
+    mut check: impl FnMut(BirthEntryWrite) -> ferros_core::BackendResult<()>,
+) -> Result<()>
+{
     with_task(pid, |task| {
         let registers = crate::registers::read_registers_arm64(thread)?;
-        crate::birth::emulate_entry_writes(task, thread, registers, |write| {
-            if write == fault {
-                return Err(DebuggerError::Io(std::io::Error::other(format!(
-                    "injected {fault:?} write failure"
-                ))));
-            }
-            Ok(())
-        })
-        .map_err(|error| DebuggerError::Io(std::io::Error::other(error)))
+        crate::birth::emulate_entry_writes(task, thread, registers, |write| check(write).map_err(Into::into))
+            .map_err(Into::into)
     })
 }
 

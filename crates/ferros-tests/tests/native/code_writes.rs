@@ -369,6 +369,41 @@ fn failed_birth_entry_neon_write_leaves_the_thread_unchanged()
     assert_entry_write_leaves_thread_unchanged(diagnostics::BirthEntryWrite::NeonRegisters);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn failed_birth_entry_rollback_preserves_the_neon_error_category()
+{
+    use diagnostics::BirthEntryWrite;
+    use ferros_core::DebuggerError;
+
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (thread, _) = hold_a_newborn(&mut d, &fixture);
+        let port = u32::try_from(thread.raw()).expect("Mach thread port");
+
+        let error = diagnostics::emulate_birth_entry_with_faults(d.pid(), port, |write| match write {
+            BirthEntryWrite::NeonRegisters => Err(BackendError::PermissionDenied("injected NEON write failure".into())),
+            BirthEntryWrite::RestoreGeneralRegisters => Err(BackendError::Os {
+                code: 4,
+                message: "injected general register rollback failure".into(),
+            }),
+            _ => Ok(()),
+        })
+        .expect_err("the injected entry write must fail");
+
+        let DebuggerError::PermissionDenied(message) = error else {
+            panic!("expected the original permission error, got {error:?}");
+        };
+        assert!(message.contains("injected NEON write failure"), "{message}");
+        assert!(message.contains("restoring the original general registers"), "{message}");
+        assert!(
+            message.contains("also failed (OS error 4: injected general register rollback failure)"),
+            "{message}"
+        );
+    });
+}
+
 /// A write the backend refuses after planning it leaves a covered birth trap's saved
 /// instruction and client-breakpoint ownership as they were, and a later successful
 /// write is what disarm keeps.

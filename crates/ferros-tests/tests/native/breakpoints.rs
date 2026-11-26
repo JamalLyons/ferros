@@ -13,9 +13,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use ferros_core::{
-    Address, BreakpointId, BreakpointRequest, DebuggerError, Session, SessionState, StopEvent, ThreadId, arch,
-};
+use ferros_core::{Address, BreakpointId, BreakpointRequest, DebuggerError, Session, SessionState, StopEvent, ThreadId};
 use ferros_tests::arm64::{Flow, NOP, TRAP, flow, sp_decrement};
 use ferros_tests::harness::{self, Spawned};
 use ferros_tests::symbols::function_address;
@@ -170,10 +168,14 @@ fn breakpoint_writes_trap_and_remove_restores_original_bytes()
 
         let id = add(&mut d, pc);
         let with_trap = raw(&mut d, pc);
-        let trap = arch::for_architecture(d.architecture())
-            .expect("architecture with trap support")
-            .trap_instruction();
-        assert_eq!(&with_trap[..trap.len()], trap, "trap bytes not written at {pc}");
+        let trap = d
+            .session()
+            .backend()
+            .arch()
+            .expect("backend architecture with trap support")
+            .trap_instruction()
+            .to_vec();
+        assert_eq!(&with_trap[..trap.len()], &trap[..], "trap bytes not written at {pc}");
         assert_eq!(with_trap, TRAP, "arm64 brk #0 not written at {pc}");
         assert_ne!(with_trap, original, "the entry instruction already was a trap");
         assert_eq!(

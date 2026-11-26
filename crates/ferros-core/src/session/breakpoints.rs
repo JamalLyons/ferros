@@ -127,8 +127,8 @@ impl Session
     /// Add a breakpoint and insert its trap.
     ///
     /// Only [`BreakpointRequest::Software`] is supported. If a software breakpoint
-    /// already exists at the address, its id is returned and nothing changes (a disabled
-    /// breakpoint stays disabled).
+    /// already exists at the address, its id and enabled state are preserved. An armed
+    /// temporary trap at the address becomes a user breakpoint and survives cleanup.
     ///
     /// # Errors
     ///
@@ -150,6 +150,19 @@ impl Session
                 return Err(BackendError::Unsupported("watchpoints are not supported by Session".into()).into());
             }
         };
+        let id = self.add_software_breakpoint(address)?;
+        if let Some(plan) = &mut self.line_plan {
+            plan.claim_site(id);
+        }
+        if let Some(exits) = &mut self.handler_exits {
+            exits.claim_site(id);
+        }
+        Ok(id)
+    }
+
+    pub(super) fn add_software_breakpoint(&mut self, address: Address) -> Result<BreakpointId>
+    {
+        self.require_stopped()?;
         if let Some(existing) = self.breakpoints.id_for_kind(address, BreakpointKind::Software) {
             return Ok(existing);
         }
@@ -660,7 +673,7 @@ impl Session
                         break;
                     }
                 },
-                None => match self.add_breakpoint(BreakpointRequest::Software { address: site.address }) {
+                None => match self.add_software_breakpoint(site.address) {
                     Ok(id) => added.push(id),
                     Err(error) => {
                         result = Err(error);

@@ -688,3 +688,40 @@ fn an_unreadable_uuid_is_another_build_than_a_known_mapped_one()
     assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
     assert!(error.to_string().contains("another build"), "{error}");
 }
+
+#[test]
+fn a_known_mapped_uuid_skips_a_universal_slice_with_an_unreadable_uuid()
+{
+    let unreadable = slice_with_unreadable_uuid();
+    let matching = slice(ARM64, ARM64E, [4; 16], 0x2_0000_0000);
+    let target = SliceIdentity::from_header(&matching).unwrap();
+    let path = Path::new("/universal");
+
+    let bytes = universal(&[&unreadable, &matching], &[(ARM64, ARM64E), (ARM64, ARM64E)]);
+    assert_eq!(image_slice(path, &bytes, Some(&target)).unwrap(), &matching[..]);
+
+    let bytes = universal(&[&unreadable], &[(ARM64, ARM64E)]);
+    let error = image_slice(path, &bytes, Some(&target)).expect_err("no slice with the mapped UUID");
+    assert!(matches!(error, DebuggerError::InvalidArgument(_)), "{error}");
+}
+
+#[test]
+fn an_unknown_mapped_uuid_serves_a_universal_slice_with_an_absent_build_id()
+{
+    let unreadable = slice_with_unreadable_uuid();
+    let matching = slice(ARM64, ARM64E, [4; 16], 0x2_0000_0000);
+    let known = SliceIdentity::from_header(&matching).unwrap();
+    let unknown = SliceIdentity { uuid: None, ..known };
+    let bytes = universal(&[&unreadable, &matching], &[(ARM64, ARM64E), (ARM64, ARM64E)]);
+    let path = write("universal-unreadable-uuid", &bytes);
+    let image = parse(&path, Some(&unknown));
+    fs::remove_file(&path).unwrap();
+
+    let image = image.expect("read the first slice while the mapped UUID is unknown");
+    assert_eq!(text(&image), Some(0x1_0000_0000));
+    assert_eq!(image.build_id, BuildIdentity::Absent);
+    assert!(!ferros_core::types::same_build(
+        image.build_id,
+        known.to_image_slice().build_id()
+    ));
+}

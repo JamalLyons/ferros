@@ -10,10 +10,14 @@ use ferros_core::{Address, LaunchSpec, ProcessId, Session, StopEvent, ThreadId};
 
 use super::commands::{find, parse_address, parse_number};
 use super::jobs::NoJobControl;
-use super::{Debugger, Input, PROMPT, Target, history_path};
+use super::{Debugger, Input, PROMPT, Target, TerminalSignals, history_path};
 
 const THREAD: ThreadId = ThreadId(7);
 const CODE: u64 = 0x1_0000;
+const TEST_TERMINAL_SIGNALS: TerminalSignals = TerminalSignals {
+    suppress_on_continue: &[2, 18],
+    background_io: &[21, 22],
+};
 
 fn mock() -> MockBackend
 {
@@ -43,9 +47,14 @@ struct Transcript
     err: String,
 }
 
-fn run_with(mock: &MockBackend, target: Target, input: Input<Cursor<Vec<u8>>>) -> Transcript
+fn run_with(
+    mock: &MockBackend,
+    target: Target,
+    input: Input<Cursor<Vec<u8>>>,
+    terminal_signals: TerminalSignals,
+) -> Transcript
 {
-    let (mut debugger, _) = Debugger::start(session(mock), target).expect("start");
+    let (mut debugger, _) = Debugger::start(session(mock), target, terminal_signals).expect("start");
     let mut out = Vec::new();
     let mut err = Vec::new();
     let ok = super::run(
@@ -66,7 +75,12 @@ fn run_with(mock: &MockBackend, target: Target, input: Input<Cursor<Vec<u8>>>) -
 fn batch(mock: &MockBackend, commands: &[&str]) -> Transcript
 {
     let lines = commands.iter().map(|line| (*line).to_owned()).collect();
-    run_with(mock, Target::Launch(LaunchSpec::new("/bin/prog")), Input::Lines(lines))
+    run_with(
+        mock,
+        Target::Launch(LaunchSpec::new("/bin/prog")),
+        Input::Lines(lines),
+        TEST_TERMINAL_SIGNALS,
+    )
 }
 
 #[test]
@@ -245,6 +259,7 @@ fn end_of_input_detaches_an_attached_process()
         &mock,
         Target::Attach(ProcessId(42)),
         Input::Lines(["status".to_owned()].into()),
+        TEST_TERMINAL_SIGNALS,
     );
     assert!(t.ok, "{}", t.err);
     assert!(t.out.ends_with("detached from process 42\n"), "{}", t.out);
@@ -258,7 +273,12 @@ fn piped_input_prints_prompts_and_echoes()
 {
     let mock = mock();
     let input = Input::Reader(Cursor::new(b"status\nbogus\n".to_vec()));
-    let t = run_with(&mock, Target::Launch(LaunchSpec::new("/bin/prog")), input);
+    let t = run_with(
+        &mock,
+        Target::Launch(LaunchSpec::new("/bin/prog")),
+        input,
+        TEST_TERMINAL_SIGNALS,
+    );
     assert!(!t.ok);
     assert!(
         t.out.starts_with(&format!(
@@ -342,6 +362,52 @@ fn continue_does_not_pass_sigint_on()
 }
 
 #[test]
+fn suspend_signal_follows_the_injected_map()
+{
+    use ferros_core::ResumeRequest;
+    use ferros_core::backend::mock::MockCall;
+
+    const SUSPEND: i32 = 20;
+
+    let mock = mock();
+    mock.script(MockStop::new(StopEvent::Signal {
+        thread: THREAD,
+        signal: SUSPEND,
+    }));
+    mock.script(MockStop::new(StopEvent::Signal {
+        thread: THREAD,
+        signal: 18,
+    }));
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    let t = run_with(
+        &mock,
+        Target::Launch(LaunchSpec::new("/bin/prog")),
+        Input::Lines(["c"; 3].into_iter().map(str::to_owned).collect()),
+        TerminalSignals {
+            suppress_on_continue: &[2, SUSPEND],
+            ..TEST_TERMINAL_SIGNALS
+        },
+    );
+    assert!(t.ok, "{}", t.err);
+    let resumes: Vec<_> = mock
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            MockCall::Resume(request) => Some(request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resumes,
+        vec![
+            ResumeRequest::continue_all(),
+            ResumeRequest::continue_all(),
+            ResumeRequest::continue_all().with_signal(THREAD, 18),
+        ]
+    );
+}
+
+#[test]
 fn continue_after_a_fault_prints_its_kind_and_passes_no_signal()
 {
     use ferros_core::backend::mock::MockCall;
@@ -375,7 +441,12 @@ fn continue_after_a_fault_prints_its_kind_and_passes_no_signal()
 fn interrupt_flag_interrupts_a_running_process()
 {
     let mock = mock();
-    let (mut debugger, _) = Debugger::start(session(&mock), Target::Launch(LaunchSpec::new("/bin/prog"))).expect("start");
+    let (mut debugger, _) = Debugger::start(
+        session(&mock),
+        Target::Launch(LaunchSpec::new("/bin/prog")),
+        TEST_TERMINAL_SIGNALS,
+    )
+    .expect("start");
     debugger.session.resume().expect("resume");
     let flag = AtomicBool::new(true);
     let event = super::interrupt::wait_for_stop(&mut debugger.session, &flag, &NoJobControl).expect("wait");

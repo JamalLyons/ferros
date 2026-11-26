@@ -9,8 +9,8 @@ impl Backend for MacOSBackend
     /// take its task port.
     ///
     /// `spec.program` is argv\[0\], followed by `spec.args`; the environment, working
-    /// directory and standard streams follow `spec`. If the task port cannot be obtained,
-    /// the spawned process is killed and reaped before the error is returned.
+    /// directory and standard streams follow `spec`. If the architecture lookup or task
+    /// acquisition fails, the spawned process is killed and reaped before the error is returned.
     fn launch(&mut self, spec: &LaunchSpec) -> BackendResult<ProcessId>
     {
         use tracing::{debug, info};
@@ -27,16 +27,16 @@ impl Backend for MacOSBackend
             .compare_exchange(-1, pid, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            Err(DebuggerError::PermissionDenied("injected task_for_pid failure".into()))
+            Err(BackendError::PermissionDenied("injected task_for_pid failure".into()))
         } else {
-            self.attach_task(process_id)
+            self.attach_task_with_architecture(process_id)
         };
         if let Err(err) = attached {
             Self::discard_child(pid).map_err(|cleanup| BackendError::Os {
                 code: -1,
                 message: format!("launch failed ({err}); child cleanup also failed: {cleanup}"),
             })?;
-            return Err(backend_error(err));
+            return Err(err);
         }
         self.launched = true;
         self.child_cleanup.launched(pid);
@@ -60,7 +60,7 @@ impl Backend for MacOSBackend
             return Err(self.invalid_state("attach"));
         }
 
-        self.attach_task(pid).map_err(backend_error)?;
+        self.attach_task_with_architecture(pid)?;
         self.state = BackendState::Stopped;
         if let Err(err) = self.start_tracing() {
             // Before tracing succeeds no SIGSTOP was sent; afterwards undo tracing

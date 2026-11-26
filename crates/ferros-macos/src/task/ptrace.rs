@@ -95,6 +95,7 @@ impl MacOSBackend
         self.task = 0;
         self.threads.clear();
         self.pid = ProcessId(0);
+        self.architecture = Architecture::current();
         self.launched = false;
         self.child_cleanup = launch::ChildCleanup::default();
         self.traced = false;

@@ -102,6 +102,7 @@ use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE};
 use mach2::task::{task_resume, task_suspend, task_threads};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
+use object::macho::{CPU_TYPE_ARM64, CPU_TYPE_X86_64, CpuType};
 
 use crate::error::MachError;
 use crate::exception::{
@@ -254,6 +255,36 @@ pub fn target_arch(architecture: Architecture) -> BackendResult<Arc<dyn Arch>>
     }
 }
 
+/// Ask the kernel for the CPU type of the running executable slice. This is
+/// available even for a suspended spawn, before dyld publishes its image list.
+fn process_cpu_type(pid: ProcessId) -> BackendResult<u32>
+{
+    // Darwin's <sys/proc_info.h> defines this flavor and its two-word proc_archinfo
+    // result (CPU type followed by CPU subtype). libc does not expose either.
+    const PROC_PIDARCHINFO: c_int = 19;
+    let mut info = [0_u32; 2];
+    let size = std::mem::size_of_val(&info) as c_int;
+    // SAFETY: `info` is aligned for both native 32-bit words and writable for `size` bytes.
+    let written = unsafe { libc::proc_pidinfo(pid.0 as c_int, PROC_PIDARCHINFO, 0, info.as_mut_ptr().cast(), size) };
+    if written == size {
+        return Ok(info[0]);
+    }
+    if written <= 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Err(BackendError::NotFound(format!("process {} has exited", pid.0)));
+        }
+        return Err(backend_error(error.into()));
+    }
+    Err(BackendError::Os {
+        code: -1,
+        message: format!(
+            "proc_pidinfo returned {written} bytes of architecture data for process {}",
+            pid.0
+        ),
+    })
+}
+
 /// Read the registers of `thread` for `architecture`.
 pub(crate) fn read_registers_for_port(architecture: Architecture, thread: thread_act_t) -> Result<Registers>
 {
@@ -359,7 +390,7 @@ pub struct MacOSBackend
     threads: Vec<thread_act_t>,
     /// Process ID of the target process.
     pid: ProcessId,
-    /// Architecture metadata.
+    /// Detected target architecture, or the host default while there is no target.
     architecture: Architecture,
     /// Contract state.
     state: BackendState,
@@ -399,6 +430,8 @@ pub struct MacOSBackend
     /// child's task port. `0` unarmed, `-1` armed, otherwise the pid of the child that
     /// launch discarded.
     fail_launch_task: Arc<AtomicI32>,
+    /// One-shot integration test override for the CPU type returned by `proc_pidinfo`.
+    target_cpu_type_override: Option<u32>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
     events_tx: Option<mpsc::Sender<LoopEvent>>,
     /// Receiver side of the stop event channel, read by `wait`.
@@ -452,6 +485,32 @@ impl MacOSBackend
         Ok(Self::empty())
     }
 
+    /// Detect the architecture before `attach_task` configures the exception handler.
+    fn attach_task_with_architecture(&mut self, pid: ProcessId) -> BackendResult<()>
+    {
+        let cpu_type = process_cpu_type(pid)?;
+        let cpu_type = CpuType(self.target_cpu_type_override.take().unwrap_or(cpu_type));
+        self.architecture = match cpu_type {
+            CPU_TYPE_ARM64 if cfg!(target_arch = "aarch64") => Architecture::Arm64,
+            CPU_TYPE_ARM64 => return Err(BackendError::Unsupported("arm64 targets require an arm64 debugger".into())),
+            CPU_TYPE_X86_64 => {
+                return Err(BackendError::Unsupported(
+                    "the macOS backend does not support x86-64 targets".into(),
+                ));
+            }
+            _ => {
+                return Err(BackendError::Unsupported(format!(
+                    "unsupported target CPU type {:#010x}",
+                    cpu_type.0
+                )));
+            }
+        };
+        self.attach_task(pid).map_err(|error| {
+            self.architecture = Architecture::current();
+            backend_error(error)
+        })
+    }
+
     fn empty() -> Self
     {
         Self {
@@ -476,6 +535,7 @@ impl MacOSBackend
             fail_hold_suspend: Arc::default(),
             fail_register_read: Arc::default(),
             fail_launch_task: Arc::default(),
+            target_cpu_type_override: None,
             events_tx: None,
             events_rx: None,
             peeked: None,
@@ -648,6 +708,13 @@ impl MacOSBackend
                 .filter(|&pid| pid != 0)
                 .map(ProcessId)
         }
+    }
+
+    /// Test hook: substitute the raw CPU type from the next successful target lookup.
+    #[doc(hidden)]
+    pub fn override_next_target_cpu_type(&mut self, cpu_type: u32)
+    {
+        self.target_cpu_type_override = Some(cpu_type);
     }
 }
 

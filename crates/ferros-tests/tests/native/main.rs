@@ -13,6 +13,7 @@ mod breakpoints;
 mod cli;
 mod code_writes;
 mod debuginfo;
+mod error_codes;
 mod exit_watcher;
 mod fixture_staging;
 mod fixtures;

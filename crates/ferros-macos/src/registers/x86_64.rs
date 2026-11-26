@@ -33,6 +33,7 @@ use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use tracing::debug;
 
+use crate::error::mach_failure;
 use crate::{constants, ffi};
 
 /// Read x86-64 registers from a thread
@@ -68,7 +69,7 @@ use crate::{constants, ffi};
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::ReadRegistersFailed`: `thread_get_state()` failed
+/// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_get_state()`
 ///
 /// ## See Also
 ///
@@ -138,11 +139,7 @@ pub fn read_registers_x86_64(thread: thread_act_t) -> Result<Registers>
         );
 
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::ReadRegistersFailed {
-                operation: "read x86-64 thread state".to_string(),
-                thread_id: None,
-                details: format!("thread_get_state failed: {}", result),
-            });
+            return Err(mach_failure("thread_get_state(x86_THREAD_STATE64)", result).into());
         }
 
         let mut regs = Registers::new();
@@ -293,7 +290,7 @@ pub fn write_registers_x86_64(thread: thread_act_t, regs: &Registers) -> Result<
         );
 
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::InvalidArgument(format!("thread_set_state failed: {}", result)));
+            return Err(mach_failure("thread_set_state(x86_THREAD_STATE64)", result).into());
         }
     }
 
@@ -462,11 +459,7 @@ fn fetch_x86_float_state(thread: thread_act_t) -> Result<Option<X86FloatState64>
         debug!("x86 FLOAT state not available on this system");
         Ok(None)
     } else {
-        Err(DebuggerError::ReadRegistersFailed {
-            operation: "read x86-64 floating-point state".to_string(),
-            thread_id: None,
-            details: format!("thread_get_state(x86_FLOAT_STATE64) failed: {}", kr),
-        })
+        Err(mach_failure("thread_get_state(x86_FLOAT_STATE64)", kr).into())
     }
 }
 
@@ -528,10 +521,7 @@ fn write_x86_simd_state(thread: thread_act_t, regs: &Registers) -> Result<()>
         )
     };
     if kr != KERN_SUCCESS {
-        return Err(DebuggerError::InvalidArgument(format!(
-            "thread_set_state(x86_FLOAT_STATE64) failed: {}",
-            kr
-        )));
+        return Err(mach_failure("thread_set_state(x86_FLOAT_STATE64)", kr).into());
     }
 
     Ok(())

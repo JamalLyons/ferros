@@ -26,8 +26,8 @@ use crate::symbols::SourceLookupError;
 ///
 /// ## Error Categories
 ///
-/// 1. **Process errors**: ProcessNotFound, AttachFailed, NotAttached
-/// 2. **State errors**: NotStopped, SuspendFailed, ResumeFailed
+/// 1. **Process errors**: ProcessNotFound, NotAttached, AlreadyAttached
+/// 2. **State errors**: NotStopped, NotRunning
 /// 3. **Breakpoint errors**: NoBreakpoint, BreakpointIdNotFound
 /// 4. **Permission errors**: PermissionDenied
 /// 5. **Resource errors**: ResourceExhausted (hardware breakpoint/watchpoint limits)
@@ -101,19 +101,6 @@ pub enum DebuggerError
         /// The original failure.
         source: Box<DebuggerError>,
     },
-
-    /// Failed to attach to a process
-    ///
-    /// This is a general error for attachment failures that don't fit
-    /// into more specific categories. The string contains details about
-    /// what went wrong.
-    ///
-    /// For more specific errors, see:
-    /// - `NotAttached`: Debugger is not attached to any process
-    /// - `PermissionDenied`: Insufficient permissions to attach
-    /// - `ProcessNotFound`: Process doesn't exist
-    #[error("Failed to attach to process: {0}")]
-    AttachFailed(String),
 
     /// Operation requires the debugger to be attached to a process
     ///
@@ -191,47 +178,6 @@ pub enum DebuggerError
     /// ```
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
-
-    /// Failed to suspend the target process
-    ///
-    /// This error occurs when `suspend()` fails. This can happen if:
-    /// - The process has already exited
-    /// - The task port is invalid
-    /// - Insufficient permissions
-    #[error("Failed to suspend process: {0}")]
-    SuspendFailed(String),
-
-    /// Failed to resume the target process
-    ///
-    /// This error occurs when `resume()` fails. This can happen if:
-    /// - The process has already exited
-    /// - The task port is invalid
-    /// - Insufficient permissions
-    #[error("Failed to resume process: {0}")]
-    ResumeFailed(String),
-
-    /// Failed to read registers from the target process
-    ///
-    /// This can happen if:
-    /// - The thread has exited
-    /// - The thread state structure doesn't match what we expect
-    /// - The architecture is different than expected
-    ///
-    /// ## Context
-    ///
-    /// - `operation`: Description of what operation was being performed (e.g., "read ARM64 registers")
-    /// - `thread_id`: Optional thread ID if the operation was thread-specific
-    /// - `details`: Additional error details from the underlying system call
-    #[error("Failed to read registers: {operation}")]
-    ReadRegistersFailed
-    {
-        /// Description of the operation that failed
-        operation: String,
-        /// Thread ID if the operation was thread-specific
-        thread_id: Option<crate::types::ThreadId>,
-        /// Additional error details
-        details: String,
-    },
 
     /// Any other operating-system failure, carrying the raw OS code and message.
     #[error("OS error {code}: {message}")]
@@ -312,23 +258,11 @@ impl DebuggerError
                 path: path.clone(),
                 source: Box::new(source.duplicate()),
             },
-            Self::AttachFailed(message) => Self::AttachFailed(message.clone()),
             Self::NotAttached => Self::NotAttached,
             Self::NotStopped => Self::NotStopped,
             Self::NoBreakpoint(address) => Self::NoBreakpoint(*address),
             Self::BreakpointIdNotFound(id) => Self::BreakpointIdNotFound(*id),
             Self::ResourceExhausted(message) => Self::ResourceExhausted(message.clone()),
-            Self::SuspendFailed(message) => Self::SuspendFailed(message.clone()),
-            Self::ResumeFailed(message) => Self::ResumeFailed(message.clone()),
-            Self::ReadRegistersFailed {
-                operation,
-                thread_id,
-                details,
-            } => Self::ReadRegistersFailed {
-                operation: operation.clone(),
-                thread_id: *thread_id,
-                details: details.clone(),
-            },
             Self::Os { code, message } => Self::Os {
                 code: *code,
                 message: message.clone(),

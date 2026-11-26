@@ -21,7 +21,7 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 use std::sync::{Arc, RwLock};
 
 use ferros_core::BackendError;
@@ -48,7 +48,7 @@ use mach2::vm_statistics::{
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 use once_cell::sync::Lazy;
 
-use crate::error::{MachError, vm_read_error};
+use crate::error::{MachError, mach_failure, vm_read_error};
 use crate::{constants, ffi};
 
 // Use constants from the centralized constants module
@@ -333,10 +333,7 @@ pub fn write_memory(task: mach_port_t, addr: Address, data: &[u8]) -> Result<usi
         );
 
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("vm_write() failed with error code: {}", result),
-            )));
+            return Err(mach_failure(format_args!("vm_write at {addr}"), result).into());
         }
     }
 
@@ -404,7 +401,7 @@ fn write_with_protection_using(
             match (written, guard.restore_with(restore)) {
                 (Ok(_), Ok(())) => Ok(()),
                 (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-                (Err(error), Err(restore)) => Err(DebuggerError::Io(Error::other(format!("{error}; {restore}")))),
+                (Err(error), Err(restore)) => Err(with_context(error, |message| format!("{message}; {restore}"))),
             }
         }
     }
@@ -486,12 +483,28 @@ pub(crate) fn restore_failed_write(
             );
             error
         }
-        Err(rollback) => DebuggerError::Io(Error::other(format!(
-            "{error}; restoring the original {} bytes at 0x{:016x} also failed ({rollback}), so that memory may be partly \
-             written",
-            before.len(),
-            addr.value()
-        ))),
+        Err(rollback) => with_context(error, |message| {
+            format!(
+                "{message}; restoring the original {} bytes at 0x{:016x} also failed ({rollback}), so that memory may be \
+                 partly written",
+                before.len(),
+                addr.value()
+            )
+        }),
+    }
+}
+
+/// `error` with its message rewritten by `context`, keeping its category and code.
+///
+/// A [`DebuggerError::PermissionDenied`] stays one; any other error becomes the
+/// [`BackendError`] the `Backend` boundary would map it to, so a failure that collects
+/// more context on its way out never decays into `Os { code: -1 }` text.
+fn with_context(error: DebuggerError, context: impl FnOnce(&str) -> String) -> DebuggerError
+{
+    match error {
+        DebuggerError::PermissionDenied(message) => DebuggerError::PermissionDenied(context(&message)),
+        DebuggerError::Backend(error) => crate::error::reword(error, context).into(),
+        other => crate::error::reword(crate::task::backend_error(other), context).into(),
     }
 }
 
@@ -516,9 +529,11 @@ fn flush_caches(task: mach_port_t, addr: Address, len: usize) -> Result<()>
         // and writes that one value and validates the range in the target map itself.
         let result = unsafe { mach_vm_machine_attribute(task, start, size, MATTR_CACHE, &raw mut value) };
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(Error::other(format!(
-                "flushing the caches for 0x{start:016x}+{size} failed with error code: {result}"
-            ))));
+            return Err(mach_failure(
+                format_args!("mach_vm_machine_attribute(MATTR_CACHE) flushing 0x{start:016x}+{size}"),
+                result,
+            )
+            .into());
         }
         start += size;
     }
@@ -905,7 +920,7 @@ impl MemoryProtectionGuard
         let copy_on_write = (protection & VM_PROT_COPY) != 0;
 
         if requested_write && !max_allows_write && !copy_on_write {
-            return Err(DebuggerError::Io(Error::other(format!(
+            return Err(DebuggerError::from(BackendError::PermissionDenied(format!(
                 "Cannot make memory writable at 0x{:016x}: region maximum protection (0x{:x}) does not allow writes. \
                  Maximum protection cannot be changed. Consider using hardware breakpoints instead.",
                 addr.value(),
@@ -951,17 +966,19 @@ impl MemoryProtectionGuard
             self.addr,
             self.len
         );
-        protect(self.task, self.addr, self.len, self.original).map_err(|error| self.restore_error(&error))
+        protect(self.task, self.addr, self.len, self.original).map_err(|error| self.restore_error(error))
     }
 
-    fn restore_error(&self, error: &DebuggerError) -> DebuggerError
+    fn restore_error(&self, error: DebuggerError) -> DebuggerError
     {
-        DebuggerError::Io(Error::other(format!(
-            "the protection of 0x{:016x}+{} could not be restored to {} ({error}), so the range is left writable",
-            self.addr,
-            self.len,
-            protection_label(self.original)
-        )))
+        with_context(error, |message| {
+            format!(
+                "the protection of 0x{:016x}+{} could not be restored to {} ({message}), so the range is left writable",
+                self.addr,
+                self.len,
+                protection_label(self.original)
+            )
+        })
     }
 }
 
@@ -972,7 +989,7 @@ impl Drop for MemoryProtectionGuard
         if self.active
             && let Err(error) = change_protection(self.task, self.addr, self.len, self.original)
         {
-            tracing::warn!("{}", self.restore_error(&error));
+            tracing::warn!("{}", self.restore_error(error));
         }
     }
 }
@@ -1042,33 +1059,34 @@ fn ensure_range(task: mach_port_t, addr: Address, len: usize) -> Result<RegionIn
 
 fn ensure_range_with_permissions(task: mach_port_t, addr: Address, len: usize, required: Option<u32>) -> Result<RegionInfo>
 {
+    let info = region_for_address(task, addr)?
+        .ok_or_else(|| DebuggerError::from(BackendError::NotFound(format!("address {addr} is not mapped"))))?;
     if len == 0 {
-        return region_for_address(task, addr)?
-            .ok_or_else(|| DebuggerError::Io(Error::new(ErrorKind::NotFound, "address is not mapped in target task")));
+        return Ok(info);
     }
 
-    let info = region_for_address(task, addr)?
-        .ok_or_else(|| DebuggerError::Io(Error::new(ErrorKind::NotFound, "address is not mapped in target task")))?;
-
-    let start = addr.value();
-    let end = start
-        .checked_add(len as u64)
-        .ok_or_else(|| DebuggerError::Io(Error::other("address range overflowed")))?;
+    let end = range_end(addr, len)?;
     let region_end = info.start + info.size;
 
     if end > region_end {
-        return Err(DebuggerError::Io(Error::other(
-            "requested range crosses a memory region boundary",
-        )));
+        // A hole after the region is `NotFound`; a mapped neighbour is a range this
+        // single-region operation does not handle.
+        let next = Address::from(region_end);
+        return Err(match region_for_address(task, next)? {
+            None => BackendError::NotFound(format!("{len} bytes at {addr} run into unmapped memory at {next}")),
+            Some(_) => BackendError::Unsupported(format!("{len} bytes at {addr} cross a memory region boundary at {next}")),
+        }
+        .into());
     }
 
     if let Some(mask) = required
         && (info.protection & mask) != mask
     {
-        return Err(DebuggerError::Io(Error::new(
-            ErrorKind::PermissionDenied,
-            "memory range lacks required permissions",
-        )));
+        return Err(BackendError::PermissionDenied(format!(
+            "memory at {addr} lacks the required permissions ({})",
+            protection_label(mask as c_int)
+        ))
+        .into());
     }
 
     Ok(info)
@@ -1201,10 +1219,14 @@ fn change_protection(task: mach_port_t, addr: mach_vm_address_t, len: mach_vm_si
         // This will fail if the requested protection exceeds the maximum, which is expected
         let result = mach_vm_protect(task as vm_map_t, addr, len, 0, protection);
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::Io(Error::other(format!(
-                "mach_vm_protect failed: {} - requested protection may exceed region maximum",
-                result
-            ))));
+            return Err(mach_failure(
+                format_args!(
+                    "mach_vm_protect of 0x{addr:016x}+{len} to {} (requested protection may exceed region maximum)",
+                    protection_label(protection)
+                ),
+                result,
+            )
+            .into());
         }
     }
 

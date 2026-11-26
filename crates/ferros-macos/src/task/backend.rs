@@ -587,7 +587,10 @@ impl Backend for MacOSBackend
     fn read_registers(&mut self, thread: ThreadId) -> BackendResult<Registers>
     {
         self.require_stopped("read_registers")?;
-        let port = self.thread_port(thread)?;
+        let mut port = self.thread_port(thread)?;
+        if self.fail_register_read.swap(false, Ordering::Relaxed) {
+            port = mach2::port::MACH_PORT_NULL;
+        }
         read_registers_for_port(self.architecture, port).map_err(backend_error)
     }
 

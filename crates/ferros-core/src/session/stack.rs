@@ -141,7 +141,7 @@ impl Session
             let (frames, lookups) = {
                 let traps = self.trap_originals();
                 let memory = BackendMemory::new(self.backend.as_mut(), traps);
-                StackUnwinder::new(arch, &self.symbols, &memory)
+                StackUnwinder::new(&*arch, &self.symbols, &memory)
                     .with_runtime(self.runtime.as_ref())
                     .unwind_with_lookups(thread, &registers, max_frames)?
             };

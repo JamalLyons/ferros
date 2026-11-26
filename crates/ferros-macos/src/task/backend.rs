@@ -656,6 +656,12 @@ impl Backend for MacOSBackend
     {
         self.architecture
     }
+
+    /// [`target_arch`] of the target's architecture: the xnu arm64 conventions.
+    fn arch(&self) -> BackendResult<Arc<dyn Arch>>
+    {
+        target_arch(self.architecture)
+    }
 }
 
 impl Drop for MacOSBackend

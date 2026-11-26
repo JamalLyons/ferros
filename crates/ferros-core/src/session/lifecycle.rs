@@ -3,7 +3,6 @@
 use std::time::{Duration, Instant};
 
 use super::{ProcessOwnership, SIGKILL, Session, SessionState};
-use crate::arch;
 use crate::backend::{BackendError, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
 use crate::error::{DebuggerError, Result};
 use crate::types::ProcessId;
@@ -428,7 +427,7 @@ impl Session
 
         let event = match event {
             StopEvent::Breakpoint { thread, pc } => {
-                let pc = arch::for_architecture(self.backend.architecture()).map_or(pc, |arch| arch.pc_after_trap(pc));
+                let pc = self.arch().map_or(pc, |arch| arch.pc_after_trap(pc));
                 self.breakpoints.record_hit(pc);
                 self.record_logical_hit(pc);
                 StopEvent::Breakpoint { thread, pc }

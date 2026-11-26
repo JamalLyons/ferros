@@ -16,7 +16,10 @@
 // second `PROT_NONE`, prints `boundary: 0x<address of the second page>` and sleeps
 // forever, so a debugger can read across a readable-to-protected page boundary.
 // `--guard-page-with-tail` adds a readable third page filled with 0x5a.
-// `--read-only-page` publishes a permanent read-only page for a refused debugger write.
+// `--read-only-page` maps a page filled with 0xa5 twice: as an ordinary writable page and
+// as a permanent view whose maximum protection is read-only, and prints
+// `read-only page: 0x<view> backing: 0x<ordinary page>`, so a debugger write to the view
+// is refused and its effect on the shared bytes can be read through the ordinary page.
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -111,20 +114,31 @@ static int raise_software_exception(void)
 static int hold_read_only_page(void)
 {
     mach_port_t task = mach_task_self();
-    mach_vm_address_t address = 0;
-    // A permanent mapping prevents VM_PROT_COPY from adding write access back.
-    kern_return_t kr = mach_vm_allocate(task, &address, vm_page_size, VM_FLAGS_ANYWHERE | VM_FLAGS_PERMANENT);
+    mach_vm_address_t backing = 0;
+    kern_return_t kr = mach_vm_allocate(task, &backing, vm_page_size, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "allocate permanent page: %d\n", kr);
+        fprintf(stderr, "allocate backing page: %d\n", kr);
         return 1;
     }
-    memset((void *)address, 0xa5, vm_page_size);
-    kr = mach_vm_protect(task, address, vm_page_size, TRUE, VM_PROT_READ);
+    memset((void *)backing, 0xa5, vm_page_size);
+    memory_object_size_t size = vm_page_size;
+    mach_port_t entry = MACH_PORT_NULL;
+    kr = mach_make_memory_entry_64(task, &size, backing, VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "set maximum protection to read-only: %d\n", kr);
+        fprintf(stderr, "make memory entry: %d\n", kr);
         return 1;
     }
-    printf("read-only page: 0x%llx\n", address);
+    // The view shares the backing page's memory, is permanent, and has a read-only
+    // maximum protection, so VM_PROT_COPY may not add write access to it. A refusal can
+    // strip the view's access (macOS 15); the backing page still shows its bytes.
+    mach_vm_address_t view = 0;
+    kr = mach_vm_map(task, &view, size, 0, VM_FLAGS_ANYWHERE | VM_FLAGS_PERMANENT, entry, 0, FALSE, VM_PROT_READ,
+                     VM_PROT_READ, VM_INHERIT_DEFAULT);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "map permanent read-only view: %d\n", kr);
+        return 1;
+    }
+    printf("read-only page: 0x%llx backing: 0x%llx\n", view, backing);
     fflush(stdout);
     for (;;) {
         sleep(1);

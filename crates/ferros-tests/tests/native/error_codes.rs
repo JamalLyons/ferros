@@ -102,6 +102,24 @@ fn write_that_runs_into_an_unmapped_hole_is_not_found()
     });
 }
 
+/// `KERN_NO_SPACE`: what macOS 15 returns for a refused `VM_PROT_COPY` on a permanent page.
+const KERN_NO_SPACE: i64 = 3;
+
+/// A write to a permanent page whose maximum protection is read-only is refused by the
+/// kernel's `mach_vm_protect(VM_PROT_COPY)`, and the page's bytes do not change.
+///
+/// The refusal differs by release (checked against apple-oss-distributions/xnu):
+/// - Since xnu-12377.101 (macOS 26.4 and later, including the macOS 27 this was
+///   written on), `vm_map_delete` refuses to overwrite a permanent entry before
+///   touching it, so `mach_vm_protect` fails with `KERN_PROTECTION_FAILURE` (2) and the
+///   page keeps its `r--` protection.
+/// - On xnu-11417 (macOS 15, the `macos-15` CI runner) and xnu-12377 before .101,
+///   the overwrite leaves the permanent entry in place but strips it to `---/---`, then
+///   finds the entry still there and fails with `KERN_NO_SPACE` (3). The page cannot
+///   be read through that mapping any more.
+///
+/// So the fixture maps the bytes twice, and the backing page, an ordinary mapping of
+/// the same memory, shows them whichever way the kernel refused.
 #[test]
 fn refused_memory_protection_change_is_permission_denied_and_preserves_bytes()
 {
@@ -119,27 +137,52 @@ fn refused_memory_protection_change_is_permission_denied_and_preserves_bytes()
         assert!(matches!(stop, Some(StopEvent::Interrupted { .. })), "got {stop:?}");
 
         let stdout = d.stdout();
-        let hex = stdout
+        let (view, backing) = stdout
             .lines()
-            .find_map(|line| line.strip_prefix("read-only page: 0x"))
+            .find_map(|line| line.strip_prefix("read-only page: 0x")?.split_once(" backing: 0x"))
             .expect("page address line");
-        let address = Address::from(u64::from_str_radix(hex, 16).expect("page address"));
+        let parse = |hex: &str| Address::from(u64::from_str_radix(hex, 16).expect("page address"));
+        let (address, backing) = (parse(view), parse(backing));
         let pid = d.pid();
         let before = diagnostics::raw_memory(pid, address, SPAN).expect("read the original bytes");
         assert_eq!(before, [0xa5; SPAN]);
+        assert_eq!(
+            diagnostics::raw_memory(pid, backing, SPAN).expect("read the backing page"),
+            before,
+            "the view and the backing page share memory"
+        );
 
         let error = d
             .session_mut()
             .backend_mut()
             .write_memory(address, &[0x5a; SPAN])
             .expect_err("write to the permanent read-only page");
-        // Require the kernel's KERN_PROTECTION_FAILURE from mach_vm_protect itself.
-        assert!(
-            matches!(error, BackendError::PermissionDenied(ref message)
-                if message.starts_with("mach_vm_protect ") && message.ends_with("(kern_return_t 2)")),
-            "write at {address}: {error:?}"
-        );
-        let after = diagnostics::raw_memory(pid, address, SPAN).expect("reread the target bytes without the cache");
+        // The refusal comes from mach_vm_protect itself, with the release's code. The rest
+        // of the message is not checked: on macOS 15 the engine also reports a failed
+        // rollback, because the stripped page can no longer be read back.
+        let view_after = diagnostics::raw_memory(pid, address, SPAN);
+        match error {
+            BackendError::PermissionDenied(ref message)
+                if message.starts_with("mach_vm_protect ") && message.ends_with("(kern_return_t 2)") =>
+            {
+                let view_after = view_after.expect("the view stays readable after a KERN_PROTECTION_FAILURE");
+                assert_eq!(view_after, before, "failed write changed the view");
+            }
+            BackendError::Os {
+                code: KERN_NO_SPACE,
+                ref message,
+            } if message.starts_with("mach_vm_protect ") => {
+                // The kernel strips a refused permanent view to no access on these
+                // releases; if it is readable, it must hold its original bytes.
+                if let Ok(view_after) = view_after {
+                    assert_eq!(view_after, before, "failed write changed the view");
+                }
+            }
+            ref other => panic!(
+                "write at {address}: expected mach_vm_protect's KERN_PROTECTION_FAILURE or KERN_NO_SPACE, got {other:?}"
+            ),
+        }
+        let after = diagnostics::raw_memory(pid, backing, SPAN).expect("reread the backing page without the cache");
         assert_eq!(after, before, "failed write changed target memory");
     });
 }

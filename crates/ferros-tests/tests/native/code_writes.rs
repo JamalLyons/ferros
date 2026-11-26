@@ -471,3 +471,48 @@ fn failed_overlapping_birth_write_keeps_the_saved_instruction()
         );
     });
 }
+
+#[test]
+fn retried_non_breakpoint_write_releases_client_ownership_of_a_birth_trap()
+{
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let backend_handle = MacOSBackend::new().expect("backend");
+        let fail_store = backend_handle.memory_store_fault_injector();
+        let mut d = t.launch_with_backend(&fixture, &[], backend_handle);
+
+        let (_, entry) = hold_a_newborn(&mut d, &fixture);
+        let original = backend(&mut d).read_memory(entry, TRAP.len()).expect("read the entry");
+        assert_ne!(original, TRAP);
+        backend(&mut d).write_memory(entry, &TRAP).expect("plant a client breakpoint");
+
+        fail_store();
+        let error = backend(&mut d)
+            .write_memory(entry, &original)
+            .expect_err("the first restore must fail in the store");
+        assert!(error.to_string().contains("injected memory store failure"), "{error}");
+        assert_eq!(
+            backend(&mut d).read_memory(entry, TRAP.len()).expect("read after failure"),
+            TRAP,
+            "the failed restore lost client ownership"
+        );
+
+        backend(&mut d).write_memory(entry, &original).expect("retry the restore");
+        assert_eq!(
+            backend(&mut d).read_memory(entry, TRAP.len()).expect("read after retry"),
+            original
+        );
+        assert_eq!(raw_word(&d, entry), TRAP, "the birth trap must stay armed until resume");
+
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all())
+            .expect("continue and disarm the birth trap");
+        let stop = backend(&mut d)
+            .wait(Some(STOP_TIMEOUT))
+            .expect("wait for the fixture to exit");
+        assert!(
+            matches!(stop, Some(StopEvent::Exited { code: 0 })),
+            "unexpected stop: {stop:?}"
+        );
+    });
+}

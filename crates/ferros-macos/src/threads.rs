@@ -94,7 +94,7 @@ impl ThreadManager
     ///
     /// ## Errors
     ///
-    /// Returns `DebuggerError::Os` with the `kern_return_t` if `task_threads()` fails;
+    /// Returns `DebuggerError::Backend` with the `kern_return_t` if `task_threads()` fails;
     /// `previous` is then left untouched.
     pub(crate) fn refresh_thread_list(task: libc::mach_port_t, previous: &[thread_act_t]) -> Result<Vec<thread_act_t>>
     {
@@ -103,10 +103,7 @@ impl ThreadManager
             let mut thread_count: mach_msg_type_number_t = 0;
             let result = task_threads(task, &mut threads, &mut thread_count);
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::Os {
-                    code: i64::from(result),
-                    message: format!("Failed to enumerate threads: {result}"),
-                });
+                return Err(crate::error::mach_failure("task_threads", result).into());
             }
 
             let list = if threads.is_null() {
@@ -146,7 +143,7 @@ impl ThreadManager
     /// ## Errors
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
-    /// - `SuspendFailed`: `thread_suspend()` failed
+    /// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_suspend()`
     pub(crate) fn suspend_thread(threads: &[thread_act_t], thread_id: ThreadId) -> Result<()>
     {
         let thread_port = thread_id.raw() as thread_act_t;
@@ -160,11 +157,11 @@ impl ThreadManager
         unsafe {
             let result = ffi::thread_suspend(thread_port);
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::SuspendFailed(format!(
-                    "thread_suspend failed for thread {}: {}",
-                    thread_id.raw(),
-                    result
-                )));
+                return Err(crate::error::mach_failure(
+                    format_args!("thread_suspend of thread {}", thread_id.raw()),
+                    result,
+                )
+                .into());
             }
         }
 
@@ -192,7 +189,7 @@ impl ThreadManager
     /// ## Errors
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
-    /// - `ResumeFailed`: `thread_resume()` failed
+    /// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_resume()`
     pub(crate) fn resume_thread(threads: &[thread_act_t], thread_id: ThreadId) -> Result<()>
     {
         let thread_port = thread_id.raw() as thread_act_t;
@@ -206,11 +203,9 @@ impl ThreadManager
         unsafe {
             let result = ffi::thread_resume(thread_port);
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::ResumeFailed(format!(
-                    "thread_resume failed for thread {}: {}",
-                    thread_id.raw(),
-                    result
-                )));
+                return Err(
+                    crate::error::mach_failure(format_args!("thread_resume of thread {}", thread_id.raw()), result).into(),
+                );
             }
         }
 

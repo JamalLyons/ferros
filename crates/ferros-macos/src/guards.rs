@@ -76,16 +76,13 @@ impl ThreadSuspendGuard
     ///
     /// ## Errors
     ///
-    /// - `SuspendFailed`: Failed to suspend the thread
+    /// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_suspend()`
     pub fn new(thread_port: thread_act_t) -> Result<Self>
     {
         unsafe {
             let result = ffi::thread_suspend(thread_port);
             if result != mach2::kern_return::KERN_SUCCESS {
-                return Err(ferros_core::error::DebuggerError::SuspendFailed(format!(
-                    "thread_suspend failed: {}",
-                    result
-                )));
+                return Err(crate::error::mach_failure("thread_suspend", result).into());
             }
         }
 
@@ -105,10 +102,7 @@ impl ThreadSuspendGuard
             unsafe {
                 let result = ffi::thread_resume(self.thread_port);
                 if result != mach2::kern_return::KERN_SUCCESS {
-                    return Err(ferros_core::error::DebuggerError::ResumeFailed(format!(
-                        "thread_resume failed: {}",
-                        result
-                    )));
+                    return Err(crate::error::mach_failure("thread_resume", result).into());
                 }
             }
             self.active = false;

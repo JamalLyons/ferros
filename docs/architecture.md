@@ -187,7 +187,6 @@ Session and backend operations return the crate result type. The error types are
 
 **Common Error Types**:
 - `NotAttached`: Operation requires an attached process
-- `AttachFailed`: Failed to attach to process
 - `PermissionDenied`: Insufficient permissions
 - `InvalidArgument`: Invalid parameter
 - `Io`: I/O error (file operations, memory access, etc.)

@@ -40,6 +40,7 @@ use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use tracing::debug;
 
+use crate::error::mach_failure;
 use crate::{constants, ffi};
 
 /// Read ARM64 registers from a thread
@@ -74,7 +75,8 @@ use crate::{constants, ffi};
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::ReadRegistersFailed`: `thread_get_state()` failed
+/// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_get_state()`
+///   (see [`mach_failure`](crate::error::mach_failure))
 ///
 /// ## See Also
 ///
@@ -94,11 +96,7 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 
         // Check if the call succeeded
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::ReadRegistersFailed {
-                operation: "read ARM64 thread state".to_string(),
-                thread_id: None,
-                details: format!("thread_get_state failed: {}", result),
-            });
+            return Err(mach_failure("thread_get_state(ARM_THREAD_STATE64)", result).into());
         }
 
         // Helper function to read a u64 from two u32s
@@ -219,7 +217,7 @@ pub(crate) fn write_arm64_gpr_state(thread: thread_act_t, regs: &Registers) -> R
         );
 
         if result != KERN_SUCCESS {
-            return Err(DebuggerError::InvalidArgument(format!("thread_set_state failed: {}", result)));
+            return Err(mach_failure("thread_set_state(ARM_THREAD_STATE64)", result).into());
         }
     }
 
@@ -289,11 +287,7 @@ fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>
         debug!("ARM NEON state not available on this system");
         Ok(None)
     } else {
-        Err(DebuggerError::ReadRegistersFailed {
-            operation: "read ARM64 NEON state".to_string(),
-            thread_id: None,
-            details: format!("thread_get_state(ARM_NEON_STATE64) failed: {}", kr),
-        })
+        Err(mach_failure("thread_get_state(ARM_NEON_STATE64)", kr).into())
     }
 }
 
@@ -356,10 +350,7 @@ pub(crate) fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> 
         )
     };
     if kr != KERN_SUCCESS {
-        return Err(DebuggerError::InvalidArgument(format!(
-            "thread_set_state(ARM_NEON_STATE64) failed: {}",
-            kr
-        )));
+        return Err(mach_failure("thread_set_state(ARM_NEON_STATE64)", kr).into());
     }
 
     Ok(())

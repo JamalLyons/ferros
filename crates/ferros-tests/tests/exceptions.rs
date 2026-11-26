@@ -1201,6 +1201,11 @@ fn detach_armed_before_a_suspend_retry_takes_no_fresh_suspend()
 /// target untraced and running. Taking the client SIGSTOP for the private one would
 /// satisfy the handshake before the detach raised its own, and the detach's real SIGSTOP
 /// would then land after `PT_DETACH`.
+///
+/// Nor may the client SIGSTOP stop the released process before its private stop is
+/// answered (#311): detach's wait would take that stop for its private one, send its
+/// SIGCONT early, and a private stop landing after it would leave the target stopped.
+/// Detach continues the process anyway, so it drops that SIGSTOP instead of replaying it.
 #[test]
 fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
 {
@@ -1233,6 +1238,7 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
         let awaited = faults.send_next_detach_stop_after_suspend_retry();
         wait_for_detach_stop_hold(&faults);
         faults.fail_thread_freezes(0);
+        let stopped_early = faults.observe_stop_before_next_detach_reply();
         let began = std::time::Instant::now();
         drop(backend);
         let took = began.elapsed();
@@ -1240,6 +1246,12 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
             awaited.try_recv(),
             Ok(true),
             "the held client SIGSTOP satisfied the detach handshake before its private SIGSTOP was sent"
+        );
+        assert_eq!(
+            stopped_early.try_recv(),
+            Ok(false),
+            "the released target was stopped before its private SIGSTOP was answered: detach's wait would take that stop \
+             for its own"
         );
         assert!(took < Duration::from_secs(3), "detach took {took:?}");
         assert_runs(pid.0);

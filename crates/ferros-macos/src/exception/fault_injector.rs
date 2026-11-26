@@ -36,6 +36,9 @@ pub struct ReplyFaultInjector
     pub(crate) detach_handshake: Arc<AtomicBool>,
     detach_stop_wait: Arc<Mutex<Option<DetachStopWait>>>,
     pub(super) detach_suspend_probe: Arc<Mutex<Option<DetachSuspendProbe>>>,
+    /// Receives whether a job-control stop was in effect just before the next detach
+    /// answered its private SIGSTOP. Tests only (#311).
+    detach_reply_stop_probe: Arc<Mutex<Option<mpsc::Sender<bool>>>>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     pub(super) birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
@@ -179,6 +182,30 @@ impl ReplyFaultInjector
             .take();
         if let Some(probe) = probe {
             let _ = probe.sample.send(crate::diagnostics::thread_suspend_count(probe.thread));
+        }
+    }
+
+    /// Report whether the released process is already in a job-control stop (`SSTOP`
+    /// and a task hold) just before the next detach answers its private SIGSTOP, after
+    /// `PT_DETACH` and the replay of signals held during the handshake. Detach's wait
+    /// cannot tell such a stop from its private one. Tests only (#311).
+    pub fn observe_stop_before_next_detach_reply(&self) -> mpsc::Receiver<bool>
+    {
+        let (probe, result) = mpsc::channel();
+        *self.detach_reply_stop_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+        result
+    }
+
+    /// Answer an armed [`Self::observe_stop_before_next_detach_reply`] with `stopped()`.
+    pub(crate) fn sample_stop_before_detach_reply(&self, stopped: impl FnOnce() -> bool)
+    {
+        let probe = self
+            .detach_reply_stop_probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(probe) = probe {
+            let _ = probe.send(stopped());
         }
     }
 

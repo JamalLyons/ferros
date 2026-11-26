@@ -433,6 +433,17 @@ impl MacOSBackend
         // Replay and continuation belong to every successful PT_DETACH, including
         // fallback after a handshake error. Preserve that error in the return value.
         let replayed = if !self.traced {
+            if private_stop_sent {
+                // Below, detach continues the released process with SIGCONT, which undoes
+                // any SIGSTOP; one cannot be caught, so replaying it changes nothing but
+                // lets its job-control stop take effect before the private one is even
+                // answered. Detach's wait would take that stop for its own and send its
+                // SIGCONT before the private stop lands, leaving the process stopped
+                // (#311). Drop it instead.
+                if let Some(signals) = lock_shared(&self.exception_state).handshake_signals.as_mut() {
+                    signals.retain(|signal| signal.signal != libc::SIGSTOP);
+                }
+            }
             self.requeue_handshake_signals(false)
         } else {
             Ok(())
@@ -446,6 +457,13 @@ impl MacOSBackend
         let expire_wait = stop_fault.is_some() && !hide_stop && private_stop_sent && !self.traced;
         if expire_wait {
             self.send_detach_sigcont();
+        }
+        if private_stop_sent && !self.traced {
+            // Test hook (#311): whether a job-control stop is already in effect before the
+            // private SIGSTOP is answered, which detach's wait would take for its own.
+            self.reply_faults.sample_stop_before_detach_reply(|| {
+                crate::lifecycle::job_control_stop_has_taken_effect(self.pid.0 as libc::pid_t, self.task)
+            });
         }
         let restored = self.stop_exception_handler(true);
         self.release_suspends();

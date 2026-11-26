@@ -227,6 +227,7 @@ impl Session
             if let Some(event) = self.pending_event()? {
                 break event;
             }
+            self.retry_line_cleanup()?;
             let noted = self.handler_return.as_ref().map(|pending| pending.request.clone());
             let armed = self.handler_exits.is_none();
             self.note_handler_continue(request, signal_policy)?;
@@ -451,6 +452,7 @@ impl Session
                 self.deferred = Some(event);
                 return self.enter_running();
             }
+            self.retry_line_cleanup()?;
             match self.step_thread(thread) {
                 // A stop arrived after the drain and nothing ran: report it, or step again
                 // if it was one `pending_event` drops. If none comes in time the target

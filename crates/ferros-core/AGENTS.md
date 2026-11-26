@@ -1,0 +1,31 @@
+# ferros-core map
+
+Portable engine. Root [`AGENTS.md`](../../AGENTS.md) Conventions bind here (platform and format boundary, no `unsafe`); this file only says where things are. Module docs carry the contracts.
+
+Open first: `src/session/mod.rs` (state-machine table), then `src/backend/mod.rs` (the `Backend` contract).
+
+## Modules (`src/`)
+- `session/`: `Session`, the policy engine. `lifecycle`, `breakpoints`, `stepping`, `line_stepping`, `location`, `stack`, `images`, `exits`: one row each in the root key-interfaces table.
+- `session/tests.rs` + `session/tests/<area>.rs`: `Session` unit tests on `MockBackend`. Shared helpers live in `tests.rs`.
+- `backend/`: `Backend` trait (`mod.rs`), `StopEvent`/`LaunchSpec`/`ResumeRequest` (`types.rs`), `BackendError` (`error.rs`), `MockBackend` (`mock.rs`, `test-util`).
+- `objfile/`: `ObjectFormat`, the format-neutral image trait (ADR 0001). `contents.rs`: what a format reads. `mock.rs`: `MockObjectFormat`.
+- `runtime/`: `TargetRuntime` (non-local exits, signal-frame state). `mock.rs`: `MockRuntime`.
+- `symbols/`: DWARF and symbol work.
+  - `image.rs`: `BinaryImage`, sections and segment mapping read through `ObjectFormat`.
+  - `cache.rs`: per-session symbol cache, address symbolication.
+  - `lines.rs`: line tables, `file:line` to addresses and back.
+  - `functions.rs`: function name to entry and post-prologue address.
+  - `unwind.rs`: stack walk (CFI, unwind hints, frame-pointer chain).
+  - `extractor.rs`: DWARF type extraction. `demangle.rs`: Rust/C++ demangling. `load_inputs.rs`: retry stamps for failed loads.
+- `arch/`: instruction-set knowledge. `arm64.rs`, `arm64_frame.rs` (prologue/epilogue analysis for `unwind.rs`), `x86_64.rs` (placeholder).
+- `breakpoints/`: breakpoint and watchpoint bookkeeping; `builder.rs`.
+- `types/`: `Address`, build identity, process/thread, registers, stack frames, symbols.
+- `error.rs`: `DebuggerError`. `events.rs`: `DebuggerEvent` (only parked `ferros-ui` uses it).
+
+## Fast loop
+```sh
+cargo test -p ferros-core session::tests::   # Session unit tests
+cargo test -p ferros-core symbols::lines::   # one module
+just test-crate ferros-core                  # whole crate, any OS
+```
+Engine behaviour still needs an integration test in `crates/ferros-tests` (root Rule).

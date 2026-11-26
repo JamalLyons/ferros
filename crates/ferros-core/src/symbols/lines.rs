@@ -35,6 +35,16 @@
 //!
 //! All public lookups take and return runtime [`Address`]es; the index itself stores file
 //! virtual addresses and translates through the image mapping.
+//!
+//! # Map of this file
+//!
+//! - Errors and skips: `SourceLookupError`, `SkippedDebugInfo`, `merge_skipped`, `warn_skipped`.
+//! - Results: `LineAddresses`, `AddressLine`.
+//! - `LineIndex` (`LineRow`, `LineSequence`): built by `LineIndex::build`; `row_at`.
+//! - Path rendering and normalization: `render_file`, `normalize_path`.
+//! - `impl BinaryImage`: `line_index`, `skipped_debug_info`, `line_addresses`,
+//!   `line_at_address`, `statement_at_address`.
+//! - Synthetic DWARF writer for tests, then `mod tests`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;

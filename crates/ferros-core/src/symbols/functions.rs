@@ -55,6 +55,15 @@
 //!
 //! All public lookups return runtime [`Address`]es; the index stores file virtual addresses
 //! and translates through the image mapping.
+//!
+//! # Map of this file
+//!
+//! - `FunctionAddress`: a lookup result.
+//! - `FunctionIndex`: built by `FunctionIndex::build` from `index_die`, `resolve_name`,
+//!   `function_code`, `entry_base`, and `after_prologue`.
+//! - Name normalization: `normalize`, `normalize_type`, `split_top`, `strip_generics`.
+//! - `impl BinaryImage`: `function_index`, `function_addresses`, `function_containing`.
+//! - Tests in `mod tests`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;

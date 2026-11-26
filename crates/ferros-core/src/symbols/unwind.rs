@@ -139,6 +139,16 @@
 //! unwind row too, so the reported line is the call site and a call that is the last
 //! instruction of a function still finds that function.
 //!
+//! ## Map of this file
+//!
+//! - `MemoryAccess`: the memory the walk reads.
+//! - `StackUnwinder`: `new`, `with_runtime`, `unwind`; the per-step logic is in its `impl`
+//!   (`unwind_with_lookups` and the CFI, leaf and frame-record steps described above).
+//! - `hinted`: which [`UnwindHint`] applies to a lookup address.
+//! - `append_logical_frames`: inlined frames for one physical frame.
+//! - Register helpers (`general_bit`, `read_register_value`, `return_register`); tests in
+//!   `mod tests`.
+//!
 //! ## References
 //!
 //! - [DWARF 5, section 6.4 Call Frame Information](https://dwarfstd.org/doc/DWARF5.pdf)

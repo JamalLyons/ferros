@@ -17,6 +17,9 @@ on:
       - '.cargo/**'
       - 'scripts/**'
       - '**/*.entitlements'
+      # Agent and decision docs: a change to the rules should run the checks that enforce them.
+      - '**/AGENTS.md'
+      - 'docs/adr/**'
   pull_request:
     branches: [ "trunk" ]
     paths:
@@ -33,6 +36,9 @@ on:
       - '.cargo/**'
       - 'scripts/**'
       - '**/*.entitlements'
+      # Agent and decision docs: a change to the rules should run the checks that enforce them.
+      - '**/AGENTS.md'
+      - 'docs/adr/**'
 
 env:
   CARGO_TERM_COLOR: always

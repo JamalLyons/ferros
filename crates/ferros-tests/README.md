@@ -61,6 +61,13 @@ cargo test -p ferros-tests --test native <area>::               # one area
 just test-integration                                          # all of them
 ```
 
+Off macOS, every `#![cfg(target_os = "macos")]` target compiles empty and passes. Only these
+run there:
+
+```sh
+cargo test -p ferros-tests --test backend_mock --test unwind_eh_frame --test platform_boundary
+```
+
 After any run, check for leaked fixtures. It prints nothing when clean (it also lists other
 worktrees' fixtures). Clean only this worktree's with `just kill-fixtures`; never `pkill -f`.
 
@@ -252,7 +259,7 @@ fn resume_runs_hello()
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
   with a comment naming the issue. The external SIGKILL regressions for held signal
-  stops (`tests/native/lifecycle.rs`) and breakpoint stops (`tests/exceptions.rs`) are enabled,
+  stops (`tests/native/lifecycle/`) and breakpoint stops (`tests/exceptions.rs`) are enabled,
   including a signal deferred behind a breakpoint (issue #56). Client signal replies
   are answered early under task suspension; delivery decisions remain logical stops
   until resume requeues the selected signal on its original thread.
@@ -261,7 +268,7 @@ fn resume_runs_hello()
   arriving before or with the attach/detach SIGSTOP, and dropping a running backend or session
   whose signal stop is already pending. A one-shot diagnostic hook forces actual kernel signal
   requests into the two handshake orderings; the drop cases use naturally pending signals.
-- `tests/native/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
+- `tests/native/lifecycle/` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.
 - When the deadline passes, the harness kills that test's processes and fails the test with a

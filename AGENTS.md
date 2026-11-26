@@ -18,6 +18,8 @@ Cargo workspace members under `crates/`, one purpose each:
 
 There is no `ferros-linux` or `ferros-windows` crate.
 
+Per-crate module maps (where each file is, which to open first): [`crates/ferros-core/AGENTS.md`](crates/ferros-core/AGENTS.md), [`crates/ferros-macos/AGENTS.md`](crates/ferros-macos/AGENTS.md), [`crates/ferros-tests/AGENTS.md`](crates/ferros-tests/AGENTS.md). They add no rules; Conventions below stay the contract.
+
 ## Key interfaces
 Read before changing engine behavior; module docs carry the contracts. Paths under `crates/`.
 
@@ -68,9 +70,19 @@ just test-crate ferros-core   # one crate
 just fmt-check
 just lint                     # clippy, warnings denied
 just check-boundary
+just check                    # the five pre-commit checks below, read-only
 ```
 
-Before committing, all five must pass: `just fmt-check`, `just lint`, `just test`, `just test-integration`, `just check-boundary`.
+Before committing, all five must pass: `just fmt-check`, `just lint`, `just test`, `just test-integration`, `just check-boundary`. `just check` runs exactly those five and writes nothing.
+
+Targeted loop while iterating (the `just` recipes take no filter):
+```sh
+cargo test -p ferros-core session::tests::            # one engine module's unit tests
+cargo test -p ferros-tests --test native stepping::   # one integration area
+cargo test -p ferros-tests --test backend_mock        # mock-backend engine tests, any OS
+```
+
+Off macOS (a Linux VM) `ferros-macos` compiles empty and every `#![cfg(target_os = "macos")]` test compiles empty and passes, so a pass proves nothing about them. The loop that does run there: `just test-crate ferros-core`, `just check-boundary`, and `cargo test -p ferros-tests --test backend_mock --test unwind_eh_frame --test platform_boundary`. macOS failures are not reproducible there, and `#![warn(missing_docs)]` failures show only in `just lint` on macOS.
 
 "task_for_pid was denied" or `Session::launch did not return within 5s`: see Troubleshooting in [`CONTRIBUTING.md`](CONTRIBUTING.md). Run integration tests via `just test-integration` so the runner signs them.
 
@@ -111,4 +123,5 @@ Repo-local skills are not part of that submodule. They live in `.agents/skills/<
 - Platform and format boundary: `crates/ferros-core` is platform-neutral and format-neutral: no OS dependency (`mach2`, `libproc`, `libc`), no OS `cfg` (`target_os`, `target_family`, `target_vendor`, `target_env`, a `unix`/`windows` predicate in `cfg`, `cfg!` or `cfg_attr`, or `std::os::unix` / `std::os::windows`), no `unsafe`, no object-file format knowledge. All macOS code, including Mach-O (`MH_MAGIC` scanning, `LC_SYMTAB`, compact unwind, `LC_UUID`), lives only in `crates/ferros-macos`. A future `ferros-linux` (ELF) or `ferros-windows` (PE/COFF) crate keeps its own OS and format code; it never enters `ferros-core` or the other platform crate. DWARF consumption stays in `ferros-core` behind a format-neutral trait. `ferros-core` sees images only through `objfile::ObjectFormat` and does not depend on the `object` crate. `just check-boundary` and `crates/ferros-tests/tests/platform_boundary.rs` enforce both halves per accepted [ADR 0001](docs/adr/0001-object-file-boundary.md): no OS crate, no OS `cfg`, no `unsafe`, no object-file parser dependency, no Mach-O text in core sources, comments included (`MH_MAGIC`, `LC_*`, `macho`/`Mach-O`, `nlist`, `__LINKEDIT`, `__unwind_info`, compact unwind, `dSYM`, and similar), and no macOS runtime text (`dylib`, `dyld`, `libunwind`, `libsystem_`, `unw_resume`, `__longjmp`, `xnu`, `_sigtramp`, `ucontext`, `mcontext`, `sigframe`, `uc_mcsize`): system libraries and signal frames come from `runtime::TargetRuntime`. The only `cfg(target_os)` switch outside the platform and test crates is `crates/ferros/src/platform.rs`.
 - `unsafe`: forbidden workspace-wide via `unsafe_code = "forbid"` in the root `Cargo.toml`. Only `crates/ferros-macos` permits it, for raw Mach FFI bindings.
 - Formatting: Governed by `rustfmt.toml`. Format all code with `just fmt`.
+- File maps: an implementation file under `crates/*/src/` longer than 1,000 lines (unit-test modules excepted) has a `Map of this file` heading (any level) in its leading `//!` docs, naming its items in source order; `just check-boundary` fails otherwise.
 - Linting: `just lint` runs clippy with warnings denied. The workspace enables the `pedantic` and `cargo` lint groups; `crates/ferros-core` and `crates/ferros-macos` opt out of `pedantic` for now.

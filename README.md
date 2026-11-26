@@ -39,7 +39,7 @@ Ferros aims to be a Rust-aware debugger: ownership, lifetimes, and MIR-level und
 Ferros is **early and actively developed**. What is verified today:
 
 - The workspace targets Rust 1.100.0 (Edition 2024); formatting uses nightly rustfmt.
-- **Process lifecycle & control**: On macOS arm64, launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (verified by `tests/native/lifecycle.rs` and `tests/native/smoke.rs`).
+- **Process lifecycle & control**: On macOS arm64, launching suspended, attaching by PID, task port acquisition, thread and memory-region enumeration, resuming, detaching, timed wait, process exit detection and reaping, signal pass-through/suppression, interrupt and kill (verified by `tests/native/lifecycle/` and `tests/native/smoke.rs`).
 - **Mach exception loop**: Queueing simultaneous stops, exception port rights lifecycle, port restoration on detach, and signal delivery (verified by `tests/exceptions.rs`).
 - **Single-stepping**: Hardware single-step (`MDSCR_EL1.SS`) and per-thread single-stepping while other threads remain suspended (verified by `tests/native/single_step/`). Source-level step over, into, and out (verified by `tests/native/stepping.rs`).
 - **Software breakpoints**: Trap insertion, hit counting, transparent trap-hiding in memory reads, automatic serial step-over on resume, and trap restoration on detach and drop (verified by `tests/native/breakpoints.rs`). Source breakpoints by file:line and function name (verified by `tests/native/source_breakpoints.rs`).

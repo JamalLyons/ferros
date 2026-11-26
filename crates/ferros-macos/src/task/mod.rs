@@ -373,7 +373,7 @@ fn write_registers_to_port(architecture: Architecture, thread: thread_act_t, reg
 /// the exception port's receive right) are destroyed, and XNU sends SIGKILL to the
 /// still-traced process as part of tracer exit: a held target does not outlive a
 /// debugger, such as the CLI, that exits right after dropping its session
-/// (`held_target_when_the_debugger_process_exits` in `ferros-tests/tests/native/lifecycle.rs`
+/// (`held_target_when_the_debugger_process_exits` in `ferros-tests/tests/native/lifecycle/`
 /// observes the SIGKILL). If the exit watcher fails before the target dies, the
 /// retained resources are not released.
 ///

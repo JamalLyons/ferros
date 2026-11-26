@@ -12,6 +12,21 @@
 //! - **mach_vm_region_recurse()**: Enumerate memory regions in a process
 //! - **mach_vm_protect()**: Change memory protection flags
 //!
+//! ## Map of this file
+//!
+//! In source order:
+//!
+//! - `MemoryCache`: page cache over `read_memory`; `invalidate_range` after writes.
+//! - Reads: `read_memory`, `read_memory_into`, `read_checked_span`.
+//! - Writes: `write_memory`, `write_memory_all_or_nothing`, then the `write_with_*` /
+//!   `write_restoring*` / `restore_failed_write` helpers that make text writable, write, restore
+//!   protection, and roll back a partial write; `flush_caches` after a code write.
+//! - `get_memory_regions`: the region map.
+//! - Hexdump and search: `format_hexdump`, `hexdump_memory`, `find_pattern`.
+//! - `MemoryProtectionGuard`: RAII protection change (`make_writable`, `with_protection`, `restore`).
+//! - Region checks: `ensure_readable_span`, `ensure_range*`, `region_for_address`, region names.
+//! - `change_protection`, `aligned_range`; unit tests in `mod tests`.
+//!
 //! ## References
 //!
 //! - [vm_read(3) man page](https://developer.apple.com/documentation/kernel/1402149-vm_read/)

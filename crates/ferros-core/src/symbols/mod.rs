@@ -13,6 +13,7 @@
 //! - **`image`**: Binary images: DWARF sections, segment mapping and unwind information
 //!   read by the session's [`ObjectFormat`](crate::objfile::ObjectFormat)
 //! - **`lines`**: Line-table index: `file:line` to addresses, address to line and ranges
+//! - **`unwind`**: Stack unwinding: call frame information, unwind hints, frame-pointer chain
 //!
 //! ## DWARF Sections
 //!

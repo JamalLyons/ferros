@@ -75,6 +75,38 @@ fn resume_retries_failed_step_out_hook_cleanup()
     assert!(!breakpoints[0].enabled, "the user breakpoint is disabled again");
 }
 
+#[test]
+fn step_out_cleanup_preserves_a_new_logical_breakpoint()
+{
+    use ferros_core::backend::BackendError;
+    use ferros_core::backend::mock::MockCallKind;
+    use ferros_core::{BreakpointLocation, DebuggerError};
+
+    let mock = returning_to_breakpoint();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("step-out-trap-adoption")).expect("launch");
+    mock.script(MockStop::new(StopEvent::Interrupted { thread: Some(THREAD) }).expect_resume(step_out_continue()));
+    session.step_out().expect("arm the return trap");
+
+    let error = BackendError::Os {
+        code: 5,
+        message: "injected return trap restore failure".into(),
+    };
+    mock.fail_next(MockCallKind::WriteMemory, error.clone());
+    assert!(matches!(session.wait(None), Err(DebuggerError::Backend(actual)) if actual == error));
+    let logical = session
+        .set_breakpoint(BreakpointLocation::Address(BREAKPOINT))
+        .expect("claim the existing return trap");
+    session.resume().expect("retry cleanup before continuing");
+
+    assert_eq!(session.logical_breakpoint_at(BREAKPOINT).map(|bp| bp.id), Some(logical));
+    assert_eq!(
+        mock.peek_memory(BREAKPOINT, 4),
+        Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()),
+        "the new logical breakpoint still traps"
+    );
+}
+
 /// Script `step_out`'s return trap: `THREAD` reaches `BREAKPOINT` in its caller's frame.
 fn script_return_trap(mock: &MockBackend, session: &mut Session)
 {

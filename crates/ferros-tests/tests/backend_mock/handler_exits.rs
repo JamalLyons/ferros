@@ -1,10 +1,12 @@
 //! Signal handlers: return, long-jump exit and replacement exit images.
 
-use ferros_core::backend::mock::{MockBackend, MockStop};
-use ferros_core::backend::{LaunchSpec, ResumeRequest, StopEvent};
+use ferros_core::backend::mock::{MockBackend, MockCallKind, MockStop};
+use ferros_core::backend::{BackendError, LaunchSpec, ResumeRequest, StopEvent};
 use ferros_core::objfile::mock::{MockObjectFormat, MockObjectImage};
+use ferros_core::runtime::ExitSource;
+use ferros_core::runtime::mock::MockRuntime;
 use ferros_core::types::Address;
-use ferros_core::{Session, SessionState, arch};
+use ferros_core::{BreakpointKind, BreakpointLocation, DebuggerError, Session, SessionState, arch};
 
 use crate::helpers::*;
 
@@ -21,14 +23,18 @@ const LONG_JUMP_IMAGE: Address = Address::new(0x2_0000_0000);
 /// `EXIT_ENTRY` in that image, where the session traps a stopped handler's exit.
 const LONG_JUMP: Address = Address::new(0x2_0000_1000);
 
-/// A mapped `EXIT_IMAGE` with one symbol, `EXIT_ENTRY` at `LONG_JUMP`, in the neutral
+const SECOND_EXIT_ENTRY: &str = "second_leaf";
+const SECOND_EXIT: Address = Address::new(0x2_0000_1004);
+
+/// A mapped `EXIT_IMAGE` with `EXIT_ENTRY` at `LONG_JUMP` plus a second exit, in the neutral
 /// `MockObjectFormat`: its header at the load address, code at 0x1000..0x1100, its table
 /// at 0x4000 and names at 0x5000.
 fn long_jump_image() -> Vec<u8>
 {
     let base = LONG_JUMP_IMAGE.value();
     let image = MockObjectImage::new(LONG_JUMP.value()..LONG_JUMP.value() + 0x100, base + 0x4000, base + 0x5000)
-        .with_symbol(LONG_JUMP.value(), EXIT_ENTRY);
+        .with_symbol(LONG_JUMP.value(), EXIT_ENTRY)
+        .with_symbol(SECOND_EXIT.value(), SECOND_EXIT_ENTRY);
     let mut bytes = image.header_bytes();
     bytes.resize(0x1000, 0);
     bytes.extend(std::iter::repeat_n(0x1F, 0x3000));
@@ -601,17 +607,17 @@ fn handler_exit_step_consumes_a_fresh_step_of_the_previously_stepped_thread()
     assert_eq!(mock.script_len(), 0);
 }
 
-/// #339: a stopped handler returns to its rendezvous, so the exit trap armed for its
-/// continue is released, and every restore of that trap fails. The trap stays the
-/// session's and is restored before the next resume runs the process; before, the
-/// first failed release dropped it, leaving a private trap in the program.
-#[test]
-fn resume_retries_a_failed_handler_exit_hook_release()
+fn exit_restore_error() -> BackendError
 {
-    use ferros_core::backend::BackendError;
-    use ferros_core::backend::mock::MockCallKind;
-    use ferros_core::{BreakpointKind, DebuggerError};
+    BackendError::Os {
+        code: 5,
+        message: "injected exit hook restore failure".into(),
+    }
+}
 
+/// The handler returned but every attempt to remove its exit trap failed.
+fn handler_return_with_failed_exit_restore() -> (MockBackend, Session, Vec<u8>)
+{
     let mock = handler_stopped_with_long_jump();
     let mut session = exit_session(&mock);
     session
@@ -627,10 +633,7 @@ fn resume_retries_a_failed_handler_exit_hook_release()
 
     // The rendezvous releases the exit trap, and the cleanup after that error may try
     // again: fail each restore until the wait returns.
-    let error = BackendError::Os {
-        code: 5,
-        message: "injected exit hook restore failure".into(),
-    };
+    let error = exit_restore_error();
     for _ in 0..2 {
         mock.fail_next(MockCallKind::WriteMemory, error.clone());
     }
@@ -638,6 +641,15 @@ fn resume_retries_a_failed_handler_exit_hook_release()
     mock.clear_failures();
     assert_eq!(session.state(), SessionState::Stopped);
     assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(trap), "the restore failed");
+    (mock, session, original)
+}
+
+/// #339: the failed restore leaves the exit hook owned by the session. The next resume
+/// restores it before running the process.
+#[test]
+fn resume_retries_a_failed_handler_exit_hook_release()
+{
+    let (mock, mut session, original) = handler_return_with_failed_exit_restore();
 
     mock.script(handler_step_off());
     mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
@@ -661,4 +673,97 @@ fn resume_retries_a_failed_handler_exit_hook_release()
         vec![ResumeRequest::step(HANDLER), ResumeRequest::continue_all()]
     );
     assert_eq!(mock.script_len(), 0);
+}
+
+/// The peer's queued stop is reported by the source step. A failed restore must not
+/// let an exit hook consume it and reissue the handler's previous continue.
+#[test]
+fn source_step_reports_queued_stop_at_handler_hook_pending_cleanup()
+{
+    let mock = handler_stopped_with_long_jump();
+    let mut session = exit_session(&mock);
+    session.launch(&LaunchSpec::new("queued-exit-hook-stop")).expect("launch");
+    handler_stopped_in_its_handler(&mock, &mut session);
+
+    let queued = StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: LONG_JUMP,
+    };
+    mock.script_simultaneous(vec![
+        MockStop::new(StopEvent::Interrupted { thread: Some(HANDLER) }).expect_resume(ResumeRequest::continue_all()),
+        MockStop::new(queued.clone()).set_pc(THREAD, LONG_JUMP),
+    ]);
+    session.resume().expect("run the handler");
+    let error = exit_restore_error();
+    mock.fail_next(MockCallKind::WriteMemory, error.clone());
+    assert!(matches!(session.wait(None), Err(DebuggerError::Backend(actual)) if actual == error));
+    assert_eq!(mock.pending_len(), 1);
+
+    // If the old continue is reissued, it steps the peer off the hook before running all threads.
+    mock.script(
+        MockStop::new(StopEvent::SingleStep { thread: THREAD })
+            .set_pc(THREAD, LONG_JUMP + 4)
+            .expect_resume(ResumeRequest::step(THREAD)),
+    );
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    let _ = mock.take_calls();
+    session.step_over().expect("defer the queued stop");
+    let stop = session.wait(None).expect("report the queued stop");
+    assert_eq!(resumes(&mock), [], "the source step must not reissue the old continue");
+    assert_eq!(stop, Some(queued));
+}
+
+#[test]
+fn handler_exit_cleanup_preserves_a_new_logical_breakpoint()
+{
+    let (mock, mut session, _) = handler_return_with_failed_exit_restore();
+    let logical = session
+        .set_breakpoint(BreakpointLocation::Address(LONG_JUMP))
+        .expect("claim the existing trap");
+    mock.script(handler_step_off());
+    session.resume().expect("retry cleanup before continuing");
+
+    assert_eq!(session.logical_breakpoint_at(LONG_JUMP).map(|bp| bp.id), Some(logical));
+    assert_eq!(
+        mock.peek_memory(LONG_JUMP, 4),
+        Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()),
+        "the new logical breakpoint still traps"
+    );
+}
+
+#[test]
+fn resume_retries_failed_rollback_of_partially_armed_handler_exit_hooks()
+{
+    let mock = handler_stopped_with_long_jump();
+    let runtime = MockRuntime::new()
+        .with_exit_source(ExitSource::named(EXIT_IMAGE, &[EXIT_ENTRY, SECOND_EXIT_ENTRY]))
+        .into_shared();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared()).with_runtime(runtime);
+    session.launch(&LaunchSpec::new("partial-exit-hooks")).expect("launch");
+    let (rendezvous, _) = handler_stopped_in_its_handler(&mock, &mut session);
+    let original = mock.peek_memory(LONG_JUMP, 4).expect("original first entry");
+    let second = mock.peek_memory(SECOND_EXIT, 4).expect("original second entry");
+
+    let arm_error = BackendError::Os {
+        code: 5,
+        message: "injected second hook insertion failure".into(),
+    };
+    mock.fail_on_nth(MockCallKind::WriteMemory, 2, arm_error.clone());
+    mock.fail_next(MockCallKind::WriteMemory, exit_restore_error());
+    let _ = mock.take_calls();
+    assert!(matches!(session.resume(), Err(DebuggerError::Backend(actual)) if actual == arm_error));
+    assert_eq!(resumes(&mock), [], "failed arming never resumed the target");
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(mock.peek_memory(SECOND_EXIT, 4), Ok(second));
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+
+    // Give up the rendezvous so the next continue needs no new exit hooks.
+    session
+        .remove_breakpoint(rendezvous)
+        .expect("remove the handler's return trap");
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
+    session.resume().expect("retry the failed rollback before continuing");
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(original), "the first hook was restored");
+    assert!(session.breakpoints().is_empty());
+    assert_eq!(session.wait(None).expect("wait"), Some(StopEvent::Exited { code: 0 }));
 }

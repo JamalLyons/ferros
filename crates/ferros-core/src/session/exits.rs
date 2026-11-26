@@ -75,9 +75,7 @@ pub(super) struct ExitHooks
     images: Vec<ExitImage>,
     hooks: Vec<Hook>,
     leaving: Option<Leaving>,
-    /// The traps outlived the continue they were armed for: a restore failed, and they
-    /// are only waiting to be removed (#339). A pending handler return's stops are never
-    /// matched against them; `retry_handler_cleanup` removes them before the next run.
+    /// A restore failed. The remaining traps are kept for cleanup before the next run.
     cleanup_pending: bool,
 }
 
@@ -97,40 +95,15 @@ pub(super) enum ExitStep
 
 impl ExitHooks
 {
-    /// Hooks of `thread` with nothing armed.
-    pub(super) fn empty(thread: ThreadId) -> Self
-    {
-        Self {
-            thread,
-            images: Vec::new(),
-            hooks: Vec::new(),
-            leaving: None,
-            cleanup_pending: false,
-        }
-    }
-
     pub(super) fn thread(&self) -> ThreadId
     {
         self.thread
     }
 
-    /// Whether any trap is still armed.
-    pub(super) fn armed(&self) -> bool
-    {
-        !self.hooks.is_empty()
-    }
-
-    /// Whether these traps only wait to be removed (see `cleanup_pending`).
+    /// Whether the remaining traps are kept solely for cleanup.
     pub(super) fn cleanup_pending(&self) -> bool
     {
         self.cleanup_pending
-    }
-
-    /// Keep these traps only for their removal: a restore failed.
-    pub(super) fn mark_cleanup_pending(&mut self)
-    {
-        self.cleanup_pending = true;
-        self.leaving = None;
     }
 
     /// Whether an exit of the thread is being stepped.
@@ -171,14 +144,8 @@ impl Session
         let Some(address) = self.breakpoints.get(id).map(|entry| entry.info.address) else {
             return Ok(());
         };
-        // Or set or enabled a logical breakpoint there while it was: the site still
-        // trapped, so the logical breakpoint took it over (`insert_sites`), and the trap
-        // is now the user's.
-        if self
-            .logical
-            .iter()
-            .any(|breakpoint| breakpoint.enabled && breakpoint.site_at(address).is_some())
-        {
+        // An enabled logical breakpoint can claim the still-armed site while cleanup is pending.
+        if self.logical_breakpoint_at(address).is_some() {
             return Ok(());
         }
         match owner {
@@ -219,8 +186,8 @@ impl Session
         Ok(())
     }
 
-    /// Attempt every hook restore, keeping only hooks whose restore failed. The first
-    /// failure is returned and the option is cleared once all hooks are released.
+    /// Attempt every hook restore, retaining failed hooks only for cleanup. Return the
+    /// first failure and clear the option once all hooks are released.
     pub(super) fn restore_exit_hooks(&mut self, exits: &mut Option<ExitHooks>) -> Result<()>
     {
         let Some(armed) = exits else { return Ok(()) };
@@ -236,6 +203,9 @@ impl Session
         });
         if armed.hooks.is_empty() {
             *exits = None;
+        } else {
+            armed.cleanup_pending = true;
+            armed.leaving = None;
         }
         result
     }

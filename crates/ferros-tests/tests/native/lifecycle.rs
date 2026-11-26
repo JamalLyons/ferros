@@ -1746,7 +1746,8 @@ fn held_target_when_the_debugger_process_exits()
         let tag = t.tag();
         let holder = Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", "--nocapture", "--"])
-            .arg("held_target_when_the_debugger_process_exits")
+            // libtest names it by module path inside the `native` binary.
+            .arg("lifecycle::held_target_when_the_debugger_process_exits")
             .arg(tag.as_str())
             .env(HOLDER_TARGET_ENV, pid.0.to_string())
             .output()

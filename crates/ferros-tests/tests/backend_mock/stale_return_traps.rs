@@ -53,7 +53,7 @@ fn enabling_a_breakpoint_at_a_line_step_site_keeps_it_enabled_and_armed()
 /// interrupting the instruction step before it executes, then handler return to
 /// that same pc. This ordering cannot be forced by sending a signal to a stopped
 /// process: the kernel may deliver it after the instruction completes instead. The real
-/// handler test is `tests/stepping.rs::signal_handler_return_does_not_count_the_step_resume_breakpoint`.
+/// handler test is `tests/native/stepping.rs::signal_handler_return_does_not_count_the_step_resume_breakpoint`.
 #[test]
 fn signal_during_breakpoint_step_does_not_report_or_count_a_second_hit()
 {

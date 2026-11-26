@@ -9,7 +9,7 @@ use ferros_tests::control::ControlDir;
 use ferros_tests::symbols::{function_address, marker_address};
 use ferros_tests::{fixture, harness};
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// Disarm or release the publication hook even if an assertion unwinds, so a hook
 /// armed but not yet reached cannot pause a late exception during teardown (#183).

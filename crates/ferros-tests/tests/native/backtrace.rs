@@ -617,7 +617,7 @@ fn deep_backtrace_is_fast_and_complete()
 #[test]
 fn bt_prints_the_frames()
 {
-    // Build and sign `ferros` before the harness deadline starts (see `tests/cli.rs`).
+    // Build and sign `ferros` before the harness deadline starts (see `tests/native/cli.rs`).
     let _ = transcript::ferros_bin();
     harness::run(|t: &TestContext| {
         let fixture = fixture!("nested_calls");

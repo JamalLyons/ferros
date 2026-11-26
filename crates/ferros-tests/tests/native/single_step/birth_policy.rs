@@ -11,7 +11,7 @@ use ferros_tests::harness::{self, Debuggee, Spawned};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture};
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// A resume that starts before dyld has published pthread still holds the new thread.
 #[test]

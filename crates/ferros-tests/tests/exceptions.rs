@@ -1262,6 +1262,139 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
     });
 }
 
+/// Hold a client `kill -<signal>` across the detach handshake of a running `target`, as
+/// [`unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake`] does for
+/// SIGSTOP, then drop the backend and return what the detach did with the held signals.
+fn detach_holding_client_signal(pid: ferros_core::ProcessId, signal: &str) -> ferros_macos::exception::DetachReplay
+{
+    let mut backend = MacOSBackend::new().expect("MacOSBackend::new");
+    let faults = backend.reply_fault_injector();
+    ferros_core::Backend::attach(&mut backend, pid).expect("attach");
+    ferros_core::Backend::resume(&mut backend, &ResumeRequest::continue_all()).expect("resume");
+    faults.fail_suspends_and_suppressions_until_detach();
+    faults.fail_thread_freezes(u32::MAX);
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args([&format!("-{signal}"), &pid.0.to_string()])
+            .status()
+            .expect("kill")
+            .success()
+    );
+    match ferros_core::Backend::wait(&mut backend, Some(STOP_TIMEOUT)) {
+        Err(err) => assert!(
+            err.to_string().contains("task_suspend") || err.to_string().contains("suppress"),
+            "first error: {err}"
+        ),
+        Ok(event) => panic!("expected the suspend or suppression failure from wait, got {event:?}"),
+    }
+    let awaited = faults.send_next_detach_stop_after_suspend_retry();
+    wait_for_detach_stop_hold(&faults);
+    faults.fail_thread_freezes(0);
+    let replay = faults.observe_next_detach_replay();
+    let began = std::time::Instant::now();
+    drop(backend);
+    let took = began.elapsed();
+    assert_eq!(
+        awaited.try_recv(),
+        Ok(true),
+        "the held client {signal} satisfied the detach handshake before its private SIGSTOP was sent"
+    );
+    assert!(took < Duration::from_secs(3), "detach took {took:?}");
+    replay.try_recv().expect("the detach reported its handshake signals")
+}
+
+/// A running `signal_tracing` fixture in a process group of its own: in the test's
+/// orphaned group the kernel would discard a stop signal sent to it.
+struct StopSignalTarget
+{
+    pid: ferros_core::ProcessId,
+    directory: std::path::PathBuf,
+    _target: harness::Spawned,
+}
+
+impl StopSignalTarget
+{
+    /// Spawn it, handling SIGTSTP when `catch` is set, and wait until it is set up.
+    fn spawn(t: &harness::TestContext, catch: bool) -> Self
+    {
+        let directory = ferros_tests::scratch::create_dir("ferros-tstp");
+        let path = directory.to_str().expect("observer path");
+        let mut args = vec![path, "--own-group"];
+        if catch {
+            args.push("--catch-tstp");
+        }
+        let target = t.spawn(&fixture!("signal_tracing"), &args);
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while !directory.join("ready").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture did not install its handlers"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Self {
+            pid: target.pid(),
+            directory,
+            _target: target,
+        }
+    }
+}
+
+/// SIGTSTP at its default action stops the process just as SIGSTOP does (#319): replayed
+/// after `PT_DETACH`, its stop can land before the private one is answered, detach's wait
+/// takes it for its own and sends SIGCONT early, and the late private stop leaves the
+/// target stopped. Detach continues the process anyway, so it drops that SIGTSTP.
+#[test]
+fn unanswered_default_sigtstp_is_dropped_on_detach()
+{
+    let _ipc = shared();
+    harness::run(|t| {
+        let target = StopSignalTarget::spawn(t, false);
+        let pid = target.pid;
+        let replay = detach_holding_client_signal(pid, "TSTP");
+        assert!(
+            replay.held.contains(&SIGTSTP),
+            "the client SIGTSTP was not held by the handshake: {replay:?}"
+        );
+        assert!(
+            !replay.replayed.contains(&SIGTSTP),
+            "detach replayed a default-action SIGTSTP; its stop can land before the private one is answered and detach's \
+             wait would take it for its own: {replay:?}"
+        );
+        assert_runs(pid.0);
+    });
+}
+
+/// A SIGTSTP the target handles does not stop it, so detach replays it after `PT_DETACH`
+/// and its handler runs in the released process (#319).
+#[test]
+fn unanswered_handled_sigtstp_is_replayed_on_detach()
+{
+    let _ipc = shared();
+    harness::run(|t| {
+        let target = StopSignalTarget::spawn(t, true);
+        let pid = target.pid;
+        let replay = detach_holding_client_signal(pid, "TSTP");
+        assert!(
+            replay.held.contains(&SIGTSTP),
+            "the client SIGTSTP was not held by the handshake: {replay:?}"
+        );
+        assert!(
+            replay.replayed.contains(&SIGTSTP),
+            "detach dropped a SIGTSTP the target handles: {replay:?}"
+        );
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while !target.directory.join("tstp").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replayed SIGTSTP's handler did not run in the released process"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_runs(pid.0);
+    });
+}
+
 /// An exception raised just before the exception handler is torn down waits queued on
 /// the exception port (#198, F6). The detach joins the loop, which holds the private
 /// stop's record, and the loop answers what is queued before the port is destroyed. A
@@ -1494,6 +1627,7 @@ fn soft_faults_location(marker: &str) -> ferros_core::BreakpointLocation
 /// `SIGUSR1` on macOS (`<sys/signal.h>`).
 const SIGUSR1: i32 = 30;
 const SIGSTOP: i32 = 17;
+const SIGTSTP: i32 = 18;
 
 /// A store through a null pointer is a memory access fault that holds no signal: a
 /// forwarding continue is not rejected as signal injection, and the store faults again

@@ -129,7 +129,8 @@ The crate defines twenty-one fixture binaries:
   `spin_line` until a SIGUSR1 sent from outside runs the handler `on_sigusr1` (marker
   `in_handler`). Used for backtraces through `_sigtramp`.
 - `ferros-fixture-signal_tracing`: Keeps two threads alive and acknowledges SIGUSR1 through
-  files in a test-owned directory (macOS).
+  files in a test-owned directory (macOS). `--own-group` moves it into its own process group so
+  job-control stop signals reach it; `--catch-tstp` handles SIGTSTP and writes `tstp`.
 - `ferros-fixture-thread_signals`: Two workers raise thread-directed SIGUSR1 independently and report
   which worker handlers ran, for selective delivery and retained-stop races (macOS).
 - `ferros-fixture-step_races`: Two workers wait behind independent file gates before

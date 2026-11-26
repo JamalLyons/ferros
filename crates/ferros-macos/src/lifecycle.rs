@@ -57,6 +57,52 @@ pub(crate) fn job_control_stop_has_taken_effect(pid: pid_t, task: mach_port_t) -
     kr == mach2::kern_return::KERN_SUCCESS && basic.suspend_count > 0
 }
 
+/// Size of Darwin's `struct kinfo_proc`, which `libc` does not define for this target.
+const KINFO_PROC_SIZE: usize = 648;
+/// Offset of `kp_proc.p_sigcatch` in `struct kinfo_proc`: the mask of signals the
+/// process has a handler for (bit `n - 1` for signal `n`).
+const KINFO_PROC_SIGCATCH: usize = 236;
+
+/// The signals `pid` currently catches with a handler, as a `sigset_t` mask, or `None`
+/// if the kernel does not report them (the process has gone, or the layout changed).
+pub(crate) fn caught_signals(pid: pid_t) -> Option<u32>
+{
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut buffer = [0_u8; KINFO_PROC_SIZE];
+    let mut size = buffer.len();
+    // SAFETY: mib holds four valid ints; buffer is writable for `size` bytes and the
+    // kernel stores the number written in `size`.
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != KINFO_PROC_SIZE {
+        return None;
+    }
+    let mask = buffer.get(KINFO_PROC_SIGCATCH..KINFO_PROC_SIGCATCH + 4)?;
+    Some(u32::from_ne_bytes(mask.try_into().ok()?))
+}
+
+/// Whether a stop signal that `pid` does not catch would stop it: the signal is
+/// `SIGSTOP`, or one of `SIGTSTP`, `SIGTTIN` and `SIGTTOU` with no handler installed.
+/// An unknown mask counts as uncaught.
+pub(crate) fn stops_without_handler(pid: pid_t, signal: i32) -> bool
+{
+    match signal {
+        libc::SIGSTOP => true,
+        libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
+            caught_signals(pid).is_none_or(|mask| mask & (1 << (signal - 1)) == 0)
+        }
+        _ => false,
+    }
+}
+
 /// A cancellable exit watcher that owns the tracee's waitpid calls.
 pub(crate) struct ExitWatcher
 {

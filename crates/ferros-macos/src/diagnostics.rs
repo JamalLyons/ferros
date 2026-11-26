@@ -304,6 +304,56 @@ pub fn sigcont_observed() -> bool
     SIGCONT_OBSERVED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Move the calling process into a new process group of its own. Its parent, in another
+/// group of the same session, keeps that group from being orphaned, so the kernel
+/// delivers `SIGTSTP`, `SIGTTIN` and `SIGTTOU` to it instead of discarding them. Tests
+/// only (#319).
+///
+/// # Errors
+/// Returns the OS error of `setpgid`.
+#[doc(hidden)]
+pub fn enter_own_process_group() -> std::io::Result<()>
+{
+    // SAFETY: `setpgid` takes plain integers; 0, 0 names the caller and a new group.
+    if unsafe { libc::setpgid(0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Set by the fixture's SIGTSTP observer. Tests only (#319).
+static SIGTSTP_OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn observe_sigtstp(_: libc::c_int)
+{
+    SIGTSTP_OBSERVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install a SIGTSTP handler that only records that it ran, so the signal no longer
+/// stops the calling process. Tests only (#319).
+///
+/// # Errors
+/// Returns the OS error if the handler could not be installed.
+#[doc(hidden)]
+pub fn install_sigtstp_observer() -> std::io::Result<()>
+{
+    // SAFETY: the static handler has C ABI and performs only a lock-free atomic store.
+    if unsafe { libc::signal(libc::SIGTSTP, observe_sigtstp as *const () as libc::sighandler_t) } == libc::SIG_ERR {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the fixture's SIGTSTP handler has run. Tests only (#319).
+#[doc(hidden)]
+#[must_use]
+pub fn sigtstp_observed() -> bool
+{
+    SIGTSTP_OBSERVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Install the SIGUSR1 observer used by the signal-tracing fixture. Tests only.
 #[doc(hidden)]
 pub fn install_sigusr1_observer() -> std::io::Result<()>

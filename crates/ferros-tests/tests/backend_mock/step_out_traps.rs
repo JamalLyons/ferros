@@ -1,4 +1,4 @@
-//! Step-out: stale, real and program trap stops queued for its return continue.
+//! Step-out: return-continue stops and temporary trap cleanup.
 
 use ferros_core::backend::mock::{MockBackend, MockStop, arm64_registers};
 use ferros_core::backend::{LaunchSpec, ResumeRequest, StopEvent};
@@ -7,6 +7,73 @@ use ferros_core::types::ThreadId;
 use ferros_core::{Session, arch};
 
 use crate::helpers::*;
+
+#[test]
+fn resume_retries_failed_step_out_hook_cleanup()
+{
+    use ferros_core::backend::mock::MockCallKind;
+    use ferros_core::backend::{BackendError, ImageRole, LoadedImage};
+    use ferros_core::objfile::mock::MockObjectImage;
+    use ferros_core::runtime::ExitSource;
+    use ferros_core::runtime::mock::MockRuntime;
+    use ferros_core::types::Address;
+    use ferros_core::{BreakpointRequest, DebuggerError, SessionState};
+
+    const BASE: u64 = 0x2_0000_0000;
+    const USER: Address = Address::new(BASE + 0x400);
+    const PRIVATE: Address = Address::new(BASE + 0x408);
+    const SECOND_ENTRY: &str = "second_leaf";
+    let symbols = MockObjectImage::new(USER.value()..USER.value() + 16, BASE + 0x1000, BASE + 0x1100)
+        .with_symbol(USER.value(), EXIT_ENTRY)
+        .with_symbol(PRIVATE.value(), SECOND_ENTRY);
+    let mut image = symbols.header_bytes();
+    image.resize(0x1000, 0);
+    image.extend(symbols.table_bytes());
+    image.resize(0x1100, 0);
+    image.extend(symbols.name_bytes());
+    let mock = returning_to_breakpoint()
+        .with_region(Address::new(BASE), "r-x", image)
+        .with_image(LoadedImage {
+            path: format!("/usr/lib/{EXIT_IMAGE}").into(),
+            load_address: Address::new(BASE),
+            build_id: ferros_core::BuildIdentity::Unknown,
+            role: ImageRole::Library,
+        });
+    let runtime = MockRuntime::new()
+        .with_exit_source(ExitSource::named(EXIT_IMAGE, &[EXIT_ENTRY, SECOND_ENTRY]))
+        .into_shared();
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared()).with_runtime(runtime);
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    let user = session
+        .add_breakpoint(BreakpointRequest::Software { address: USER })
+        .expect("add user breakpoint");
+    session.disable_breakpoint(user).expect("disable user breakpoint");
+
+    mock.script(MockStop::new(StopEvent::Interrupted { thread: Some(THREAD) }).expect_resume(step_out_continue()));
+    session.step_out().expect("arm the return trap and both exit hooks");
+    let trap = arch::Arm64::TRAP_INSTRUCTION.to_vec();
+    assert_eq!(mock.peek_memory(USER, 4), Ok(trap.clone()));
+    assert_eq!(mock.peek_memory(PRIVATE, 4), Ok(trap.clone()));
+
+    // Restore the return trap first, then fail the write for the first exit hook.
+    let error = BackendError::Os {
+        code: 5,
+        message: "injected hook restore failure".into(),
+    };
+    mock.fail_on_nth(MockCallKind::WriteMemory, 2, error.clone());
+    assert!(matches!(session.wait(None), Err(DebuggerError::Backend(actual)) if actual == error));
+    assert_eq!(session.state(), SessionState::Stopped);
+    assert_eq!(mock.peek_memory(USER, 4), Ok(trap));
+    assert_eq!(mock.peek_memory(PRIVATE, 4), Ok(vec![0; 4]));
+
+    session.resume().expect("retry hook cleanup before resuming");
+    assert_eq!(mock.peek_memory(USER, 4), Ok(vec![0; 4]), "the first hook was restored");
+    assert_eq!(mock.peek_memory(PRIVATE, 4), Ok(vec![0; 4]));
+    let breakpoints = session.breakpoints();
+    assert_eq!(breakpoints.len(), 1, "only the user breakpoint remains");
+    assert_eq!(breakpoints[0].id, user);
+    assert!(!breakpoints[0].enabled, "the user breakpoint is disabled again");
+}
 
 /// Script `step_out`'s return trap: `THREAD` reaches `BREAKPOINT` in its caller's frame.
 fn script_return_trap(mock: &MockBackend, session: &mut Session)

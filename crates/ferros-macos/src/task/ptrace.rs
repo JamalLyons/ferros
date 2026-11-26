@@ -446,13 +446,19 @@ impl MacOSBackend
             let held = self.held_handshake_signal_numbers();
             if private_stop_sent {
                 // Below, detach continues the released process with SIGCONT, which undoes
-                // any SIGSTOP; one cannot be caught, so replaying it changes nothing but
-                // lets its job-control stop take effect before the private one is even
-                // answered. Detach's wait would take that stop for its own and send its
-                // SIGCONT before the private stop lands, leaving the process stopped
-                // (#311). Drop it instead.
+                // any job-control stop. A SIGSTOP cannot be caught, and SIGTSTP, SIGTTIN
+                // and SIGTTOU at their default action stop the process just the same, so
+                // replaying one changes nothing but lets its stop take effect before the
+                // private one is even answered. Detach's wait would take that stop for its
+                // own and send its SIGCONT before the private stop lands, leaving the
+                // process stopped (#311, #319). Drop those instead; a stop signal the
+                // target handles is replayed so its handler runs.
+                //
+                // Still open: a stop another process sends between PT_DETACH and the
+                // private reply is not held here, and can win the same race.
+                let pid = self.pid.0 as libc::pid_t;
                 if let Some(signals) = lock_shared(&self.exception_state).handshake_signals.as_mut() {
-                    signals.retain(|signal| signal.signal != libc::SIGSTOP);
+                    signals.retain(|signal| !crate::lifecycle::stops_without_handler(pid, signal.signal));
                 }
             }
             let replayed = self.held_handshake_signal_numbers();

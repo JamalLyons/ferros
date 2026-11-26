@@ -14,11 +14,11 @@ use crate::platform::create_session;
 use crate::repl::jobs::JobControl;
 use crate::repl::{Debugger, Input, Target};
 
-/// A Rust-native debugger with hybrid MIR and system-level introspection.
+/// A Rust debugger for macOS arm64.
 #[derive(Parser, Debug)]
 #[command(name = "ferros")]
 #[command(version)]
-#[command(about = "A Rust-native debugger with hybrid MIR and system-level introspection", long_about = None)]
+#[command(about = "A Rust debugger for macOS arm64", long_about = None)]
 struct Cli
 {
     /// Set the log level (error, warn, info, debug, trace); overrides `RUST_LOG`.

@@ -33,8 +33,9 @@ pub enum MachError
     ///
     /// This means the operation was blocked by macOS's security system.
     /// Common causes:
-    /// - `task_for_pid()` requires special permissions
-    /// - Need to run with `sudo` or grant debugging entitlements
+    /// - `task_for_pid()` requires the debugger entitlement
+    ///   (`com.apple.security.cs.debugger`). Sign with `just sign-debugger`
+    /// - Root also satisfies the check. Do not use `sudo` for tests
     /// - System Integrity Protection (SIP) is blocking the operation
     ///
     /// See: [macOS Debugging Entitlements](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger)

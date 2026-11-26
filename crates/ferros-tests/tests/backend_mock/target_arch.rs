@@ -2,11 +2,16 @@
 //! (`Backend::arch`), so a target's own address width and unwind conventions reach every
 //! decision: breakpoint stops in `handle_stop`, trap bytes and backtraces.
 
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
-use ferros_core::arch::{Arch, Arm64, UndefinedReturnAddress};
+#[cfg(target_os = "macos")]
+use ferros_core::arch::UndefinedReturnAddress;
+use ferros_core::arch::{Arch, Arm64};
+#[cfg(target_os = "macos")]
+use ferros_core::backend::Backend;
 use ferros_core::backend::mock::{MockBackend, MockStop, arm64_registers};
-use ferros_core::backend::{Backend, BackendResult, ImageRole, LaunchSpec, LoadedImage, StopEvent};
+use ferros_core::backend::{BackendResult, ImageRole, LaunchSpec, LoadedImage, StopEvent};
 use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat, MockObjectImage};
 use ferros_core::types::{Address, Architecture, BuildIdentity, Registers};
 use ferros_core::{BreakpointRequest, Session};

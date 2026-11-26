@@ -25,7 +25,7 @@ use libc::{natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::KERN_SUCCESS;
 
-use crate::error::MachError;
+use crate::error::mach_failure;
 use crate::{constants, ffi};
 
 // Use constants from the centralized constants module
@@ -89,7 +89,8 @@ struct ArmDebugState64
 ///
 /// ## Errors
 ///
-/// Returns `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+/// `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 /// Returns `InvalidArgument` if all hardware breakpoint slots are in use.
 ///
 /// ## See Also
@@ -126,7 +127,8 @@ pub fn set_hardware_breakpoint(thread: thread_act_t, address: Address) -> Result
 ///
 /// ## Errors
 ///
-/// Returns `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+/// `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 /// Returns `InvalidArgument` if the slot index is out of range.
 ///
 /// ## See Also
@@ -167,7 +169,8 @@ pub fn clear_hardware_breakpoint(thread: thread_act_t, slot: u32) -> Result<()>
 ///
 /// - `InvalidArgument` if the architecture is not supported, or parameters are unsupported.
 /// - `ResourceExhausted` if all watchpoint slots are in use.
-/// - `MachError` if `thread_get_state()` or `thread_set_state()` fails.
+/// - `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+///   `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 pub fn set_watchpoint(thread: thread_act_t, address: Address, length: usize, access: WatchpointAccess) -> Result<u32>
 {
     #[cfg(target_arch = "x86_64")]
@@ -222,7 +225,9 @@ const MDSCR_EL1_SS: u64 = 1;
 ///
 /// ## Errors
 ///
-/// - `MachError` if `thread_get_state()` or `thread_set_state()` fails (for example the
+/// - `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+///   `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or
+///   `thread_set_state()` fails (for example `Os { code: KERN_INVALID_ARGUMENT }` once the
 ///   thread has exited).
 /// - `InvalidArgument` on x86-64, where single-step is not implemented.
 pub fn set_single_step(thread: thread_act_t, enabled: bool) -> Result<()>
@@ -249,7 +254,7 @@ pub fn set_single_step(thread: thread_act_t, enabled: bool) -> Result<()>
                 &mut count,
             );
             if kr != KERN_SUCCESS {
-                return Err(DebuggerError::from(MachError::from(kr)));
+                return Err(mach_failure("thread_get_state", kr).into());
             }
 
             if enabled {
@@ -265,7 +270,7 @@ pub fn set_single_step(thread: thread_act_t, enabled: bool) -> Result<()>
                 constants::ARM_DEBUG_STATE64_COUNT,
             );
             if kr != KERN_SUCCESS {
-                return Err(DebuggerError::from(MachError::from(kr)));
+                return Err(mach_failure("thread_set_state", kr).into());
             }
         }
         Ok(())
@@ -288,9 +293,21 @@ pub(crate) fn single_step_enabled(thread: thread_act_t) -> Result<bool>
         )
     };
     if kr != KERN_SUCCESS {
-        return Err(DebuggerError::from(MachError::from(kr)));
+        return Err(mach_failure("thread_get_state", kr).into());
     }
     Ok(state.mdscr_el1 & MDSCR_EL1_SS != 0)
+}
+
+/// A port name in the calling process that is not a thread: its own task port. Tests only.
+///
+/// Every debug-register call on it reaches the kernel and fails in `thread_get_state`
+/// with `KERN_INVALID_ARGUMENT`, so a test can check what that failure becomes.
+#[doc(hidden)]
+#[must_use]
+pub fn not_a_thread_port() -> thread_act_t
+{
+    // SAFETY: reads the task-self port name the runtime set up at startup.
+    unsafe { mach2::traps::mach_task_self() }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -307,7 +324,7 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         // Find a free slot
@@ -358,7 +375,7 @@ fn set_hw_bp_x86(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(slot)
@@ -379,7 +396,7 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         // Clear local enable bit
@@ -393,7 +410,7 @@ fn clear_hw_bp_x86(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(())
@@ -414,7 +431,7 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         // Find a free slot
@@ -458,7 +475,7 @@ fn set_hw_bp_arm64(thread: thread_act_t, address: Address) -> Result<u32>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(slot as u32)
@@ -479,7 +496,7 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         if slot >= 16 {
@@ -497,7 +514,7 @@ fn clear_hw_bp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(())
@@ -533,7 +550,7 @@ fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: W
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         // Find a free slot in the watchpoint control registers.
@@ -568,7 +585,7 @@ fn set_wp_arm64(thread: thread_act_t, address: Address, length: usize, access: W
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(slot as u32)
@@ -589,7 +606,7 @@ fn clear_wp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_get_state", kr).into());
         }
 
         if slot >= 16 {
@@ -608,7 +625,7 @@ fn clear_wp_arm64(thread: thread_act_t, slot: u32) -> Result<()>
         );
 
         if kr != KERN_SUCCESS {
-            return Err(DebuggerError::from(MachError::from(kr)));
+            return Err(mach_failure("thread_set_state", kr).into());
         }
 
         Ok(())

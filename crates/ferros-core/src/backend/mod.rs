@@ -251,6 +251,10 @@ pub trait Backend: Send
     ///   the previous resume failed. The backend state is unchanged by that error.
     /// - An error from delivering a signal the previous resume forwarded, when that resume
     ///   had already let the target run: the target keeps running.
+    /// - [`BackendError::InvalidState`], [`BackendError::Unsupported`],
+    ///   [`BackendError::NotFound`], [`BackendError::PermissionDenied`], or [`BackendError::Os`]
+    ///   from emulating a thread-start entry. This error concerns a single thread. The
+    ///   process is still alive and the backend remains *Running*, including on `NotFound`.
     fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>;
 
     /// Resume the target as described by `request`; the backend becomes *Running*.

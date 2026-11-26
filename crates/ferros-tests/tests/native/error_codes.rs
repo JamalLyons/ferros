@@ -1,10 +1,12 @@
 //! Mach failures reach the `Backend` caller as a typed category that keeps the real
-//! `kern_return_t` (issue #226).
+//! `kern_return_t` (issues #226 and #340).
 //!
-//! The macOS helpers used to report a failed `thread_get_state`, `vm_write` or
-//! `mach_vm_protect` as `DebuggerError` text, which the `Backend` boundary turned into
+//! The macOS helpers used to report a failed `thread_get_state`, `vm_write`,
+//! `mach_vm_protect` or `mach_vm_region_recurse` as `DebuggerError` text, which the `Backend` boundary turned into
 //! `BackendError::Os { code: -1 }`: the category and the code were both lost.
 #![cfg(target_os = "macos")]
+
+use std::time::Duration;
 
 #[cfg(target_arch = "aarch64")]
 use ferros_core::types::VectorRegisterValue;
@@ -14,7 +16,7 @@ use ferros_macos::MacOSBackend;
 use ferros_macos::registers::arm64::fail_next_arm64_neon_write;
 use ferros_tests::{fixture, harness};
 
-/// `MACH_SEND_INVALID_DEST`: what a Mach call on `MACH_PORT_NULL` returns.
+/// `MACH_SEND_INVALID_DEST`: Mach IPC error for a null or dead destination port.
 const MACH_SEND_INVALID_DEST: i64 = 0x1000_0003;
 
 /// Bytes written across the end of a region: half before it, half after.
@@ -110,6 +112,32 @@ fn failed_gpr_rollback_keeps_neon_error_category_and_reports_both_failures()
     });
 }
 
+#[test]
+fn memory_regions_on_a_dead_task_preserves_the_mach_error_code()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("loop_counter"));
+        let pid = d.pid().0;
+        assert_ne!(d.memory_regions().expect("live task's memory regions"), []);
+
+        assert!(harness::kill_tagged(d.tag()).contains(&pid), "kill fixture {pid}");
+        assert!(
+            harness::wait_until_gone(pid, Duration::from_secs(5)),
+            "fixture {pid} was not reaped"
+        );
+
+        // Query before wait consumes the terminal event and releases the dead task port.
+        let error = d.memory_regions().expect_err("enumeration on a dead task port");
+        match error {
+            DebuggerError::Backend(BackendError::Os { code, message }) => {
+                assert_eq!(code, MACH_SEND_INVALID_DEST, "{message}");
+                assert!(message.contains("mach_vm_region_recurse"), "{message}");
+            }
+            other => panic!("expected Os with the mach_vm_region_recurse code, got {other:?}"),
+        }
+    });
+}
+
 /// The target's memory regions, sorted by start address.
 fn regions(d: &mut harness::Debuggee) -> Vec<MemoryRegion>
 {
@@ -169,5 +197,60 @@ fn write_that_runs_into_an_unmapped_hole_is_not_found()
             .write_memory(at, &[0; SPAN])
             .expect_err("write into the hole");
         assert!(matches!(error, BackendError::NotFound(_)), "write at {at}: {error:?}");
+    });
+}
+
+/// `KERN_INVALID_ARGUMENT`: what a thread call returns for a port that names no thread.
+#[cfg(target_arch = "aarch64")]
+const KERN_INVALID_ARGUMENT: i64 = 4;
+
+/// A debug-register call whose `thread_get_state` fails with `KERN_INVALID_ARGUMENT`
+/// keeps that code (issue #341). It used to go through `From<MachError>`, which made it
+/// `DebuggerError::InvalidArgument`, so `BackendError::Unsupported` at the `Backend`
+/// boundary, with no code.
+///
+/// The port is this process's own task port: the kernel answers a thread call on a task
+/// with `KERN_INVALID_ARGUMENT` every time. (A thread that has exited answers it only
+/// briefly before its port becomes a dead name, `MACH_SEND_INVALID_DEST`.) The calls go
+/// to the kernel, not to a debuggee, so this test launches no fixture.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn debug_register_calls_on_a_port_that_is_not_a_thread_keep_kern_invalid_argument()
+{
+    use ferros_macos::{breakpoints, registers};
+
+    harness::run(|_| {
+        let port = registers::debug::not_a_thread_port();
+        let failures = vec![
+            ("set_single_step", registers::set_single_step(port, true).err()),
+            (
+                "clear_hardware_breakpoint",
+                registers::clear_hardware_breakpoint(port, 0).err(),
+            ),
+            ("clear_watchpoint", registers::clear_watchpoint(port, 0).err()),
+            (
+                "install_hardware_breakpoint",
+                breakpoints::install_hardware_breakpoint(&[port], Address::from(0x1000u64)).err(),
+            ),
+            (
+                "install_watchpoint",
+                breakpoints::install_watchpoint(
+                    &[port],
+                    Address::from(0x1000u64),
+                    8,
+                    ferros_core::WatchpointAccess::ReadWrite,
+                )
+                .err(),
+            ),
+        ];
+        for (call, error) in failures {
+            match error {
+                Some(DebuggerError::Backend(BackendError::Os { code, ref message })) => {
+                    assert_eq!(code, KERN_INVALID_ARGUMENT, "{call}: {message}");
+                    assert!(message.contains("thread_get_state"), "{call}: {message}");
+                }
+                other => panic!("{call} on a task port: expected Os {{ code: 4 }}, got {other:?}"),
+            }
+        }
     });
 }

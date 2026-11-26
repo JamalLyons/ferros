@@ -9,7 +9,7 @@
 //!
 //! - **vm_read()**: Read memory from a target process
 //! - **vm_write()**: Write memory to a target process
-//! - **mach_vm_region()**: Enumerate memory regions in a process
+//! - **mach_vm_region_recurse()**: Enumerate memory regions in a process
 //! - **mach_vm_protect()**: Change memory protection flags
 //!
 //! ## References
@@ -21,7 +21,6 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
-use std::io::Error;
 use std::sync::{Arc, RwLock};
 
 use ferros_core::BackendError;
@@ -542,7 +541,7 @@ fn flush_caches(task: mach_port_t, addr: Address, len: usize) -> Result<()>
 
 /// Get memory regions for a Mach task
 ///
-/// Uses `mach_vm_region()` to enumerate all memory regions in the target process.
+/// Uses `mach_vm_region_recurse()` to enumerate all memory regions in the target process.
 /// This iterates through the entire virtual address space, collecting information
 /// about each contiguous memory region (code segments, data segments, stack, heap, etc.).
 ///
@@ -557,23 +556,17 @@ fn flush_caches(task: mach_port_t, addr: Address, len: usize) -> Result<()>
 ///
 /// ## Errors
 ///
-/// Returns an `Io` error if:
-/// - The task port is invalid
-/// - Insufficient permissions to query memory regions
-///
-/// ## Note
-///
-/// On macOS 10.5+, `vm_region` was replaced by `mach_vm_region` for 64-bit applications.
-/// This function uses `mach_vm_region` which is the modern API.
+/// Returns a categorized Mach error that keeps the `kern_return_t` if the query fails,
+/// for example `MACH_SEND_INVALID_DEST` once the task has exited.
 ///
 /// ## Implementation Details
 ///
 /// The function iterates through memory regions by:
 /// 1. Starting at address 0
-/// 2. Calling `mach_vm_region()` to get information about the region at the current address
+/// 2. Calling `mach_vm_region_recurse()` to get information about the region at the current address
 /// 3. Converting protection flags to a permission string (r/w/x)
 /// 4. Moving to the next address (current address + region size)
-/// 5. Repeating until `mach_vm_region()` returns an error (end of address space)
+/// 5. Repeating until `KERN_INVALID_ADDRESS` marks the end of the address space
 ///
 /// See: [mach_vm_region(3) man page](https://developer.apple.com/documentation/kernel/1402149-mach_vm_region/)
 pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
@@ -602,10 +595,7 @@ pub fn get_memory_regions(task: mach_port_t) -> Result<Vec<MemoryRegion>>
                 break;
             }
             if result != KERN_SUCCESS {
-                return Err(DebuggerError::Io(Error::other(format!(
-                    "mach_vm_region_recurse failed: {}",
-                    result
-                ))));
+                return Err(mach_failure("mach_vm_region_recurse", result).into());
             }
 
             if info.is_submap != 0 {
@@ -1247,6 +1237,7 @@ fn aligned_range(addr: Address, len: usize) -> (mach_vm_address_t, mach_vm_size_
 mod tests
 {
     use std::cell::{Cell, UnsafeCell};
+    use std::io::Error;
 
     use mach2::traps::mach_task_self;
 

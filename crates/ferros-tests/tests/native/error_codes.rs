@@ -127,3 +127,58 @@ fn write_that_runs_into_an_unmapped_hole_is_not_found()
         assert!(matches!(error, BackendError::NotFound(_)), "write at {at}: {error:?}");
     });
 }
+
+/// `KERN_INVALID_ARGUMENT`: what a thread call returns for a port that names no thread.
+#[cfg(target_arch = "aarch64")]
+const KERN_INVALID_ARGUMENT: i64 = 4;
+
+/// A debug-register call whose `thread_get_state` fails with `KERN_INVALID_ARGUMENT`
+/// keeps that code (issue #341). It used to go through `From<MachError>`, which made it
+/// `DebuggerError::InvalidArgument`, so `BackendError::Unsupported` at the `Backend`
+/// boundary, with no code.
+///
+/// The port is this process's own task port: the kernel answers a thread call on a task
+/// with `KERN_INVALID_ARGUMENT` every time. (A thread that has exited answers it only
+/// briefly before its port becomes a dead name, `MACH_SEND_INVALID_DEST`.) The calls go
+/// to the kernel, not to a debuggee, so this test launches no fixture.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn debug_register_calls_on_a_port_that_is_not_a_thread_keep_kern_invalid_argument()
+{
+    use ferros_macos::{breakpoints, registers};
+
+    harness::run(|_| {
+        let port = registers::debug::not_a_thread_port();
+        let failures = vec![
+            ("set_single_step", registers::set_single_step(port, true).err()),
+            (
+                "clear_hardware_breakpoint",
+                registers::clear_hardware_breakpoint(port, 0).err(),
+            ),
+            ("clear_watchpoint", registers::clear_watchpoint(port, 0).err()),
+            (
+                "install_hardware_breakpoint",
+                breakpoints::install_hardware_breakpoint(&[port], Address::from(0x1000u64)).err(),
+            ),
+            (
+                "install_watchpoint",
+                breakpoints::install_watchpoint(
+                    &[port],
+                    Address::from(0x1000u64),
+                    8,
+                    ferros_core::WatchpointAccess::ReadWrite,
+                )
+                .err(),
+            ),
+        ];
+        for (call, error) in failures {
+            match error {
+                Some(DebuggerError::Backend(BackendError::Os { code, ref message })) => {
+                    assert_eq!(code, KERN_INVALID_ARGUMENT, "{call}: {message}");
+                    assert!(message.contains("thread_get_state"), "{call}: {message}");
+                }
+                other => panic!("{call} on a task port: expected Os {{ code: 4 }}, got {other:?}"),
+            }
+        }
+    });
+}

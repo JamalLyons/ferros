@@ -28,7 +28,7 @@ use std::mem::MaybeUninit;
 
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::types::{Address, Architecture, Registers, VectorRegisterValue};
-use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
+use libc::{natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use tracing::debug;
@@ -304,7 +304,7 @@ pub fn write_registers_x86_64(thread: thread_act_t, regs: &Registers) -> Result<
 /// Represents an 80-bit MMX/ST register (10 bytes of data + 6 bytes reserved).
 /// These are legacy x87 floating-point registers.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct MmstRegister
 {
     /// Register data (80 bits = 10 bytes)
@@ -313,34 +313,15 @@ struct MmstRegister
     reserved: [u8; 6],
 }
 
-impl Default for MmstRegister
-{
-    fn default() -> Self
-    {
-        Self {
-            bytes: [0; 10],
-            reserved: [0; 6],
-        }
-    }
-}
-
 /// XMM register structure.
 ///
 /// Represents a 128-bit XMM register (XMM0-XMM15) used for SSE/AVX SIMD operations.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct XmmRegister
 {
     /// Register data (128 bits = 16 bytes)
     bytes: [u8; 16],
-}
-
-impl Default for XmmRegister
-{
-    fn default() -> Self
-    {
-        Self { bytes: [0; 16] }
-    }
 }
 
 /// x86-64 floating-point and SIMD state structure.

@@ -430,6 +430,8 @@ pub struct MacOSBackend
     /// child's task port. `0` unarmed, `-1` armed, otherwise the pid of the child that
     /// launch discarded.
     fail_launch_task: Arc<AtomicI32>,
+    /// One-shot integration test fault for the next task-port request.
+    fail_task_for_pid: bool,
     /// One-shot integration test override for the CPU type returned by `proc_pidinfo`.
     target_cpu_type_override: Option<u32>,
     /// Sender side of the stop event channel (the exception loop holds a clone).
@@ -538,6 +540,7 @@ impl MacOSBackend
             fail_hold_suspend: Arc::default(),
             fail_register_read: Arc::default(),
             fail_launch_task: Arc::default(),
+            fail_task_for_pid: false,
             target_cpu_type_override: None,
             events_tx: None,
             events_rx: None,
@@ -711,6 +714,13 @@ impl MacOSBackend
                 .filter(|&pid| pid != 0)
                 .map(ProcessId)
         }
+    }
+
+    /// Test hook: inject `KERN_FAILURE` on the next task-port request.
+    #[doc(hidden)]
+    pub fn fail_next_task_for_pid(&mut self)
+    {
+        self.fail_task_for_pid = true;
     }
 
     /// Test hook: substitute the raw CPU type from the next successful target lookup.

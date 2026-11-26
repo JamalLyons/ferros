@@ -486,6 +486,35 @@ fn out_of_range_replacement_signal_is_refused_and_keeps_the_held_signal()
     });
 }
 
+#[test]
+fn signal_for_a_thread_kept_suspended_is_refused()
+{
+    use ferros_core::StopEvent;
+    use ferros_core::backend::{ResumeRequest, ThreadAction};
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("thread_signals"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready-0");
+        observer.wait("ready-1");
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(target.pid()).expect("attach");
+        std::fs::write(observer.0.join("signal-0"), b"go").expect("open worker signal gate");
+        backend.resume(&ResumeRequest::continue_all()).expect("run to signal");
+        let thread = match backend.wait(Some(Duration::from_secs(2))).expect("signal stop") {
+            Some(StopEvent::Signal { thread, signal: SIGUSR1 }) => thread,
+            other => panic!("expected worker SIGUSR1, got {other:?}"),
+        };
+
+        let deliver = ResumeRequest::continue_all().with_signal(thread, SIGUSR1);
+        let suspend = deliver.clone().with_thread(thread, ThreadAction::Suspend);
+        assert_refused(backend.resume(&suspend), "stays suspended", "signal for suspended worker");
+        assert!(!observer.0.join("handled-0").exists(), "the held signal was delivered early");
+        backend.resume(&deliver).expect("deliver the held signal");
+        observer.wait("handled-0");
+        backend.kill().expect("kill");
+    });
+}
+
 /// F18 (c): native resume validates a request before it looks at queued stops, unlike
 /// `MockBackend`. A real step completes in the same exception batch as a real SIGUSR1 on
 /// a peer, so the signal stop is queued behind the step's. Invalid requests are refused

@@ -15,6 +15,7 @@
 // With `--guard-page`, `main` maps two pages, fills the first with 0xa5, makes the
 // second `PROT_NONE`, prints `boundary: 0x<address of the second page>` and sleeps
 // forever, so a debugger can read across a readable-to-protected page boundary.
+// `--guard-page-with-tail` adds a readable third page filled with 0x5a.
 
 #include <mach/mach.h>
 #include <signal.h>
@@ -121,20 +122,25 @@ int main(int argc, char **argv)
     if (argc > 1 && strcmp(argv[1], "--software-exception") == 0) {
         return raise_software_exception();
     }
-    if (argc > 1 && strcmp(argv[1], "--guard-page") == 0) {
+    int readable_tail = argc > 1 && strcmp(argv[1], "--guard-page-with-tail") == 0;
+    if (readable_tail || (argc > 1 && strcmp(argv[1], "--guard-page") == 0)) {
         long page = sysconf(_SC_PAGESIZE);
-        unsigned char *pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        unsigned char *pages = mmap(NULL, (readable_tail ? 3 : 2) * page,
+                                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (pages == MAP_FAILED || mprotect(pages + page, page, PROT_NONE) != 0) {
             perror("guard page");
             return 1;
         }
         memset(pages, 0xa5, page);
+        if (readable_tail) {
+            memset(pages + 2 * page, 0x5a, page);
+        }
         printf("boundary: 0x%lx\n", (unsigned long)(pages + page));
         fflush(stdout);
         for (;;) {
             sleep(1);
         }
     }
-    printf("usage: --null-store | --handler-once | --software-exception | --guard-page\n");
+    printf("usage: --null-store | --handler-once | --software-exception | --guard-page | --guard-page-with-tail\n");
     return 2;
 }

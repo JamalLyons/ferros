@@ -214,3 +214,51 @@ fn read_across_a_readable_to_protected_boundary_is_permission_denied_on_both_pat
         );
     });
 }
+
+#[test]
+fn read_across_a_protected_to_readable_boundary_is_permission_denied_on_both_paths()
+{
+    use std::time::Duration;
+
+    use ferros_core::StopEvent;
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--guard-page-with-tail"]);
+        d.resume().expect("run to the guard page");
+        assert!(d.wait_for_stdout("\n", Duration::from_secs(5)), "fixture printed no boundary");
+        d.interrupt().expect("interrupt");
+        let stop = d.wait(Some(Duration::from_secs(5))).expect("interrupt stop");
+        assert!(matches!(stop, Some(StopEvent::Interrupted { .. })), "got {stop:?}");
+        let stdout = d.stdout();
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("boundary: 0x"))
+            .expect("guard page address line");
+        let guard = Address::from(u64::from_str_radix(hex, 16).expect("guard page address"));
+        let regions = regions(&mut d);
+        let boundary = regions
+            .windows(2)
+            .find(|pair| pair[0].start == guard && !readable(&pair[0]) && pair[0].end == pair[1].start && readable(&pair[1]))
+            .map(|pair| pair[1].start)
+            .expect("a mapped guard page followed by readable bytes");
+        let before = Address::from(boundary.value() - SPAN as u64 / 2);
+        for warm in [false, true] {
+            if warm {
+                let bytes = d
+                    .session_mut()
+                    .backend_mut()
+                    .read_memory(boundary, SPAN / 2)
+                    .expect("readable suffix through the cache");
+                assert_eq!(bytes, [0x5a; SPAN / 2]);
+            }
+            let (cached, uncached) = read_both_ways(&mut d, before);
+            assert!(
+                matches!(cached, BackendError::PermissionDenied(_)),
+                "cached read at {before} (warm: {warm}): {cached:?}"
+            );
+            assert!(
+                matches!(uncached, DebuggerError::PermissionDenied(_)),
+                "uncached read at {before} (warm: {warm}): {uncached:?}"
+            );
+        }
+    });
+}

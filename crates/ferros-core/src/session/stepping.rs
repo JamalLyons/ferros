@@ -607,9 +607,15 @@ impl Session
             let mut exits = None;
             let armed = self.arm_exit_hooks(&mut exits, thread);
             if let Err(error) = armed {
-                if let Err(cleanup) = self.release_exit_hooks(exits) {
+                // The traps whose rollback fails stay the session's, for the next
+                // resume to remove (#339).
+                if let Err(cleanup) = self.restore_exit_hooks(&mut exits) {
                     tracing::warn!("could not remove a temporary exit breakpoint: {cleanup}");
                 }
+                self.handler_exits = exits.map(|mut left| {
+                    left.mark_cleanup_pending();
+                    left
+                });
                 return Err(error);
             }
             self.handler_exits = exits;
@@ -619,7 +625,9 @@ impl Session
 
     /// Remove the exit traps of a pending handler return. They exist only while a continue
     /// runs; the backend is stopped whenever this is called. The hooks whose restore fails
-    /// stay in `handler_exits`, for `retry_handler_cleanup` before the next resume (#339).
+    /// stay in `handler_exits`, marked cleanup-pending (see `ExitHooks::cleanup_pending`):
+    /// no stop is matched against them any more, and `retry_handler_cleanup` removes them
+    /// before the next resume (#339).
     fn release_handler_exits(&mut self) -> Result<()>
     {
         let mut exits = self.handler_exits.take();
@@ -629,6 +637,9 @@ impl Session
         let state = std::mem::replace(&mut self.state, SessionState::Stopped);
         let result = self.restore_exit_hooks(&mut exits);
         self.state = state;
+        if let Some(left) = &mut exits {
+            left.mark_cleanup_pending();
+        }
         self.handler_exits = exits;
         result
     }
@@ -720,6 +731,10 @@ impl Session
         let (Some(exits), Some(pending)) = (&self.handler_exits, &self.handler_return) else {
             return Ok(None);
         };
+        // Traps kept only for their removal belong to no continue (#339).
+        if exits.cleanup_pending() {
+            return Ok(None);
+        }
         let Some((request, signal_policy)) = pending.request.clone() else {
             return Ok(None);
         };
@@ -751,7 +766,8 @@ impl Session
                 // runs again. The ones whose restore fails are kept for a retry (#339).
                 let mut given_up = Some(std::mem::replace(&mut exits, ExitHooks::empty(thread)));
                 let released = self.restore_exit_hooks(&mut given_up);
-                if let Some(left) = given_up {
+                if let Some(mut left) = given_up {
+                    left.mark_cleanup_pending();
                     exits = left;
                 }
                 released?;

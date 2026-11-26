@@ -75,6 +75,10 @@ pub(super) struct ExitHooks
     images: Vec<ExitImage>,
     hooks: Vec<Hook>,
     leaving: Option<Leaving>,
+    /// The traps outlived the continue they were armed for: a restore failed, and they
+    /// are only waiting to be removed (#339). A pending handler return's stops are never
+    /// matched against them; `retry_handler_cleanup` removes them before the next run.
+    cleanup_pending: bool,
 }
 
 /// Where one instruction step of an exit left the thread.
@@ -101,6 +105,7 @@ impl ExitHooks
             images: Vec::new(),
             hooks: Vec::new(),
             leaving: None,
+            cleanup_pending: false,
         }
     }
 
@@ -113,6 +118,19 @@ impl ExitHooks
     pub(super) fn armed(&self) -> bool
     {
         !self.hooks.is_empty()
+    }
+
+    /// Whether these traps only wait to be removed (see `cleanup_pending`).
+    pub(super) fn cleanup_pending(&self) -> bool
+    {
+        self.cleanup_pending
+    }
+
+    /// Keep these traps only for their removal: a restore failed.
+    pub(super) fn mark_cleanup_pending(&mut self)
+    {
+        self.cleanup_pending = true;
+        self.leaving = None;
     }
 
     /// Whether an exit of the thread is being stepped.
@@ -150,7 +168,17 @@ impl Session
     pub(super) fn release_site(&mut self, id: BreakpointId, owner: &SiteOwner) -> Result<()>
     {
         // The user may have removed the breakpoint while cleanup was pending.
-        if self.breakpoints.get(id).is_none() {
+        let Some(address) = self.breakpoints.get(id).map(|entry| entry.info.address) else {
+            return Ok(());
+        };
+        // Or set or enabled a logical breakpoint there while it was: the site still
+        // trapped, so the logical breakpoint took it over (`insert_sites`), and the trap
+        // is now the user's.
+        if self
+            .logical
+            .iter()
+            .any(|breakpoint| breakpoint.enabled && breakpoint.site_at(address).is_some())
+        {
             return Ok(());
         }
         match owner {
@@ -177,6 +205,7 @@ impl Session
             images,
             hooks: Vec::new(),
             leaving: None,
+            cleanup_pending: false,
         });
         for (image, address) in entries {
             let (id, owner) = self.take_site(address)?;
@@ -188,12 +217,6 @@ impl Session
             });
         }
         Ok(())
-    }
-
-    /// Release exit hooks when the caller owns them only for this attempt.
-    pub(super) fn release_exit_hooks(&mut self, mut exits: Option<ExitHooks>) -> Result<()>
-    {
-        self.restore_exit_hooks(&mut exits)
     }
 
     /// Attempt every hook restore, keeping only hooks whose restore failed. The first

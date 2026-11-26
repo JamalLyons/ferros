@@ -3,10 +3,11 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, BreakpointRequest, ResumeRequest, StopEvent, ThreadAction};
+use ferros_core::{Address, BreakpointRequest, ProcessId, ResumeRequest, Session, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::TRAP;
-use ferros_tests::harness::{self, Debuggee};
+use ferros_tests::control::ControlDir;
+use ferros_tests::harness::{self, Debuggee, Spawned};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture};
 
@@ -418,70 +419,174 @@ fn failed_birth_resume_can_still_continue()
     });
 }
 
+/// An attached `spawn_thread`, stopped by an interrupt while the birth policy holds the
+/// thread `spawn_later` created at its pthread entry, every earlier thread suspended.
+struct AttachedHold
+{
+    target: Spawned,
+    session: Session,
+    /// The fixture's gate directory, removed when the test ends.
+    _control: ControlDir,
+}
+
+/// Attach to `spawn_thread` while it waits at its gate, run it to `spawn_later`, and
+/// resume only the creator under default `Suspend`. Waits until Mach shows the newborn
+/// suspended, interrupts, and requires an `Interrupted` stop with the newborn on its
+/// trapped entry and the other threads where they were.
+fn attach_and_hold_newborn(t: &harness::TestContext) -> AttachedHold
+{
+    let fixture = fixture!("spawn_thread");
+    let control = ControlDir::new();
+    let gate = format!("gate={}", control.path().display());
+    let target = t.spawn(&fixture, &[&gate]);
+    control.wait("ready");
+    let pid = target.pid();
+    let mut session = ferros_macos::new_session().expect("backend");
+    session.attach(pid).expect("attach");
+    let address = function_address(&mut session, &fixture, "spawn_later");
+    let original = session.read_memory(address, TRAP.len()).expect("read");
+    session.write_memory(address, &TRAP).expect("trap");
+    control.release("spawn");
+    session.resume().expect("run to spawn_later");
+    let creator = match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
+        Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
+        other => panic!("expected the spawn_later breakpoint, got {other:?}"),
+    };
+    session.write_memory(address, &original).expect("restore");
+    let suspended: Vec<_> = session
+        .threads()
+        .expect("threads")
+        .into_iter()
+        .filter(|&id| id != creator)
+        .map(|id| (id, session.read_registers_for(id).expect("registers").pc))
+        .collect();
+    assert!(!suspended.is_empty(), "expected the first worker");
+    let entry = attached_thread_start(&mut session, suspended[0].0);
+    session
+        .backend_mut()
+        .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
+        .expect("hold new threads");
+    wait_until_only_the_creator_runs(pid, suspended.len() + 2);
+    session.backend_mut().interrupt().expect("interrupt the hold");
+    let stop = session.wait(Some(STOP_TIMEOUT)).expect("stop");
+    assert!(
+        matches!(stop, Some(StopEvent::Interrupted { .. })),
+        "expected the interrupt, got {stop:?}"
+    );
+    for &(id, pc) in &suspended {
+        assert_eq!(
+            session.read_registers_for(id).expect("registers").pc,
+            pc,
+            "suspended thread {id:?} moved"
+        );
+    }
+    let known: Vec<_> = suspended.iter().map(|(id, _)| *id).chain([creator]).collect();
+    let newborns: Vec<_> = session
+        .threads()
+        .expect("threads")
+        .into_iter()
+        .filter(|id| !known.contains(id))
+        .collect();
+    let [newborn] = newborns[..] else {
+        panic!("expected exactly one new thread, got {newborns:?}");
+    };
+    let pc = session.read_registers_for(newborn).expect("newborn registers").pc;
+    assert_eq!(pc, entry, "the newborn is not at _thread_start");
+    let raw = diagnostics::raw_memory(pid, pc, 4).expect("raw entry");
+    assert_eq!(
+        u32::from_le_bytes(raw.try_into().expect("four bytes")),
+        BRK,
+        "the newborn is not held on a birth trap at {pc}"
+    );
+    AttachedHold {
+        target,
+        session,
+        _control: control,
+    }
+}
+
+/// Poll Mach until `pid` has `threads` threads and every one but the creator is
+/// suspended: the existing threads by the selective resume, the newborn by the birth
+/// policy. A newborn that was never trapped runs with a suspend count of 0.
+fn wait_until_only_the_creator_runs(pid: ProcessId, threads: usize)
+{
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        let counts = diagnostics::process_suspend_counts(pid).expect("suspend counts");
+        if let Ok(samples) = &counts.threads
+            && samples.len() == threads
+            && samples
+                .iter()
+                .filter(|sample| sample.as_ref().is_ok_and(|state| state.suspend_count > 0))
+                .count()
+                == threads - 1
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new thread was not held: expected {threads} threads with only the creator running, got {counts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// `_thread_start` of `libsystem_pthread`, from the outermost frame record of `thread`,
+/// a running `std::thread` (see `helpers::thread_start_of`, which takes a launched target).
+fn attached_thread_start(session: &mut Session, thread: ThreadId) -> Address
+{
+    let mut fp = session.read_registers_for(thread).expect("registers").fp.value();
+    let mut outermost = None;
+    for _ in 0..512 {
+        if fp == 0 {
+            break;
+        }
+        let record = session.read_memory(Address::from(fp), 16).expect("read a frame record");
+        outermost = Some(u64::from_le_bytes(record[8..16].try_into().expect("lr")));
+        fp = u64::from_le_bytes(record[..8].try_into().expect("fp"));
+    }
+    let start = Address::from(outermost.expect("the thread has no frame records") - 8);
+    let bytes = session.read_memory(start, 4).expect("read _thread_start");
+    assert_eq!(
+        u32::from_le_bytes(bytes.try_into().expect("four bytes")),
+        STP_XZR_XZR_PREDEC,
+        "the outermost frame of {thread:?} does not return into _thread_start"
+    );
+    start
+}
+
+/// Wait for the spawned target to exit with success after the session let it go.
+fn assert_finishes(target: &mut Spawned, what: &str)
+{
+    let pid = target.pid();
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        if let Some(status) = target.try_wait().expect("status") {
+            assert!(status.success(), "{what} left a failing process: {status}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not let the process finish: {}",
+            process_state(pid.0)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Detach, while a newborn is held, lets the process finish. Drop of a launched target
 /// that still holds one is covered by killing below.
 #[test]
 fn detach_releases_a_held_new_thread_and_the_process_finishes()
 {
-    harness::run_with_timeout(Duration::from_secs(30), |t| {
-        let fixture = fixture!("spawn_thread");
-        let mut target = t.spawn(&fixture, &["pause=4000"]);
-        let pid = target.pid();
-        let mut session = ferros_macos::new_session().expect("backend");
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        loop {
-            match session.attach(pid) {
-                Ok(()) => break,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-                Err(err) => panic!("attach failed: {err}"),
-            }
-        }
-        let address = function_address(&mut session, &fixture, "spawn_later");
-        let original = {
-            let bytes = session.read_memory(address, TRAP.len()).expect("read");
-            session.write_memory(address, &TRAP).expect("trap");
-            bytes
-        };
-        session.resume().expect("run to spawn_later");
-        let creator = match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
-            Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
-            other => panic!("expected the spawn_later breakpoint, got {other:?}"),
-        };
-        session.write_memory(address, &original).expect("restore");
-        let threads = session.threads().expect("threads");
-        let suspended: Vec<_> = threads
-            .into_iter()
-            .filter(|&id| id != creator)
-            .map(|id| (id, session.read_registers_for(id).expect("registers").pc))
-            .collect();
-        session
-            .backend_mut()
-            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
-            .expect("hold new threads");
-        std::thread::sleep(BIRTH_QUIET);
-        session.backend_mut().interrupt().expect("interrupt the hold");
-        assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
-        for (id, pc) in suspended {
-            assert_eq!(
-                session.read_registers_for(id).expect("registers").pc,
-                pc,
-                "suspended thread moved"
-            );
-        }
+    harness::run(|t| {
+        let AttachedHold {
+            mut target,
+            mut session,
+            _control,
+        } = attach_and_hold_newborn(t);
         session.detach().expect("detach");
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        loop {
-            if let Some(status) = target.try_wait().expect("status") {
-                assert!(status.success(), "detached process failed: {status}");
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "detached process did not finish: {}",
-                process_state(pid.0)
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_finishes(&mut target, "detach");
     });
 }
 
@@ -489,52 +594,14 @@ fn detach_releases_a_held_new_thread_and_the_process_finishes()
 #[test]
 fn drop_releases_a_held_new_thread_and_the_process_finishes()
 {
-    harness::run_with_timeout(Duration::from_secs(30), |t| {
-        let fixture = fixture!("spawn_thread");
-        let mut target = t.spawn(&fixture, &["pause=4000"]);
-        let pid = target.pid();
-        let mut session = ferros_macos::new_session().expect("backend");
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        loop {
-            match session.attach(pid) {
-                Ok(()) => break,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-                Err(err) => panic!("attach failed: {err}"),
-            }
-        }
-        let address = function_address(&mut session, &fixture, "spawn_later");
-        let original = {
-            let bytes = session.read_memory(address, TRAP.len()).expect("read");
-            session.write_memory(address, &TRAP).expect("trap");
-            bytes
-        };
-        session.resume().expect("run to spawn_later");
-        let creator = match session.wait(Some(STOP_TIMEOUT)).expect("wait") {
-            Some(StopEvent::Breakpoint { thread, pc }) if pc == address => thread,
-            other => panic!("expected the spawn_later breakpoint, got {other:?}"),
-        };
-        session.write_memory(address, &original).expect("restore");
-        session
-            .backend_mut()
-            .resume(&ResumeRequest::all(ThreadAction::Suspend).with_thread(creator, ThreadAction::Continue))
-            .expect("hold new threads");
-        std::thread::sleep(BIRTH_QUIET);
-        session.backend_mut().interrupt().expect("interrupt the hold");
-        assert!(session.wait(Some(STOP_TIMEOUT)).expect("stop").is_some());
+    harness::run(|t| {
+        let AttachedHold {
+            mut target,
+            session,
+            _control,
+        } = attach_and_hold_newborn(t);
         drop(session);
-        let deadline = Instant::now() + STOP_TIMEOUT;
-        loop {
-            if let Some(status) = target.try_wait().expect("status") {
-                assert!(status.success(), "dropped session left a failing process: {status}");
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "dropped session did not let the process finish: {}",
-                process_state(pid.0)
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_finishes(&mut target, "dropped session");
     });
 }
 

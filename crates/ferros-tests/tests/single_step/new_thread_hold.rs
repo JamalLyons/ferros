@@ -457,9 +457,19 @@ fn second_thread_created_during_birth_step_off_stays_at_the_trap()
             std::thread::sleep(Duration::from_millis(1));
         }
         // The entry instruction is restored and the stepping thread has already
-        // stopped. Without freezing the creator, this wait is long enough for it
-        // to start the second worker through the open entry.
-        std::thread::sleep(Duration::from_millis(300));
+        // stopped. The creator was told to `Continue`, so only the step-off freeze
+        // gives it a suspend of its own; without one it could start the second worker
+        // through the open entry whenever it is scheduled.
+        assert!(
+            diagnostics::thread_suspend_count(creator).expect("creator suspend count") > 0,
+            "the creator is not frozen while the birth entry is restored"
+        );
+        for (id, _) in &suspended {
+            assert!(
+                diagnostics::thread_suspend_count(*id).expect("suspend count") > 0,
+                "existing thread {id:?} is not suspended while the birth entry is restored"
+            );
+        }
         assert!(
             !d.stdout().contains("second worker ran"),
             "the second thread ran while the birth entry was restored: {}",

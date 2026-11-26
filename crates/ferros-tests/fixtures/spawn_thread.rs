@@ -2,8 +2,14 @@
 //!
 //! The second worker is a normal `std::thread`, so it enters `libsystem_pthread` at
 //! `_thread_start`. `pause=<milliseconds>` sleeps after the first worker is running and
-//! before `spawn_later`. `spawn_later` itself waits, then starts one more worker from
-//! `spawn_second`, so a test can stop between those two creates.
+//! before `spawn_later`. `gate=<directory>` instead writes `<directory>/ready` once the
+//! first worker is running and waits for `<directory>/spawn` to exist before
+//! `spawn_later`, so a test can attach first without a fixed delay; the first worker
+//! starts its sleep only once that gate is open, so it is still alive at `spawn_later`.
+//! `spawn_later` itself
+//! waits, then starts one more worker from `spawn_second`, so a test can stop between
+//! those two creates.
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -32,12 +38,27 @@ fn spawn_later()
     child.join().expect("new worker");
 }
 
+/// Wait until the test opens the `spawn` gate in `directory`.
+fn wait_for_gate(directory: &Path)
+{
+    while !directory.join("spawn").exists() {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn main()
 {
+    let gate = std::env::args()
+        .skip(1)
+        .find_map(|arg| arg.strip_prefix("gate=").map(PathBuf::from));
     let barrier = Arc::new(Barrier::new(2));
     let other = Arc::clone(&barrier);
+    let worker_gate = gate.clone();
     let worker = thread::spawn(move || {
         other.wait();
+        if let Some(directory) = worker_gate {
+            wait_for_gate(&directory);
+        }
         thread::sleep(Duration::from_secs(2));
     });
     barrier.wait();
@@ -48,6 +69,10 @@ fn main()
         {
             thread::sleep(Duration::from_millis(milliseconds));
         }
+    }
+    if let Some(directory) = &gate {
+        std::fs::write(directory.join("ready"), b"ready").expect("write the ready file");
+        wait_for_gate(directory);
     }
     spawn_later();
     worker.join().expect("worker");

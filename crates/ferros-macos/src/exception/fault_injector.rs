@@ -84,6 +84,11 @@ pub struct ReplyFaultInjector
     /// The next resume takes one extra task suspend, its last `task_resume` resumes the
     /// task and then reports failure, and the re-suspend fails. Tests only (#250).
     pub(crate) resume_partway: Arc<AtomicBool>,
+    /// The backend's exception-state mutex, so a test can `try_lock` it while
+    /// `task_resume` is paused. `None` until [`Self::bind_exception_state`]. Tests only (#366).
+    shared_state: Arc<Mutex<Option<Arc<Mutex<ExceptionSharedState>>>>>,
+    /// 0 idle, 1 armed, 2 paused inside `task_resume`, 3 released. Tests only (#366).
+    resume_lock_probe: Arc<AtomicU8>,
 }
 
 /// What a detach did with the client signals held during its handshake. Tests only (#311).
@@ -242,6 +247,91 @@ impl ReplyFaultInjector
     pub fn fail_next_task_resume_partway(&self)
     {
         self.resume_partway.store(true, Ordering::SeqCst);
+    }
+
+    /// Remember the backend's exception-state mutex for [`Self::exception_lock_is_available`].
+    pub(crate) fn bind_exception_state(&self, state: Arc<Mutex<ExceptionSharedState>>)
+    {
+        *self.shared_state.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+    }
+
+    /// Pause the next `task_resume` that balances task suspends, before the kernel call.
+    ///
+    /// [`Self::exception_lock_is_available`] then reports whether that call still holds
+    /// the exception-state lock. One-shot. Tests only (#366).
+    pub fn arm_task_resume_lock_probe(&self)
+    {
+        self.resume_lock_probe.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether a `task_resume` armed by [`Self::arm_task_resume_lock_probe`] is paused.
+    #[must_use]
+    pub fn task_resume_lock_probe_is_paused(&self) -> bool
+    {
+        self.resume_lock_probe.load(Ordering::SeqCst) == 2
+    }
+
+    /// Let a paused `task_resume` continue. Also disarms a probe the resume has not
+    /// reached yet, so a dropped test cannot leave the next resume parked.
+    pub fn release_task_resume_lock_probe(&self)
+    {
+        let phase = self.resume_lock_probe.load(Ordering::SeqCst);
+        if phase == 1 || phase == 2 {
+            self.resume_lock_probe.store(3, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the exception-state lock can be taken right now.
+    ///
+    /// `true` means the probed `task_resume` is not holding it. Panics when the backend
+    /// never bound the mutex. Tests only (#366).
+    #[must_use]
+    pub fn exception_lock_is_available(&self) -> bool
+    {
+        let shared = self.shared_state.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(state) = shared.as_ref() else {
+            panic!("task_resume lock probe has no exception state");
+        };
+        let state = Arc::clone(state);
+        drop(shared);
+        match state.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                drop(poisoned.into_inner());
+                true
+            }
+        }
+    }
+
+    /// If a test armed [`Self::arm_task_resume_lock_probe`], pause before `task_resume`.
+    ///
+    /// The production path is one atomic load. The pause runs on the resume thread, which
+    /// must already hold the exception-state lock for the kernel call to be serialized
+    /// with the exception loop's `task_suspend` (#335, #366).
+    pub(crate) fn pause_task_resume_lock_probe(&self)
+    {
+        if self.resume_lock_probe.load(Ordering::SeqCst) != 1 {
+            return;
+        }
+        if self
+            .resume_lock_probe
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.resume_lock_probe.load(Ordering::SeqCst) == 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task_resume lock probe was not released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Simulate an exited recipient when replaying the next handshake signal. Tests only.

@@ -513,6 +513,9 @@ impl MacOSBackend
 
     fn empty() -> Self
     {
+        let exception_state = Arc::new(Mutex::new(ExceptionSharedState::new()));
+        let reply_faults = ReplyFaultInjector::default();
+        reply_faults.bind_exception_state(Arc::clone(&exception_state));
         Self {
             task: 0,
             threads: Vec::new(),
@@ -526,9 +529,9 @@ impl MacOSBackend
             exception_port: MACH_PORT_NULL,
             exception_thread: None,
             exception_commands: None,
-            exception_state: Arc::new(Mutex::new(ExceptionSharedState::new())),
+            exception_state,
             saved_exception_ports: None,
-            reply_faults: ReplyFaultInjector::default(),
+            reply_faults,
             fail_memory_write: Arc::default(),
             fail_memory_store: Arc::default(),
             drop_next_interrupt: Arc::default(),

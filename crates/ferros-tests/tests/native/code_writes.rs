@@ -10,9 +10,12 @@
 //! core they run on.
 #![cfg(target_os = "macos")]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferros_core::{Address, Backend, BackendError, ResumeRequest, StopEvent, ThreadAction, ThreadId};
+use ferros_macos::exception::ReplyFaultInjector;
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::TRAP;
 use ferros_tests::harness::{self, Debuggee};
@@ -172,9 +175,92 @@ fn planted_trap_is_executed_once_the_target_runs()
     });
 }
 
+/// Drop guard so a panic cannot leave the next `task_resume` parked (#366).
+struct ReleaseResumeProbe(ReplyFaultInjector);
+
+impl Drop for ReleaseResumeProbe
+{
+    fn drop(&mut self)
+    {
+        self.0.release_task_resume_lock_probe();
+    }
+}
+
+/// Run `resume` while another thread samples the exception-state lock at the paused
+/// `task_resume`. The lock must be held: that is what keeps the exception loop out of
+/// `task_suspend` until the kernel finishes the resume (#335, #366).
+fn assert_task_resume_holds_exception_lock(faults: &ReplyFaultInjector, resume: impl FnOnce())
+{
+    let _release = ReleaseResumeProbe(faults.clone());
+    faults.arm_task_resume_lock_probe();
+    let probe = faults.clone();
+    let available = Arc::new(AtomicBool::new(false));
+    let saw = Arc::clone(&available);
+    let sampler = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !probe.task_resume_lock_probe_is_paused() {
+            assert!(Instant::now() < deadline, "task_resume did not reach the lock probe");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        saw.store(probe.exception_lock_is_available(), Ordering::SeqCst);
+        probe.release_task_resume_lock_probe();
+    });
+    resume();
+    sampler.join().expect("lock probe thread");
+    assert!(
+        !available.load(Ordering::SeqCst),
+        "task_resume ran without the exception-state lock; a new task_suspend can overlap it"
+    );
+}
+
+/// #366: an ordinary continue holds the exception-state lock across `task_resume`.
+///
+/// The probe pauses inside `resume_task`, before the kernel call, and another thread
+/// tries the same mutex. With the #335 serialization the try fails. Dropping that lock
+/// before `resume_task` — the race #357 closed — lets the try succeed, so this fails
+/// on the first resume.
+#[test]
+fn task_resume_holds_the_exception_lock()
+{
+    harness::run(|t| {
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("hello"), &[], debugger);
+        assert_task_resume_holds_exception_lock(&faults, || {
+            backend(&mut d).resume(&ResumeRequest::continue_all()).expect("resume");
+        });
+    });
+}
+
+/// #366: `release_suspends` holds the same lock across its `task_resume` calls.
+///
+/// Kill of a stopped target balances the launch suspend on that path. The probe sits
+/// in the loop, next to the kernel call, so taking the suspend count under the lock
+/// and then dropping it before `task_resume` fails this test.
+#[test]
+fn release_suspends_holds_the_exception_lock()
+{
+    harness::run(|t| {
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("hello"), &[], debugger);
+        assert_task_resume_holds_exception_lock(&faults, || {
+            backend(&mut d).kill().expect("kill");
+        });
+    });
+}
+
 /// #335: repeatedly resume onto the same trap to exercise the race between the
 /// exception loop's new suspension and the preceding `task_resume`.
+///
+/// On the host that fixed #335 this loop passed both with and without the
+/// exception-state lock held across `task_resume` (a direct Mach probe failed at
+/// iteration 26; this native loop did not). It is stress coverage, not a guard.
+/// `task_resume_holds_the_exception_lock` and
+/// `release_suspends_holds_the_exception_lock` are the deterministic checks. Run
+/// this with `--ignored` when a long stress pass is useful.
 #[test]
+#[ignore = "stress only; passes without the #335 task_resume lock (#366)"]
 fn immediate_retrap_keeps_the_task_suspended()
 {
     harness::run(|t| {

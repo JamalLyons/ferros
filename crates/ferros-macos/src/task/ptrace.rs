@@ -14,6 +14,9 @@ impl MacOSBackend
         let mut shared = lock_shared(&self.exception_state);
         let count = std::mem::take(&mut shared.suspends);
         for _ in 0..count {
+            // #366: sample the lock on the resume thread, immediately before the kernel
+            // call. `shared` must still be alive here.
+            self.reply_faults.pause_task_resume_lock_probe();
             unsafe {
                 let _ = task_resume(self.task);
             }
@@ -29,6 +32,9 @@ impl MacOSBackend
     /// caller must treat the target as running (#250 W11).
     pub(super) fn resume_task(&self, count: u32) -> std::result::Result<(), ResumeTaskError>
     {
+        // #366: the caller holds the exception-state lock for this whole call. The probe
+        // pauses here, before any `task_resume`, so a test can see that hold.
+        self.reply_faults.pause_task_resume_lock_probe();
         // Test hook (#250): one extra suspend, so the last `task_resume` below runs the
         // task before its failure is reported, and the suspends cannot be put back.
         // SAFETY: the backend owns this task right.

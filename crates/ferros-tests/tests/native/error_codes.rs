@@ -101,6 +101,7 @@ fn write_that_runs_into_an_unmapped_hole_is_not_found()
 }
 
 /// `KERN_INVALID_ARGUMENT`: what a thread call returns for a port that names no thread.
+#[cfg(target_arch = "aarch64")]
 const KERN_INVALID_ARGUMENT: i64 = 4;
 
 /// A debug-register call whose `thread_get_state` fails with `KERN_INVALID_ARGUMENT`

@@ -89,7 +89,8 @@ struct ArmDebugState64
 ///
 /// ## Errors
 ///
-/// Returns `DebuggerError::Backend` keeping the `kern_return_t` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+/// `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 /// Returns `InvalidArgument` if all hardware breakpoint slots are in use.
 ///
 /// ## See Also
@@ -126,7 +127,8 @@ pub fn set_hardware_breakpoint(thread: thread_act_t, address: Address) -> Result
 ///
 /// ## Errors
 ///
-/// Returns `DebuggerError::Backend` keeping the `kern_return_t` if `thread_get_state()` or `thread_set_state()` fails.
+/// Returns `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+/// `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 /// Returns `InvalidArgument` if the slot index is out of range.
 ///
 /// ## See Also
@@ -167,7 +169,8 @@ pub fn clear_hardware_breakpoint(thread: thread_act_t, slot: u32) -> Result<()>
 ///
 /// - `InvalidArgument` if the architecture is not supported, or parameters are unsupported.
 /// - `ResourceExhausted` if all watchpoint slots are in use.
-/// - `DebuggerError::Backend` keeping the `kern_return_t` if `thread_get_state()` or `thread_set_state()` fails.
+/// - `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+///   `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or `thread_set_state()` fails.
 pub fn set_watchpoint(thread: thread_act_t, address: Address, length: usize, access: WatchpointAccess) -> Result<u32>
 {
     #[cfg(target_arch = "x86_64")]
@@ -222,7 +225,8 @@ const MDSCR_EL1_SS: u64 = 1;
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::Backend` keeping the `kern_return_t` if `thread_get_state()` or
+/// - `DebuggerError::Backend` keeping the `kern_return_t` (or `DebuggerError::PermissionDenied` for
+///   `KERN_PROTECTION_FAILURE`) if `thread_get_state()` or
 ///   `thread_set_state()` fails (for example `Os { code: KERN_INVALID_ARGUMENT }` once the
 ///   thread has exited).
 /// - `InvalidArgument` on x86-64, where single-step is not implemented.

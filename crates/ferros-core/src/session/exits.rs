@@ -143,6 +143,10 @@ impl Session
 
     pub(super) fn release_site(&mut self, id: BreakpointId, owner: &SiteOwner) -> Result<()>
     {
+        // The user may have removed the breakpoint while cleanup was pending.
+        if self.breakpoints.get(id).is_none() {
+            return Ok(());
+        }
         match owner {
             SiteOwner::Private => self.remove_breakpoint(id)?,
             SiteOwner::Disabled => self.disable_breakpoint(id)?,
@@ -180,15 +184,29 @@ impl Session
         Ok(())
     }
 
-    /// Release every hook in `exits`, even when one fails; the first failure is returned.
-    pub(super) fn release_exit_hooks(&mut self, exits: Option<ExitHooks>) -> Result<()>
+    /// Release exit hooks when the caller owns them only for this attempt.
+    pub(super) fn release_exit_hooks(&mut self, mut exits: Option<ExitHooks>) -> Result<()>
     {
+        self.restore_exit_hooks(&mut exits)
+    }
+
+    /// Attempt every hook restore, keeping only hooks whose restore failed. The first
+    /// failure is returned and the option is cleared once all hooks are released.
+    pub(super) fn restore_exit_hooks(&mut self, exits: &mut Option<ExitHooks>) -> Result<()>
+    {
+        let Some(armed) = exits else { return Ok(()) };
         let mut result = Ok(());
-        for hook in exits.into_iter().flat_map(|exits| exits.hooks) {
-            let released = self.release_site(hook.id, &hook.owner);
+        armed.hooks.retain(|hook| {
+            let Err(error) = self.release_site(hook.id, &hook.owner) else {
+                return false;
+            };
             if result.is_ok() {
-                result = released;
+                result = Err(error);
             }
+            true
+        });
+        if armed.hooks.is_empty() {
+            *exits = None;
         }
         result
     }

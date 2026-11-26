@@ -1,4 +1,4 @@
-//! Selection of the backend, the object format and the job control for the host operating system.
+//! Selection of the backend, object format, terminal signals and job control for the host operating system.
 //!
 //! `ferros-core` holds no OS-specific code, so the choice of backend is made here, in
 //! the binary. This module is the only place outside the platform crates (and the test
@@ -8,6 +8,7 @@ use std::io;
 
 use ferros_core::Session;
 
+use crate::repl::TerminalSignals;
 use crate::repl::jobs::JobControl;
 
 /// Create a [`Session`] for the current operating system: its backend and the object
@@ -32,6 +33,26 @@ pub fn create_session() -> ferros_core::Result<Session>
         Err(ferros_core::DebuggerError::Backend(ferros_core::BackendError::Unsupported(
             format!("no debugger backend for platform: {}", std::env::consts::OS),
         )))
+    }
+}
+
+/// Classify the current operating system's terminal signals for the command loop.
+pub fn terminal_signals() -> TerminalSignals
+{
+    #[cfg(target_os = "macos")]
+    {
+        TerminalSignals {
+            suppress_on_continue: &[2, 18], // SIGINT, SIGTSTP
+            background_io: &[21, 22],       // SIGTTIN, SIGTTOU
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        TerminalSignals {
+            suppress_on_continue: &[],
+            background_io: &[],
+        }
     }
 }
 

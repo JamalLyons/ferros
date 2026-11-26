@@ -99,6 +99,52 @@ fn cache_does_not_reread_an_unchanged_image_without_debug_info()
     });
 }
 
+/// A rewrite in place that keeps the image's size and restores its modification time is
+/// still seen as a change (#346): the status-change time moves, and the file is read again.
+#[test]
+fn cache_rereads_an_image_rewritten_with_its_size_and_mtime_kept()
+{
+    harness::run(|_| {
+        let directory = scratch::create_dir("ferros-no-debug-info-rewrite");
+        let path = directory.join("image.mock");
+        let original = MockObjectFile::new(0x1000, 0x1000).to_bytes();
+        fs::write(&path, &original).expect("write image without DWARF");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut cache = SymbolCache::new(Arc::new(CountingFormat(opens.clone())));
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x2_0000_0000,
+        };
+        assert!(matches!(
+            cache.load_image(descriptor.clone()),
+            Err(DebuggerError::NoDebugInfo { .. })
+        ));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        let before = fs::metadata(&path).expect("image metadata");
+        let modified = before.modified().expect("image mtime");
+        let rewritten = MockObjectFile::new(0x1000, 0x2000).to_bytes();
+        assert_eq!(rewritten.len(), original.len(), "the rewrite must keep the size");
+        assert_ne!(rewritten, original);
+        {
+            let mut file = fs::File::options().write(true).open(&path).expect("open image in place");
+            std::io::Write::write_all(&mut file, &rewritten).expect("rewrite image in place");
+            file.set_modified(modified).expect("restore the image's mtime");
+        }
+        let after = fs::metadata(&path).expect("rewritten image metadata");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().ok(), Some(modified), "the mtime was not restored");
+
+        assert!(matches!(cache.load_image(descriptor), Err(DebuggerError::NoDebugInfo { .. })));
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "a same-size rewrite with its mtime restored was not read again"
+        );
+        let _ = fs::remove_dir_all(directory);
+    });
+}
+
 /// `frameless_stack` copied without its dSYM and with its debug map stripped, so its
 /// main executable has no source debug information.
 fn stripped_frameless_stack() -> StrippedFixture

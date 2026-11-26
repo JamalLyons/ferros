@@ -5,10 +5,15 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferros_core::backend::mock::MockBackend;
 use ferros_core::backend::{LoadedImage, StdioSpec};
+use ferros_core::objfile::{
+    DebugInfoRetry, ImageContents, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, TargetMemory,
+};
 use ferros_core::symbols::{BinaryImage, ImageDescriptor};
 use ferros_core::{
     Address, BreakpointLocation, BreakpointRequest, BuildId, BuildIdentity, DebuggerError, LaunchSpec, Registers, Session,
@@ -469,10 +474,53 @@ fn session_reports_a_transient_symbol_load_failure_and_retries_later()
     });
 }
 
+/// [`MachOFormat`], counting how often the session opens an image file.
+struct CountingMachO
+{
+    format: MachOFormat,
+    opens: Arc<AtomicUsize>,
+}
+
+impl ObjectFormat for CountingMachO
+{
+    fn mapped_symbols(&self, memory: &mut dyn TargetMemory, load_address: Address)
+    -> Result<Arc<dyn MappedSymbols>, String>
+    {
+        self.format.mapped_symbols(memory, load_address)
+    }
+
+    fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+    {
+        self.format.map_image(memory, load_address)
+    }
+
+    fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> ferros_core::Result<ImageContents>
+    {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.format.open_image(path, load_address, slice)
+    }
+
+    fn open_image_with_debug_retry(
+        &self,
+        path: &Path,
+        load_address: u64,
+        slice: Option<&ImageSlice>,
+    ) -> ferros_core::Result<(ImageContents, Option<DebugInfoRetry>)>
+    {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.format.open_image_with_debug_retry(path, load_address, slice)
+    }
+
+    fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
+    {
+        self.format.load_inputs(path)
+    }
+}
+
 /// Issue #100: a symbol load that keeps failing (here a corrupt image file) is read and
 /// parsed once, not on every request. While the file is unchanged, every request returns
-/// the original error: after the file is made unreadable, a re-read would report
-/// permission denied instead. Once the file changes, the next request reads it again.
+/// the original error without opening the file again. Once the file changes, the next
+/// request reads it again.
 #[test]
 fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
 {
@@ -497,10 +545,12 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
                 build_id: ferros_core::types::BuildIdentity::Unknown,
                 role: ferros_core::backend::ImageRole::MainExecutable,
             });
-        let mut session = Session::new(
-            Box::new(mock),
-            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
-        );
+        let opens = Arc::new(AtomicUsize::new(0));
+        let format = CountingMachO {
+            format: MachOFormat::with_debug_info_options(scratch.options()),
+            opens: opens.clone(),
+        };
+        let mut session = Session::new(Box::new(mock), Arc::new(format));
         session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
         let assert_parse_failure = |error: DebuggerError| {
             let DebuggerError::SymbolLoad { path, source } = &error else {
@@ -514,16 +564,19 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
         };
 
         assert_parse_failure(session.symbolicate(address).expect_err("corrupt image"));
-        // Permissions are not part of the file's identity (size and timestamps), so the
-        // kept failure still applies; reading the file now would fail differently.
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o000)).expect("make unreadable");
+        let first_opens = opens.load(Ordering::SeqCst);
+        assert!(first_opens > 0, "the corrupt image was never opened");
         for _ in 0..3 {
             assert_parse_failure(session.symbolicate(address).expect_err("kept failure"));
         }
         assert!(session.stack_trace(1).expect("raw stack")[0].symbol.is_none());
         assert_parse_failure(session.symbolicate(address).expect_err("kept failure after a stack trace"));
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            first_opens,
+            "an unchanged image was opened again"
+        );
 
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).expect("make readable");
         fs::remove_file(&executable).expect("remove corrupt image");
         fs::copy(fixture.path(), &executable).expect("replace with the real executable");
         std::os::unix::fs::symlink(fixture.dsym_path(), scratch.0.join("program.dSYM")).expect("link the dSYM");

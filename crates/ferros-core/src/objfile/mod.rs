@@ -143,7 +143,8 @@ pub trait ObjectFormat: Send + Sync
 
     /// The files [`open_image`](Self::open_image) reads for the image at `path`, `path`
     /// included, in a stable order: companion debug files and any cache directory the
-    /// format consults. The session stamps them (size and timestamps) when a read fails
+    /// format consults. The session stamps them (size, timestamps and, where the
+    /// filesystem reports them, file number and status-change time) when a read fails
     /// and reads again only once one of them changes. For paths derived from the opened
     /// image, [`DebugInfoRetry`] can supply additional stamps. The default is `path` alone.
     fn load_inputs(&self, path: &Path) -> Vec<PathBuf>

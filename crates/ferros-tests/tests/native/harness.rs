@@ -5,12 +5,12 @@ use std::mem::DropGuard;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use ferros_core::SessionState;
-use ferros_tests::fixture;
 use ferros_tests::harness::{self, TEST_ID_ARG_PREFIX};
+use ferros_tests::{fixture, scratch};
 
 /// Pid and identifying argument of a debuggee, handed out of a test body.
 type Seen = Arc<Mutex<Option<(u32, String)>>>;
@@ -122,6 +122,71 @@ fn deadline_reaps_a_spawned_child()
         state.trim().is_empty(),
         "child {pid} survived the deadline in state {state:?}"
     );
+}
+
+#[test]
+fn deadline_removes_registered_scratch_paths()
+{
+    let (path_tx, path_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let started = Instant::now();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        harness::run_with_timeout(Duration::from_secs(2), move |t| {
+            let (_, file) = t.scratch_file("ferros-harness-selftest", ".gate");
+            let dir = scratch::create_dir("ferros-harness-selftest");
+            fs::write(dir.join("inner"), b"x").expect("write inside registered directory");
+            t.remove_on_cleanup(dir.clone());
+            assert!(file.exists() && dir.exists());
+            path_tx.send((file, dir)).expect("send paths");
+            // Hold the worker past the deadline: no drop guard in this body ever runs.
+            let _ = release_rx.recv();
+        });
+    }));
+
+    let payload = result.expect_err("a body that outlives its deadline must fail");
+    assert!(panic_message(&*payload).contains("timed out"));
+    let (file, dir) = path_rx.try_recv().expect("the body never created its scratch paths");
+    let gone = (!file.exists(), !dir.exists());
+    drop(release_tx);
+    assert!(gone.0, "registered file {} survived the deadline", file.display());
+    assert!(gone.1, "registered directory {} survived the deadline", dir.display());
+    assert!(
+        started.elapsed() < Duration::from_secs(2) + Duration::from_secs(4),
+        "scratch removal must not extend deadline cleanup"
+    );
+}
+
+#[test]
+fn normal_completion_removes_registered_scratch_paths()
+{
+    let (path_tx, path_rx) = mpsc::channel();
+    harness::run(move |t| {
+        let (_, file) = t.scratch_file("ferros-harness-selftest", ".log");
+        assert!(file.exists());
+        path_tx.send(file).expect("send path");
+    });
+    let file = path_rx.try_recv().expect("the body never created its scratch file");
+    assert!(
+        !file.exists(),
+        "registered file {} survived normal completion",
+        file.display()
+    );
+}
+
+#[test]
+fn panic_removes_registered_scratch_paths()
+{
+    let (path_tx, path_rx) = mpsc::channel();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        harness::run(move |t| {
+            let (_, file) = t.scratch_file("ferros-harness-selftest", ".log");
+            path_tx.send(file).expect("send path");
+            panic!("deliberate");
+        });
+    }));
+    result.expect_err("the body's panic must propagate");
+    let file = path_rx.try_recv().expect("the body never created its scratch file");
+    assert!(!file.exists(), "registered file {} survived a panic", file.display());
 }
 
 #[test]

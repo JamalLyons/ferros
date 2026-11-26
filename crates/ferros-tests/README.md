@@ -302,6 +302,10 @@ fn resume_runs_hello()
   `transcript::normalize` replaces addresses, pids and thread ids with placeholders. Reserve the
   identifying argument with `t.tag()`: the helpers pass it to the fixture after `--`, and the
   harness kills every process carrying it on the deadline and when the `Tag` is dropped.
+- Scratch files a test creates: `t.scratch_file(stem, suffix)` (or `t.remove_on_cleanup(path)` for a path from
+  `scratch::create_dir` / `unique_path`) registers the path with the harness, which removes it (file or
+  directory tree) after killing the test's processes on normal completion, on a panic and when the deadline
+  fires. A drop guard alone leaks on a deadline because the abandoned worker never unwinds.
 - `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe

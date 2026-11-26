@@ -824,9 +824,10 @@ struct ReleaseFile(std::path::PathBuf);
 
 impl ReleaseFile
 {
-    fn exit_gate() -> Self
+    fn exit_gate(t: &harness::TestContext) -> Self
     {
-        let (_, path) = scratch::create_file("ferros-release", ".gate");
+        // Registered with the harness too: `Drop` does not run when the deadline fires.
+        let (_, path) = t.scratch_file("ferros-release", ".gate");
         Self(path)
     }
 
@@ -869,9 +870,9 @@ impl Grandchild
     fn spawn(t: &harness::TestContext) -> Self
     {
         let tag = t.tag();
-        let exit_gate = ReleaseFile::exit_gate();
+        let exit_gate = ReleaseFile::exit_gate(t);
         // Files cannot fill a pipe and delay the very completion being measured.
-        let (output, output_path) = scratch::create_file("ferros-release", ".log");
+        let (output, output_path) = t.scratch_file("ferros-release", ".log");
         let output_path = ReleaseFile(output_path);
         let shell = Command::new("/bin/sh")
             .arg("-c")
@@ -1071,7 +1072,7 @@ fn released_processes_run_to_completion()
         });
 
         // A launched process released with detach also runs to completion.
-        let exit_gate = ReleaseFile::exit_gate();
+        let exit_gate = ReleaseFile::exit_gate(t);
         let mut d = t.launch_with_args(&fixture!("loop_counter"), &exit_gate.gate_args());
         d.detach().expect("detach a launched process");
         exit_gate.open_gate();
@@ -1483,7 +1484,7 @@ fn restore_failure_is_reported_after_detach_and_session_can_be_reused()
 fn detach_resumes_a_target_stopped_before_attach()
 {
     harness::run(|t| {
-        let exit_gate = ReleaseFile::exit_gate();
+        let exit_gate = ReleaseFile::exit_gate(t);
         let mut target = t.spawn(&fixture!("loop_counter"), &exit_gate.gate_args());
         let pid = target.pid().0;
         signal(pid, "-STOP");

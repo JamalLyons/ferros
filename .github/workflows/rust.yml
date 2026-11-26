@@ -62,6 +62,12 @@ jobs:
       run: just fmt-check
     - name: Lint
       run: just lint
+    # Local runs and the other jobs build only arm64, so nothing else compiles the
+    # x86_64 register code. Clippy denies warnings, as `just lint` does.
+    - name: Lint ferros-macos for x86_64-apple-darwin
+      run: |
+        rustup target add x86_64-apple-darwin
+        cargo clippy -p ferros-macos --target x86_64-apple-darwin --all-targets -- -D warnings
     - name: Check platform boundary
       run: just check-boundary
     - name: Test

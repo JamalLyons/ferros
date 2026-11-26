@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use gimli::{RunTimeEndian, SectionId};
 
+use super::LoadInputs;
 use crate::symbols::image::ImageMapping;
 use crate::types::{Address, Architecture, BuildIdentity};
 
@@ -147,7 +148,40 @@ pub struct ImageContents
 
 /// Re-read companion debug information for an already validated executable without
 /// reparsing it. Returned by [`ObjectFormat::open_image_with_debug_retry`](super::ObjectFormat::open_image_with_debug_retry).
-pub type DebugInfoRetry = Arc<dyn Fn() -> crate::Result<DebugSections> + Send + Sync>;
+#[derive(Clone)]
+pub struct DebugInfoRetry
+{
+    pub(crate) inputs: LoadInputs,
+    read: Arc<dyn Fn() -> crate::Result<DebugSections> + Send + Sync>,
+}
+
+impl DebugInfoRetry
+{
+    /// Save the operation and stamps of any companion paths derived from the opened
+    /// image. Capture those stamps before the initial lookup so changes during it can
+    /// trigger another attempt.
+    pub fn new(inputs: LoadInputs, read: impl Fn() -> crate::Result<DebugSections> + Send + Sync + 'static) -> Self
+    {
+        Self {
+            inputs,
+            read: Arc::new(read),
+        }
+    }
+
+    /// Repeat discovery, returning the result and a retry with freshly stamped inputs.
+    pub fn retry(&self) -> (crate::Result<DebugSections>, Self)
+    {
+        let inputs = self.inputs.refresh();
+        let debug = (self.read)();
+        (
+            debug,
+            Self {
+                inputs,
+                read: self.read.clone(),
+            },
+        )
+    }
+}
 
 impl std::fmt::Debug for ImageContents
 {

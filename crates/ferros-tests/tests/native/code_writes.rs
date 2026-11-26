@@ -223,9 +223,9 @@ fn assert_task_resume_holds_exception_lock(faults: &ReplyFaultInjector, resume: 
 fn task_resume_holds_the_exception_lock()
 {
     harness::run(|t| {
-        let backend = MacOSBackend::new().expect("backend");
-        let faults = backend.reply_fault_injector();
-        let mut d = t.launch_with_backend(&fixture!("hello"), &[], backend);
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("hello"), &[], debugger);
         assert_task_resume_holds_exception_lock(&faults, || {
             backend(&mut d).resume(&ResumeRequest::continue_all()).expect("resume");
         });
@@ -241,9 +241,9 @@ fn task_resume_holds_the_exception_lock()
 fn release_suspends_holds_the_exception_lock()
 {
     harness::run(|t| {
-        let backend = MacOSBackend::new().expect("backend");
-        let faults = backend.reply_fault_injector();
-        let mut d = t.launch_with_backend(&fixture!("hello"), &[], backend);
+        let debugger = MacOSBackend::new().expect("backend");
+        let faults = debugger.reply_fault_injector();
+        let mut d = t.launch_with_backend(&fixture!("hello"), &[], debugger);
         assert_task_resume_holds_exception_lock(&faults, || {
             backend(&mut d).kill().expect("kill");
         });

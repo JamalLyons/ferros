@@ -67,7 +67,11 @@ impl MacOSBackend
             if result != KERN_SUCCESS || thread_count == 0 {
                 threads::ThreadManager::deallocate_threads_array(thread_list, thread_count);
                 let _ = ffi::mach_port_deallocate(mach_task_self(), task);
-                return Err(DebuggerError::AttachFailed(format!("Failed to get threads: {}", result)));
+                return Err(if result == KERN_SUCCESS {
+                    BackendError::NotFound(format!("process {} has no threads", pid.0)).into()
+                } else {
+                    crate::error::mach_failure("task_threads", result).into()
+                });
             }
 
             let slice = std::slice::from_raw_parts(thread_list, thread_count as usize);
@@ -117,7 +121,7 @@ impl MacOSBackend
     /// ## Errors
     ///
     /// Returns `MachError` if port allocation or exception port registration fails.
-    /// Returns `AttachFailed` if the handler thread cannot be spawned.
+    /// Returns `Io` with the OS error if the handler thread cannot be spawned.
     ///
     /// ## See Also
     ///
@@ -190,7 +194,7 @@ impl MacOSBackend
                         faults,
                     );
                 })
-                .map_err(|e| DebuggerError::AttachFailed(format!("Failed to spawn exception handler: {e}")))?;
+                .map_err(DebuggerError::Io)?;
 
             self.exception_thread = Some(handle);
             self.exception_commands = Some(command_tx);

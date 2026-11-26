@@ -161,6 +161,52 @@ impl From<MachError> for ferros_core::DebuggerError
     }
 }
 
+/// Classify a failed Mach call of `operation` while its `kern_return_t` is still known.
+///
+/// - `KERN_INVALID_ADDRESS` -> [`BackendError::NotFound`]
+/// - `KERN_PROTECTION_FAILURE` -> [`BackendError::PermissionDenied`]
+/// - any other code -> [`BackendError::Os`] with that code
+///
+/// Every message names the operation and the raw code, so no category loses it.
+///
+/// [`BackendError::NotFound`]: ferros_core::BackendError::NotFound
+/// [`BackendError::PermissionDenied`]: ferros_core::BackendError::PermissionDenied
+/// [`BackendError::Os`]: ferros_core::BackendError::Os
+pub(crate) fn mach_failure(operation: impl std::fmt::Display, code: libc::kern_return_t) -> ferros_core::BackendError
+{
+    use ferros_core::BackendError;
+
+    let message = format!("{operation}: {} (kern_return_t {code})", MachError::from(code));
+    match code {
+        libc::KERN_INVALID_ADDRESS => BackendError::NotFound(message),
+        libc::KERN_PROTECTION_FAILURE => BackendError::PermissionDenied(message),
+        _ => BackendError::Os {
+            code: i64::from(code),
+            message,
+        },
+    }
+}
+
+/// `error` with its message replaced by `reword(message)`, in the same category.
+pub(crate) fn reword(error: ferros_core::BackendError, reword: impl FnOnce(&str) -> String) -> ferros_core::BackendError
+{
+    use ferros_core::BackendError;
+
+    match error {
+        BackendError::NotFound(m) => BackendError::NotFound(reword(&m)),
+        BackendError::PermissionDenied(m) => BackendError::PermissionDenied(reword(&m)),
+        BackendError::InvalidState(m) => BackendError::InvalidState(reword(&m)),
+        BackendError::Unsupported(m) => BackendError::Unsupported(reword(&m)),
+        BackendError::DetachCleanup(m) => BackendError::DetachCleanup(reword(&m)),
+        BackendError::KillCleanup(m) => BackendError::KillCleanup(reword(&m)),
+        BackendError::Os { code, message } => BackendError::Os {
+            code,
+            message: reword(&message),
+        },
+        BackendError::StopPending => BackendError::StopPending,
+    }
+}
+
 /// Classify a failed VM read while its `kern_return_t` and address are still known.
 ///
 /// - `KERN_INVALID_ADDRESS` (the range is not mapped) -> [`BackendError::NotFound`]
@@ -198,7 +244,7 @@ mod tests
 {
     use ferros_core::{Address, BackendError, DebuggerError};
 
-    use super::{MachError, vm_read_error};
+    use super::{MachError, mach_failure, vm_read_error};
 
     #[test]
     fn protection_failure_maps_to_permission_denied()
@@ -283,5 +329,32 @@ mod tests
             }
             other => panic!("expected Os, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mach_failure_keeps_the_code_in_every_category()
+    {
+        let err = mach_failure("thread_get_state", mach2::message::MACH_SEND_INVALID_DEST);
+        assert_eq!(
+            err,
+            BackendError::Os {
+                code: i64::from(mach2::message::MACH_SEND_INVALID_DEST),
+                message: format!(
+                    "thread_get_state: {} (kern_return_t {})",
+                    MachError::Unknown(mach2::message::MACH_SEND_INVALID_DEST),
+                    mach2::message::MACH_SEND_INVALID_DEST
+                ),
+            }
+        );
+        let err = mach_failure("mach_vm_protect", libc::KERN_PROTECTION_FAILURE);
+        assert!(
+            matches!(err, BackendError::PermissionDenied(ref m) if m.contains("kern_return_t 2")),
+            "{err:?}"
+        );
+        let err = mach_failure("vm_write", libc::KERN_INVALID_ADDRESS);
+        assert!(
+            matches!(err, BackendError::NotFound(ref m) if m.contains("kern_return_t 1")),
+            "{err:?}"
+        );
     }
 }

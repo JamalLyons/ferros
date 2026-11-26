@@ -172,20 +172,33 @@ enum BackendState
 /// - `PermissionDenied`, and I/O errors of kind `PermissionDenied` -> `PermissionDenied`
 /// - `NotAttached`, `NotStopped`, `NotRunning`, `AlreadyAttached` -> `InvalidState`
 /// - `InvalidArgument` -> `Unsupported` (unsupported architecture, bad argument strings)
-/// - `Os { code, .. }` keeps its code; every other error -> `Os` with code -1 (or the
-///   errno of an I/O error)
+/// - `ThreadNotFound`, `NoThreadSelected`, `NoBreakpoint`, `BreakpointIdNotFound` ->
+///   `NotFound`
+/// - `ResourceExhausted` -> `Unsupported`
+/// - `Os { code, .. }` keeps its code; an I/O error keeps its errno (or -1 without one)
+/// - the engine's symbol and source errors, which no Mach helper returns, -> `Os` with
+///   code -1, each named so a new category cannot fall into that arm unnoticed
+///
+/// Mach helpers build their `BackendError` with [`mach_failure`](crate::error::mach_failure)
+/// while the `kern_return_t` is known, and it passes through unchanged.
 pub(crate) fn backend_error(err: DebuggerError) -> BackendError
 {
     let message = err.to_string();
     match err {
         DebuggerError::Backend(err) => err,
-        DebuggerError::ProcessNotFound(_) => BackendError::NotFound(message),
+        DebuggerError::ProcessNotFound(_)
+        | DebuggerError::ThreadNotFound(_)
+        | DebuggerError::NoThreadSelected
+        | DebuggerError::NoBreakpoint(_)
+        | DebuggerError::BreakpointIdNotFound(_) => BackendError::NotFound(message),
         DebuggerError::PermissionDenied(detail) => BackendError::PermissionDenied(detail),
         DebuggerError::NotAttached
         | DebuggerError::NotStopped
         | DebuggerError::NotRunning
         | DebuggerError::AlreadyAttached => BackendError::InvalidState(message),
-        DebuggerError::InvalidArgument(detail) => BackendError::Unsupported(detail),
+        DebuggerError::InvalidArgument(detail) | DebuggerError::ResourceExhausted(detail) => {
+            BackendError::Unsupported(detail)
+        }
         DebuggerError::Os { code, message } => BackendError::Os { code, message },
         DebuggerError::Io(io) => match io.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotFound(io.to_string()),
@@ -195,20 +208,17 @@ pub(crate) fn backend_error(err: DebuggerError) -> BackendError
                 message: io.to_string(),
             },
         },
-        _ => BackendError::Os { code: -1, message },
+        DebuggerError::NoDebugInfo { .. }
+        | DebuggerError::ImageMapping { .. }
+        | DebuggerError::SymbolLoad { .. }
+        | DebuggerError::SourceLookup(_) => BackendError::Os { code: -1, message },
     }
 }
 
-/// Map a failed `kern_return_t` to a [`BackendError`].
+/// Map a failed `kern_return_t` of `what` to a [`BackendError`] that keeps the code.
 fn mach_error(kr: libc::kern_return_t, what: &str) -> BackendError
 {
-    match backend_error(DebuggerError::from(MachError::from(kr))) {
-        BackendError::Os { code, message } => BackendError::Os {
-            code,
-            message: format!("{what}: {message}"),
-        },
-        other => other,
-    }
+    crate::error::mach_failure(what, kr)
 }
 
 /// Significant bits of an arm64 user pointer on macOS: xnu gives user processes a 47-bit
@@ -379,6 +389,9 @@ pub struct MacOSBackend
     drop_next_interrupt: Arc<AtomicBool>,
     /// One-shot integration test fault: the `task_suspend` in `hold_attached_on_drop` fails.
     fail_hold_suspend: Arc<AtomicBool>,
+    /// One-shot integration test fault: the next `read_registers` asks `thread_get_state`
+    /// for the state of `MACH_PORT_NULL`, so the real call fails.
+    fail_register_read: Arc<AtomicBool>,
     /// One-shot integration test fault: the next launch fails to take the spawned
     /// child's task port. `0` unarmed, `-1` armed, otherwise the pid of the child that
     /// launch discarded.
@@ -458,6 +471,7 @@ impl MacOSBackend
             fail_memory_store: Arc::default(),
             drop_next_interrupt: Arc::default(),
             fail_hold_suspend: Arc::default(),
+            fail_register_read: Arc::default(),
             fail_launch_task: Arc::default(),
             events_tx: None,
             events_rx: None,
@@ -527,7 +541,7 @@ impl MacOSBackend
     /// ## Errors
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
-    /// - `SuspendFailed`: `thread_suspend()` failed
+    /// - `Backend` with the `kern_return_t` of a failed `thread_suspend()`
     pub fn suspend_thread(&mut self, thread_id: ThreadId) -> Result<()>
     {
         threads::ThreadManager::suspend_thread(&self.threads, thread_id)
@@ -540,7 +554,7 @@ impl MacOSBackend
     /// ## Errors
     ///
     /// - `InvalidArgument`: Thread ID is not valid (not in the thread list)
-    /// - `ResumeFailed`: `thread_resume()` failed
+    /// - `Backend` with the `kern_return_t` of a failed `thread_resume()`
     pub fn resume_thread(&mut self, thread_id: ThreadId) -> Result<()>
     {
         threads::ThreadManager::resume_thread(&self.threads, thread_id)
@@ -603,6 +617,16 @@ impl MacOSBackend
     pub fn hold_suspend_fault_injector(&self) -> impl FnOnce() + use<>
     {
         let fail = Arc::clone(&self.fail_hold_suspend);
+        move || fail.store(true, Ordering::Relaxed)
+    }
+
+    /// Test hook: make the next [`Backend::read_registers`] call `thread_get_state` on
+    /// `MACH_PORT_NULL` instead of the thread's port, so the real call fails with its own
+    /// `kern_return_t`. Tests only.
+    #[doc(hidden)]
+    pub fn register_read_fault_injector(&self) -> impl FnOnce() + use<>
+    {
+        let fail = Arc::clone(&self.fail_register_read);
         move || fail.store(true, Ordering::Relaxed)
     }
 

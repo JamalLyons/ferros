@@ -16,6 +16,7 @@
 //!
 //! - [registers::debug] for the debug register implementation
 
+use ferros_core::BackendError;
 use ferros_core::breakpoints::WatchpointAccess;
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::types::Address;
@@ -30,7 +31,7 @@ use crate::registers;
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::AttachFailed`: `threads` is empty
+/// - `DebuggerError::Backend(BackendError::NotFound)`: `threads` is empty
 /// - Any error from programming a thread's debug registers (for example all slots in use)
 pub fn install_hardware_breakpoint(threads: &[thread_act_t], address: Address) -> Result<u32>
 {
@@ -47,7 +48,11 @@ pub fn install_hardware_breakpoint(threads: &[thread_act_t], address: Address) -
         }
     }
 
-    used_slot.ok_or_else(|| DebuggerError::AttachFailed("No threads available to set hardware breakpoint".into()))
+    used_slot.ok_or_else(|| {
+        DebuggerError::from(BackendError::NotFound(
+            "no threads available to set hardware breakpoint".into(),
+        ))
+    })
 }
 
 /// Install a data watchpoint for `length` bytes at `address` on every thread in `threads`.
@@ -57,7 +62,7 @@ pub fn install_hardware_breakpoint(threads: &[thread_act_t], address: Address) -
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::AttachFailed`: `threads` is empty
+/// - `DebuggerError::Backend(BackendError::NotFound)`: `threads` is empty
 /// - Any error from programming a thread's debug registers
 pub fn install_watchpoint(threads: &[thread_act_t], address: Address, length: usize, access: WatchpointAccess)
 -> Result<u32>
@@ -75,7 +80,8 @@ pub fn install_watchpoint(threads: &[thread_act_t], address: Address, length: us
         }
     }
 
-    used_slot.ok_or_else(|| DebuggerError::AttachFailed("No threads available to set data watchpoint".into()))
+    used_slot
+        .ok_or_else(|| DebuggerError::from(BackendError::NotFound("no threads available to set data watchpoint".into())))
 }
 
 /// Remove the hardware breakpoint in `slot` from every thread in `threads`.

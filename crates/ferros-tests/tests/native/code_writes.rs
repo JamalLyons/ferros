@@ -172,6 +172,31 @@ fn planted_trap_is_executed_once_the_target_runs()
     });
 }
 
+/// #335: repeatedly resume onto the same trap to exercise the race between the
+/// exception loop's new suspension and the preceding `task_resume`.
+#[test]
+fn immediate_retrap_keeps_the_task_suspended()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hot_loop");
+        let mut d = t.launch_with_args(&fixture, &["1"]);
+        let site = function_address(d.session_mut(), &fixture, "spin_site");
+        backend(&mut d).write_memory(site, &TRAP).expect("plant the trap");
+        let request = ResumeRequest::continue_all();
+        for round in 0..20_000 {
+            backend(&mut d).resume(&request).unwrap_or_else(|err| {
+                let counts = diagnostics::process_suspend_counts(d.pid()).map(|counts| counts.task);
+                panic!("round {round}: {err}; task suspend count {counts:?}");
+            });
+            let stop = backend(&mut d).wait(Some(STOP_TIMEOUT)).expect("wait for the trap");
+            assert!(
+                matches!(stop, Some(StopEvent::Breakpoint { pc, .. }) if pc == site),
+                "round {round}: {stop:?}"
+            );
+        }
+    });
+}
+
 /// A write the backend refuses changes nothing: `Backend::write_memory` is all or
 /// nothing (issue #133), which the session's trap rollback relies on. The write starts
 /// in the last bytes of the code region that holds `tick` and runs past its end, so part

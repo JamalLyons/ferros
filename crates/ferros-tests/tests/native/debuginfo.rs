@@ -11,14 +11,15 @@ use ferros_core::backend::mock::MockBackend;
 use ferros_core::backend::{LoadedImage, StdioSpec};
 use ferros_core::symbols::{BinaryImage, ImageDescriptor};
 use ferros_core::{
-    Address, BreakpointLocation, BreakpointRequest, DebuggerError, LaunchSpec, Registers, Session, StopEvent, SymbolCache,
-    ThreadId,
+    Address, BreakpointLocation, BreakpointRequest, BuildId, BuildIdentity, DebuggerError, LaunchSpec, Registers, Session,
+    StopEvent, SymbolCache, ThreadId,
 };
 use ferros_macos::{DebugInfoOptions, MacOSBackend, MacOSRuntime, MachOFormat};
 use ferros_tests::stripped::StrippedFixture;
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness, scratch};
-use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::read::macho::{MachHeader as _, MachOFile64};
+use object::{Endianness, Object, ObjectSection, ObjectSymbol, SymbolKind, macho};
 
 struct Scratch(PathBuf);
 
@@ -470,6 +471,101 @@ fn session_does_not_reread_an_unchanged_image_whose_symbol_load_failed()
                 .iter()
                 .any(|frame| rustc_demangle::try_demangle(frame.symbol.raw())
                     .is_ok_and(|name| format!("{name:#}") == "ferros_fixture_hello::main")),
+            "{symbolication:?}"
+        );
+    });
+}
+
+#[test]
+fn late_build_id_retries_an_unchanged_universal_file()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        t.remove_on_cleanup(scratch.0.clone());
+        let executable = scratch.0.join("program");
+        let bytes = fs::read(fixture.path()).expect("read fixture");
+        let file = MachOFile64::<Endianness>::parse(&*bytes).expect("parse fixture");
+        let uuid = file.mach_uuid().expect("read UUID").expect("fixture UUID");
+        let cpu = file.macho_header().cputype(file.endian()).0;
+        let subtype = file.macho_header().cpusubtype(file.endian()).0;
+        let header_size = ferros_macos::macho::header_size(&bytes).expect("header size");
+        let mut mapped_header = bytes[..header_size].to_vec();
+        let mut commands = file.macho_load_commands().expect("load commands");
+        let uuid_offset = loop {
+            let command = commands.next().expect("parse load command").expect("find UUID command");
+            if command.cmd() == macho::LC_UUID {
+                break command.raw_data().as_ptr().addr() - bytes.as_ptr().addr();
+            }
+        };
+        // The target header exposes its CPU and layout but no UUID on the first read.
+        mapped_header[uuid_offset..uuid_offset + 4].fill(0);
+
+        // Both universal entries match that CPU. The first slice has a valid range but
+        // invalid bytes. Only the UUID selector skips it in favor of the second slice.
+        let damaged = b"invalid slice";
+        let mut universal = [
+            macho::FAT_MAGIC,
+            2,
+            cpu,
+            subtype,
+            0x1000,
+            u32::try_from(damaged.len()).unwrap(),
+            12,
+            cpu,
+            subtype,
+            0x2000,
+            u32::try_from(bytes.len()).unwrap(),
+            12,
+        ]
+        .into_iter()
+        .flat_map(u32::to_be_bytes)
+        .collect::<Vec<_>>();
+        universal.resize(0x1000, 0);
+        universal.extend_from_slice(damaged);
+        universal.resize(0x2000, 0);
+        universal.extend_from_slice(&bytes);
+        fs::write(&executable, universal).expect("install universal executable");
+        std::os::unix::fs::symlink(fixture.dsym_path(), scratch.0.join("program.dSYM")).expect("link the dSYM");
+
+        let load_address = Address::new(0x2_0000_0000);
+        let (file_address, _) = symbol(fixture.path(), "ferros_fixture_hello::main");
+        let address = ferros_macos::macho::file_mapping(fixture.path(), load_address.value())
+            .expect("mapping")
+            .runtime_address(file_address)
+            .expect("runtime address");
+        let mut image = LoadedImage {
+            path: executable,
+            load_address,
+            build_id: BuildIdentity::Unknown,
+            role: ferros_core::backend::ImageRole::MainExecutable,
+        };
+        let mock = MockBackend::new()
+            .with_region(load_address, "r-x", mapped_header)
+            .with_thread(ThreadId(1), Registers::default())
+            .with_image(image.clone());
+        let mut session = Session::new(
+            Box::new(mock.clone()),
+            MachOFormat::with_debug_info_options(scratch.options()).into_shared(),
+        );
+        session.launch(&LaunchSpec::new(fixture.path())).expect("mock launch");
+        let error = session.symbolicate(address).expect_err("the first matching slice is damaged");
+        assert!(
+            matches!(&error, DebuggerError::SymbolLoad { source, .. } if source.to_string().contains("failed to parse")),
+            "{error}"
+        );
+
+        image.build_id = BuildIdentity::Known(BuildId::from(uuid));
+        mock.set_images(vec![image]);
+        let symbolication = session
+            .symbolicate(address)
+            .expect("retry with the known UUID and unchanged files")
+            .expect("main has a symbol");
+        assert!(
+            symbolication.frames.iter().any(|frame| {
+                rustc_demangle::try_demangle(frame.symbol.raw())
+                    .is_ok_and(|name| format!("{name:#}") == "ferros_fixture_hello::main")
+            }),
             "{symbolication:?}"
         );
     });
@@ -1060,6 +1156,51 @@ fn stripped_executable_still_unwinds_its_caller()
         }
         let registers = d.read_registers_for(thread).expect("registers");
         assert_eq!(registers.pc, return_address, "step-out stops in the caller");
+    });
+}
+
+#[test]
+fn late_companion_repairs_the_same_session_lookup()
+{
+    harness::run(|t| {
+        let stripped = stripped_frameless_stack();
+        t.remove_on_cleanup(stripped.directory.clone());
+        let fixture = &stripped.fixture;
+        let original = fixture!("frameless_stack");
+        let scratch = Scratch::new();
+        t.remove_on_cleanup(scratch.0.clone());
+        let tag = t.tag();
+        let mut d = launch_with_debug_options(fixture, tag.as_str(), scratch.options());
+        let (_, return_address, _) = stop_in_unwind_only_callee(&mut d, fixture);
+        let line = original.marker_line("frameless_done");
+        let location = BreakpointLocation::Line {
+            file: "frameless_stack.rs".into(),
+            line,
+        };
+        let error = d.set_breakpoint(location.clone()).expect_err("no companion yet");
+        assert!(matches!(error, DebuggerError::NoDebugInfo { .. }), "{error}");
+        let frames = d.stack_trace(2).expect("stack trace before installing DWARF");
+        assert_eq!(frames.get(1).map(|frame| frame.pc), Some(return_address), "{frames:#?}");
+
+        // Public SymbolCache loads already retry after a stamp change (#236).
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(scratch.options()).into_shared());
+        let descriptor = descriptor(fixture.path(), 0x2_0000_0000);
+        expect_no_debug_info(cache.load_image(descriptor.clone()));
+        std::os::unix::fs::symlink(original.dsym_path(), fixture.dsym_path()).expect("install matching companion");
+        assert!(cache.load_image(descriptor).expect("public cache retries").has_debug_info());
+
+        // Permissions are outside the load stamp. A session retry must read only the
+        // companion, since reopening the executable for its unwind tables would fail.
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o000)).expect("make executable unreadable");
+        assert!(fs::read(fixture.path()).is_err(), "executable is still readable");
+        d.set_breakpoint(location)
+            .expect("retry the source lookup in the same session");
+        let site = &d.logical_breakpoints()[0].sites[0];
+        assert_eq!(site.position.line, Some(line));
+        let address = site.address;
+        assert!(d.symbolicate(address).expect("symbolicate repaired lookup").is_some());
+        let frames = d.stack_trace(2).expect("stack trace after installing DWARF");
+        assert_eq!(frames.get(1).map(|frame| frame.pc), Some(return_address), "{frames:#?}");
     });
 }
 

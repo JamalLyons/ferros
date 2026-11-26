@@ -307,13 +307,13 @@ impl Session
     ///
     /// # Failed loads
     ///
-    /// Missing debug info is kept while the image stays loaded. Any other failure is
-    /// kept with a stamp (size and timestamps) of the files the load read: the image, its
-    /// companion debug-info files and the debug cache directory. While those are
-    /// unchanged, later calls (and [`stack_trace`](Self::stack_trace)) return the same
-    /// [`DebuggerError::SymbolLoad`] without reading the image again; once one of them
-    /// appears, disappears or changes, the next call loads the image again. A file
-    /// rewritten in place with the same size and timestamps is not noticed.
+    /// A load failure is kept with a stamp (size and timestamps) of the image and its
+    /// companion inputs. Later calls, including [`stack_trace`](Self::stack_trace), retry
+    /// when one of those inputs appears, disappears or changes. If only the companion
+    /// inputs changed and the executable was loaded, discovery can retry over the cached
+    /// unwind information. A failure to open the executable can also be retried when the
+    /// mapped build id becomes known. A file rewritten with the same size and timestamps
+    /// is not noticed.
     ///
     /// Like [`stack_trace`](Self::stack_trace), each call refreshes the image list once.
     pub fn symbolicate(&mut self, address: Address) -> Result<Option<Symbolication>>

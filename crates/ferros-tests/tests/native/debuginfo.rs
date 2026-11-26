@@ -186,6 +186,72 @@ fn mismatched_dsym_is_rejected_and_no_tool_has_actionable_typed_error()
 }
 
 #[test]
+fn cache_retries_debug_info_after_an_in_place_uuid_cache_repair()
+{
+    harness::run(|t| {
+        let fixture = fixture!("hello");
+        let scratch = Scratch::new();
+        t.remove_on_cleanup(scratch.0.clone());
+        let executable = scratch.0.join("program");
+        fs::copy(fixture.path(), &executable).expect("copy executable without companion");
+        let bytes = fs::read(&executable).expect("read executable");
+        let file = object::File::parse(&*bytes).expect("parse executable");
+        let uuid = file.mach_uuid().expect("read UUID").expect("executable UUID");
+        let key = BuildId::from(uuid);
+        let options = scratch.options();
+        let directory = options.cache_directory.clone();
+        fs::create_dir(&directory).expect("create cache directory");
+        let entry = directory.join(format!("{key}-{:?}.dwarf", file.architecture()));
+        fs::write(&entry, b"corrupt DWARF").expect("install corrupt cache entry");
+        let modified = fs::metadata(&directory)
+            .and_then(|metadata| metadata.modified())
+            .expect("cache directory mtime");
+
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(options).into_shared());
+        let descriptor = descriptor(&executable, 0x2_0000_0000);
+        expect_no_debug_info(cache.load_image(descriptor.clone()));
+
+        fs::write(&entry, fs::read(dwarf_member(&fixture)).expect("read matching DWARF"))
+            .expect("repair cache entry in place");
+        assert_eq!(
+            fs::metadata(directory)
+                .and_then(|metadata| metadata.modified())
+                .expect("cache directory mtime after repair"),
+            modified
+        );
+        let image = cache.load_image(descriptor).expect("retry the repaired cache entry");
+        assert_source_line(&image, &executable, &fixture);
+    });
+}
+
+#[test]
+fn cache_runs_a_failing_dsymutil_once_for_unchanged_inputs()
+{
+    harness::run(|t| {
+        let scratch = Scratch::new();
+        t.remove_on_cleanup(scratch.0.clone());
+        let executable = scratch.0.join("program");
+        fs::copy(fixture!("hello").path(), &executable).expect("copy executable with debug map and no companion");
+        let tool = scratch.0.join("failing-dsymutil");
+        fs::write(&tool, "#!/bin/sh\nprintf 'invoked\\n' >> \"$0.log\"\nexit 1\n").expect("write fake tool");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).expect("make fake tool executable");
+
+        let mut options = scratch.options();
+        options.dsymutil = Some(tool.clone());
+        let mut cache = SymbolCache::new(MachOFormat::with_debug_info_options(options).into_shared());
+        let descriptor = descriptor(&executable, 0x2_0000_0000);
+        for _ in 0..2 {
+            let Err(error) = cache.load_image(descriptor.clone()) else {
+                panic!("unexpected debug info");
+            };
+            assert!(matches!(error, DebuggerError::NoDebugInfo { detail, .. } if detail.contains("dsymutil failed")));
+        }
+        let log = fs::read_to_string(tool.with_extension("log")).expect("read tool invocations");
+        assert_eq!(log, "invoked\n", "unchanged inputs triggered another dsymutil invocation");
+    });
+}
+
+#[test]
 fn default_cargo_build_uses_dsymutil_then_reuses_validated_cache()
 {
     harness::run_with_timeout(Duration::from_secs(90), |_| {

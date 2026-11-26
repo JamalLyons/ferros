@@ -41,7 +41,7 @@ use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
-use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, SectionData, UnwindHints};
+use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
 
 /// Describes a binary image mapped in the debuggee's address space.
@@ -367,9 +367,15 @@ impl BinaryImage
     /// Refresh the source debug information and its indexes over the same executable.
     pub(super) fn retry_debug_info(&self) -> Option<Self>
     {
-        let retry = self.retry_debug.as_ref()?;
-        let debug = retry();
-        Some(Self::new(self.executable.clone(), debug, Some(retry.clone())))
+        let (debug, retry) = self.retry_debug.as_ref()?.retry();
+        Some(Self::new(self.executable.clone(), debug, Some(retry)))
+    }
+
+    pub(super) fn debug_load_inputs(&self) -> LoadInputs
+    {
+        self.retry_debug
+            .as_ref()
+            .map_or_else(LoadInputs::default, |retry| retry.inputs.clone())
     }
 
     pub(crate) fn runtime_range(&self) -> (u64, u64)

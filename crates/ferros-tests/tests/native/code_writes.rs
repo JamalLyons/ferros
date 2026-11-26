@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferros_core::{Address, Backend, BackendError, ResumeRequest, StopEvent, ThreadAction};
+use ferros_core::{Address, Backend, BackendError, ResumeRequest, StopEvent, ThreadAction, ThreadId};
 use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::arm64::TRAP;
 use ferros_tests::harness::{self, Debuggee};
@@ -204,6 +204,51 @@ fn refused_write_across_a_code_region_end_leaves_memory_unchanged()
     });
 }
 
+#[test]
+fn short_snapshot_refuses_the_write_before_storing_any_bytes()
+{
+    harness::run(|t| {
+        let fixture = fixture!("loop_counter");
+        let mut d = t.launch(&fixture);
+        let tick = function_address(d.session_mut(), &fixture, "tick");
+        let before = raw_word(&d, tick);
+        assert_ne!(before, TRAP);
+
+        let result = diagnostics::write_with_short_snapshot(d.pid(), tick, &TRAP);
+        assert_eq!(raw_word(&d, tick), before, "short snapshot allowed a write: {result:?}");
+        let error = result.expect_err("a short snapshot must fail the write").to_string();
+        assert!(error.contains("rollback snapshot read 3 of 4 bytes"), "{error}");
+        assert!(!error.contains("restored"), "{error}");
+    });
+}
+
+#[test]
+fn unreadable_snapshot_refuses_a_write_to_a_protected_page()
+{
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--guard-page"]);
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all())
+            .expect("run to the guard page");
+        assert!(d.wait_for_stdout("\n", STOP_TIMEOUT), "fixture printed no guard page");
+        interrupt(&mut d);
+        let stdout = d.stdout();
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("boundary: 0x"))
+            .expect("guard page address line");
+        let guard = Address::from(u64::from_str_radix(hex, 16).expect("guard page address"));
+
+        let error = backend(&mut d)
+            .write_memory(guard, &[0xa5])
+            .expect_err("an unreadable snapshot must fail the write");
+        assert!(
+            matches!(error, BackendError::PermissionDenied(ref message) if message.contains("not readable")),
+            "{error}"
+        );
+    });
+}
+
 /// The four bytes at `address` as they are in memory, including traps the backend hides
 /// from `read_memory`.
 fn raw_word(d: &Debuggee, address: Address) -> Vec<u8>
@@ -212,9 +257,9 @@ fn raw_word(d: &Debuggee, address: Address) -> Vec<u8>
 }
 
 /// Stop the creator of `spawn_thread` at `spawn_later`, then run only it until its
-/// newborn is enumerated and held on a birth trap. Returns that trap's address, with
-/// the target stopped.
-fn hold_a_newborn(d: &mut Debuggee, fixture: &Fixture) -> Address
+/// newborn is enumerated and held on a birth trap. Returns the thread and trap address,
+/// with the target stopped.
+fn hold_a_newborn(d: &mut Debuggee, fixture: &Fixture) -> (ThreadId, Address)
 {
     // Stop the creator at `spawn_later`, then let only it run so the newborn is held.
     let spawn_later = function_address(d.session_mut(), fixture, "spawn_later");
@@ -249,7 +294,7 @@ fn hold_a_newborn(d: &mut Debuggee, fixture: &Fixture) -> Address
         if let Some(newborn) = newborn {
             let pc = backend(d).read_registers(newborn).expect("newborn registers").pc;
             if raw_word(d, pc) == TRAP {
-                return pc;
+                return (newborn, pc);
             }
         }
         assert!(
@@ -258,6 +303,70 @@ fn hold_a_newborn(d: &mut Debuggee, fixture: &Fixture) -> Address
             d.stdout()
         );
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn assert_entry_write_leaves_thread_unchanged(fault: diagnostics::BirthEntryWrite)
+{
+    harness::run(move |t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (thread, entry) = hold_a_newborn(&mut d, &fixture);
+        let before = backend(&mut d).read_registers(thread).expect("read the newborn registers");
+        assert_eq!(before.pc, entry);
+        assert_eq!(before.general.len(), 31);
+        assert_eq!(before.vector.len(), 32);
+        assert!(before.floating.fpsr.is_some() && before.floating.fpcr.is_some());
+
+        // Make the store observable even if the kernel zeroed the new stack.
+        let stack = Address::from(before.sp.value() - 16);
+        let sentinel = [0xa5; 16];
+        backend(&mut d).write_memory(stack, &sentinel).expect("seed the entry frame");
+
+        let port = u32::try_from(thread.raw()).expect("Mach thread port");
+        let error = diagnostics::emulate_birth_entry_with_fault(d.pid(), port, fault)
+            .expect_err("the injected entry write must fail")
+            .to_string();
+        assert!(error.contains(&format!("injected {fault:?} write failure")), "{error}");
+
+        let after = backend(&mut d).read_registers(thread).expect("read the registers again");
+        let after_stack = diagnostics::raw_memory(d.pid(), stack, sentinel.len()).expect("read the entry frame");
+        assert_eq!(after.vector, before.vector, "NEON registers changed");
+        assert_eq!(after.floating, before.floating, "floating-point state changed");
+        assert_eq!(
+            (after.pc, after.sp, after.fp, after.status, after.general, after_stack),
+            (
+                before.pc,
+                before.sp,
+                before.fp,
+                before.status,
+                before.general,
+                sentinel.to_vec()
+            ),
+            "{fault:?} failure changed the general registers or entry frame"
+        );
+    });
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn failed_birth_entry_stack_write_leaves_the_thread_unchanged()
+{
+    assert_entry_write_leaves_thread_unchanged(diagnostics::BirthEntryWrite::Stack);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn failed_birth_entry_general_register_write_leaves_the_thread_unchanged()
+{
+    assert_entry_write_leaves_thread_unchanged(diagnostics::BirthEntryWrite::GeneralRegisters);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn failed_birth_entry_neon_write_leaves_the_thread_unchanged()
+{
+    assert_entry_write_leaves_thread_unchanged(diagnostics::BirthEntryWrite::NeonRegisters);
 }
 
 /// A write the backend refuses after planning it leaves a covered birth trap's saved
@@ -281,7 +390,7 @@ fn failed_overlapping_birth_write_keeps_the_saved_instruction()
         let fail_store_again = backend_handle.memory_store_fault_injector();
         let mut d = t.launch_with_backend(&fixture, &[], backend_handle);
 
-        let site = hold_a_newborn(&mut d, &fixture);
+        let (_, site) = hold_a_newborn(&mut d, &fixture);
         let saved = backend(&mut d).read_memory(site, 4).expect("read the entry");
         assert_ne!(saved, TRAP, "read_memory shows the birth trap instead of the entry");
 

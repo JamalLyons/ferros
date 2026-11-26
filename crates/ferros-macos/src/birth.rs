@@ -29,12 +29,16 @@
 use std::fs;
 
 use ferros_core::backend::{ImageRole, LoadedImage, StopEvent};
-use ferros_core::types::{Address, Arm64Register, ProcessId, RegisterId};
+#[cfg(target_arch = "aarch64")]
+use ferros_core::error::DebuggerError;
+use ferros_core::types::{Address, Arm64Register, ProcessId, RegisterId, Registers};
 use libc::{mach_port_t, thread_act_t};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
 
-use crate::memory::{read_memory, write_memory, write_memory_all_or_nothing};
+use crate::memory::{read_memory, write_memory_all_or_nothing};
+#[cfg(target_arch = "aarch64")]
+use crate::memory::{read_memory_into, restore_failed_write, write_memory};
 
 /// `brk #0`, the same trap the engine plants for software breakpoints.
 const BRK: [u8; 4] = [0x00, 0x00, 0x20, 0xD4];
@@ -51,6 +55,19 @@ const CPU_TYPE_ARM64: u32 = 0x0100_000c;
 const MAX_COMMANDS: usize = 1 << 20;
 const PTHREAD_FILE: &str = "libsystem_pthread.dylib";
 const ENTRY_SYMBOLS: [&str; 2] = ["_thread_start", "_start_wqthread"];
+
+/// Write boundaries of pthread entry emulation, exposed for integration tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BirthEntryWrite
+{
+    /// The stack store and its cache flush.
+    Stack,
+    /// The general-purpose register update.
+    GeneralRegisters,
+    /// The NEON register update.
+    NeonRegisters,
+}
 
 /// Why a birth trap could not be installed. The resume that needed it must fail.
 #[derive(Debug)]
@@ -177,10 +194,11 @@ impl BirthPolicy
     /// # Errors
     ///
     /// The entry is not the expected `stp`, or the thread or its stack cannot be updated.
-    /// The thread is then unchanged.
+    /// The original stack and register state is preserved. If the kernel also refuses
+    /// a rollback, the error reports what could not be restored.
     pub(crate) fn emulate_entry(&self, task: mach_port_t, thread: thread_act_t) -> Result<(), String>
     {
-        let mut registers = crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread)
+        let registers = crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread)
             .map_err(|err| format!("reading the registers of thread {thread} failed: {err}"))?;
         let pc = registers.pc.value();
         let site = self
@@ -194,16 +212,7 @@ impl BirthPolicy
                 site.original
             ));
         }
-        let sp = registers
-            .sp
-            .value()
-            .checked_sub(16)
-            .ok_or_else(|| format!("thread {thread} has no room on its stack"))?;
-        write_memory(task, Address::from(sp), &[0; 16])
-            .map_err(|err| format!("writing the entry frame of thread {thread} failed: {err}"))?;
-        registers.sp = Address::from(sp);
-        registers.pc = Address::from(pc + 4);
-        write_entry_registers(thread, &registers)
+        emulate_entry_writes(task, thread, registers, |_| Ok(()))
     }
 
     /// Show the original instruction wherever `data`, read at `address`, covers an armed
@@ -593,14 +602,66 @@ fn overlap(address: u64, len: usize, site: u64) -> Option<(usize, usize, usize)>
 }
 
 #[cfg(target_arch = "aarch64")]
-fn write_entry_registers(thread: thread_act_t, registers: &ferros_core::types::Registers) -> Result<(), String>
+pub(crate) fn emulate_entry_writes(
+    task: mach_port_t,
+    thread: thread_act_t,
+    registers: Registers,
+    mut check: impl FnMut(BirthEntryWrite) -> ferros_core::Result<()>,
+) -> Result<(), String>
 {
-    crate::registers::write_registers_arm64(thread, registers)
-        .map_err(|err| format!("writing the registers of thread {thread} failed: {err}"))
+    use crate::registers::arm64::{write_arm64_gpr_state, write_arm64_neon_state};
+
+    let sp = registers
+        .sp
+        .value()
+        .checked_sub(16)
+        .map(Address::from)
+        .ok_or_else(|| format!("thread {thread} has no room on its stack"))?;
+    let mut original_frame = [0; 16];
+    read_memory_into(task, sp, &mut original_frame)
+        .map_err(|err| format!("reading the entry frame of thread {thread} failed: {err}"))?;
+
+    let mut updated = registers.clone();
+    updated.sp = sp;
+    updated.pc = Address::from(registers.pc.value() + 4);
+
+    // The entry stores to a writable stack, so neither the write nor its rollback
+    // should change page protection.
+    let write_frame = |task, address, bytes: &[u8]| write_memory(task, address, bytes).map(|_| ());
+    let result = (|| {
+        write_frame(task, sp, &[0; 16])?;
+        // Like a failed cache flush, this fault is reported after the bytes changed.
+        check(BirthEntryWrite::Stack)?;
+        check(BirthEntryWrite::GeneralRegisters)?;
+        write_arm64_gpr_state(thread, &updated)?;
+
+        // A rejected Mach register write leaves that flavor unchanged. Restore the
+        // GPRs independently if updating NEON fails after the GPR update succeeded.
+        let Err(error) = check(BirthEntryWrite::NeonRegisters).and_then(|()| write_arm64_neon_state(thread, &updated))
+        else {
+            return Ok(());
+        };
+        match write_arm64_gpr_state(thread, &registers) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(DebuggerError::Io(std::io::Error::other(format!(
+                "{error}; restoring the original general registers of thread {thread} also failed ({rollback})"
+            )))),
+        }
+    })();
+
+    result.map_err(|error| {
+        let error = restore_failed_write(task, sp, &original_frame, error, write_frame);
+        format!("emulating the entry of thread {thread} failed: {error}")
+    })
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn write_entry_registers(thread: thread_act_t, _registers: &ferros_core::types::Registers) -> Result<(), String>
+fn emulate_entry_writes(
+    _task: mach_port_t,
+    thread: thread_act_t,
+    _registers: Registers,
+    _check: impl FnMut(BirthEntryWrite) -> ferros_core::Result<()>,
+) -> Result<(), String>
 {
     Err(format!("arm64 thread {thread} cannot be updated by this build"))
 }

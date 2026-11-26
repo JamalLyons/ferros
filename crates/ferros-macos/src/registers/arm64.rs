@@ -54,7 +54,8 @@ thread_local! {
 }
 
 /// Test hook: fail the next ARM64 NEON write on the calling debugger thread by
-/// sending `thread_set_state` to `MACH_PORT_NULL`. The flag also faults GPR rollback.
+/// sending `thread_set_state` to `MACH_PORT_NULL`. With `also_fail_gpr_rollback`, the
+/// GPR rollback after it fails the same way. The fault is consumed by the next write.
 #[doc(hidden)]
 pub fn fail_next_arm64_neon_write(also_fail_gpr_rollback: bool)
 {
@@ -173,6 +174,8 @@ fn fetch_arm64_gpr_state(thread: thread_act_t) -> BackendResult<ArmGprState64>
 /// - [thread_set_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
+    // Consume an armed test fault on every call, so it never outlives this write.
+    let fault = NEON_WRITE_FAULT.take();
     let Some(neon) = prepare_arm64_neon_state(thread, regs)? else {
         return write_arm64_gpr_state(thread, regs);
     };
@@ -180,7 +183,6 @@ pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<(
     let original = fetch_arm64_gpr_state(thread)?;
     write_arm64_gpr_state(thread, regs)?;
 
-    let fault = NEON_WRITE_FAULT.take();
     let neon_thread = if fault.is_some() { MACH_PORT_NULL } else { thread };
     let Err(error) = set_arm64_neon_state(neon_thread, &neon) else {
         return Ok(());

@@ -37,15 +37,15 @@ use self::jobs::JobControl;
 /// The prompt printed before each command.
 pub const PROMPT: &str = "(ferros) ";
 
-/// `SIGINT` and `SIGTSTP`: a stop for one of these signals is not passed back to the
-/// program by `continue`. With `launch --terminal`, Ctrl-C and Ctrl-Z reach the program
-/// as these signals; passing `SIGTSTP` on would stop it for the shell, outside ferros.
-const SIGINT: i32 = 2;
-const SIGTSTP: i32 = 18;
-/// `SIGTTIN` and `SIGTTOU`: a launched program, in a background process group, used the
-/// terminal. `continue` passes the signal back and the program stops again.
-const SIGTTIN: i32 = 21;
-const SIGTTOU: i32 = 22;
+/// Signal numbers for terminal events on the target platform.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalSignals
+{
+    /// Signals held when Ctrl-C or Ctrl-Z reaches the program under `launch --terminal`.
+    pub suppress_on_continue: &'static [i32],
+    /// Signals held when the program reads or writes the terminal from the background.
+    pub background_io: &'static [i32],
+}
 
 /// How the session got its process, and how `run` starts it again.
 #[derive(Debug, Clone)]
@@ -67,6 +67,7 @@ pub struct Debugger
     pub target: Target,
     /// The process is at its initial stop and has never run.
     pub at_entry: bool,
+    terminal_signals: TerminalSignals,
 }
 
 impl Debugger
@@ -79,7 +80,11 @@ impl Debugger
     /// # Errors
     ///
     /// The launch or attach error of the session.
-    pub fn start(mut session: Session, target: Target) -> ferros_core::Result<(Self, String)>
+    pub fn start(
+        mut session: Session,
+        target: Target,
+        terminal_signals: TerminalSignals,
+    ) -> ferros_core::Result<(Self, String)>
     {
         let message = match &target {
             Target::Launch(spec) => format!("launched process {}", session.launch(spec)?.0),
@@ -93,6 +98,7 @@ impl Debugger
                 session,
                 target,
                 at_entry: true,
+                terminal_signals,
             },
             message,
         ))
@@ -158,14 +164,14 @@ impl Ctx<'_>
     /// The session's resume, step or wait error.
     pub fn resume_and_wait(&mut self, step: Option<ThreadId>) -> Result<StopEvent, CommandError>
     {
+        let suppress_on_continue = self.debugger.terminal_signals.suppress_on_continue;
         self.run_program(|session| match step {
             Some(thread) => session.step_instruction(thread),
             None if matches!(
                 session.last_stop(),
                 Some(StopEvent::Signal {
-                    signal: SIGINT | SIGTSTP,
-                    ..
-                })
+                    signal, ..
+                }) if suppress_on_continue.contains(signal)
             ) =>
             {
                 session.resume()
@@ -232,10 +238,8 @@ impl Ctx<'_>
     {
         let line = output::describe_stop(&mut self.debugger.session, event);
         writeln!(self.out, "{line}")?;
-        if let StopEvent::Signal {
-            signal: SIGTTIN | SIGTTOU,
-            ..
-        } = event
+        if let StopEvent::Signal { signal, .. } = event
+            && self.debugger.terminal_signals.background_io.contains(signal)
         {
             writeln!(
                 self.out,

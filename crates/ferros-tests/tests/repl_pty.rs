@@ -75,15 +75,16 @@ type Screen = Arc<(Mutex<(Vec<u8>, bool)>, Condvar)>;
 /// `ferros launch <fixture> -- <tag>` on a pseudo-terminal.
 ///
 /// A background thread copies the master's output into a buffer; it is never joined, so a
-/// read that does not end (a leaked writer on the slave) cannot hang the test. Dropping
-/// the value kills and reaps `ferros` if it is still running.
+/// read that does not end (a leaked writer on the slave) cannot hang the test: waits on
+/// it are bounded. Dropping the value kills and reaps `ferros` if it is still running.
 struct PtyFerros
 {
     child: Box<dyn Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     screen: Screen,
-    /// Kept open so the slave stays usable until the test is done with it.
-    _master: Box<dyn MasterPty + Send>,
+    /// Kept open so the slave stays usable until the test is done with it; also asked for
+    /// the terminal's foreground process group.
+    master: Box<dyn MasterPty + Send>,
     /// Byte offset of the output already consumed by [`PtyFerros::expect`].
     cursor: usize,
 }
@@ -152,7 +153,7 @@ impl PtyFerros
             child,
             writer,
             screen,
-            _master: pair.master,
+            master: pair.master,
             cursor: 0,
         };
         ferros.expect("launched process ");
@@ -213,13 +214,39 @@ impl PtyFerros
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Wait for `ferros` to exit and return its status.
+    /// The pid of `ferros` on the pty.
+    fn pid(&self) -> u32
+    {
+        self.child.process_id().expect("ferros pid")
+    }
+
+    /// Wait until the terminal's foreground process group is `group` (`tcgetpgrp`).
+    fn wait_for_foreground(&self, group: u32)
+    {
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        let wanted = i32::try_from(group).expect("process group in range");
+        loop {
+            let current = self.master.process_group_leader();
+            if current == Some(wanted) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let what = format!("the terminal foreground is {current:?}, not {group}");
+                panic!("{what} after {STEP_TIMEOUT:?}; terminal output:\n{}", self.text());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait for `ferros` to exit, then for the end of its terminal output, and return its
+    /// status. Output written just before the exit (an error, say) is in [`PtyFerros::text`]
+    /// afterwards. The end comes once every process holding the slave is gone.
     fn wait_exit(&mut self) -> ExitStatus
     {
         let deadline = Instant::now() + STEP_TIMEOUT;
-        loop {
+        let status = loop {
             if let Ok(Some(status)) = self.child.try_wait() {
-                return status;
+                break status;
             }
             assert!(
                 Instant::now() < deadline,
@@ -227,7 +254,22 @@ impl PtyFerros
                 self.text()
             );
             thread::sleep(Duration::from_millis(20));
+        };
+        let (lock, ready) = &*self.screen;
+        let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !state.1 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let text = String::from_utf8_lossy(&state.0).into_owned();
+                drop(state);
+                panic!(
+                    "ferros exited with {status:?} but its terminal output did not end within {STEP_TIMEOUT:?}; terminal \
+                     output:\n{text}"
+                );
+            }
+            state = ready.wait_timeout(state, remaining).unwrap_or_else(PoisonError::into_inner).0;
         }
+        status
     }
 }
 
@@ -261,14 +303,7 @@ fn continue_then_ctrl_d_ends_the_session()
         ferros.expect("process exited with status 0");
         ferros.expect(PROMPT);
 
-        ferros.type_keys(CTRL_D);
-        let status = ferros.wait_exit();
-        assert!(
-            status.success(),
-            "ferros exited with {status:?}; terminal output:\n{}",
-            ferros.text()
-        );
-        assert!(tagged(&tag).is_empty(), "processes left running: {:?}", tagged(&tag));
+        end_with_ctrl_d(&mut ferros, &tag);
     });
 }
 
@@ -285,7 +320,7 @@ fn ctrl_c_at_the_prompt_discards_the_line_and_keeps_the_session()
         ferros.expect("bogus");
         ferros.type_keys(CTRL_C);
         ferros.expect(PROMPT);
-        thread::sleep(Duration::from_millis(200));
+        // The commands below show it stays up; this catches an exit right after the prompt.
         assert!(ferros.is_running(), "ferros died on Ctrl-C:\n{}", ferros.text());
 
         // Ctrl-C on an empty line too.
@@ -302,12 +337,9 @@ fn ctrl_c_at_the_prompt_discards_the_line_and_keeps_the_session()
         ferros.expect("process exited with status 0");
         ferros.expect(PROMPT);
 
-        ferros.type_keys(CTRL_D);
-        let status = ferros.wait_exit();
+        end_with_ctrl_d(&mut ferros, &tag);
         let text = ferros.text();
-        assert!(status.success(), "ferros exited with {status:?}; terminal output:\n{text}");
         assert!(!text.contains("unknown command 'bogus"), "the interrupted line ran:\n{text}");
-        assert!(tagged(&tag).is_empty(), "processes left running: {:?}", tagged(&tag));
     });
 }
 
@@ -331,13 +363,7 @@ fn history_goes_to_ferros_history_not_home()
         ferros.type_line("status");
         ferros.expect("status: stopped");
         ferros.expect(PROMPT);
-        ferros.type_keys(CTRL_D);
-        let status = ferros.wait_exit();
-        assert!(
-            status.success(),
-            "ferros exited with {status:?}; terminal output:\n{}",
-            ferros.text()
-        );
+        end_with_ctrl_d(&mut ferros, &tag);
 
         let saved = fs::read_to_string(&history).expect("read the history file");
         let entries: Vec<&str> = saved.lines().filter(|line| !line.starts_with('#')).collect();
@@ -351,20 +377,18 @@ fn history_goes_to_ferros_history_not_home()
             "history was also written to {}",
             default_history.display()
         );
-        assert!(tagged(&tag).is_empty(), "processes left running: {:?}", tagged(&tag));
     });
 }
 
-/// Type Ctrl-D at the prompt and check that `ferros` exits 0 and leaves nothing behind.
+/// Type Ctrl-D at the prompt and check that `ferros` exits 0, printed no error anywhere
+/// in its terminal output (read to the end), and leaves nothing behind.
 fn end_with_ctrl_d(ferros: &mut PtyFerros, tag: &Tag)
 {
     ferros.type_keys(CTRL_D);
     let status = ferros.wait_exit();
-    assert!(
-        status.success(),
-        "ferros exited with {status:?}; terminal output:\n{}",
-        ferros.text()
-    );
+    let text = ferros.text();
+    assert!(status.success(), "ferros exited with {status:?}; terminal output:\n{text}");
+    assert!(!text.contains("error:"), "ferros printed an error; terminal output:\n{text}");
     assert!(tagged(tag).is_empty(), "processes left running: {:?}", tagged(tag));
 }
 
@@ -437,7 +461,7 @@ fn ctrl_c_while_the_program_runs_stops_it()
         ferros.type_keys(CTRL_C);
         ferros.expect("stopped: interrupted");
         ferros.expect(PROMPT);
-        thread::sleep(Duration::from_millis(200));
+        // The commands below show it stays up; this catches an exit right after the prompt.
         assert!(ferros.is_running(), "ferros died on Ctrl-C:\n{}", ferros.text());
         let text = ferros.text();
         assert!(
@@ -456,9 +480,9 @@ fn ctrl_c_while_the_program_runs_stops_it()
 
         // `continue` does not pass the `SIGINT` on: the program keeps counting, and a
         // second Ctrl-C stops it again.
+        // A tick printed after the prompt means the program runs again.
         ferros.type_line("continue");
         ferros.expect("tick: ");
-        thread::sleep(Duration::from_millis(100));
         ferros.type_keys(CTRL_C);
         ferros.expect("stopped: interrupted");
         ferros.expect(PROMPT);
@@ -480,7 +504,7 @@ fn sigint_to_ferros_process_group_always_reports_interrupted()
         let tag = t.tag();
         let scratch = Scratch::new();
         let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
-        let pid = ferros.child.process_id().expect("ferros pid");
+        let pid = ferros.pid();
         let group = ferros_macos::launch::process_group(ferros_core::ProcessId(pid)).expect("ferros group");
         assert_eq!(group.0, pid, "pty child must lead its isolated group");
         let targets: Vec<_> = tagged(&tag).into_iter().filter(|candidate| *candidate != pid).collect();
@@ -517,7 +541,7 @@ fn sigint_sent_directly_to_the_debuggee_remains_a_signal_stop()
         let tag = t.tag();
         let scratch = Scratch::new();
         let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
-        let pid = ferros.child.process_id().expect("ferros pid");
+        let pid = ferros.pid();
         let targets: Vec<_> = tagged(&tag).into_iter().filter(|candidate| *candidate != pid).collect();
         assert_eq!(targets.len(), 1, "one debuggee: {targets:?}");
         ferros.type_line("continue");
@@ -590,7 +614,7 @@ fn ctrl_z_while_the_program_runs_stops_it_then_ferros()
         let tag = t.tag();
         let scratch = Scratch::new();
         let mut ferros = PtyFerros::launch_with(&tag, &fixture!("loop_counter"), &scratch, &[], &["100000", "--progress"]);
-        let pid = ferros.child.process_id().expect("ferros pid");
+        let pid = ferros.pid();
 
         ferros.type_line("continue");
         ferros.expect("tick: ");
@@ -643,14 +667,21 @@ fn terminal_mode_gives_the_program_typed_input()
         let scratch = Scratch::new();
         let fixture = fixture!("read_line");
         let mut ferros = PtyFerros::launch_with(&tag, &fixture, &scratch, &["--terminal"], &[]);
+        let pid = ferros.pid();
+        let targets: Vec<_> = tagged(&tag).into_iter().filter(|candidate| *candidate != pid).collect();
+        assert_eq!(targets.len(), 1, "one debuggee must carry the test tag: {targets:?}");
+        let target_group = ferros_macos::launch::process_group(ferros_core::ProcessId(targets[0])).expect("debuggee group");
+        ferros.wait_for_foreground(pid);
 
+        // Type only once ferros has handed the terminal to the program's group.
         ferros.type_line("continue");
-        // Wait until the program blocks in its read with the terminal in the foreground.
-        thread::sleep(Duration::from_millis(500));
+        ferros.wait_for_foreground(target_group.0);
         ferros.type_line("typed at the terminal");
         ferros.expect("read: typed at the terminal");
         ferros.expect("process exited with status 0");
         ferros.expect(PROMPT);
+        // Ferros took the terminal back at the exit.
+        ferros.wait_for_foreground(pid);
 
         ferros.type_line("status");
         ferros.expect("status: exited");

@@ -1,5 +1,5 @@
 //! Loader-reported image identity: the Mach-O UUID next to path and load address
-//! (issue #121), and the mapped-header UUID cache (issue #182).
+//! (issue #121), the mapped-header UUID cache (issue #182), and path aliasing (#347).
 #![cfg(target_os = "macos")]
 
 use std::fmt::Write;
@@ -20,7 +20,7 @@ use object::Object;
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resume until a breakpoint at `address` stops the process.
-fn run_to(session: &mut Session, address: Address)
+fn run_to(session: &mut harness::Debuggee, address: Address)
 {
     session
         .add_breakpoint(BreakpointRequest::Software { address })
@@ -30,7 +30,10 @@ fn run_to(session: &mut Session, address: Address)
         Some(StopEvent::Breakpoint { pc, thread }) if pc == address => {
             session.select_thread(thread).expect("select the stopped thread");
         }
-        other => panic!("expected a breakpoint stop at {address}, got {other:?}"),
+        other => panic!(
+            "expected a breakpoint stop at {address}, got {other:?}; fixture stderr: {}",
+            session.stderr()
+        ),
     }
 }
 
@@ -42,6 +45,67 @@ fn file_uuid(path: &Path) -> [u8; 16]
     file.mach_uuid()
         .unwrap_or_else(|error| panic!("uuid of {}: {error}", path.display()))
         .unwrap_or_else(|| panic!("{} has no LC_UUID", path.display()))
+}
+
+/// dyld publishes one row per mapped header even after a library is opened through aliases.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn dyld_reports_one_image_for_library_path_aliases()
+{
+    use std::collections::HashMap;
+    use std::os::unix::fs::symlink;
+
+    use ferros_tests::scratch;
+    use ferros_tests::symbols::raw_symbol_address;
+
+    harness::run(|t| {
+        let directory = scratch::create_dir("ferros-dyld-aliases");
+        t.remove_on_cleanup(&directory);
+        let directory = directory.canonicalize().expect("canonical scratch directory");
+        let library = directory.join("libferros_alias_fixture.dylib");
+        let built_library = Path::new(env!("OUT_DIR")).join("libferros_alias_fixture.dylib");
+        fs::copy(built_library, &library).expect("copy alias fixture library");
+        symlink(&library, directory.join("symlink.dylib")).expect("create library symlink");
+        fs::hard_link(&library, directory.join("hardlink.dylib")).expect("create library hard link");
+
+        let fixture = fixture!("dyld_aliases");
+        let args = vec![
+            directory.to_str().expect("UTF-8 scratch path"),
+            library.to_str().expect("UTF-8 library path"),
+            "./libferros_alias_fixture.dylib",
+            "./symlink.dylib",
+            "./hardlink.dylib",
+        ]
+        .into_boxed_slice();
+        let mut d = t.launch_with_args(&fixture, &args);
+        let loaded = raw_symbol_address(&mut d, &fixture, "_aliases_loaded");
+        run_to(&mut d, loaded);
+
+        let images = d.images().expect("images after opening library aliases");
+        let mut paths_by_address = HashMap::new();
+        for image in &images {
+            let previous_path = paths_by_address.insert(image.load_address, &image.path);
+            assert!(
+                previous_path.is_none(),
+                "dyld reported two rows at {}: {previous_path:?} and {:?}",
+                image.load_address,
+                image.path,
+            );
+        }
+        let build_id = file_uuid(&library).into();
+        let library_images: Vec<_> = images
+            .iter()
+            .filter(|image| image.build_id.known() == Some(build_id))
+            .collect();
+        assert_eq!(library_images.len(), 1, "expected one fixture library row: {images:#?}");
+        eprintln!(
+            "dyld alias probe: absolute, relative, symlink, hard link; {} rows at {} distinct addresses; {} fixture \
+             library row",
+            images.len(),
+            paths_by_address.len(),
+            library_images.len(),
+        );
+    });
 }
 
 /// The main executable's reported UUID is the `LC_UUID` of the fixture file. dyld's

@@ -82,7 +82,7 @@ integration tests to verify debugger functionality against real processes.
 
 ## Fixtures
 
-The crate defines twenty-one fixture binaries:
+The crate defines twenty-two fixture binaries:
 
 - `ferros-fixture-hello`: Prints a greeting line and exits normally with status 0.
 - `ferros-fixture-exit_code`: Exits immediately with non-zero exit status 7.
@@ -115,6 +115,9 @@ The crate defines twenty-one fixture binaries:
   callback `init_routine` (marker `in_init`) is entered from `__pthread_once_handler`, a static
   function of `libsystem_pthread` in the dyld shared cache. Used for a backtrace that names
   that function from the cache image's symbol table (issue #121).
+- `ferros-fixture-dyld_aliases` opens a test library through absolute, relative,
+  symlink, and hard-link paths. It reaches `_aliases_loaded` after every path resolves
+  to the same symbol. The image test stops there and checks dyld's reported rows (#347).
 - `ferros-fixture-caught_panic`: `inner` panics (marker `in_inner`) and `main`'s `catch_unwind`
   catches it; `middle` (marker `call_inner`) never sees the call return. `after_catch` is the
   first line after `catch_unwind`.

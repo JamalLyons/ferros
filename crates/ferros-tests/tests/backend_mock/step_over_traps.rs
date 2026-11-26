@@ -152,6 +152,11 @@ impl Backend for DelayedStep
     {
         self.0.architecture()
     }
+
+    fn arch(&self) -> BackendResult<std::sync::Arc<dyn arch::Arch>>
+    {
+        self.0.arch()
+    }
 }
 
 /// #227: a late completion of an abandoned step spends part of the caller's wait budget.

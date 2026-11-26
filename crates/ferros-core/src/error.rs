@@ -49,7 +49,7 @@ pub enum DebuggerError
     ///
     /// On macOS, this typically means:
     /// - `task_for_pid()` returned `KERN_PROTECTION_FAILURE`
-    /// - You need to run with `sudo` or grant debugging entitlements
+    /// - Grant the debugger entitlement (`just sign-debugger`). Do not use `sudo` for tests
     ///
     /// There is no Linux or Windows backend. See the
     /// [macOS debugging entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_debugger).

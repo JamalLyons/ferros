@@ -1,9 +1,10 @@
 //! # macOS Mach API FFI Declarations
 //!
 //! This module contains all unsafe extern "C" function declarations for Mach APIs
-//! that are not provided by the `mach2` crate. These functions require special
-//! permissions (sudo or debugging entitlements) and are therefore not included
-//! in the standard Mach bindings.
+//! that are not provided by the `mach2` crate. `task_for_pid` needs the debugger
+//! entitlement (`com.apple.security.cs.debugger`) or root. The documented workflow
+//! is `just sign-debugger`, not `sudo`, and tests must not use `sudo`. These
+//! functions are therefore not included in the standard Mach bindings.
 //!
 //! ## Why Centralize These?
 //!
@@ -87,8 +88,9 @@ unsafe extern "C" {
     /// ## Security
     ///
     /// This function requires special permissions:
-    /// - Running as root (sudo)
-    /// - Debugging entitlements (`com.apple.security.cs.debugger`)
+    /// - The debugger entitlement (`com.apple.security.cs.debugger`), via
+    ///   `just sign-debugger`
+    /// - Root, which also satisfies the check. Do not use `sudo` for tests
     ///
     /// Without these permissions, the function will return `KERN_PROTECTION_FAILURE`.
     ///

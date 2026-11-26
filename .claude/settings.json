@@ -9,6 +9,8 @@
       "Bash(just fmt)",
       "Bash(just fmt-check)",
       "Bash(just check-boundary)",
+      "Bash(just docs-drift)",
+      "Bash(sh scripts/docs-drift.sh)",
       "Bash(just kill-fixtures)",
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",

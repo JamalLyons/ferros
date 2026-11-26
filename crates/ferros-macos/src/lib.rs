@@ -130,35 +130,36 @@
 //!
 //! ## Permissions and Entitlements
 //!
-//! macOS requires special permissions to debug other processes. There are two approaches:
+//! `task_for_pid` needs the `com.apple.security.cs.debugger` entitlement, or root.
+//! The documented workflow is the entitlement. Do not use `sudo` for tests or for
+//! day-to-day debugging.
 //!
-//! ### Option 1: Launch Processes (Recommended)
+//! ### Launch or attach
 //!
-//! Use `launch()` instead of `attach()` to spawn processes under debugger control.
-//! The process starts suspended, allowing breakpoints to be set before execution.
-//! Taking control of it still calls `task_for_pid()`, so the same permission applies.
+//! `launch()` spawns a process suspended, so breakpoints can be set before it runs.
+//! `attach()` takes a process that is already running. Both call `task_for_pid()`,
+//! so both need the same permission.
 //!
-//! ### Option 2: Attach to Running Processes
+//! ### Sign the debugger
 //!
-//! To attach to already-running processes, you need debugging permissions:
+//! Ad-hoc sign from the repository root:
 //!
-//! 1. **Run with sudo** (Simplest):
-//!    ```bash
-//!    sudo ferros attach <pid>
-//!    ```
-//!    - Quick and easy - no setup required
-//!    - Works immediately without code signing
-//!    - Requires password each time (or use `sudo` with NOPASSWD)
+//! ```bash
+//! just sign-debugger target/debug/ferros
+//! ```
 //!
-//! 2. **Code signing with entitlements** (Advanced - optional):
-//!    - Create `ferros.entitlements` file (see `crates/ferros-macos/ferros.entitlements`)
-//!    - Sign the binary: `codesign --entitlements ferros.entitlements --force --sign - target/debug/ferros`
-//    - The `com.apple.security.cs.debugger` entitlement grants debugging permissions
-//!    - Useful if you want to avoid typing `sudo` repeatedly
+//! The same codesign invocation is:
 //!
-//! **Recommendation**: For most users, running with `sudo` is the simplest approach.
-//! Entitlements are optional and mainly useful for development workflows where you
-//! frequently attach to processes.
+//! ```bash
+//! codesign --entitlements crates/ferros-macos/ferros.entitlements --force --sign - target/debug/ferros
+//! ```
+//!
+//! `.cargo/config.toml` runs `scripts/cargo-test-runner.sh`, which signs every
+//! executable Cargo invokes (`cargo test`, `cargo run`, doctests). Integration
+//! tests do not need `sudo`.
+//!
+//! Root also satisfies `task_for_pid` for a one-off attach. It is not the
+//! documented workflow, and tests must not use it.
 //!
 //! ## Key Mach APIs Used
 //!

@@ -47,9 +47,9 @@ Ferros is **early and actively developed**. What is verified today:
 - **Symbols, DWARF, and images**: Line tables, function lookup, dSYM loading, and loader-reported images (verified by `tests/native/symbols.rs`, `tests/native/debuginfo.rs`, `tests/native/images.rs`, and `tests/native/universal_images.rs`).
 - **Platform boundary**: Zero unsafe code and zero OS dependencies in `ferros-core`, strictly enforced by `just check-boundary` and `tests/platform_boundary.rs`.
 
-- **Command line**: `ferros launch` and `attach` open a line-oriented session (interactive, piped or batch with `--batch`/`--command`) with run control, breakpoints, stepping, backtrace, registers, memory, threads and images (verified by `tests/native/cli.rs`). The interactive TUI is being rebuilt. Still open: value inspection (Phase 2, gated on the owner walkthrough [#40](https://github.com/JamalLyons/ferros/issues/40) per [#41](https://github.com/JamalLyons/ferros/issues/41)), hardware breakpoints and watchpoints, x86-64 macOS, and Linux support.
+- **Command line**: `ferros launch` and `attach` open a line-oriented session (interactive, piped or batch with `--batch`/`--command`) with run control, breakpoints, stepping, backtrace, registers, memory, threads and images (verified by `tests/native/cli.rs`). The interactive TUI is being rebuilt. Still open: value inspection (Phase 2, after Phase 1.5 [#210](https://github.com/JamalLyons/ferros/issues/210) closes, per [#41](https://github.com/JamalLyons/ferros/issues/41)), hardware breakpoints and watchpoints, x86-64 macOS, and Linux support. The owner walkthrough [#40](https://github.com/JamalLyons/ferros/issues/40) is paused until Phase 1.5 closes.
 
-The plan is tracked in epic [#26](https://github.com/JamalLyons/ferros/issues/26). See [ROADMAP.md](./ROADMAP.md) for milestone tracking.
+Phase 1 ([#26](https://github.com/JamalLyons/ferros/issues/26)) closed on 2026-11-24. The current epic is Phase 1.5 ([#210](https://github.com/JamalLyons/ferros/issues/210)). See [ROADMAP.md](./ROADMAP.md) for milestone tracking.
 
 ---
 

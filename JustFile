@@ -155,6 +155,10 @@ docs-build:
     @echo "Building documentation..."
     @cargo doc --workspace --no-deps
 
+# Print documentation-drift evidence (does not edit files)
+docs-drift:
+    @sh scripts/docs-drift.sh
+
 # Run all checks (fmt, clippy, test)
 check:
     @echo "Running all checks..."

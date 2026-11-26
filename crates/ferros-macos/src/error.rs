@@ -136,11 +136,16 @@ impl From<libc::kern_return_t> for MachError
 /// mapping is:
 ///
 /// - `ProtectionFailure` -> `DebuggerError::PermissionDenied`
-/// - `InvalidArgument` -> `DebuggerError::InvalidArgument`
+/// - `InvalidArgument` -> `DebuggerError::Os` with code `KERN_INVALID_ARGUMENT`
 /// - `ProcessNotFound` (`KERN_FAILURE`) -> `DebuggerError::Os` with code `KERN_FAILURE`
 /// - `Unknown(code)` -> `DebuggerError::Os` with that code
 ///
-/// Every variant carries the `MachError` display text as its message.
+/// Every variant carries the `MachError` display text as its message. A
+/// `KERN_INVALID_ARGUMENT` from a Mach call is an OS failure (for example a thread port
+/// whose thread has exited), not a bad argument from the debugger's caller, so it keeps
+/// its code instead of becoming `DebuggerError::InvalidArgument` (which the `Backend`
+/// boundary reports as `Unsupported`). Code that still knows the operation uses
+/// [`mach_failure`] instead, which also names it.
 impl From<MachError> for ferros_core::DebuggerError
 {
     fn from(err: MachError) -> Self
@@ -148,7 +153,10 @@ impl From<MachError> for ferros_core::DebuggerError
         let message = err.to_string();
         match err {
             MachError::ProtectionFailure => ferros_core::DebuggerError::PermissionDenied(message),
-            MachError::InvalidArgument => ferros_core::DebuggerError::InvalidArgument(message),
+            MachError::InvalidArgument => ferros_core::DebuggerError::Os {
+                code: i64::from(libc::KERN_INVALID_ARGUMENT),
+                message,
+            },
             MachError::ProcessNotFound => ferros_core::DebuggerError::Os {
                 code: i64::from(libc::KERN_FAILURE),
                 message,
@@ -259,14 +267,15 @@ mod tests
     }
 
     #[test]
-    fn invalid_argument_maps_to_invalid_argument()
+    fn invalid_argument_maps_to_os_with_kern_invalid_argument_code()
     {
         let err = DebuggerError::from(MachError::from(libc::KERN_INVALID_ARGUMENT));
         match err {
-            DebuggerError::InvalidArgument(message) => {
+            DebuggerError::Os { code, message } => {
+                assert_eq!(code, i64::from(libc::KERN_INVALID_ARGUMENT));
                 assert_eq!(message, MachError::InvalidArgument.to_string());
             }
-            other => panic!("expected InvalidArgument, got {other:?}"),
+            other => panic!("expected Os, got {other:?}"),
         }
     }
 
@@ -349,6 +358,12 @@ mod tests
         let err = mach_failure("mach_vm_protect", libc::KERN_PROTECTION_FAILURE);
         assert!(
             matches!(err, BackendError::PermissionDenied(ref m) if m.contains("kern_return_t 2")),
+            "{err:?}"
+        );
+        let err = mach_failure("thread_get_state", libc::KERN_INVALID_ARGUMENT);
+        assert!(
+            matches!(err, BackendError::Os { code, ref message }
+                if code == i64::from(libc::KERN_INVALID_ARGUMENT) && message.contains("kern_return_t 4")),
             "{err:?}"
         );
         let err = mach_failure("vm_write", libc::KERN_INVALID_ADDRESS);

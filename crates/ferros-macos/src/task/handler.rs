@@ -57,7 +57,7 @@ impl MacOSBackend
                     }
                 }
 
-                return Err(DebuggerError::from(MachError::from(result)));
+                return Err(mach_error(result, "task_for_pid").into());
             }
 
             let mut thread_list: *mut thread_act_t = std::ptr::null_mut();
@@ -70,7 +70,7 @@ impl MacOSBackend
                 return Err(if result == KERN_SUCCESS {
                     BackendError::NotFound(format!("process {} has no threads", pid.0)).into()
                 } else {
-                    crate::error::mach_failure("task_threads", result).into()
+                    mach_error(result, "task_threads").into()
                 });
             }
 
@@ -120,7 +120,8 @@ impl MacOSBackend
     ///
     /// ## Errors
     ///
-    /// Returns `MachError` if port allocation or exception port registration fails.
+    /// Returns `DebuggerError::Backend` keeping the `kern_return_t` if port allocation or
+    /// exception port registration fails.
     /// Returns `Io` with the OS error if the handler thread cannot be spawned.
     ///
     /// ## See Also
@@ -143,13 +144,13 @@ impl MacOSBackend
             let mut port: mach_port_t = MACH_PORT_NULL;
             let mut kr = mach_port_allocate(self_task, MACH_PORT_RIGHT_RECEIVE, &mut port);
             if kr != KERN_SUCCESS {
-                return Err(DebuggerError::from(MachError::from(kr)));
+                return Err(mach_error(kr, "mach_port_allocate").into());
             }
 
             kr = mach_port_insert_right(self_task, port, port, MACH_MSG_TYPE_MAKE_SEND);
             if kr != KERN_SUCCESS {
                 let _ = mach_port_destroy(self_task, port);
-                return Err(DebuggerError::from(MachError::from(kr)));
+                return Err(mach_error(kr, "mach_port_insert_right").into());
             }
 
             let mask: exception_mask_t = EXC_MASK_BREAKPOINT
@@ -163,7 +164,7 @@ impl MacOSBackend
                 Ok(saved) => saved,
                 Err(kr) => {
                     let _ = mach_port_destroy(self_task, port);
-                    return Err(DebuggerError::from(MachError::from(kr)));
+                    return Err(mach_error(kr, "task_swap_exception_ports").into());
                 }
             };
             // From here on, `stop_exception_handler` restores the saved ports and destroys

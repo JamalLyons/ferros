@@ -1,16 +1,18 @@
 //! Mach failures reach the `Backend` caller as a typed category that keeps the real
-//! `kern_return_t` (issue #226).
+//! `kern_return_t` (issues #226 and #340).
 //!
 //! The macOS helpers used to report a failed `thread_get_state`, `vm_write` or
 //! `mach_vm_protect` as `DebuggerError` text, which the `Backend` boundary turned into
 //! `BackendError::Os { code: -1 }`: the category and the code were both lost.
 #![cfg(target_os = "macos")]
 
+use std::time::Duration;
+
 use ferros_core::{Address, BackendError, DebuggerError, MemoryRegion};
 use ferros_macos::MacOSBackend;
 use ferros_tests::{fixture, harness};
 
-/// `MACH_SEND_INVALID_DEST`: what a Mach call on `MACH_PORT_NULL` returns.
+/// `MACH_SEND_INVALID_DEST`: Mach IPC error for a null or dead destination port.
 const MACH_SEND_INVALID_DEST: i64 = 0x1000_0003;
 
 /// Bytes written across the end of a region: half before it, half after.
@@ -35,6 +37,32 @@ fn failed_thread_get_state_reaches_read_registers_with_its_code()
             other => panic!("expected Os with the thread_get_state code, got {other:?}"),
         }
         d.session_mut().read_registers().expect("registers after the one-shot fault");
+    });
+}
+
+#[test]
+fn memory_regions_on_a_dead_task_preserves_the_mach_error_code()
+{
+    harness::run(|t| {
+        let mut d = t.launch(&fixture!("loop_counter"));
+        let pid = d.pid().0;
+        assert_ne!(d.memory_regions().expect("live task's memory regions"), []);
+
+        assert!(harness::kill_tagged(d.tag()).contains(&pid), "kill fixture {pid}");
+        assert!(
+            harness::wait_until_gone(pid, Duration::from_secs(5)),
+            "fixture {pid} was not reaped"
+        );
+
+        // Query before wait consumes the terminal event and releases the dead task port.
+        let error = d.memory_regions().expect_err("enumeration on a dead task port");
+        match error {
+            DebuggerError::Backend(BackendError::Os { code, message }) => {
+                assert_eq!(code, MACH_SEND_INVALID_DEST, "{message}");
+                assert!(message.contains("mach_vm_region_recurse"), "{message}");
+            }
+            other => panic!("expected Os with the mach_vm_region_recurse code, got {other:?}"),
+        }
     });
 }
 

@@ -198,7 +198,7 @@ Two environment switches are available for diagnostic and harness verification:
 - `FERROS_TEST_UNSIGNED=1`: runs without the debugger entitlement to verify the permission-failure path.
 - `FERROS_TEST_FORCE_FAIL=1`: triggers an intentional harness test failure with a running fixture to verify process cleanup.
 
-When the runner needs to change a signature, it executes a cached copy alongside the Cargo artifact. `cargo clean` removes these copies. Use `just sign-debugger` to sign an artifact for direct execution.
+When the runner needs to change a signature, it executes a cached copy alongside the Cargo artifact. A full `cargo clean` removes these copies. Use `just sign-debugger` to sign an artifact for direct execution.
 
 Leaked fixtures: after an interrupted run, `pgrep -fl ferros-fixture-` lists orphans (also from other worktrees); `just kill-fixtures` kills only this worktree's. Do not use `pkill -f ferros-fixture-`.
 

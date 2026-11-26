@@ -43,6 +43,5 @@ unused_dependencies = "deny"
 
 # Workspace dependencies
 [workspace.dependencies]
-object = { version = "0.41.0", default-features = false, features = ["std", "read", "macho"] }
 thiserror = "2.0.17"
 tracing = "0.1"

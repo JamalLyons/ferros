@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ferros_tests::scratch;
 use serde_json::{Value, json};
 
 /// Third-party crates that would give `ferros-core` access to an OS API.
@@ -136,13 +137,6 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>)
             out.push(path);
         }
     }
-}
-
-/// Runs of the characters a Cargo dependency key may contain.
-fn words(line: &str) -> impl Iterator<Item = &str>
-{
-    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-        .filter(|word| !word.is_empty())
 }
 
 fn unsafe_on_code_line(line: &str) -> bool
@@ -281,19 +275,85 @@ fn check_platform_edges(metadata: &Value) -> Vec<DependencyViolation<'_>>
     violations
 }
 
-/// Locate the dependency key for diagnostics. Cargo metadata decides whether the edge exists.
-fn dependency_location<'a>(manifest: &'a str, key: &str) -> Option<(usize, &'a str)>
+/// Read a bare or quoted TOML key, leaving the following delimiter unconsumed.
+fn manifest_key(input: &mut &str) -> Option<String>
 {
+    let key = input.trim_start();
+    let (value, rest) = if let Some(literal) = key.strip_prefix('\'') {
+        let (value, rest) = literal.split_once('\'')?;
+        (value.to_owned(), rest)
+    } else if key.starts_with('"') {
+        // Decode escaped double quotes in Cargo cfg expressions.
+        let mut string = serde_json::Deserializer::from_str(key).into_iter::<String>();
+        (string.next()?.ok()?, &key[string.byte_offset()..])
+    } else {
+        let end = key
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(key.len());
+        if end == 0 {
+            return None;
+        }
+        (key[..end].to_owned(), &key[end..])
+    };
+    *input = rest.trim_start();
+    Some(value)
+}
+
+/// Cargo normalizes cfg expressions in metadata. Ignore whitespace outside string values.
+fn target_tokens(target: &str) -> impl Iterator<Item = char> + '_
+{
+    let mut quoted = false;
+    target.chars().filter(move |&c| {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        quoted || !c.is_whitespace()
+    })
+}
+
+/// Locate the declaration of this Cargo edge, using its key, target and dependency kind.
+fn dependency_location<'a>(manifest: &'a str, key: &str, dependency: &Value) -> Option<(usize, &'a str)>
+{
+    let kind = match dependency["kind"].as_str() {
+        Some("build") => "build-dependencies",
+        Some("dev") => "dev-dependencies",
+        _ => "dependencies",
+    };
+    let target = dependency["target"].as_str();
+    let mut in_table = false;
     manifest.lines().enumerate().find_map(|(index, line)| {
-        let code = line.trim_start();
-        let matches_key = if code.starts_with('[') {
-            let mut keys = words(code.split('#').next().unwrap_or_default());
-            keys.any(|word| matches!(word, "dependencies" | "build-dependencies" | "dev-dependencies"))
-                && keys.last() == Some(key)
+        let matches = if let Some(mut header) = line.trim_start().strip_prefix('[') {
+            in_table = false;
+            let first = manifest_key(&mut header)?;
+            let table = if let Some(target) = target {
+                if first != "target" {
+                    return None;
+                }
+                header = header.strip_prefix('.')?;
+                let platform = manifest_key(&mut header)?;
+                if !target_tokens(&platform).eq(target_tokens(target)) {
+                    return None;
+                }
+                header = header.strip_prefix('.')?;
+                manifest_key(&mut header)?
+            } else {
+                first
+            };
+            if table != kind && table.replace('_', "-") != kind {
+                return None;
+            }
+            in_table = header.starts_with(']');
+            header
+                .strip_prefix('.')
+                .and_then(|mut tail| manifest_key(&mut tail).filter(|_| tail.starts_with(']')))
+                .is_some_and(|name| name == key)
+        } else if in_table {
+            let mut assignment = line;
+            manifest_key(&mut assignment).is_some_and(|name| name == key && assignment.starts_with(['=', '.']))
         } else {
-            !code.starts_with('#') && code.split_once('=').is_some_and(|(left, _)| words(left).next() == Some(key))
+            false
         };
-        matches_key.then_some((index + 1, line))
+        matches.then_some((index + 1, line))
     })
 }
 
@@ -308,7 +368,7 @@ fn dependency_diagnostic(root: &Path, violation: &DependencyViolation<'_>) -> St
     let manifest = read_text(path);
     let name = package_name(violation.dependency);
     let key = violation.dependency["rename"].as_str().unwrap_or(name);
-    let (number, line) = dependency_location(&manifest, key).unwrap_or((1, key));
+    let (number, line) = dependency_location(&manifest, key, violation.dependency).unwrap_or((1, key));
     let file = path.strip_prefix(root).unwrap_or(path).display();
     let mut diagnostic = format!("{file}:{number}: {}: ", violation.rule);
     write!(diagnostic, "{line} (package `{name}`)").expect("write diagnostic");
@@ -527,11 +587,8 @@ fn check_workspace(root: &Path, metadata: &Value) -> Vec<String>
     offending
 }
 
-#[test]
-fn workspace_boundary()
+fn cargo_metadata(root: &Path) -> Value
 {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent().and_then(Path::parent).expect("workspace root");
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| env!("CARGO").into()))
         .arg("metadata")
         .args(["--format-version", "1", "--no-deps"])
@@ -543,9 +600,93 @@ fn workspace_boundary()
         "cargo metadata failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata = serde_json::from_slice(&output.stdout).expect("parse Cargo metadata");
-    let offending = check_workspace(root, &metadata);
+    serde_json::from_slice(&output.stdout).expect("parse Cargo metadata")
+}
+
+#[test]
+fn workspace_boundary()
+{
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent().and_then(Path::parent).expect("workspace root");
+    let offending = check_workspace(root, &cargo_metadata(root));
     assert!(offending.is_empty(), "\n{}", offending.join("\n"));
+}
+
+fn dependency_report(declarations: &str) -> Vec<String>
+{
+    const CRATES: &[(&str, &str)] = &[("core", "ferros-core"), ("platform", "ferros-macos")];
+
+    struct Workspace(PathBuf);
+
+    impl Drop for Workspace
+    {
+        fn drop(&mut self)
+        {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let workspace = Workspace(scratch::create_dir("ferros-platform-boundary"));
+    let root = workspace.0.canonicalize().expect("absolute workspace path");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"core\", \"platform\"]\n",
+    )
+    .expect("write the workspace manifest");
+    for &(dir, name) in CRATES {
+        fs::create_dir_all(root.join(dir).join("src")).expect("create the crate source directory");
+        fs::write(root.join(dir).join("src/lib.rs"), "#![forbid(unsafe_code)]\n").expect("write library source");
+        let mut manifest = format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n");
+        if dir == "core" {
+            manifest.push_str(declarations);
+        }
+        fs::write(root.join(dir).join("Cargo.toml"), manifest).expect("write the crate manifest");
+    }
+    check_workspace(&root, &cargo_metadata(&root))
+}
+
+#[test]
+fn workspace_reports_a_forbidden_dependency_with_its_location()
+{
+    let report = dependency_report("\n[dependencies]\nplatform = { package = \"ferros-macos\", path = \"../platform\" }\n");
+    assert_eq!(
+        report,
+        [
+            "core/Cargo.toml:6: ferros-core must not depend on a platform crate: platform = { package = \"ferros-macos\", \
+             path = \"../platform\" } (package `ferros-macos`)"
+        ]
+    );
+}
+
+#[test]
+fn workspace_reports_each_repeated_dependency_at_its_own_declaration()
+{
+    let mut report = dependency_report(
+        r#"
+[target.'cfg(target_os="macos")'.dependencies.platform]
+package = "ferros-macos"
+path = "../platform"
+
+[target."cfg(target_os = \"linux\")".dependencies]
+platform = { package = "ferros-macos", path = "../platform" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+platform.package = "ferros-macos"
+platform.path = "../platform"
+"#,
+    );
+    report.sort_unstable();
+    assert_eq!(
+        report,
+        [
+            "core/Cargo.toml:10: ferros-core must not depend on a platform crate: platform = { package = \"ferros-macos\", \
+             path = \"../platform\" } (package `ferros-macos`)",
+            "core/Cargo.toml:13: ferros-core must not depend on a platform crate: platform.package = \"ferros-macos\" \
+             (package `ferros-macos`)",
+            "core/Cargo.toml:5: ferros-core must not depend on a platform crate: \
+             [target.'cfg(target_os=\"macos\")'.dependencies.platform] (package `ferros-macos`)",
+        ]
+    );
 }
 
 const SOURCE_LINES_FORBIDDEN: &[&str] = &[
@@ -718,22 +859,35 @@ fn os_and_format_dependencies_and_cli_renames_are_rejected()
 #[test]
 fn dependency_locations_use_cargo_keys()
 {
-    const DECLARATIONS: &[(&str, &str)] = &[
-        ("libc", "libc = \"0.2\""),
-        ("mach2", "mach2 = { version = \"0.6\" }"),
-        ("libc", "[dependencies.libc]"),
-        ("libproc", "[target.'cfg(unix)'.dependencies.libproc]"),
-        ("libc", "libc.workspace = true"),
-        ("sys", "sys = { package = \"libc\", version = \"0.2\" }"),
-        ("ferros-macos", "ferros-macos = { path = \"../ferros-macos\" }"),
-        ("object", "object = { version = \"0.41\", features = [\"read\"] }"),
-        ("object", "object.workspace = true"),
-        ("object", "[dependencies.object]"),
-        ("os", "[target.'cfg(target_os = \"linux\")'.dependencies.os]"),
+    const DECLARATIONS: &[(&str, &str, Option<&str>)] = &[
+        ("libc", "libc = \"0.2\"", None),
+        ("mach2", "mach2 = { version = \"0.6\" }", None),
+        ("libc", "[dependencies.libc]", None),
+        ("libproc", "[target.'cfg(unix)'.dependencies.libproc]", Some("cfg(unix)")),
+        ("libc", "libc.workspace = true", None),
+        ("sys", "sys = { package = \"libc\", version = \"0.2\" }", None),
+        ("ferros-macos", "ferros-macos = { path = \"../ferros-macos\" }", None),
+        ("object", "object = { version = \"0.41\", features = [\"read\"] }", None),
+        ("object", "object.workspace = true", None),
+        ("object", "[dependencies.object]", None),
+        (
+            "os",
+            "[target.'cfg(target_os = \"linux\")'.dependencies.os]",
+            Some("cfg(target_os = \"linux\")"),
+        ),
     ];
-    for &(key, declaration) in DECLARATIONS {
-        let manifest = format!("# {declaration}\n{declaration}");
-        assert_eq!(dependency_location(&manifest, key).map(|(_, line)| line), Some(declaration));
+    for &(key, declaration, target) in DECLARATIONS {
+        let table = if declaration.starts_with('[') {
+            ""
+        } else {
+            "[dependencies]\n"
+        };
+        let manifest = format!("{table}# {declaration}\n{declaration}");
+        let dependency = json!({ "target": target });
+        assert_eq!(
+            dependency_location(&manifest, key, &dependency).map(|(_, line)| line),
+            Some(declaration)
+        );
     }
 }
 

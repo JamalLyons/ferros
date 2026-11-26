@@ -250,8 +250,7 @@ fn base_subtype(cpu_subtype: u32) -> u32
 /// type and subtype, or when `target` is unknown so no slice can be chosen.
 /// [`DebuggerError::InvalidArgument`] for a malformed universal file, when every slice
 /// of that CPU is damaged or another build, or when a single-architecture file is another
-/// build than the mapped one (the file was replaced): a failure the session retries once
-/// the file changes, not missing debug info it keeps.
+/// build than the mapped one (the file was replaced).
 pub(crate) fn image_slice<'data>(path: &Path, bytes: &'data [u8], target: Option<&SliceIdentity>) -> Result<&'data [u8]>
 {
     let Some(slices) = debuginfo::universal_slices(bytes) else {
@@ -458,7 +457,7 @@ fn image_debug_info(
     };
     let debug = companion_sections(path, search, options, || debuginfo::has_debug_map(file));
     let retry: Option<DebugInfoRetry> = match &debug {
-        Ok(_) | Err(DebuggerError::NoDebugInfo { .. }) => None,
+        Ok(_) => None,
         Err(_) => {
             let path = path.to_path_buf();
             let options = options.clone();

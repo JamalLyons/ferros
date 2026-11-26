@@ -4,12 +4,6 @@ use super::{Arch, UndefinedReturnAddress};
 use crate::backend::{BackendError, BackendResult};
 use crate::types::{Address, Architecture, Registers};
 
-/// Index of the frame pointer X29 in [`Registers::general`].
-const FRAME_POINTER_INDEX: usize = 29;
-
-/// Index of the link register X30 in [`Registers::general`].
-const LINK_REGISTER_INDEX: usize = 30;
-
 /// AArch64 architecture knowledge.
 ///
 /// Two answers depend on the target's conventions, not the CPU, so `Arm64` holds them:
@@ -34,6 +28,21 @@ pub struct Arm64
 
 impl Arm64
 {
+    /// Index of the frame pointer X29 in [`Registers::general`].
+    pub(crate) const FRAME_POINTER_INDEX: usize = 29;
+
+    /// Index of the link register X30 in [`Registers::general`].
+    pub(crate) const LINK_REGISTER_INDEX: usize = 30;
+
+    /// Number of general register slots (X0 through X30).
+    pub(crate) const GENERAL_REGISTER_COUNT: usize = 31;
+
+    /// DWARF register number for SP.
+    pub(crate) const STACK_POINTER_DWARF_REGISTER: usize = 31;
+
+    /// X19, the first callee-saved general register.
+    pub(crate) const FIRST_CALLEE_SAVED_INDEX: u8 = 19;
+
     /// 47-bit user address space, the configuration used on Apple Silicon.
     pub const DEFAULT_ADDRESSABLE_BITS: u8 = 47;
 
@@ -169,14 +178,14 @@ impl Arch for Arm64
     fn set_fp(&self, registers: &mut Registers, value: Address)
     {
         registers.fp = value;
-        if let Some(slot) = registers.general.get_mut(FRAME_POINTER_INDEX) {
+        if let Some(slot) = registers.general.get_mut(Self::FRAME_POINTER_INDEX) {
             *slot = value.value();
         }
     }
 
     fn link_register(&self, registers: &Registers) -> Option<Address>
     {
-        registers.general.get(LINK_REGISTER_INDEX).copied().map(Address::new)
+        registers.general.get(Self::LINK_REGISTER_INDEX).copied().map(Address::new)
     }
 
     fn set_link_register(&self, registers: &mut Registers, value: Address) -> BackendResult<()>
@@ -184,7 +193,7 @@ impl Arch for Arm64
         let len = registers.general.len();
         let slot = registers
             .general
-            .get_mut(LINK_REGISTER_INDEX)
+            .get_mut(Self::LINK_REGISTER_INDEX)
             .ok_or_else(|| BackendError::Unsupported(format!("register set has {len} general registers; x30 is missing")))?;
         *slot = value.value();
         Ok(())
@@ -193,6 +202,12 @@ impl Arch for Arm64
     fn undefined_return_address(&self) -> UndefinedReturnAddress
     {
         self.undefined_return_address
+    }
+
+    fn callee_saved_register_mask(&self) -> u32
+    {
+        // X19 through X29, including the frame pointer.
+        ((1 << Self::LINK_REGISTER_INDEX) - 1) & !((1 << Self::FIRST_CALLEE_SAVED_INDEX) - 1)
     }
 
     /// After `BRK` the reported pc is the address of the `BRK` itself: no adjustment.

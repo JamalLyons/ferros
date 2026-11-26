@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_code)]
 
+use super::Arm64;
+
 /// `x29`, the frame pointer.
 const FP: u8 = 29;
 /// `x30`, the link register.
@@ -31,8 +33,6 @@ const LR: u8 = 30;
 /// Register field value 31: `sp` as a base or an add/sub destination, else the zero
 /// register.
 const SP: u8 = 31;
-/// `x19`, the first callee-saved register (`x19`-`x29`, plus `x30` as the return address).
-const CALLEE_SAVED_FIRST: u8 = 19;
 
 /// How a load or store forms its address from the base register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,7 +436,7 @@ pub(crate) fn epilogue(
                             continue;
                         };
                         // A caller-saved register's value is not needed: no read.
-                        let value = if size == 8 && register >= CALLEE_SAVED_FIRST {
+                        let value = if size == 8 && register >= Arm64::FIRST_CALLEE_SAVED_INDEX {
                             match stored.iter().rev().find(|(word, _)| *word == at) {
                                 Some((_, value)) => *value,
                                 None if stored.iter().any(|(word, _)| word.abs_diff(at) < 8) => None,
@@ -534,7 +534,7 @@ pub(crate) fn prologue(
                 // Reloading a spilled argument is harmless; reloading a register the
                 // caller needs back is not a prologue.
                 for register in registers.into_iter().flatten() {
-                    if register >= CALLEE_SAVED_FIRST {
+                    if register >= Arm64::FIRST_CALLEE_SAVED_INDEX {
                         return None;
                     }
                     if saved[usize::from(register)].is_none() {
@@ -565,7 +565,7 @@ pub(crate) fn prologue(
                     let index = usize::from(register);
                     // Only callee-saved registers and x30 are saved for the caller; a
                     // spilled argument register says nothing about the caller's value.
-                    if register >= CALLEE_SAVED_FIRST
+                    if register >= Arm64::FIRST_CALLEE_SAVED_INDEX
                         && size == 8
                         && saved[index].is_none()
                         && clobbered & bit(register) == 0

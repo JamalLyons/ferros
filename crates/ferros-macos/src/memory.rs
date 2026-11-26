@@ -138,6 +138,7 @@ impl MemoryCache
     }
 
     /// Reads a range, using cached pages when available.
+    /// On success, returns exactly `len` bytes.
     ///
     /// A cache page can be larger than a VM page (see [`with_page_size`](Self::with_page_size)),
     /// so the cache page around readable bytes can include an unmapped or unreadable VM
@@ -181,12 +182,6 @@ impl MemoryCache
     pub fn read_u64(&self, task: mach_port_t, addr: Address) -> Result<u64>
     {
         let bytes = self.read(task, addr, 8)?;
-        if bytes.len() < 8 {
-            return Err(DebuggerError::Io(Error::new(
-                ErrorKind::UnexpectedEof,
-                "failed to read full 8 bytes",
-            )));
-        }
         Ok(u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))

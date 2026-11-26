@@ -365,3 +365,260 @@ fn a_late_stop_during_resume_retains_its_signal_decision()
         backend.kill().expect("kill");
     });
 }
+
+// Native negative cases for signal requests and resume rollback (#290, review F18, F19).
+// `MockBackend` checks pending stops before it validates a request and never touches a
+// suspend count or a step bit, so only these tests see the native order and rollback.
+
+/// `SIGUSR1` on macOS.
+const SIGUSR1: i32 = 30;
+
+/// The fixture's progress counter, as written. The main thread rewrites it every
+/// millisecond while it runs.
+fn progress(observer: &Observer) -> Option<String>
+{
+    std::fs::read_to_string(observer.0.join("progress")).ok()
+}
+
+/// The target's main loop makes no progress, so no thread was released.
+fn assert_stays_stopped(observer: &Observer, context: &str)
+{
+    let before = progress(observer);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(progress(observer), before, "the target ran after {context}");
+}
+
+/// The target's main loop advances again.
+fn assert_runs(observer: &Observer)
+{
+    let before = progress(observer);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while progress(observer) == before {
+        assert!(Instant::now() < deadline, "the target did not run after resume");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A refused request is `Unsupported` with a message naming the failed check.
+fn assert_refused(result: ferros_core::backend::BackendResult<()>, needle: &str, context: &str)
+{
+    match result {
+        Err(ferros_core::backend::BackendError::Unsupported(message)) => {
+            assert!(message.contains(needle), "{context}: refused for another reason: {message}");
+        }
+        other => panic!("{context}: expected Unsupported ({needle}), got {other:?}"),
+    }
+}
+
+/// F18 (a): with no held signal at all, a resume naming a signal is refused before
+/// anything runs. The target stays stopped and a plain resume still works.
+#[test]
+fn resume_with_a_signal_but_no_held_signal_is_refused()
+{
+    use ferros_core::backend::ResumeRequest;
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready");
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(target.pid()).expect("attach");
+        let threads = backend.threads().expect("threads");
+        assert!(threads.len() >= 2, "expected the main thread and the worker: {threads:?}");
+        for &thread in &threads {
+            for signal in [SIGUSR1, 0] {
+                assert_refused(
+                    backend.resume(&ResumeRequest::continue_all().with_signal(thread, signal)),
+                    "held soft-signal",
+                    &format!("signal {signal} for thread {thread:?} with none held"),
+                );
+                assert_stays_stopped(&observer, "a refused signal resume");
+            }
+        }
+        assert_eq!(backend.wait(Some(Duration::ZERO)).expect("no event"), None);
+        backend.resume(&ResumeRequest::continue_all()).expect("plain resume");
+        assert_runs(&observer);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!observer.0.join("handled").exists(), "a refused request delivered a signal");
+        backend.kill().expect("kill");
+    });
+}
+
+/// F18 (b): a held signal cannot be replaced by a number outside `0..32`. Each refusal
+/// leaves the target stopped and the signal held, and the held signal is then delivered.
+#[test]
+fn out_of_range_replacement_signal_is_refused_and_keeps_the_held_signal()
+{
+    use ferros_core::StopEvent;
+    use ferros_core::backend::ResumeRequest;
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready");
+        let mut backend = MacOSBackend::new().expect("backend");
+        backend.attach(target.pid()).expect("attach");
+        backend.resume(&ResumeRequest::continue_all()).expect("resume");
+        assert!(
+            std::process::Command::new("/bin/kill")
+                .args(["-USR1", &target.pid().0.to_string()])
+                .status()
+                .expect("send SIGUSR1")
+                .success()
+        );
+        let thread = match backend.wait(Some(Duration::from_secs(2))).expect("signal stop") {
+            Some(StopEvent::Signal { thread, signal: SIGUSR1 }) => thread,
+            other => panic!("expected SIGUSR1, got {other:?}"),
+        };
+        for signal in [32, 33, -1, i32::MAX, i32::MIN] {
+            assert_refused(
+                backend.resume(&ResumeRequest::continue_all().with_signal(thread, signal)),
+                "invalid signal",
+                &format!("replacement signal {signal}"),
+            );
+            assert_stays_stopped(&observer, "a refused replacement signal");
+        }
+        assert_eq!(backend.wait(Some(Duration::ZERO)).expect("no event"), None);
+        assert!(!observer.0.join("handled").exists(), "the held signal was delivered early");
+        backend
+            .resume(&ResumeRequest::continue_all().with_signal(thread, SIGUSR1))
+            .expect("deliver the held signal");
+        observer.wait("handled");
+        backend.kill().expect("kill");
+    });
+}
+
+/// F18 (c): native resume validates a request before it looks at queued stops, unlike
+/// `MockBackend`. A real step completes in the same exception batch as a real SIGUSR1 on
+/// a peer, so the signal stop is queued behind the step's. Invalid requests are refused
+/// as invalid, not as `StopPending`; the queued stop and the target are left as they were.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn invalid_signal_request_with_a_stop_queued_is_refused_before_the_queue_is_checked()
+{
+    use ferros_core::StopEvent;
+    use ferros_core::backend::ResumeRequest;
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready");
+        let mut backend = MacOSBackend::new().expect("backend");
+        let probe = backend.reply_fault_injector();
+        backend.attach(target.pid()).expect("attach");
+        let threads = backend.threads().expect("threads");
+        assert!(threads.len() >= 2, "expected the main thread and the worker: {threads:?}");
+        let (stepped, peer) = (threads[0], threads[1]);
+        // The step request suspends the peer once; the hook delivers SIGUSR1 to it and
+        // batches that real signal with the real step completion.
+        probe.batch_next_step_with_signal(peer);
+        backend.resume(&ResumeRequest::step(stepped)).expect("step");
+        assert_eq!(
+            backend.wait(Some(Duration::from_secs(5))).expect("step stop"),
+            Some(StopEvent::SingleStep { thread: stepped })
+        );
+        // The peer's signal is held and queued, not yet returned by `wait`.
+        let invalid = vec![
+            (
+                ResumeRequest::continue_all().with_signal(stepped, SIGUSR1),
+                "held soft-signal",
+                "a signal for the stepped thread, which holds none",
+            ),
+            (
+                ResumeRequest::continue_all().with_signal(peer, 32),
+                "invalid signal",
+                "an out-of-range replacement for the queued signal",
+            ),
+            (
+                ResumeRequest::continue_all().with_signal(peer, -1),
+                "invalid signal",
+                "a negative replacement for the queued signal",
+            ),
+        ];
+        for (request, needle, context) in invalid {
+            assert_refused(backend.resume(&request), needle, context);
+            assert_stays_stopped(&observer, context);
+        }
+        assert_eq!(
+            backend.wait(Some(Duration::ZERO)).expect("queued stop"),
+            Some(StopEvent::Signal {
+                thread: peer,
+                signal: SIGUSR1
+            }),
+            "the refusals changed the queued stop"
+        );
+        assert_eq!(backend.wait(Some(Duration::ZERO)).expect("drained"), None);
+        assert!(!observer.0.join("handled").exists(), "the held signal was delivered early");
+        backend
+            .resume(&ResumeRequest::continue_all().with_signal(peer, SIGUSR1))
+            .expect("deliver the held signal");
+        observer.wait("handled");
+        backend.kill().expect("kill");
+    });
+}
+
+/// F19 (d): a resume refused after it suspended and armed threads (here `task_resume`
+/// fails) gives back every per-thread suspend and clears every step bit it set, before
+/// it returns. A retry then steps normally.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn refused_step_or_suspend_resume_rolls_back_suspends_and_step_bits()
+{
+    use ferros_core::StopEvent;
+    use ferros_core::backend::{ResumeRequest, ThreadAction};
+    use ferros_macos::diagnostics;
+    harness::run(|t| {
+        let observer = Observer::new();
+        let target = t.spawn(&fixture!("signal_tracing"), &[observer.0.to_str().unwrap()]);
+        observer.wait("ready");
+        let mut backend = MacOSBackend::new().expect("backend");
+        let probe = backend.reply_fault_injector();
+        backend.attach(target.pid()).expect("attach");
+        let threads = backend.threads().expect("threads");
+        assert!(threads.len() >= 2, "expected the main thread and the worker: {threads:?}");
+        let (stepped, peer) = (threads[0], threads[1]);
+        let counts = |threads: &[ferros_core::ThreadId]| -> Vec<i32> {
+            threads
+                .iter()
+                .map(|&thread| diagnostics::thread_suspend_count(thread).expect("suspend count"))
+                .collect()
+        };
+        let baseline = counts(&threads);
+        for &thread in &threads {
+            assert!(
+                !diagnostics::single_step_enabled(thread).expect("MDSCR_EL1.SS"),
+                "thread {thread:?} had a step bit before any step"
+            );
+        }
+        let requests = vec![
+            (ResumeRequest::step(stepped), "a step of one thread"),
+            (
+                ResumeRequest::continue_all().with_thread(peer, ThreadAction::Suspend),
+                "a continue that keeps one thread suspended",
+            ),
+            (
+                ResumeRequest::continue_all()
+                    .with_thread(stepped, ThreadAction::Step)
+                    .with_thread(peer, ThreadAction::Suspend),
+                "a step with one other thread suspended",
+            ),
+        ];
+        for (request, context) in requests {
+            probe.fail_next_task_resume();
+            let refused = backend.resume(&request).expect_err(context);
+            assert!(refused.to_string().contains("task_resume"), "{context}: {refused}");
+            assert_eq!(counts(&threads), baseline, "{context}: per-thread suspends kept");
+            for &thread in &threads {
+                assert!(
+                    !diagnostics::single_step_enabled(thread).expect("MDSCR_EL1.SS"),
+                    "{context}: thread {thread:?} kept its step bit"
+                );
+            }
+            assert_stays_stopped(&observer, context);
+            assert_eq!(backend.wait(Some(Duration::ZERO)).expect("no event"), None, "{context}");
+        }
+        backend.resume(&ResumeRequest::step(stepped)).expect("retry the step");
+        assert_eq!(
+            backend.wait(Some(Duration::from_secs(5))).expect("step stop"),
+            Some(StopEvent::SingleStep { thread: stepped })
+        );
+        backend.kill().expect("kill");
+    });
+}

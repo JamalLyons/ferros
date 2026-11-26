@@ -158,8 +158,10 @@ The crate defines twenty-one fixture binaries:
   `--handler-once` raises SIGUSR1 once at a counting handler (marker `in_handler`) and
   prints `handler runs: <count>`. `--software-exception` sends its own thread's
   `EXC_SOFTWARE` exception with code `EXC_UNIX_ABORT` (not a Unix signal) to the task's
-  exception handler and prints `exception reply: <code>` once answered. Used by
-  `tests/exceptions.rs` (issue #244).
+  exception handler and prints `exception reply: <code>` once answered. `--guard-page`
+  maps a page of `0xa5` bytes followed by a `PROT_NONE` page, prints
+  `boundary: 0x<protected page>` and sleeps. Used by `tests/exceptions.rs` (issue #244)
+  and `tests/memory_reads.rs` (issue #290).
 - `ferros-fixture-read_line`: Reads one line from stdin (marker `read_stdin`) and prints `read: <line>`,
   or `read: <eof>` at end of file. Used by `tests/cli.rs` to check which stdin `ferros launch` gives
   the program (issue #95).

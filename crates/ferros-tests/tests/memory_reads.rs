@@ -142,3 +142,75 @@ fn read_of_usize_max_bytes_is_not_found_on_both_paths()
         );
     });
 }
+
+/// A read that starts in readable bytes and runs into a mapped `PROT_NONE` page is
+/// all or nothing: `PermissionDenied` on both paths, with a cold or warm cache, while
+/// the readable half alone still reads (issue #290, review F19). `MockBackend` ignores
+/// page protection, so only a native read checks this.
+#[test]
+fn read_across_a_readable_to_protected_boundary_is_permission_denied_on_both_paths()
+{
+    use std::time::Duration;
+
+    use ferros_core::StopEvent;
+    harness::run(|t| {
+        let fixture = fixture!("soft_faults");
+        let mut d = t.launch_with_args(&fixture, &["--guard-page"]);
+        d.resume().expect("run to the guard page");
+        assert!(
+            d.wait_for_stdout("boundary: 0x", Duration::from_secs(5)),
+            "fixture printed no boundary: {:?}",
+            d.stdout()
+        );
+        d.interrupt().expect("interrupt");
+        assert!(
+            matches!(
+                d.wait(Some(Duration::from_secs(5))).expect("interrupt stop"),
+                Some(StopEvent::Interrupted { .. })
+            ),
+            "expected an interrupt stop"
+        );
+        let stdout = d.stdout();
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("boundary: 0x"))
+            .expect("boundary line");
+        let boundary = Address::from(u64::from_str_radix(hex.trim(), 16).expect("boundary address"));
+        let regions = regions(&mut d);
+        let protected = regions
+            .iter()
+            .find(|region| region.start == boundary)
+            .expect("a region starting at the protected page");
+        assert!(!readable(protected), "the guard page is readable: {protected:?}");
+        assert!(
+            regions.iter().any(|region| region.end == boundary && readable(region)),
+            "no readable region ends at the guard page"
+        );
+
+        let before = Address::from(boundary.value() - SPAN as u64 / 2);
+        for warm in [false, true] {
+            if warm {
+                let bytes = d
+                    .session_mut()
+                    .backend_mut()
+                    .read_memory(before, SPAN / 2)
+                    .expect("readable half through the cache");
+                assert_eq!(bytes, vec![0xa5; SPAN / 2], "readable half");
+            }
+            let (cached, uncached) = read_both_ways(&mut d, before);
+            assert!(
+                matches!(cached, BackendError::PermissionDenied(_)),
+                "cached read at {before} (warm: {warm}): {cached:?}"
+            );
+            assert!(
+                matches!(uncached, DebuggerError::PermissionDenied(_)),
+                "uncached read at {before} (warm: {warm}): {uncached:?}"
+            );
+        }
+        let pid = d.pid();
+        assert_eq!(
+            diagnostics::raw_memory(pid, before, SPAN / 2).expect("readable half uncached"),
+            vec![0xa5; SPAN / 2]
+        );
+    });
+}

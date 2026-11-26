@@ -6,12 +6,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
   <!-- Primary Meta Tags -->
-  <title>Ferros — A Rust-Native Debugger</title>
-  <meta name="title" content="Ferros — A Rust-Native Debugger" />
+  <title>Ferros — A debugger for Rust, written in Rust</title>
+  <meta name="title" content="Ferros — A debugger for Rust, written in Rust" />
   <meta name="description"
-    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
+    content="A from-scratch debugger for macOS Apple Silicon, written in Rust. No LLDB, GDB, or debugserver underneath: Mach exception ports, Mach-O, DWARF line tables, unwinding, breakpoints, stepping, and a CLI." />
   <meta name="keywords"
-    content="rust, debugger, rust debugger, ferros, rust-native, MIR, debugging, rust development, rust tools" />
+    content="rust, debugger, rust debugger, ferros, macos, apple silicon, arm64, mach, dwarf, from scratch" />
   <meta name="author" content="Ferros Team" />
   <meta name="robots" content="index, follow" />
   <meta name="language" content="English" />
@@ -19,20 +19,20 @@
 
   <!-- Open Graph / Facebook -->
   <meta property="og:type" content="website" />
-  <meta property="og:url" content="http://ferros.jamallyons.com/" />
-  <meta property="og:title" content="Ferros — A Rust-Native Debugger" />
+  <meta property="og:url" content="https://ferros.jamallyons.com/" />
+  <meta property="og:title" content="Ferros — A debugger for Rust, written in Rust" />
   <meta property="og:description"
-    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
-  <meta property="og:image" content="http://ferros.jamallyons.com/Ferros_Logo_v3.png" />
+    content="A from-scratch debugger for macOS Apple Silicon, written in Rust. No LLDB, GDB, or debugserver underneath: Mach exception ports, Mach-O, DWARF line tables, unwinding, breakpoints, stepping, and a CLI." />
+  <meta property="og:image" content="https://ferros.jamallyons.com/Ferros_Logo_v3.png" />
   <meta property="og:site_name" content="Ferros" />
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:url" content="http://ferros.jamallyons.com/" />
-  <meta name="twitter:title" content="Ferros — A Rust-Native Debugger" />
+  <meta name="twitter:url" content="https://ferros.jamallyons.com/" />
+  <meta name="twitter:title" content="Ferros — A debugger for Rust, written in Rust" />
   <meta name="twitter:description"
-    content="A Rust-native debugger built from the same element as Rust itself. Understand ownership, lifetimes, borrows, and MIR with first-class debugging support." />
-  <meta name="twitter:image" content="http://ferros.jamallyons.com/Ferros_Logo_v3.png" />
+    content="A from-scratch debugger for macOS Apple Silicon, written in Rust. No LLDB, GDB, or debugserver underneath: Mach exception ports, Mach-O, DWARF line tables, unwinding, breakpoints, stepping, and a CLI." />
+  <meta name="twitter:image" content="https://ferros.jamallyons.com/Ferros_Logo_v3.png" />
   <meta name="twitter:site" content="@ferros_rs" />
   <meta name="twitter:creator" content="@ferros_rs" />
 
@@ -41,7 +41,7 @@
   <link rel="apple-touch-icon" href="/Ferros_Logo_v3.png" />
 
   <!-- Canonical URL -->
-  <link rel="canonical" href="http://ferros.jamallyons.com/" />
+  <link rel="canonical" href="https://ferros.jamallyons.com/" />
 
   <!-- Preconnect for Performance -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -92,9 +92,13 @@
       <h1 class="text-4xl md:text-6xl lg:text-7xl font-bold font-['Inter'] tracking-tight mb-6 opacity-0" id="tagline">
         <span class="block">Ferros</span>
       </h1>
-      <p class="text-lg md:text-xl lg:text-2xl text-gray-400 font-['JetBrains_Mono'] max-w-3xl mx-auto opacity-0"
+      <p class="text-lg md:text-xl lg:text-2xl text-gray-400 font-['JetBrains_Mono'] max-w-4xl mx-auto opacity-0 leading-relaxed"
         id="subtitle">
-        A Rust-native debugger built from the same element as Rust itself.
+        <span class="mb-4 block text-gray-200">A debugger for Rust, written in Rust, from the syscall up.</span>
+        No LLDB, no GDB, no debugserver underneath. On Apple Silicon, Ferros handles Mach exceptions
+        itself, reads Mach-O and DWARF line tables, unwinds the stack, and sets breakpoints and steps
+        from a CLI.
+        <span class="mt-6 block text-sm text-gray-500 md:text-base">Early development · macOS Apple Silicon today · Linux and Windows planned</span>
       </p>
     </div>
 
@@ -109,12 +113,17 @@
   <!-- What Makes Ferros Different - Cinematic Horizontal Scroll -->
   <section id="different" class="relative py-32 md:py-40 overflow-hidden">
     <div class="container mx-auto px-4">
-      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-16 text-center opacity-0" id="different-title">
-        What Makes Ferros Different
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-8 text-center opacity-0" id="different-title">
+        No LLDB underneath
       </h2>
+      <p class="text-gray-400 font-['JetBrains_Mono'] text-base md:text-lg leading-relaxed max-w-3xl mx-auto mb-16 text-center">
+        Every layer above the kernel is Rust you can read. DWARF line tables and unwind sections are
+        consumed with gimli and addr2line. Mach-O is read with the object crate inside
+        <span class="text-gray-300">ferros-macos</span>. Names are demangled with rustc-demangle.
+      </p>
 
       <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8" id="different-cards">
-        <!-- Card 1: Rust-Native -->
+        <!-- Card 1: Mach exception ports -->
         <div
           class="group relative bg-linear-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[-100px]">
           <div class="mb-6">
@@ -127,17 +136,18 @@
                 d="M12 4 L12 2 M12 22 L12 20 M4 12 L2 12 M22 12 L20 12 M6.343 6.343 L4.929 4.929 M19.071 19.071 L17.657 17.657 M6.343 17.657 L4.929 19.071 M19.071 4.929 L17.657 6.343" />
             </svg>
           </div>
-          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Rust-Native Understanding</h3>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Mach exception ports</h3>
           <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
-            Built to understand ownership, lifetimes, borrows, and MIR — not retrofitted C semantics.
+            The macOS backend takes the task's exception ports and reports breakpoints, signals, and
+            exits to the session. Verified by <span class="text-gray-300">tests/exceptions.rs</span>.
           </p>
         </div>
 
-        <!-- Card 2: MIR-Level -->
+        <!-- Card 2: Mach-O and dyld -->
         <div
           class="group relative bg-linear-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[-100px]">
           <div class="mb-6">
-            <!-- MIR Block Diagram Icon -->
+            <!-- Image-list icon -->
             <svg class="w-12 h-12 text-[#d3752b]" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="1.5">
               <rect x="3" y="5" width="6" height="4" stroke-dasharray="1 1" />
@@ -148,13 +158,14 @@
               <path d="M15 7 L18 7 M9 14 L12 14" />
             </svg>
           </div>
-          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">MIR-Level Debugging</h3>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Mach-O and dyld</h3>
           <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
-            Debug at the compiler's intermediate representation for precise control flow analysis.
+            Mach-O, universal binaries, and dSYM bundles, plus dyld's image list and the symbol tables
+            of mapped shared-cache libraries.
           </p>
         </div>
 
-        <!-- Card 3: Cross-Platform -->
+        <!-- Card 3: DWARF and unwinding -->
         <div
           class="group relative bg-linear-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[100px]">
           <div class="mb-6">
@@ -163,17 +174,18 @@
                 d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
             </svg>
           </div>
-          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Cross-Platform</h3>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">DWARF and unwinding</h3>
           <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
-            macOS support now, with Linux and Windows planned — unlike Linux-only alternatives.
+            Line tables, demangled names, compact unwind, and DWARF CFI, including inlined frames and
+            signal frames.
           </p>
         </div>
 
-        <!-- Card 4: Hybrid Architecture -->
+        <!-- Card 4: Session and REPL -->
         <div
           class="group relative bg-linear-to-br from-[#111315] to-[#0d0d0d] border border-[#1a1a1a] rounded-lg p-8 hover:border-[#d3752b]/50 transition-all duration-500 opacity-0 transform translate-x-[100px]">
           <div class="mb-6">
-            <!-- Ownership/Borrow Arrow Icon -->
+            <!-- Session icon -->
             <svg class="w-12 h-12 text-[#d3752b]" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="1.5">
               <path d="M4 12 L20 12" stroke-dasharray="2 2" />
@@ -183,21 +195,27 @@
               <path d="M8 8 L12 4 M8 16 L12 20" stroke-width="1" opacity="0.5" />
             </svg>
           </div>
-          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Hybrid Architecture</h3>
+          <h3 class="text-2xl font-semibold mb-4 font-['Inter']">Session and REPL</h3>
           <p class="text-gray-400 font-['JetBrains_Mono'] text-sm leading-relaxed">
-            Combines symbolic debugging and interpreted execution in a single tool.
+            Software breakpoints, hardware single-step, and source step over, into, and out, driven from
+            a line-oriented CLI. The engine forbids unsafe code.
           </p>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- Live Debugger Simulation -->
+  <!-- Demo frame. The GIF slot is #demo-slot, tracked in #364. -->
   <section id="debugger-simulation" class="relative py-32 md:py-40 overflow-hidden">
     <div class="container mx-auto px-4">
-      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-16 text-center opacity-0" id="debugger-title">
-        See Ferros in Action
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-8 text-center opacity-0" id="debugger-title">
+        From launch to backtrace
       </h2>
+      <p class="text-gray-400 font-['JetBrains_Mono'] text-base md:text-lg leading-relaxed max-w-3xl mx-auto mb-16 text-center">
+        The frame below is reserved for a recording of a real session: launch, a breakpoint,
+        <span class="text-gray-300">next</span> and <span class="text-gray-300">step</span>, then a
+        symbolicated backtrace.
+      </p>
 
       <div class="max-w-5xl mx-auto">
         <div
@@ -209,39 +227,25 @@
               <div class="w-3 h-3 rounded-full bg-yellow-500/50"></div>
               <div class="w-3 h-3 rounded-full bg-green-500/50"></div>
             </div>
-            <span class="text-sm text-gray-400 font-['JetBrains_Mono'] ml-4">ferros debug</span>
+            <span class="text-sm text-gray-400 font-['JetBrains_Mono'] ml-4">ferros launch</span>
           </div>
 
-          <!-- Terminal Body -->
-          <div class="debugger-terminal p-8 min-h-[400px]">
+          <!--
+            Demo GIF slot (#364). Keep this terminal frame.
+            The GIF is a real `ferros launch` session and waits on the owner walkthrough (#40).
+            Do not fill this slot with a synthetic session, a typed animation, or a generated GIF.
+          -->
+          <div class="debugger-terminal p-8 min-h-[400px]" id="demo-slot">
             <div class="code-display font-['JetBrains_Mono'] text-sm text-gray-300 space-y-2">
-              <!-- Code will be typed here by JavaScript -->
+              <p class="text-gray-500">Recorded session goes here.</p>
+              <p class="pt-4 text-gray-400">launch, then a breakpoint, then next / step, then a symbolicated backtrace.</p>
+              <p class="pt-8 text-gray-500">
+                Tracked in
+                <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/364">issue #364</a>.
+                It waits on the owner walkthrough
+                <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/40">#40</a>.
+              </p>
             </div>
-
-            <!-- Breakpoint Indicators -->
-            <div
-              class="breakpoint-line mt-4 flex items-center gap-3 text-xs text-[#d3752b] font-['JetBrains_Mono'] opacity-0">
-              <span class="breakpoint-indicator">●</span>
-              <span>Breakpoint hit: line 3</span>
-            </div>
-          </div>
-
-          <!-- MIR Diagram Corner -->
-          <div class="absolute bottom-4 right-4 w-32 h-32 opacity-20">
-            <svg viewBox="0 0 100 100" class="w-full h-full">
-              <defs>
-                <linearGradient id="mirGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <stop offset="0%" style="stop-color:#d3752b;stop-opacity:0.3" />
-                  <stop offset="100%" style="stop-color:#e67728;stop-opacity:0.1" />
-                </linearGradient>
-              </defs>
-              <!-- MIR Block Representation -->
-              <rect x="10" y="10" width="30" height="20" fill="none" stroke="url(#mirGradient)" stroke-width="1" />
-              <rect x="50" y="10" width="30" height="20" fill="none" stroke="url(#mirGradient)" stroke-width="1" />
-              <rect x="30" y="40" width="30" height="20" fill="none" stroke="url(#mirGradient)" stroke-width="1" />
-              <line x1="25" y1="20" x2="50" y2="20" stroke="#d3752b" stroke-width="1" />
-              <line x1="45" y1="30" x2="45" y2="40" stroke="#d3752b" stroke-width="1" />
-            </svg>
           </div>
         </div>
       </div>
@@ -258,21 +262,22 @@
           id="comparison-left">
           <div class="absolute top-0 right-0 w-0 h-full bg-[#d3752b]/10 transition-all duration-1000" id="left-overlay">
           </div>
-          <h3 class="text-4xl md:text-5xl font-bold mb-8 font-['Inter'] text-gray-300">Why Not Existing Debuggers?</h3>
+          <h3 class="text-4xl md:text-5xl font-bold mb-8 font-['Inter'] text-gray-300">What the others are built on</h3>
           <div class="space-y-6">
             <div class="border-l-2 border-red-500/50 pl-6">
-              <h4 class="text-xl font-semibold mb-2 font-['Inter']">BugStalker</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Linux-only, no macOS or Windows support</p>
-            </div>
-            <div class="border-l-2 border-red-500/50 pl-6">
-              <h4 class="text-xl font-semibold mb-2 font-['Inter']">GDB/LLDB</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">C/C++ semantics, doesn't understand Rust's
-                ownership model</p>
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">LLDB and GDB</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">C and C++ debuggers, mature after decades. Rust
+                values arrive through pretty-printers on that model.</p>
             </div>
             <div class="border-l-2 border-red-500/50 pl-6">
               <h4 class="text-xl font-semibold mb-2 font-['Inter']">CodeLLDB</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Generic debugger extension, no Rust-specific
-                features</p>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">A Rust extension that drives LLDB, so the runtime
+                under it is still LLDB.</p>
+            </div>
+            <div class="border-l-2 border-red-500/50 pl-6">
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">debugserver</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">The helper LLDB uses on macOS. Ferros talks to
+                Mach exception ports on its own.</p>
             </div>
           </div>
         </div>
@@ -286,19 +291,19 @@
           <h3 class="text-4xl md:text-5xl font-bold mb-8 font-['Inter'] text-[#d3752b]">What Ferros Brings</h3>
           <div class="space-y-6">
             <div class="border-l-2 border-[#d3752b] pl-6">
-              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Cross-Platform First</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">macOS support now, with Linux and Windows planned
-              </p>
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Rust above the kernel</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Mach exception ports, Mach-O, dyld's image list,
+                DWARF line tables, and unwinding live in this repo.</p>
             </div>
             <div class="border-l-2 border-[#d3752b] pl-6">
-              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Rust-Native Understanding</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Built for ownership, lifetimes, borrows, and MIR
-              </p>
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">One portable engine</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">ferros-core forbids unsafe and has no OS
+                dependency. CI checks that boundary. macOS stays in ferros-macos.</p>
             </div>
             <div class="border-l-2 border-[#d3752b] pl-6">
-              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Modern Design</h4>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Designed for Rust's safety guarantees from day
-                one</p>
+              <h4 class="text-xl font-semibold mb-2 font-['Inter']">Early, on Apple Silicon</h4>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">macOS arm64 is the verified target. Value
+                inspection is the next phase. Linux and Windows are each planned as their own backend crate.</p>
             </div>
           </div>
         </div>
@@ -309,8 +314,12 @@
   <!-- Features Section - Vertical Banners -->
   <section id="features" class="relative py-32 md:py-40">
     <div class="container mx-auto px-4">
-      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-20 text-center opacity-0" id="features-title">Key
-        Features</h2>
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-8 text-center opacity-0" id="features-title">Works
+        today</h2>
+      <p class="text-gray-400 font-['JetBrains_Mono'] text-base md:text-lg leading-relaxed max-w-3xl mx-auto mb-20 text-center">
+        Each of these is exercised by an integration test on macOS arm64. Locals, print, async tasks,
+        MIR, borrow visualization, and zero-cost breakpoints are on the roadmap below.
+      </p>
 
       <div class="space-y-8" id="feature-banners">
         <!-- Feature Banner 1 -->
@@ -331,9 +340,9 @@
               </svg>
             </div>
             <div class="flex-1">
-              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Rust-Native Inspection</h3>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Understands ownership, borrows, lifetimes, and
-                async tasks directly</p>
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Mach exception handling</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Launch suspended or attach by PID. Stops for
+                breakpoints, signals, and exits come from a Mach exception-port loop.</p>
             </div>
           </div>
         </div>
@@ -347,7 +356,7 @@
             id="feature-glow-2"></div>
           <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
             <div class="shrink-0">
-              <!-- MIR Blocks Icon -->
+              <!-- Stepping icon -->
               <svg class="w-16 h-16 text-[#d3752b]" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                 stroke-width="1.5">
                 <rect x="2" y="4" width="6" height="5" stroke-dasharray="1 1" />
@@ -360,9 +369,9 @@
               </svg>
             </div>
             <div class="flex-1">
-              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">MIR Integration</h3>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Debug at the mid-level IR to analyze
-                compiler-accurate control flow</p>
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Breakpoints and stepping</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Software breakpoints by address, file:line, or
+                function. Source step over, into, and out, plus one instruction, with other threads held.</p>
             </div>
           </div>
         </div>
@@ -376,7 +385,7 @@
             id="feature-glow-3"></div>
           <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
             <div class="shrink-0">
-              <!-- Zero-Cost Breakpoint Icon -->
+              <!-- Unwind icon -->
               <svg class="w-16 h-16 text-[#d3752b]" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                 stroke-width="1.5">
                 <path d="M6 6 L18 18 M18 6 L6 18" stroke-width="2" />
@@ -385,9 +394,9 @@
               </svg>
             </div>
             <div class="flex-1">
-              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Zero-Cost Breakpoints</h3>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Lightweight traps integrated with Rust's runtime
-                model</p>
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">DWARF line tables and unwinding</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Demangled names, line tables, compact unwind, and
+                DWARF CFI. Backtraces include inlined frames.</p>
             </div>
           </div>
         </div>
@@ -401,7 +410,7 @@
             id="feature-glow-4"></div>
           <div class="relative z-10 flex flex-col md:flex-row items-start md:items-center gap-8">
             <div class="shrink-0">
-              <!-- Memory Safety Visualization Icon -->
+              <!-- REPL icon -->
               <svg class="w-16 h-16 text-[#d3752b]" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                 stroke-width="1.5">
                 <rect x="4" y="6" width="16" height="12" stroke-dasharray="1 1" />
@@ -413,9 +422,9 @@
               </svg>
             </div>
             <div class="flex-1">
-              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">Memory Safety Visualization</h3>
-              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">Visualize move semantics, borrows, and drops in
-                real time</p>
+              <h3 class="text-3xl md:text-4xl font-bold mb-4 font-['Inter']">CLI and REPL</h3>
+              <p class="text-gray-400 font-['JetBrains_Mono'] text-lg">ferros launch and ferros attach, interactive,
+                piped, or batch. Backtrace, registers, memory, threads, and images.</p>
             </div>
           </div>
         </div>
@@ -426,8 +435,19 @@
   <!-- Architecture Section - Horizontal Flowchart -->
   <section id="architecture" class="relative py-32 md:py-40 overflow-hidden">
     <div class="container mx-auto px-4">
-      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-20 text-center opacity-0" id="architecture-title">
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-8 text-center opacity-0" id="architecture-title">
         Architecture</h2>
+      <p class="text-gray-400 font-['JetBrains_Mono'] text-base md:text-lg leading-relaxed max-w-3xl mx-auto mb-20 text-center">
+        The running debugger is the CLI, a portable engine, and the macOS backend.
+        <span class="text-gray-300">ferros-core</span> forbids unsafe and has no OS dependency.
+        <span class="text-gray-300">ferros-mir</span> is empty,
+        <span class="text-gray-300">ferros-ui</span> is parked, and
+        <span class="text-gray-300">ferros-protocol</span> is reserved for a future agent and editor protocol.
+        The REPL accepts <span class="text-gray-300">--batch</span> and a pipe today.
+        <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/docs/architecture.md">Architecture guide</a>
+        ·
+        <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/docs/adr/0001-object-file-boundary.md">ADR 0001</a>
+      </p>
 
       <div
         class="relative bg-linear-to-br from-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-8 md:p-16 overflow-x-auto"
@@ -448,7 +468,7 @@
               </svg>
             </div>
             <h3 class="text-xl font-semibold font-['Inter']">ferros</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">CLI</p>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">CLI and REPL</p>
           </div>
 
           <!-- Arrow -->
@@ -467,7 +487,7 @@
               </svg>
             </div>
             <h3 class="text-xl font-semibold font-['Inter']">ferros-core</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Debugging Primitives</p>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Portable engine</p>
           </div>
 
           <!-- Arrow -->
@@ -477,16 +497,16 @@
             </svg>
           </div>
 
-          <!-- ferros-mir -->
-          <div class="crate-card opacity-0 transform scale-0" data-crate="mir">
+          <!-- ferros-macos -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="macos">
             <div class="crate-icon">
               <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                   d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
             </div>
-            <h3 class="text-xl font-semibold font-['Inter']">ferros-mir</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">MIR Integration</p>
+            <h3 class="text-xl font-semibold font-['Inter']">ferros-macos</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Mach and Mach-O</p>
           </div>
 
           <!-- Arrow -->
@@ -496,16 +516,16 @@
             </svg>
           </div>
 
-          <!-- ferros-ui -->
-          <div class="crate-card opacity-0 transform scale-0" data-crate="ui">
+          <!-- Kernel boundary -->
+          <div class="crate-card opacity-0 transform scale-0" data-crate="kernel">
             <div class="crate-icon">
               <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                   d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
               </svg>
             </div>
-            <h3 class="text-xl font-semibold font-['Inter']">ferros-ui</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">TUI/GUI</p>
+            <h3 class="text-xl font-semibold font-['Inter']">XNU / Mach</h3>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Kernel boundary</p>
           </div>
 
           <!-- Vertical Divider -->
@@ -520,7 +540,7 @@
               </svg>
             </div>
             <h3 class="text-xl font-semibold font-['Inter']">ferros-protocol</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Communication</p>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Reserved, empty</p>
           </div>
 
           <!-- Vertical Divider -->
@@ -535,7 +555,7 @@
               </svg>
             </div>
             <h3 class="text-xl font-semibold font-['Inter']">ferros-utils</h3>
-            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Shared Utilities</p>
+            <p class="text-sm text-gray-400 font-['JetBrains_Mono']">Logging</p>
           </div>
         </div>
       </div>
@@ -555,10 +575,13 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
                 d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
             </svg>
-            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">A debugger that speaks Rust's language.</h2>
+            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">A debugger you can read, from the syscall up.</h2>
             <p class="text-xl text-gray-400 font-['JetBrains_Mono'] leading-relaxed">
-              To give Rust developers a <span class="text-[#d3752b]">first-class, language-native debugging
-                experience</span> — fast, intuitive, and designed for Rust's safety guarantees.
+              Ferros is a from-scratch debugger for macOS arm64. The engine stops, breaks, steps, and prints a
+              symbolicated backtrace, and the platform stays in one crate. The longer aim is a Rust-native view of
+              <span class="text-[#d3752b]">values, ownership, and MIR</span>. That starts with value inspection, which
+              is the next phase. The REPL takes a batch file or a pipe today. A protocol that hands stops to agents
+              and editors is planned.
             </p>
           </div>
         </div>
@@ -574,9 +597,12 @@
           class="relative bg-linear-to-br from-[#0d0d0d] to-[#111315] border border-[#1a1a1a] rounded-lg p-12 md:p-16 overflow-hidden">
           <div class="absolute inset-0 border-2 border-[#d3752b]/30 rounded-lg animate-pulse"></div>
           <div class="relative z-10">
-            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">Ferros is in active development.</h2>
-            <p class="text-xl text-gray-400 mb-8 font-['JetBrains_Mono']">Join the community and help shape the future
-              of Rust debugging.</p>
+            <h2 class="text-4xl md:text-5xl font-bold mb-6 font-['Inter']">Build it on an Apple Silicon Mac.</h2>
+            <p class="text-xl text-gray-400 mb-8 font-['JetBrains_Mono'] leading-relaxed">
+              Ferros is in early development and is not on crates.io. Clone the repo and build from source. Debugging
+              another process needs an ad-hoc signature with the debugger entitlement in
+              <span class="text-gray-300">crates/ferros-macos/ferros.entitlements</span>.
+            </p>
             <a href="https://github.com/jamallyons/ferros" target="_blank" rel="noopener noreferrer"
               class="inline-flex items-center gap-3 px-8 py-4 bg-[#d3752b] hover:bg-[#e67728] text-white font-semibold rounded-lg transition-all duration-300 transform hover:scale-105 border-2 border-[#d3752b] hover:border-[#e67728] shadow-lg shadow-[#d3752b]/20">
               <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
@@ -586,6 +612,13 @@
               </svg>
               <span class="font-['Inter']">View on GitHub</span>
             </a>
+            <p class="mt-8 text-sm text-gray-500 font-['JetBrains_Mono']">
+              <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/docs/walkthrough.md">Walkthrough</a>
+              ·
+              <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/docs/architecture.md">Architecture</a>
+              ·
+              <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/ROADMAP.md">Roadmap</a>
+            </p>
           </div>
         </div>
       </div>
@@ -595,9 +628,18 @@
   <!-- Roadmap Section -->
   <section id="roadmap" class="relative py-32 md:py-40 overflow-hidden">
     <div class="container mx-auto px-4">
-      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-20 text-center opacity-0" id="roadmap-title">
-        Development Roadmap
+      <h2 class="text-5xl md:text-7xl font-bold font-['Inter'] mb-8 text-center opacity-0" id="roadmap-title">
+        On the roadmap
       </h2>
+      <p class="text-gray-400 font-['JetBrains_Mono'] text-base md:text-lg leading-relaxed max-w-3xl mx-auto mb-20 text-center">
+        Phase 1 and Phase 1.5 are done. Next is value inspection, then a Debug Adapter Protocol server, then async
+        tasks, in the order recorded in
+        <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/blob/trunk/ROADMAP.md">ROADMAP.md</a>
+        and
+        <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/41">#41</a>.
+        Linux and Windows backends are planned, one crate each. MIR debugging, borrow visualization, and
+        zero-cost breakpoints are marked Planned on the cards below. A breakpoint today is a software BRK.
+      </p>
 
       <div class="max-w-6xl mx-auto">
         <!-- Timeline Line -->
@@ -607,70 +649,62 @@
           </div>
         </div>
 
-        <!-- Milestones -->
+        <!-- Milestones. Done nodes are orange. Only data-status="next" pulses. -->
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <!-- Milestone 1: POC Complete -->
           <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-[#d3752b] rounded-full mx-auto mb-4 shadow-[0_0_20px_#d3752b]"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-[#d3752b]">POC Complete</h3>
-            <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Proof of concepts working</p>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-xs mt-2">In Progress</p>
+            <div class="milestone-node w-4 h-4 bg-[#d3752b] rounded-full mx-auto mb-4 shadow-[0_0_20px_#d3752b]" data-status="done"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-[#d3752b]">Phase 1</h3>
+            <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Engine and CLI. Breakpoints, stepping, DWARF, unwinding, and the REPL.</p>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-xs mt-2">Done · <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/26">#26</a></p>
           </div>
 
-          <!-- Milestone 2: Core Complete -->
           <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Core Complete</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">ferros-core & ferros-utils</p>
+            <div class="milestone-node w-4 h-4 bg-[#d3752b] rounded-full mx-auto mb-4 shadow-[0_0_20px_#d3752b]" data-status="done"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-[#d3752b]">Phase 1.5</h3>
+            <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Reliable stops, stacks, and images.</p>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-xs mt-2">Done · <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/210">#210</a></p>
+          </div>
+
+          <div class="roadmap-milestone text-center">
+            <div class="milestone-node w-4 h-4 bg-[#d3752b] rounded-full mx-auto mb-4 shadow-[0_0_20px_#d3752b]" data-status="next"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-[#d3752b]">Phase 2</h3>
+            <p class="text-gray-400 font-['JetBrains_Mono'] text-sm">Value inspection. Frames, locals, and print.</p>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-xs mt-2">Next · <a class="text-[#d3752b] hover:text-[#e67728]" href="https://github.com/jamallyons/ferros/issues/41">#41</a></p>
+          </div>
+
+          <div class="roadmap-milestone text-center">
+            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4" data-status="planned"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Phase 3</h3>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Debug Adapter Protocol, so an editor can drive a session.</p>
+            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned · <a class="hover:text-[#d3752b]" href="https://github.com/jamallyons/ferros/issues/41">#41</a></p>
+          </div>
+
+          <div class="roadmap-milestone text-center">
+            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4" data-status="planned"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Phase 4</h3>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Async task inspection, after values exist.</p>
+            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned · <a class="hover:text-[#d3752b]" href="https://github.com/jamallyons/ferros/issues/41">#41</a></p>
+          </div>
+
+          <div class="roadmap-milestone text-center">
+            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4" data-status="planned"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">MIR debugging</h3>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Correlate a stop with Rust MIR. ferros-mir is an empty crate.</p>
             <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned</p>
           </div>
 
-          <!-- Milestone 3: Symbols Complete -->
           <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Symbols Complete</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">DWARF parsing & symbol resolution</p>
+            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4" data-status="planned"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Borrow visualization</h3>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Moves, borrows, and drops, once values can be read.</p>
             <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned</p>
           </div>
 
-          <!-- Milestone 4: CLI Complete -->
           <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">CLI Complete</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Full command-line debugger</p>
+            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4" data-status="planned"></div>
+            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Zero-cost breakpoints</h3>
+            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Today's breakpoints are software BRK instructions.</p>
             <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned</p>
-          </div>
-
-          <!-- Milestone 5: Advanced Features -->
-          <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Advanced Features</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Stack unwinding & variable inspection</p>
-            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned</p>
-          </div>
-
-          <!-- Milestone 6: v1.0 Release -->
-          <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">v1.0 Release</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">First public release</p>
-            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Planned</p>
-          </div>
-
-          <!-- Milestone 7: IDE Integration -->
-          <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">IDE Integration</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">DAP server & VS Code extension</p>
-            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Future</p>
-          </div>
-
-          <!-- Milestone 8: Cross-Platform -->
-          <div class="roadmap-milestone text-center">
-            <div class="milestone-node w-4 h-4 bg-gray-600 rounded-full mx-auto mb-4"></div>
-            <h3 class="text-xl font-bold mb-2 font-['Inter'] text-gray-400">Cross-Platform</h3>
-            <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">Linux, macOS & Windows support</p>
-            <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">Future</p>
           </div>
         </div>
       </div>
@@ -712,7 +746,7 @@
 
       <div class="text-center">
         <p class="text-gray-500 font-['JetBrains_Mono'] text-sm">
-          Ferros — built from the same element as Rust.
+          Ferros, from <span class="text-gray-400">ferrum</span>. Built from the same element as Rust.
         </p>
         <p class="text-gray-600 font-['JetBrains_Mono'] text-xs mt-2">
           Licensed under Apache License, Version 2.0

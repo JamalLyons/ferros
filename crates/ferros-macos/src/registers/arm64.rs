@@ -180,6 +180,12 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 /// - [thread_set_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
+    write_arm64_gpr_state(thread, regs)?;
+    write_arm64_neon_state(thread, regs)
+}
+
+pub(crate) fn write_arm64_gpr_state(thread: thread_act_t, regs: &Registers) -> Result<()>
+{
     let mut state_words: [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize] =
         [0; constants::ARM_THREAD_STATE64_COUNT as usize];
 
@@ -217,8 +223,6 @@ pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<(
         }
     }
 
-    write_arm64_neon_state(thread, regs)?;
-
     Ok(())
 }
 
@@ -237,7 +241,10 @@ struct ArmNeonState64
     fpsr: u32,
     /// Floating-Point Control Register (FPCR)
     fpcr: u32,
+    padding: [u32; 2],
 }
+
+const _: () = assert!(size_of::<ArmNeonState64>() == constants::ARM_NEON_STATE64_COUNT as usize * size_of::<natural_t>());
 
 /// Fetch ARM64 NEON/SIMD state from a thread.
 ///
@@ -256,8 +263,8 @@ struct ArmNeonState64
 ///
 /// ## Mach API: thread_get_state()
 ///
-/// **Flavor**: `ARM_NEON_STATE64` = 5
-/// **Count**: `ARM_NEON_STATE64_COUNT` = 68
+/// **Flavor**: `ARM_NEON_STATE64` = 17
+/// **Count**: `ARM_NEON_STATE64_COUNT` = 132
 ///
 /// ## Note
 ///
@@ -319,9 +326,9 @@ fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>
 ///
 /// ## Mach API: thread_set_state()
 ///
-/// **Flavor**: `ARM_NEON_STATE64` = 5
-/// **Count**: `ARM_NEON_STATE64_COUNT` = 68
-fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<()>
+/// **Flavor**: `ARM_NEON_STATE64` = 17
+/// **Count**: `ARM_NEON_STATE64_COUNT` = 132
+pub(crate) fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
     if regs.vector.is_empty() && regs.floating.fpsr.is_none() && regs.floating.fpcr.is_none() {
         return Ok(());

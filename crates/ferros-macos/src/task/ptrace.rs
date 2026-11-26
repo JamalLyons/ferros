@@ -381,6 +381,16 @@ impl MacOSBackend
 
     /// Deliver signals that arrived during the private handshake on their original
     /// threads. Attach still owns a task suspend; detach still holds its private reply.
+    /// Signal numbers currently held from the detach handshake, in replay order.
+    fn held_handshake_signal_numbers(&self) -> Vec<i32>
+    {
+        lock_shared(&self.exception_state)
+            .handshake_signals
+            .as_ref()
+            .map(|signals| signals.iter().map(|signal| signal.signal).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn requeue_handshake_signals(&self, traced: bool) -> BackendResult<()>
     {
         let mut shared = lock_shared(&self.exception_state);
@@ -433,6 +443,7 @@ impl MacOSBackend
         // Replay and continuation belong to every successful PT_DETACH, including
         // fallback after a handshake error. Preserve that error in the return value.
         let replayed = if !self.traced {
+            let held = self.held_handshake_signal_numbers();
             if private_stop_sent {
                 // Below, detach continues the released process with SIGCONT, which undoes
                 // any SIGSTOP; one cannot be caught, so replaying it changes nothing but
@@ -444,6 +455,9 @@ impl MacOSBackend
                     signals.retain(|signal| signal.signal != libc::SIGSTOP);
                 }
             }
+            let replayed = self.held_handshake_signal_numbers();
+            self.reply_faults
+                .report_detach_replay(|| crate::exception::DetachReplay { held, replayed });
             self.requeue_handshake_signals(false)
         } else {
             Ok(())
@@ -457,13 +471,6 @@ impl MacOSBackend
         let expire_wait = stop_fault.is_some() && !hide_stop && private_stop_sent && !self.traced;
         if expire_wait {
             self.send_detach_sigcont();
-        }
-        if private_stop_sent && !self.traced {
-            // Test hook (#311): whether a job-control stop is already in effect before the
-            // private SIGSTOP is answered, which detach's wait would take for its own.
-            self.reply_faults.sample_stop_before_detach_reply(|| {
-                crate::lifecycle::job_control_stop_has_taken_effect(self.pid.0 as libc::pid_t, self.task)
-            });
         }
         let restored = self.stop_exception_handler(true);
         self.release_suspends();

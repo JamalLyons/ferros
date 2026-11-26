@@ -36,9 +36,9 @@ pub struct ReplyFaultInjector
     pub(crate) detach_handshake: Arc<AtomicBool>,
     detach_stop_wait: Arc<Mutex<Option<DetachStopWait>>>,
     pub(super) detach_suspend_probe: Arc<Mutex<Option<DetachSuspendProbe>>>,
-    /// Receives whether a job-control stop was in effect just before the next detach
-    /// answered its private SIGSTOP. Tests only (#311).
-    detach_reply_stop_probe: Arc<Mutex<Option<mpsc::Sender<bool>>>>,
+    /// Receives the signals the next detach held from its handshake and the ones it
+    /// replayed. Tests only (#311).
+    detach_replay_probe: Arc<Mutex<Option<mpsc::Sender<DetachReplay>>>>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     pub(super) birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
@@ -84,6 +84,17 @@ pub struct ReplyFaultInjector
     /// The next resume takes one extra task suspend, its last `task_resume` resumes the
     /// task and then reports failure, and the re-suspend fails. Tests only (#250).
     pub(crate) resume_partway: Arc<AtomicBool>,
+}
+
+/// What a detach did with the client signals held during its handshake. Tests only (#311).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachReplay
+{
+    /// Signal numbers held when the handshake ended, in order.
+    pub held: Vec<i32>,
+    /// Signal numbers sent again to the released process, in order.
+    pub replayed: Vec<i32>,
 }
 
 /// Overrides the next detach's private stop waits. Tests only (#149, #282).
@@ -185,27 +196,21 @@ impl ReplyFaultInjector
         }
     }
 
-    /// Report whether the released process is already in a job-control stop (`SSTOP`
-    /// and a task hold) just before the next detach answers its private SIGSTOP, after
-    /// `PT_DETACH` and the replay of signals held during the handshake. Detach's wait
-    /// cannot tell such a stop from its private one. Tests only (#311).
-    pub fn observe_stop_before_next_detach_reply(&self) -> mpsc::Receiver<bool>
+    /// Report which client signals the next detach held from its handshake and which of
+    /// them it replayed after `PT_DETACH`. Tests only (#311).
+    pub fn observe_next_detach_replay(&self) -> mpsc::Receiver<DetachReplay>
     {
         let (probe, result) = mpsc::channel();
-        *self.detach_reply_stop_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+        *self.detach_replay_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
         result
     }
 
-    /// Answer an armed [`Self::observe_stop_before_next_detach_reply`] with `stopped()`.
-    pub(crate) fn sample_stop_before_detach_reply(&self, stopped: impl FnOnce() -> bool)
+    /// Answer an armed [`Self::observe_next_detach_replay`].
+    pub(crate) fn report_detach_replay(&self, replay: impl FnOnce() -> DetachReplay)
     {
-        let probe = self
-            .detach_reply_stop_probe
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let probe = self.detach_replay_probe.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(probe) = probe {
-            let _ = probe.send(stopped());
+            let _ = probe.send(replay());
         }
     }
 

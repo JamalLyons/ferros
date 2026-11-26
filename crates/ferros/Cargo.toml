@@ -29,3 +29,5 @@ workspace = true
 # feature, so the binary itself is never built with the mock.
 [dev-dependencies]
 ferros-core = { path = "../ferros-core", features = ["test-util"] }
+# Cargo builds the CLI integration tests' binary with this feature enabled.
+ferros-utils = { path = "../ferros-utils", features = ["test-log-write-delay"] }

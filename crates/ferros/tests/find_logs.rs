@@ -8,10 +8,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Test-only switch read by `ferros_utils::start_file_logging`: the log worker waits
-/// this many milliseconds before each write, so the last record is still queued when
-/// `main` returns. Only a flush that waits for the worker gets it into the file.
-const WRITE_DELAY: (&str, &str) = ("FERROS_TEST_LOG_WRITE_DELAY_MS", "250");
+/// Test-only switch that delays background log writes by the given milliseconds.
+const WRITE_DELAY: &str = "FERROS_TEST_LOG_WRITE_DELAY_MS";
 
 /// A fresh empty directory for one test.
 fn scratch(name: &str) -> PathBuf
@@ -29,7 +27,7 @@ fn ferros(args: &[&str], cwd: &Path, env: &[(&str, Option<&OsString>)]) -> Outpu
     command
         .args(args)
         .current_dir(cwd)
-        .env(WRITE_DELAY.0, WRITE_DELAY.1)
+        .env_remove(WRITE_DELAY)
         .env_remove("RUST_LOG")
         .env_remove("FERROS_LOG_FORMAT");
     for (name, value) in env {
@@ -81,7 +79,8 @@ fn file_log_contains_the_record_written_just_before_exit()
 {
     let home = scratch("exit");
     let home_os = OsString::from(&home);
-    let env = [("HOME", Some(&home_os))];
+    let delay = OsString::from("250");
+    let env = [("HOME", Some(&home_os)), (WRITE_DELAY, Some(&delay))];
     let output = log_and_exit(&home, &env);
 
     let log = ferros_log(&home.join(".ferros"));
@@ -141,18 +140,10 @@ fn without_a_home_an_empty_temp_directory_is_not_the_working_directory()
     let cwd = scratch("empty-tmp");
     let empty = OsString::new();
     let env = [("HOME", None), ("TMPDIR", Some(&empty))];
+    // File logging uses the same directory resolver. A launch here would
+    // append to a shared dated log under /tmp.
     let printed = printed_directory(&ferros(&["find-logs"], &cwd, &env));
-    assert!(printed.is_absolute(), "find-logs printed {printed:?}");
     assert_eq!(printed, PathBuf::from("/tmp"));
-
-    log_and_exit(&cwd, &env);
-    assert!(ferros_log(&printed).contains("ferros exiting"));
-    let stray = std::fs::read_dir(&cwd)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
-        .collect::<Vec<_>>();
-    assert!(stray.is_empty(), "the logger wrote into the working directory: {stray:?}");
     let _ = std::fs::remove_dir_all(&cwd);
 }
 

@@ -45,6 +45,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
+#[cfg(any(test, feature = "test-log-write-delay"))]
 use std::time::Duration;
 use std::{env, io};
 
@@ -316,8 +317,10 @@ pub fn start_file_logging(level: Option<LogLevel>, format: LogFormat) -> Result<
 {
     let directory = open_log_directory()?;
     let file = directory.join(dated_file_name("ferros"));
+    let appender = open_appender(&file, Rotation::NEVER)?;
+    #[cfg(any(test, feature = "test-log-write-delay"))]
     let appender = SlowWrites {
-        inner: open_appender(&file, Rotation::NEVER)?,
+        inner: appender,
         delay: test_write_delay(),
     };
     let (writer, worker) = tracing_appender::non_blocking(appender);
@@ -329,9 +332,11 @@ pub fn start_file_logging(level: Option<LogLevel>, format: LogFormat) -> Result<
 ///
 /// The exit tests set it so the last record is provably still queued when the
 /// program returns from `main`; only a flush that waits for the worker gets that
-/// record into the file. Unset (always, outside tests) it costs nothing.
+/// record into the file.
+#[cfg(any(test, feature = "test-log-write-delay"))]
 const TEST_WRITE_DELAY: &str = "FERROS_TEST_LOG_WRITE_DELAY_MS";
 
+#[cfg(any(test, feature = "test-log-write-delay"))]
 fn test_write_delay() -> Option<Duration>
 {
     let millis = env::var(TEST_WRITE_DELAY).ok()?.parse().ok()?;
@@ -339,12 +344,14 @@ fn test_write_delay() -> Option<Duration>
 }
 
 /// The log file behind the background worker, optionally slowed for tests.
+#[cfg(any(test, feature = "test-log-write-delay"))]
 struct SlowWrites<W>
 {
     inner: W,
     delay: Option<Duration>,
 }
 
+#[cfg(any(test, feature = "test-log-write-delay"))]
 impl<W: io::Write> io::Write for SlowWrites<W>
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>

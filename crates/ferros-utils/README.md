@@ -59,7 +59,7 @@ fn main() {
 - `RUST_LOG`: Set log level filter (e.g., `debug`, `ferros_core=debug,ferros=info`)
 - `FERROS_LOG_FORMAT`: Set output format (`json` or `pretty`, default: `pretty`)
 - `FERROS_LOG_FILE`: Optional path to log file for `init_logging` (if not set, logs only to console)
-- `FERROS_TEST_LOG_WRITE_DELAY_MS`: Test-only. Slows each write of the `start_file_logging` worker, so the exit tests can prove the last record is still queued when `main` returns.
+- `FERROS_TEST_LOG_WRITE_DELAY_MS`: Available with the `test-log-write-delay` feature, enabled by the CLI's dev-dependency. Slows each write of the `start_file_logging` worker so the exit regression test can prove the last record is still queued when `main` returns.
 
 ### Examples
 

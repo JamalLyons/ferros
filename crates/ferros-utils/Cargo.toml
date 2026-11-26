@@ -11,6 +11,10 @@ keywords = ["debugger", "rust", "utilities", "logging"]
 categories = ["development-tools"]
 publish = false
 
+[features]
+# Enabled by the CLI's dev-dependency for the process-exit regression test.
+test-log-write-delay = []
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }

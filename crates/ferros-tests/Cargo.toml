@@ -16,8 +16,11 @@ categories = ["development-tools"]
 [target.'cfg(target_os = "macos")'.dependencies]
 ferros-core = { path = "../ferros-core" }
 ferros-macos = { path = "../ferros-macos" }
-# `symbols::function_address` reads fixture symbol tables (Mach-O, no DWARF).
-object = { workspace = true }
+# Direct dependency, not a workspace pin: only this crate's macOS-gated code and
+# ferros-macos parse Mach-O. `symbols::function_address`, fixture staging, and the
+# native tests read symbol tables (no DWARF). `compression` is left off; ferros-macos
+# enables it, and Cargo unifies that feature onto this copy when both are built.
+object = { version = "0.41.0", default-features = false, features = ["std", "read", "macho"] }
 rustc-demangle = "0.1"
 # The `workqueue` fixture submits GCD work items without `unsafe`.
 dispatch2 = { version = "0.3.0", default-features = false, features = ["std"] }

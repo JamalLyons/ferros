@@ -60,11 +60,11 @@ pub const X86_THREAD_STATE64_COUNT: mach_msg_type_number_t = 42;
 #[cfg(target_arch = "aarch64")]
 pub const ARM_NEON_STATE64: c_int = 17;
 
-/// ARM64 NEON state count (520 bytes / 4 = 130 u32 values)
+/// ARM64 NEON state count (528 bytes / 4 = 132 u32 values).
 ///
-/// The number of `natural_t` (u32) values required to hold ARM64 NEON state.
+/// Mach counts the whole 16-byte-aligned structure, including its trailing padding.
 #[cfg(target_arch = "aarch64")]
-pub const ARM_NEON_STATE64_COUNT: mach_msg_type_number_t = 130;
+pub const ARM_NEON_STATE64_COUNT: mach_msg_type_number_t = 132;
 
 /// x86-64 floating-point state flavor (flavor 5)
 ///

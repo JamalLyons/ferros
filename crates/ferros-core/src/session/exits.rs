@@ -16,7 +16,7 @@ use super::Session;
 use super::images::same_image;
 use super::stack::BackendTarget;
 use crate::backend::StopEvent;
-use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
+use crate::breakpoints::{BreakpointId, BreakpointKind};
 use crate::error::Result;
 use crate::objfile::MappedSymbols;
 use crate::runtime::ExitSource;
@@ -106,6 +106,22 @@ impl ExitHooks
         self.cleanup_pending
     }
 
+    pub(super) fn cleanup_pending_at(&self, id: BreakpointId) -> bool
+    {
+        self.cleanup_pending
+            && self
+                .hooks
+                .iter()
+                .any(|hook| hook.id == id && !matches!(hook.owner, SiteOwner::User))
+    }
+
+    pub(super) fn claim_site(&mut self, id: BreakpointId)
+    {
+        for hook in self.hooks.iter_mut().filter(|hook| hook.id == id) {
+            hook.owner = SiteOwner::User;
+        }
+    }
+
     /// Whether an exit of the thread is being stepped.
     pub(super) fn leaving(&self) -> bool
     {
@@ -133,7 +149,7 @@ impl Session
             Some(_) => SiteOwner::Disabled,
             None => SiteOwner::Private,
         };
-        let id = self.add_breakpoint(BreakpointRequest::Software { address })?;
+        let id = self.add_software_breakpoint(address)?;
         self.enable_breakpoint(id)?;
         Ok((id, owner))
     }

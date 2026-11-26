@@ -675,15 +675,16 @@ fn resume_retries_a_failed_handler_exit_hook_release()
     assert_eq!(mock.script_len(), 0);
 }
 
-/// The peer's queued stop is reported by the source step. A failed restore must not
-/// let an exit hook consume it and reissue the handler's previous continue.
+/// The peer reached the private exit hook as the handler was interrupted. The next
+/// source step restores the hook before classifying that queued stop.
 #[test]
-fn source_step_reports_queued_stop_at_handler_hook_pending_cleanup()
+fn source_step_drops_queued_stop_at_handler_hook_pending_cleanup()
 {
     let mock = handler_stopped_with_long_jump();
     let mut session = exit_session(&mock);
     session.launch(&LaunchSpec::new("queued-exit-hook-stop")).expect("launch");
     handler_stopped_in_its_handler(&mock, &mut session);
+    let original = mock.peek_memory(LONG_JUMP, 4).expect("original bytes");
 
     let queued = StopEvent::Breakpoint {
         thread: THREAD,
@@ -691,7 +692,7 @@ fn source_step_reports_queued_stop_at_handler_hook_pending_cleanup()
     };
     mock.script_simultaneous(vec![
         MockStop::new(StopEvent::Interrupted { thread: Some(HANDLER) }).expect_resume(ResumeRequest::continue_all()),
-        MockStop::new(queued.clone()).set_pc(THREAD, LONG_JUMP),
+        MockStop::new(queued).set_pc(THREAD, LONG_JUMP),
     ]);
     session.resume().expect("run the handler");
     let error = exit_restore_error();
@@ -699,18 +700,50 @@ fn source_step_reports_queued_stop_at_handler_hook_pending_cleanup()
     assert!(matches!(session.wait(None), Err(DebuggerError::Backend(actual)) if actual == error));
     assert_eq!(mock.pending_len(), 1);
 
-    // If the old continue is reissued, it steps the peer off the hook before running all threads.
     mock.script(
-        MockStop::new(StopEvent::SingleStep { thread: THREAD })
-            .set_pc(THREAD, LONG_JUMP + 4)
-            .expect_resume(ResumeRequest::step(THREAD)),
+        MockStop::new(StopEvent::SingleStep { thread: HANDLER })
+            .set_pc(HANDLER, INTERRUPTED + 36)
+            .expect_resume(ResumeRequest::step(HANDLER)),
     );
-    mock.script(MockStop::new(StopEvent::Exited { code: 0 }).expect_resume(ResumeRequest::continue_all()));
     let _ = mock.take_calls();
-    session.step_over().expect("defer the queued stop");
-    let stop = session.wait(None).expect("report the queued stop");
-    assert_eq!(resumes(&mock), [], "the source step must not reissue the old continue");
-    assert_eq!(stop, Some(queued));
+    session.step_over().expect("restore the exit hook and step");
+    assert_eq!(
+        session.wait(None).expect("report the source step"),
+        Some(StopEvent::SingleStep { thread: HANDLER })
+    );
+    assert_eq!(resumes(&mock), vec![ResumeRequest::step(HANDLER)]);
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(original));
+    assert_eq!(mock.peek_registers(THREAD).expect("peer registers").pc, LONG_JUMP);
+    assert_eq!(mock.pending_len(), 0);
+}
+
+#[test]
+fn handler_exit_cleanup_preserves_a_new_low_level_breakpoint()
+{
+    use ferros_core::BreakpointRequest;
+
+    let (mock, mut session, original) = handler_return_with_failed_exit_restore();
+    let id = session
+        .add_breakpoint(BreakpointRequest::Software { address: LONG_JUMP })
+        .expect("claim the existing exit hook");
+    let hit = StopEvent::Breakpoint {
+        thread: THREAD,
+        pc: LONG_JUMP,
+    };
+    mock.script(handler_step_off());
+    mock.script(
+        MockStop::new(hit.clone())
+            .set_pc(THREAD, LONG_JUMP)
+            .expect_resume(ResumeRequest::continue_all()),
+    );
+    session.resume().expect("retry cleanup before continuing");
+
+    assert!(session.breakpoint_info(id).expect("claimed breakpoint survived").enabled);
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(arch::Arm64::TRAP_INSTRUCTION.to_vec()));
+    assert_eq!(session.wait(None).expect("report the breakpoint"), Some(hit));
+    assert_eq!(session.breakpoint_info(id).expect("claimed breakpoint").hit_count, 1);
+    session.remove_breakpoint(id).expect("remove the claimed breakpoint");
+    assert_eq!(mock.peek_memory(LONG_JUMP, 4), Ok(original));
 }
 
 #[test]

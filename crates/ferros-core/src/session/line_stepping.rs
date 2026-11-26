@@ -41,6 +41,31 @@ pub(super) struct LinePlan
     cleanup_pending: bool,
 }
 
+impl LinePlan
+{
+    fn cleanup_pending_at(&self, id: BreakpointId) -> bool
+    {
+        self.cleanup_pending
+            && (self
+                .run_to
+                .as_ref()
+                .is_some_and(|site| site.id == id && !matches!(site.owner, SiteOwner::User))
+                || self.exits.as_ref().is_some_and(|exits| exits.cleanup_pending_at(id)))
+    }
+
+    pub(super) fn claim_site(&mut self, id: BreakpointId)
+    {
+        if let Some(site) = &mut self.run_to
+            && site.id == id
+        {
+            site.owner = SiteOwner::User;
+        }
+        if let Some(exits) = &mut self.exits {
+            exits.claim_site(id);
+        }
+    }
+}
+
 impl Session
 {
     /// Advance the selected thread to the next source line, stepping over calls.
@@ -117,8 +142,8 @@ impl Session
         if let Some(event) = self.backend_wait(Some(std::time::Duration::ZERO))? {
             // The session is stopped, so a queued single-step completion of this thread
             // (an interrupted step's late completion) or a breakpoint stop of a private
-            // trap that is already gone, of any thread (see `stale_trap`), belongs to no
-            // request; drop it and start the step, whose resume drains the rest
+            // trap, of any thread (see `stale_trap`), belongs to no request once the
+            // trap is gone. Drop it and start the step, whose resume drains the rest
             // (`run_line_to`, `step_instruction`). Anything else is reported first.
             let stale_step = event == (StopEvent::SingleStep { thread });
             if !stale_step && !self.stale_trap(None, &event)? {
@@ -416,13 +441,10 @@ impl Session
         }
     }
 
-    /// Whether `event` is a breakpoint stop left over from a private trap this session
-    /// already removed (a return trap or an unwinder resume hook): an interrupt can stop
-    /// the thread just as it reaches the trap, so the trap's exception is delivered
-    /// later, when no trap is at that address any more (none in the table and no trap
-    /// instruction of any form in memory, see
-    /// [`Arch::is_trap_instruction`](crate::arch::Arch::is_trap_instruction)). With
-    /// `thread`, only a stop of that thread qualifies.
+    /// Whether `event` is a queued breakpoint stop left over from a private trap. An
+    /// interrupt can stop a thread just as it reaches a trap, whose exception is delivered
+    /// after the operation has ended. Retry any pending restore of that site before
+    /// checking for a trap in memory. With `thread`, only a stop of that thread qualifies.
     pub(super) fn stale_trap(&mut self, thread: Option<ThreadId>, event: &StopEvent) -> Result<bool>
     {
         let StopEvent::Breakpoint { thread: stopped, pc } = *event else {
@@ -433,8 +455,21 @@ impl Session
         }
         let arch = self.arch()?;
         let address = arch.pc_after_trap(pc);
-        if self.breakpoints.id_for_kind(address, BreakpointKind::Software).is_some() {
-            return Ok(false);
+        if let Some(id) = self.breakpoints.id_for_kind(address, BreakpointKind::Software) {
+            if self.logical_breakpoint_at(address).is_some() {
+                return Ok(false);
+            }
+            if self.line_plan.as_ref().is_some_and(|plan| plan.cleanup_pending_at(id)) {
+                self.retry_line_cleanup()?;
+            } else if self.handler_exits.as_ref().is_some_and(|exits| exits.cleanup_pending_at(id)) {
+                self.retry_handler_cleanup()?;
+            } else {
+                return Ok(false);
+            }
+            // A temporarily enabled site may still have a disabled entry after cleanup.
+            if self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled) {
+                return Ok(false);
+            }
         }
         // Any trap instruction in memory makes the stop a real one: the program's own
         // (an arm64 `brk #1` Rust emits for a trap) as well as a trap of this session.

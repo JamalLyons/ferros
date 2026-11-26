@@ -15,8 +15,11 @@ use serde_json::{Value, json};
 /// Third-party crates that would give `ferros-core` access to an OS API.
 const OS_DEPENDENCIES: &[&str] = &["mach2", "libproc", "libc"];
 
-/// Source text that marks OS-specific code. Checked on every line, comments included,
-/// because the rule is that `grep -rn "target_os" crates/ferros-core/src` prints nothing.
+/// Source text that marks an operating-system switch. Checked on every line, comments
+/// included. `ferros-core` also rejects the other OS `cfg` predicates in
+/// [`core_os_violation`]: `unix`, `windows`, `target_family`, `target_vendor`,
+/// `target_env`, and the `std::os::unix` / `std::os::windows` modules. A scan for
+/// `target_os` alone missed `cfg(unix)` (#360, #365).
 const OS_SWITCH: &str = "target_os";
 
 /// Text that marks Mach-O knowledge, which belongs in `ferros-macos` only (ADR 0001).
@@ -392,6 +395,145 @@ fn cli_violation<'a>(path: &Path, line: &str, cli_platform_names: &'a BTreeSet<S
         .map(|name| ("only platform.rs may name a platform crate in the CLI", name.as_str()))
 }
 
+/// An OS `cfg` or OS-specific standard-library path on a `ferros-core` line.
+///
+/// `target_os` anywhere on the line, including a comment. `unix` and `windows` only as
+/// predicates of `cfg`, `cfg!` or `cfg_attr`, so a feature named `"unix"` and prose about
+/// a timestamp stay legal. `std::os::unix` and `std::os::windows` are the modules those
+/// predicates were importing.
+fn core_os_violation(line: &str) -> Option<(&'static str, &'static str)>
+{
+    if line.contains(OS_SWITCH) {
+        return Some(("ferros-core must not contain target_os", OS_SWITCH));
+    }
+    for marker in ["target_family", "target_vendor", "target_env"] {
+        if line.contains(marker) {
+            return Some(("ferros-core must not contain an OS cfg", marker));
+        }
+    }
+    for marker in ["std::os::unix", "std::os::windows"] {
+        if line.contains(marker) {
+            return Some(("ferros-core must not name an OS-specific std module", marker));
+        }
+    }
+    cfg_os_predicate(line).map(|marker| ("ferros-core must not contain an OS cfg", marker))
+}
+
+/// `unix` or `windows` used as a predicate inside `cfg(...)`, `cfg!(...)` or
+/// `cfg_attr(...)` on `line`.
+fn cfg_os_predicate(line: &str) -> Option<&'static str>
+{
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let word_start = index == 0 || !is_ident_byte(bytes[index - 1]);
+        if word_start && bytes[index..].starts_with(b"cfg") {
+            let mut cursor = index + 3;
+            if bytes.get(cursor..).is_some_and(|rest| rest.starts_with(b"_attr")) {
+                cursor += 5;
+            }
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) == Some(&b'!') {
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+            }
+            if bytes.get(cursor) == Some(&b'(')
+                && let Some(name) = os_predicate_in(cfg_arguments(&line[cursor + 1..]))
+            {
+                return Some(name);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_ident_byte(byte: u8) -> bool
+{
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The text inside the parentheses that start at the beginning of `args`, which is the
+/// first byte after `(`.
+fn cfg_arguments(args: &str) -> &str
+{
+    let mut depth = 1i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, character) in args.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if character == '\\' {
+                escape = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &args[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// The first `unix` or `windows` identifier in a `cfg` argument list. Text inside a
+/// string is not an identifier, so `feature = "unix"` does not match.
+fn os_predicate_in(body: &str) -> Option<&'static str>
+{
+    const NAMES: &[&str] = &["unix", "windows"];
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if is_ident_byte(byte) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_ident_byte(bytes[index]) {
+                index += 1;
+            }
+            let word = &body[start..index];
+            if let Some(name) = NAMES.iter().copied().find(|name| *name == word) {
+                return Some(name);
+            }
+            continue;
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Checks `path` (relative to the crate directory) against the rules for crate `owner`.
 fn source_violation<'a>(
     owner: &str,
@@ -403,8 +545,8 @@ fn source_violation<'a>(
     match owner {
         "ferros" => return cli_violation(path, line, cli_platform_names),
         "ferros-core" => {
-            if line.contains(OS_SWITCH) {
-                return Some(("ferros-core must not contain target_os", OS_SWITCH));
+            if let Some((rule, marker)) = core_os_violation(line) {
+                return Some((rule, marker));
             }
             if unsafe_on_code_line(line) {
                 return Some(("ferros-core must not contain unsafe code", "unsafe"));
@@ -692,13 +834,29 @@ platform.path = "../platform"
 const SOURCE_LINES_FORBIDDEN: &[&str] = &[
     "#[cfg(target_os = \"macos\")]",
     "// see cfg(target_os)",
+    "    #[cfg(unix)]",
+    "    #[cfg(not(unix))]",
+    "    if cfg!(windows) {}",
+    "    #[cfg_attr(unix, allow(dead_code))]",
+    "    #[cfg(target_family = \"unix\")]",
+    "        use std::os::unix::fs::MetadataExt;",
     "    unsafe { run() }",
     "unsafe fn f() {}",
     "unsafe{ run() }",
     "unsafe\timpl Trait for T {}",
     "unsafe",
 ];
-const SOURCE_LINES_ALLOWED: &[&str] = &["/// Never write unsafe { ... } here", "#![forbid(unsafe_code)]", "let x = 1;"];
+const SOURCE_LINES_ALLOWED: &[&str] = &[
+    "/// Never write unsafe { ... } here",
+    "#![forbid(unsafe_code)]",
+    "let x = 1;",
+    "#[cfg(target_arch = \"aarch64\")]",
+    "#[cfg(any(test, feature = \"test-util\"))]",
+    "#[cfg(feature = \"unix\")]",
+    "#[cfg(notunix)]",
+    "/// a unix timestamp is not an OS cfg",
+    "let windows = 1;",
+];
 const MACH_O_LINES_FORBIDDEN: &[&str] = &[
     "const MH_MAGIC_64: u32 = 0xfeed_facf;",
     "if magic == 0xfeedfacf {",
@@ -902,6 +1060,59 @@ fn ferros_utils_forbids_unsafe_code()
         rust_lints.is_some_and(|mut lints| lints.any(|line| line.trim() == "unsafe_code = \"forbid\"")),
         "ferros-utils must forbid unsafe code in its rustc lints"
     );
+}
+
+/// The lines PR #360 added under `cfg(unix)`. A checker that only searches for
+/// `target_os` accepts every one of them (#365).
+#[test]
+fn unix_cfg_in_core_is_rejected()
+{
+    const LEAK: &[&str] = &[
+        "    #[cfg(unix)]",
+        "    #[cfg(not(unix))]",
+        "        use std::os::unix::fs::MetadataExt;",
+        "    if cfg!(unix) {}",
+        "    if cfg!(not(windows)) {}",
+        "    #[cfg_attr(unix, allow(dead_code))]",
+        "    #[cfg(target_family = \"unix\")]",
+        "    #[cfg(any(unix, windows))]",
+        "    #[cfg(all(not(windows), feature = \"x\"))]",
+    ];
+    const FILE: &str = "\
+#[cfg(unix)]
+fn of(metadata: &fs::Metadata) -> Option<Self> {
+    use std::os::unix::fs::MetadataExt;
+    Some(())
+}
+#[cfg(not(unix))]
+fn of(_: &fs::Metadata) -> Option<Self> {
+    None
+}
+";
+    const FILES: &[(&str, &str)] = &[
+        ("src/lib.rs", "#![forbid(unsafe_code)]\n"),
+        ("src/symbols/load_inputs.rs", FILE),
+    ];
+    let names = BTreeSet::new();
+    let path = Path::new("src/symbols/load_inputs.rs");
+    for line in LEAK {
+        assert!(
+            !line.contains(OS_SWITCH),
+            "a target_os scan already rejects this line, so it does not prove the gap: {line}"
+        );
+        let violation = source_violation("ferros-core", path, line, &names);
+        assert!(violation.is_some(), "not rejected: {line}");
+    }
+
+    let report = synthetic_report("ferros-core", "crates/ferros-core", FILES);
+    assert!(
+        report
+            .iter()
+            .any(|line| line.starts_with("crates/ferros-core/src/symbols/load_inputs.rs:1:")),
+        "{report:?}"
+    );
+    assert!(report.iter().any(|line| line.contains("std::os::unix")), "{report:?}");
+    assert!(report.iter().any(|line| line.contains("not(unix)")), "{report:?}");
 }
 
 #[test]

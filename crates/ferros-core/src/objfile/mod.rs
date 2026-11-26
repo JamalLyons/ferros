@@ -43,7 +43,7 @@ pub use self::contents::{
     UnwindHint, UnwindHints,
 };
 pub use crate::symbols::image::{ImageMapping, ImageSegment};
-pub use crate::symbols::load_inputs::LoadInputs;
+pub use crate::symbols::load_inputs::{FileIdentity, FileIdentityReader, LoadInputs};
 use crate::types::Address;
 
 /// Reads of the target's memory, for an [`ObjectFormat`].
@@ -143,13 +143,26 @@ pub trait ObjectFormat: Send + Sync
 
     /// The files [`open_image`](Self::open_image) reads for the image at `path`, `path`
     /// included, in a stable order: companion debug files and any cache directory the
-    /// format consults. The session stamps them (size, timestamps and, where the
-    /// filesystem reports them, file number and status-change time) when a read fails
-    /// and reads again only once one of them changes. For paths derived from the opened
-    /// image, [`DebugInfoRetry`] can supply additional stamps. The default is `path` alone.
+    /// format consults. The session stamps them (size, timestamps and
+    /// [`file_identity_reader`](Self::file_identity_reader)) when a read fails and reads
+    /// again only once one of them changes. For paths derived from the opened image,
+    /// [`DebugInfoRetry`] can supply additional stamps. The default is `path` alone.
     fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
     {
         vec![path.to_path_buf()]
+    }
+
+    /// How this host identifies a file beyond its size and the timestamps a process can
+    /// set, or `None` when it has nothing to add.
+    ///
+    /// The session asks this while stamping [`load_inputs`](Self::load_inputs). A reader
+    /// that reports a status-change time or a file number makes a rewrite visible even
+    /// when the size stays the same and the modification time is restored (#346). The
+    /// platform crate supplies the reader; core only compares what it returns. The
+    /// default adds nothing, so that rewrite is not seen.
+    fn file_identity_reader(&self) -> Option<FileIdentityReader>
+    {
+        None
     }
 }
 

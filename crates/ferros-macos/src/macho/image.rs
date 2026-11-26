@@ -456,7 +456,7 @@ fn image_debug_info(
         Ok(Some(search)) => search,
         Err(error) => return (Err(error), None),
     };
-    let inputs = LoadInputs::of([search.cache_path.clone()]);
+    let inputs = LoadInputs::with_identity([search.cache_path.clone()], Some(crate::file_identity::unix_file_identity));
     let debug = companion_sections(path, &search, options, || debuginfo::has_debug_map(file));
     let retry: Option<DebugInfoRetry> = match &debug {
         Ok(_) => None,

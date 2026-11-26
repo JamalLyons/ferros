@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use ferros_core::error::Result as EngineResult;
 use ferros_core::objfile::{
-    DebugInfoRetry, ImageContents, ImageProbe, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, SymbolIndex, SymbolKey,
-    TargetMemory,
+    DebugInfoRetry, FileIdentityReader, ImageContents, ImageProbe, ImageSlice, MappedImage, MappedSymbols, ObjectFormat,
+    SymbolIndex, SymbolKey, TargetMemory,
 };
 use ferros_core::types::Address;
 use object::Endianness;
@@ -212,6 +212,13 @@ impl ObjectFormat for MachOFormat
     fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
     {
         debuginfo::load_inputs(path)
+    }
+
+    /// Device, file number and status-change time. A rewrite that keeps the size and
+    /// restores the modification time still moves the status-change time (#346).
+    fn file_identity_reader(&self) -> Option<FileIdentityReader>
+    {
+        Some(crate::file_identity::unix_file_identity)
     }
 }
 

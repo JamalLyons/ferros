@@ -115,14 +115,14 @@ struct MissingDebug
 }
 
 /// Stamps of the executable and of the files consulted for its companion debug information.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ImageLoadInputs
 {
     pub(crate) executable: LoadInputs,
     pub(crate) companions: CompanionLoadInputs,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CompanionLoadInputs
 {
     listed: LoadInputs,
@@ -380,10 +380,14 @@ impl SymbolCache
     pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor, previous: Option<&ImageLoadInputs>) -> ImageLoadInputs
     {
         let path = Self::canonical(descriptor).unwrap_or_else(|_| descriptor.path.clone());
+        let identity = self.format.file_identity_reader();
         ImageLoadInputs {
-            executable: LoadInputs::of([path.clone()]),
+            executable: LoadInputs::with_identity([path.clone()], identity),
             companions: CompanionLoadInputs {
-                listed: LoadInputs::of(self.format.load_inputs(&path).into_iter().filter(|input| *input != path)),
+                listed: LoadInputs::with_identity(
+                    self.format.load_inputs(&path).into_iter().filter(|input| *input != path),
+                    identity,
+                ),
                 discovered: previous.map_or_else(LoadInputs::default, |inputs| inputs.companions.discovered.refresh()),
             },
         }
@@ -444,5 +448,94 @@ impl SymbolCache
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    use super::SymbolCache;
+    use crate::objfile::mock::MockObjectFormat;
+    use crate::objfile::{
+        FileIdentity, FileIdentityReader, ImageContents, ImageSlice, MappedImage, MappedSymbols, ObjectFormat, TargetMemory,
+    };
+    use crate::symbols::ImageDescriptor;
+    use crate::types::Address;
+
+    /// [`MockObjectFormat`] that reports one fixed file identity.
+    struct Reporting(FileIdentityReader);
+
+    impl ObjectFormat for Reporting
+    {
+        fn file_identity_reader(&self) -> Option<FileIdentityReader>
+        {
+            Some(self.0)
+        }
+
+        fn mapped_symbols(
+            &self,
+            memory: &mut dyn TargetMemory,
+            load_address: Address,
+        ) -> Result<Arc<dyn MappedSymbols>, String>
+        {
+            MockObjectFormat.mapped_symbols(memory, load_address)
+        }
+
+        fn map_image(&self, memory: &mut dyn TargetMemory, load_address: Address) -> MappedImage
+        {
+            MockObjectFormat.map_image(memory, load_address)
+        }
+
+        fn open_image(
+            &self,
+            path: &std::path::Path,
+            load_address: u64,
+            slice: Option<&ImageSlice>,
+        ) -> crate::Result<ImageContents>
+        {
+            MockObjectFormat.open_image(path, load_address, slice)
+        }
+    }
+
+    fn fixed(_: &std::fs::Metadata) -> Option<FileIdentity>
+    {
+        Some(FileIdentity::new(1, 2, 3, 4))
+    }
+
+    fn moved(_: &std::fs::Metadata) -> Option<FileIdentity>
+    {
+        Some(FileIdentity::new(1, 2, 9, 0))
+    }
+
+    #[test]
+    fn cache_stamps_use_the_format_file_identity()
+    {
+        let path = std::env::temp_dir().join(format!("ferros-cache-identity-{}", std::process::id()));
+        let bytes = b"same-size-body";
+        let mut file = std::fs::File::create(&path).expect("create sample");
+        file.write_all(bytes).expect("write sample");
+        let modified = file.metadata().expect("sample metadata").modified().expect("sample mtime");
+        let descriptor = ImageDescriptor {
+            path: path.clone(),
+            load_address: 0x1000,
+        };
+
+        let cache = SymbolCache::new(Arc::new(Reporting(fixed)));
+        let first = cache.load_inputs(&descriptor, None);
+        file.seek(SeekFrom::Start(0)).expect("rewind sample");
+        file.write_all(bytes).expect("rewrite sample");
+        file.set_modified(modified).expect("restore mtime");
+        let again = cache.load_inputs(&descriptor, None);
+        assert_eq!(first, again, "the same identity must not look like a change");
+
+        let changed = SymbolCache::new(Arc::new(Reporting(moved))).load_inputs(&descriptor, None);
+        assert_ne!(
+            first, changed,
+            "the cache ignored the format's file identity for a same-size, same-mtime rewrite"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -204,6 +204,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod exception;
 pub mod ffi;
+mod file_identity;
 pub mod guards;
 pub mod images;
 pub mod launch;
@@ -217,6 +218,7 @@ pub mod terminal;
 pub mod threads;
 pub mod types;
 
+pub use file_identity::unix_file_identity;
 pub use macho::{DebugInfoOptions, MachOFormat};
 pub use runtime::MacOSRuntime;
 pub use task::MacOSBackend;

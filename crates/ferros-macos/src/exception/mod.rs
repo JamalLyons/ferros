@@ -20,7 +20,7 @@
 //! the running threads have stopped, so a thread that raised an exception at the same
 //! moment has queued its message by then: the loop drains the port without blocking and
 //! reports one event per message. It counts one suspend per stop in
-//! [`ExceptionSharedState::suspends`], answers client exception messages, and queues
+//! `ExceptionSharedState::suspends`, answers client exception messages, and queues
 //! their events under the shared lock. User code remains stopped by the task
 //! suspension. Keeping replies unanswered would prevent external SIGKILL from
 //! taking effect. The loop still services the port while stopped, suppressing and
@@ -77,9 +77,9 @@
 //! after 10 ms. A failed `task_suspend` for a handshake's private SIGSTOP counts
 //! against no retry budget: the handshake has taken the held batch apart.
 //!
-//! While such a batch is held, [`ExceptionSharedState::held_unsuspended`] is set. An
+//! While such a batch is held, `ExceptionSharedState::held_unsuspended` is set. An
 //! interrupt then takes the task suspend and hands it to the loop
-//! ([`ExceptionSharedState::interrupt_suspend`]) instead of queueing `Interrupted`: the
+//! (`ExceptionSharedState::interrupt_suspend`) instead of queueing `Interrupted`: the
 //! loop publishes the held batch with that suspend as the stop, so a held step or
 //! breakpoint cannot be published after a later resume it does not belong to. A thread
 //! is held at most once per batch, and a failed signal suppression is retried with the
@@ -107,7 +107,7 @@
 //!
 //! A selective resume uses `thread_suspend` to keep threads stopped. Their logical
 //! exception records and signal decisions remain in
-//! [`ExceptionSharedState::held`] until a later resume lets them run. Records own the
+//! `ExceptionSharedState::held` until a later resume lets them run. Records own the
 //! message's thread right even after an early reply; removing a record
 //! releases that right exactly once.
 //!
@@ -115,7 +115,7 @@
 //!
 //! A thread that completes a hardware single-step raises `EXC_BREAKPOINT` with codes
 //! `[EXC_ARM_BREAKPOINT, 0]`; a `brk` raises it with `[EXC_ARM_BREAKPOINT, pc]`, and no
-//! trap can be at address 0. [`stop_event_from_exception`] reports the first as
+//! trap can be at address 0. `stop_event_from_exception` reports the first as
 //! `StopEvent::SingleStep` and the second as `StopEvent::Breakpoint`.
 //!
 //! ## Port rights

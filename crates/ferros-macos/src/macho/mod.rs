@@ -3,7 +3,7 @@
 //! [`MachOFormat`] answers the engine's container questions for 64-bit little-endian
 //! Mach-O images as mapped in a target:
 //!
-//! - **Symbol tables** ([`symtab`]): an image's `LC_SYMTAB`, `LC_FUNCTION_STARTS` and
+//! - **Symbol tables** (`symtab`): an image's `LC_SYMTAB`, `LC_FUNCTION_STARTS` and
 //!   executable sections, read from its mapped header and `__LINKEDIT`, including images in
 //!   the dyld shared cache, which have no file of their own.
 //! - **Unlisted images**: code that no listed image contains (an image a backend leaves
@@ -16,7 +16,7 @@
 //!   the slice of a universal file to read (#169, #175).
 //! - **Image files** ([`image`], [`debuginfo`]): DWARF from the image, its `.dSYM`, a
 //!   UUID-keyed cache or `dsymutil` ([`DebugInfoOptions`]); `__eh_frame`,
-//!   `__eh_frame_hdr`, and `__unwind_info` (Apple compact unwind, [`compact_unwind`]) as
+//!   `__eh_frame_hdr`, and `__unwind_info` (Apple compact unwind, `compact_unwind`) as
 //!   the engine's unwind hints.
 //!
 //! Mach-O prefixes C-level names with an underscore (`_main`, `__ZN...`), which is not

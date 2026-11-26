@@ -437,9 +437,9 @@ impl Session
 {
     /// Add a logical breakpoint at `location` and insert a trap at each of its sites.
     ///
-    /// With a stopped process the location is resolved now (see the
-    /// [`location`](super::location) module) and an error adds nothing. With no process,
-    /// a source location is kept pending and resolved when one is launched or attached.
+    /// With a stopped process the location is resolved immediately and an error adds
+    /// nothing. With no process, a source location is kept pending and resolved when
+    /// a process is launched or attached.
     ///
     /// # Errors
     ///

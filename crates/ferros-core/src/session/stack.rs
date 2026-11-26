@@ -98,9 +98,9 @@ impl Session
     /// [`ObjectFormat`](crate::objfile::ObjectFormat); code in no listed image is named
     /// from the image whose header precedes it in memory, if the format searches for one.
     /// Its symbol's [`source`](crate::types::SymbolName::source) is
-    /// [`SymbolSource::SymbolTable`](crate::types::SymbolSource::SymbolTable) and it has
-    /// no location (see [`objfile`](crate::objfile)). A frame with neither has no
-    /// symbol. Memory is read through the backend as little-endian 64-bit words.
+    /// [`SymbolSource::SymbolTable`] and it has no location (see [`objfile`](crate::objfile)).
+    /// A frame with neither has no symbol. Memory is read through the backend as
+    /// little-endian 64-bit words.
     ///
     /// # Errors
     ///

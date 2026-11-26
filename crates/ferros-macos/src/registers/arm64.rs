@@ -94,7 +94,7 @@ pub fn fail_next_arm64_neon_write(also_fail_gpr_rollback: bool)
 /// ## Errors
 ///
 /// - `DebuggerError::Backend` with the `kern_return_t` of a failed `thread_get_state()`
-///   (see [`mach_failure`](crate::error::mach_failure))
+///   (see `mach_failure`)
 ///
 /// ## See Also
 ///

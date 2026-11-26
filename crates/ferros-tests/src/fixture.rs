@@ -74,7 +74,7 @@ impl Fixture
 {
     /// Creates a new fixture descriptor from its short name and executable path.
     ///
-    /// The path is used as given. [`fixture!`](crate::fixture) uses [`Fixture::stable`]
+    /// The path is used as given. [`fixture!`](crate::fixture!) uses [`Fixture::stable`]
     /// instead, so tests do not read Cargo's uplifted executable.
     #[must_use]
     pub fn from_built(name: &'static str, path: &'static str) -> Self
@@ -114,7 +114,7 @@ impl Fixture
         self.name
     }
 
-    /// Returns the path to the fixture executable (for [`fixture!`](crate::fixture), the
+    /// Returns the path to the fixture executable (for [`fixture!`](crate::fixture!), the
     /// stable copy).
     #[must_use]
     pub fn path(&self) -> &Path

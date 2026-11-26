@@ -45,8 +45,7 @@
 //! A hint cannot describe the instructions of a frame-record function before `x29` is set
 //! to its frame record or after the epilogue reloads `x29`/`x30`, nor a leaf after its
 //! epilogue released the stack. For an innermost frame with those hints, past the first
-//! instruction, the unwinder decodes the code around
-//! the pc ([`arch::arm64_frame`](crate::arch::arm64_frame)), read with
+//! instruction, the unwinder decodes the instructions around the pc, read with
 //! [`MemoryAccess::read_u32`]:
 //!
 //! 1. **Epilogue**: from the pc forward, the straight-line code to the `ret` (`ret`,
@@ -96,7 +95,7 @@
 //!
 //! How a trampoline frame is recognized and where the saved state lies belong to the
 //! platform: the unwinder asks the session's
-//! [`TargetRuntime::signal_context`](crate::runtime::TargetRuntime::signal_context)
+//! [`TargetRuntime::signal_context`]
 //! about every caller frame (arm64 only) before any other rule. A
 //! [`StackUnwinder::new`] without [`with_runtime`](StackUnwinder::with_runtime) finds
 //! none. When the runtime returns a [`SignalContext`], the trampoline's caller is the

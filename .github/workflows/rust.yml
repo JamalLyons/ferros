@@ -68,6 +68,10 @@ jobs:
       run: just fmt-check
     - name: Lint
       run: just lint
+    - name: Check rustdoc
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+      run: cargo doc --workspace --no-deps
     # Local runs and the other jobs build only arm64, so nothing else compiles the
     # x86_64 register code. Clippy denies warnings, as `just lint` does.
     - name: Lint ferros-macos for x86_64-apple-darwin

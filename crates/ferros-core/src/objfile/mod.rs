@@ -15,9 +15,12 @@
 //! recognizes and parses its own bytes.
 //!
 //! [`ObjectFormat`] is not part of [`Backend`](crate::Backend). Process control and
-//! container parsing stay separate (ADR 0001), and a test that drives
-//! [`MockBackend`](crate::backend::mock::MockBackend) uses
-//! [`mock::MockObjectFormat`] for symbol tables without any format's bytes.
+//! container parsing stay separate (ADR 0001).
+#![cfg_attr(
+    feature = "test-util",
+    doc = "Tests can pair [`MockBackend`](crate::backend::mock::MockBackend) with
+[`mock::MockObjectFormat`] to supply symbol tables without parsing object files."
+)]
 //!
 //! ## Symbol tables
 //!

@@ -6,15 +6,14 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// What can be observed of the files one symbol load reads, without reading them: the
-/// image itself and the companion files and directories its format consults
-/// ([`ObjectFormat::load_inputs`](crate::objfile::ObjectFormat::load_inputs)). Two
+/// image itself and the companion files and directories its format consults. Two
 /// equal stamps mean none of those files was created, removed, resized or modified in
 /// between, as far as the filesystem's size and timestamps tell.
 ///
 /// A file rewritten in place with the same size and its timestamps restored is not
 /// seen as changed; neither is one changed within the filesystem's timestamp resolution.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LoadInputs(Vec<(PathBuf, FileStamp)>);
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadInputs(Vec<(PathBuf, FileStamp)>);
 
 /// One path's stamp: the link itself and what it resolves to (equal for a regular
 /// file), so retargeting a symlink is seen too. `None` when the path does not exist or
@@ -52,7 +51,7 @@ impl MetadataStamp
 impl LoadInputs
 {
     /// Stamp `paths`, the files and directories one load of an image reads.
-    pub(crate) fn of(paths: impl IntoIterator<Item = PathBuf>) -> Self
+    pub fn of(paths: impl IntoIterator<Item = PathBuf>) -> Self
     {
         Self(
             paths
@@ -66,5 +65,10 @@ impl LoadInputs
                 })
                 .collect(),
         )
+    }
+
+    pub(crate) fn refresh(&self) -> Self
+    {
+        Self::of(self.0.iter().map(|(path, _)| path.clone()))
     }
 }

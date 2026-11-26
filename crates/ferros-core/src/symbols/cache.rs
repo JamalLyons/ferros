@@ -119,7 +119,23 @@ struct MissingDebug
 pub(crate) struct ImageLoadInputs
 {
     pub(crate) executable: LoadInputs,
-    pub(crate) companions: LoadInputs,
+    pub(crate) companions: CompanionLoadInputs,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct CompanionLoadInputs
+{
+    listed: LoadInputs,
+    discovered: LoadInputs,
+}
+
+impl ImageLoadInputs
+{
+    pub(crate) fn with_discovered_companions(mut self, image: &BinaryImage) -> Self
+    {
+        self.companions.discovered = image.debug_load_inputs();
+        self
+    }
 }
 
 impl SymbolCache
@@ -233,8 +249,9 @@ impl SymbolCache
         if let Some(existing) = self.images.get(&id).filter(|image| image.has_debug_info()) {
             return Ok(existing.clone());
         }
-        let inputs = self.load_inputs(&descriptor);
-        if let Some(missing) = self.missing_debug.get(&id).filter(|missing| missing.inputs == inputs) {
+        let missing = self.missing_debug.get(&id);
+        let inputs = self.load_inputs(&descriptor, missing.map(|missing| &missing.inputs));
+        if let Some(missing) = missing.filter(|missing| missing.inputs == inputs) {
             return Err(missing.error.duplicate());
         }
         let image = self.read_image(descriptor, slice);
@@ -245,6 +262,8 @@ impl SymbolCache
             // DWARF, since rereading unchanged files gives the same answer (#244).
             Err(error @ DebuggerError::NoDebugInfo { .. }) => {
                 let reported = error.duplicate();
+                let mut inputs = inputs;
+                inputs.companions.discovered = LoadInputs::default();
                 self.missing_debug.insert(id, MissingDebug { inputs, error });
                 return Err(reported);
             }
@@ -256,6 +275,7 @@ impl SymbolCache
         if let Some(error) = image.debug_error() {
             let error = error.duplicate();
             let reported = error.duplicate();
+            let inputs = inputs.with_discovered_companions(&image);
             self.missing_debug.insert(id, MissingDebug { inputs, error });
             return Err(reported);
         }
@@ -355,13 +375,17 @@ impl SymbolCache
     }
 
     /// Stamp the files [`load_image`](Self::load_image) would read for `descriptor`,
-    /// without reading them. A relative path that no longer resolves is stamped as given.
-    pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor) -> ImageLoadInputs
+    /// without reading them. Include any paths discovered on the previous attempt.
+    /// A relative path that no longer resolves is stamped as given.
+    pub(crate) fn load_inputs(&self, descriptor: &ImageDescriptor, previous: Option<&ImageLoadInputs>) -> ImageLoadInputs
     {
         let path = Self::canonical(descriptor).unwrap_or_else(|_| descriptor.path.clone());
         ImageLoadInputs {
             executable: LoadInputs::of([path.clone()]),
-            companions: LoadInputs::of(self.format.load_inputs(&path).into_iter().filter(|input| *input != path)),
+            companions: CompanionLoadInputs {
+                listed: LoadInputs::of(self.format.load_inputs(&path).into_iter().filter(|input| *input != path)),
+                discovered: previous.map_or_else(LoadInputs::default, |inputs| inputs.companions.discovered.refresh()),
+            },
         }
     }
 

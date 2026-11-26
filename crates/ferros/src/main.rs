@@ -49,8 +49,8 @@ enum Commands
         #[arg(long, value_name = "FILE")]
         stdin: Option<PathBuf>,
         /// Give the program the terminal while it runs, so it can read typed input and
-        /// change terminal settings. Ctrl-C and Ctrl-Z then reach the program as signals
-        /// (stops for signal 2 and 18); ferros takes the terminal back at each stop
+        /// change terminal settings. Ctrl-C and Ctrl-Z then stop the program with
+        /// SIGINT and SIGTSTP. Ferros takes the terminal back at each stop
         #[arg(long)]
         terminal: bool,
         /// Path to the executable to launch
@@ -288,7 +288,7 @@ fn run_session(target: Target, mode: Mode, jobs: &mut dyn JobControl) -> bool
     // ours afterwards so signals received while a command runs reach wait_for_stop.
     // At the prompt Ctrl-C is a raw-mode key, handled by the editor itself.
     let interrupt = repl::interrupt::install();
-    let started = create_session().and_then(|session| Debugger::start(session, target));
+    let started = create_session().and_then(|session| Debugger::start(session, target, platform::terminal_signals()));
     let (mut debugger, message) = match started {
         Ok(started) => started,
         Err(error) => {

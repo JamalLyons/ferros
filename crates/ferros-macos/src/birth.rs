@@ -717,10 +717,7 @@ fn resolve_main_entry(task: mach_port_t, pid: ProcessId) -> Result<Option<BirthS
             "dyld image list is unreadable ({err}); new threads cannot be suspended"
         ))
     })?;
-    let Some(image) = main_executable(&images).map_err(BirthInstallError::Os)? else {
-        return Ok(None);
-    };
-    let load = image.load_address.value();
+    let load = main_executable(&images).load_address.value();
     let header = read_target(task, load, 32).map_err(BirthInstallError::Os)?;
     if header.len() < 32 || u32::from_le_bytes(header[..4].try_into().expect("magic")) != MH_MAGIC_64 {
         return Ok(None);
@@ -747,22 +744,14 @@ fn resolve_main_entry(task: mach_port_t, pid: ProcessId) -> Result<Option<BirthS
     }))
 }
 
-/// The image marked [`ImageRole::MainExecutable`], wherever it is listed, so a list
-/// without one or in another order never has a library parsed for `LC_MAIN`. `None`
-/// when no image is marked; an error when several are, which breaks the
-/// [`ImageRole`] contract.
-fn main_executable(images: &[LoadedImage]) -> Result<Option<&LoadedImage>, String>
+/// The image marked [`ImageRole::MainExecutable`], wherever it is listed.
+/// The adapter validates that there is exactly one.
+fn main_executable(images: &[LoadedImage]) -> &LoadedImage
 {
-    let mut mains = images.iter().filter(|image| image.role == ImageRole::MainExecutable);
-    let main = mains.next();
-    if let Some(second) = mains.next() {
-        return Err(format!(
-            "the dyld image list marks more than one main executable ({} and {})",
-            main.map_or_else(String::new, |main| main.path.display().to_string()),
-            second.path.display()
-        ));
-    }
-    Ok(main)
+    images
+        .iter()
+        .find(|image| image.role == ImageRole::MainExecutable)
+        .expect("validated image list contains a main executable")
 }
 
 const LC_MAIN: u32 = 0x8000_0028;
@@ -1047,23 +1036,8 @@ mod tests
     {
         let library = image("/usr/lib/libSystem.B.dylib", ImageRole::Library);
         let main = image("/bin/prog", ImageRole::MainExecutable);
-        let images = [library.clone(), main.clone()];
-        assert_eq!(main_executable(&images).unwrap().map(|image| &image.path), Some(&main.path));
-        assert!(main_executable(std::slice::from_ref(&library)).unwrap().is_none());
-        assert!(main_executable(&[]).unwrap().is_none());
-    }
-
-    /// Two images marked as the main executable break the `ImageRole` contract: report it
-    /// rather than use the first.
-    #[test]
-    fn two_marked_main_executables_are_reported()
-    {
-        let images = [
-            image("/bin/first", ImageRole::MainExecutable),
-            image("/bin/second", ImageRole::MainExecutable),
-        ];
-        let error = main_executable(&images).unwrap_err();
-        assert!(error.contains("/bin/first") && error.contains("/bin/second"), "{error}");
+        let images = [library, main.clone()];
+        assert_eq!(main_executable(&images).path, main.path);
     }
 
     /// On this machine both pthread entries are `stp xzr, xzr, [sp, #-16]!` then `bl`.

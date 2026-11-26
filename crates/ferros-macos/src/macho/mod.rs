@@ -208,11 +208,10 @@ impl ObjectFormat for MachOFormat
         image::open(path, load_address, target.as_ref(), &self.debug_info)
     }
 
-    /// The image, its `.dSYM` bundle's DWARF directory and members, and the debug cache
-    /// directory.
+    /// The image and its `.dSYM` bundle's DWARF directory and members.
     fn load_inputs(&self, path: &Path) -> Vec<PathBuf>
     {
-        debuginfo::load_inputs(path, &self.debug_info)
+        debuginfo::load_inputs(path)
     }
 }
 

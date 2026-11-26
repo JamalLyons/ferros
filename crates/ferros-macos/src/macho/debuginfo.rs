@@ -152,18 +152,18 @@ fn companion(path: &Path, uuid: [u8; 16], architecture: object::Architecture) ->
     matching_slice(&bytes, uuid, architecture).map(<[u8]>::to_vec)
 }
 
-/// Identity of the validated executable slice whose companion we are looking for.
-#[derive(Clone, Copy)]
+/// Identity and cache path for the validated executable slice's companion.
 pub(crate) struct CompanionSearch
 {
     uuid: [u8; 16],
     architecture: object::Architecture,
+    pub(crate) cache_path: PathBuf,
 }
 
 impl CompanionSearch
 {
     /// Embedded DWARF takes precedence over a companion.
-    pub(crate) fn for_executable(path: &Path, file: &object::File<'_>) -> Result<Option<Self>>
+    pub(crate) fn for_executable(path: &Path, file: &object::File<'_>, options: &DebugInfoOptions) -> Result<Option<Self>>
     {
         if has_dwarf(file) {
             return Ok(None);
@@ -172,9 +172,13 @@ impl CompanionSearch
             .mach_uuid()
             .map_err(|error| no_debug_info(path, format!("cannot read executable UUID: {error}")))?
             .ok_or_else(|| no_debug_info(path, "executable has no Mach-O UUID for companion lookup"))?;
+        let architecture = file.architecture();
+        let uuid_key: String = uuid.iter().map(|byte| format!("{byte:02x}")).collect();
+        let cache_path = options.cache_directory.join(format!("{uuid_key}-{architecture:?}.dwarf"));
         Ok(Some(Self {
             uuid,
-            architecture: file.architecture(),
+            architecture,
+            cache_path,
         }))
     }
 }
@@ -183,12 +187,16 @@ impl CompanionSearch
 /// decide whether generation is possible after both companion lookups miss.
 pub(crate) fn discover_companion(
     path: &Path,
-    search: CompanionSearch,
+    search: &CompanionSearch,
     options: &DebugInfoOptions,
     has_map: impl FnOnce() -> bool,
 ) -> Result<Vec<u8>>
 {
-    let CompanionSearch { uuid, architecture } = search;
+    let CompanionSearch {
+        uuid,
+        architecture,
+        ref cache_path,
+    } = *search;
 
     if let Ok(entries) = fs::read_dir(dwarf_directory(path)) {
         // UUID and architecture, not the DWARF member's name, establish identity.
@@ -199,9 +207,7 @@ pub(crate) fn discover_companion(
         }
     }
 
-    let uuid_key: String = uuid.iter().map(|byte| format!("{byte:02x}")).collect();
-    let cache_path = options.cache_directory.join(format!("{uuid_key}-{architecture:?}.dwarf"));
-    if let Some(bytes) = companion(&cache_path, uuid, architecture) {
+    if let Some(bytes) = companion(cache_path, uuid, architecture) {
         return Ok(bytes);
     }
     if !has_map() {
@@ -263,18 +269,19 @@ pub(crate) fn discover_companion(
     })?;
     // The temporary file is on the same filesystem. Readers see either the previous
     // entry or a fully generated and validated file, including concurrent generation.
-    if let Err(error) = fs::rename(&output, &cache_path)
-        && companion(&cache_path, uuid, architecture).is_none()
+    if let Err(error) = fs::rename(&output, cache_path)
+        && companion(cache_path, uuid, architecture).is_none()
     {
         return Err(no_debug_info(path, format!("cannot publish debug cache: {error}")));
     }
     Ok(bytes)
 }
 
-/// The files [`discover_companion`] and the image parse read for the image at `path`, in a stable
-/// order: the image, its `.dSYM` bundle's DWARF directory and members, and the debug
-/// cache directory.
-pub(crate) fn load_inputs(path: &Path, options: &DebugInfoOptions) -> Vec<PathBuf>
+/// Inputs known before opening the image: the image and its adjacent DWARF directory
+/// and members. The search adds the UUID cache entry after it has the slice identity.
+/// The cache directory itself changes even when a tool workspace is created and removed
+/// without publishing an entry.
+pub(crate) fn load_inputs(path: &Path) -> Vec<PathBuf>
 {
     let dwarf_directory = dwarf_directory(path);
     let mut members: Vec<_> = fs::read_dir(&dwarf_directory)
@@ -283,7 +290,6 @@ pub(crate) fn load_inputs(path: &Path, options: &DebugInfoOptions) -> Vec<PathBu
     members.sort();
     let mut inputs = vec![path.to_path_buf(), dwarf_directory];
     inputs.extend(members);
-    inputs.push(options.cache_directory.clone());
     inputs
 }
 
@@ -403,9 +409,9 @@ mod tests
     fn discover(path: &Path, executable: &[u8], options: &DebugInfoOptions) -> Result<Vec<u8>>
     {
         let file = object::File::parse(executable).unwrap();
-        match CompanionSearch::for_executable(path, &file)? {
+        match CompanionSearch::for_executable(path, &file, options)? {
             None => Ok(executable.to_vec()),
-            Some(search) => discover_companion(path, search, options, || has_debug_map(&file)),
+            Some(search) => discover_companion(path, &search, options, || has_debug_map(&file)),
         }
     }
 

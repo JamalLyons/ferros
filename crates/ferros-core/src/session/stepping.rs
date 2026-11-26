@@ -513,17 +513,21 @@ impl Session
     }
 
     /// `Backend::wait`, minus the `SingleStep` of an abandoned internal step (see
-    /// `stale_step`), which belongs to no request of the caller.
+    /// `stale_step`), which belongs to no request of the caller. A finite timeout
+    /// covers both the discarded stop and the next wait.
     pub(super) fn backend_wait(&mut self, timeout: Option<std::time::Duration>) -> Result<Option<StopEvent>>
     {
+        let started = std::time::Instant::now();
+        let mut remaining = timeout;
         loop {
-            let event = self.backend.wait(timeout)?;
+            let event = self.backend.wait(remaining)?;
             if event.is_some() {
                 self.stop_generation = self.stop_generation.wrapping_add(1);
             }
             match (&event, self.stale_step) {
                 (Some(StopEvent::SingleStep { thread }), Some(stale)) if *thread == stale => {
                     self.stale_step = None;
+                    remaining = timeout.map(|limit| limit.saturating_sub(started.elapsed()));
                 }
                 _ => return Ok(event),
             }

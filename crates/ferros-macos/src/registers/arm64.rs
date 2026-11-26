@@ -23,7 +23,7 @@
 //! Index 30:     LR (X30) (2 u32s)
 //! Index 31:     SP (2 u32s)
 //! Index 32:     PC (2 u32s)
-//! Index 33:     CPSR + padding (2 u32s)
+//! Index 33:     CPSR + format flags or padding (2 u32s)
 //! Total: 34 u64s = 68 u32s
 //! ```
 //!
@@ -33,15 +33,34 @@
 //! - [ARM CPSR Register](https://developer.arm.com/documentation/dui0801/a/A32-and-T32-Instructions/CPSR)
 //! - [ARM_THREAD_STATE64 structure](https://opensource.apple.com/source/xnu/xnu-4570.71.2/osfmk/mach/arm/_structs.h)
 
+use std::cell::Cell;
+
+use ferros_core::BackendResult;
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::types::{Address, Architecture, Registers, VectorRegisterValue};
 use libc::{mach_msg_type_number_t, natural_t, thread_act_t};
 #[cfg(target_os = "macos")]
 use mach2::kern_return::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
+use mach2::port::MACH_PORT_NULL;
 use tracing::debug;
 
-use crate::error::mach_failure;
+use crate::error::{mach_failure, reword};
 use crate::{constants, ffi};
+
+type ArmGprState64 = [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize];
+
+thread_local! {
+    static NEON_WRITE_FAULT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Test hook: fail the next ARM64 NEON write on the calling debugger thread by
+/// sending `thread_set_state` to `MACH_PORT_NULL`. With `also_fail_gpr_rollback`, the
+/// GPR rollback after it fails the same way. The fault is consumed by the next write.
+#[doc(hidden)]
+pub fn fail_next_arm64_neon_write(also_fail_gpr_rollback: bool)
+{
+    NEON_WRITE_FAULT.set(Some(also_fail_gpr_rollback));
+}
 
 /// Read ARM64 registers from a thread
 ///
@@ -54,9 +73,8 @@ use crate::{constants, ffi};
 ///
 /// ## Returns
 ///
-/// `Ok(Registers)` containing all register values, or an error if:
-/// - `thread_get_state()` failed
-/// - NEON state read failed (non-fatal, logged as debug)
+/// `Ok(Registers)` containing all available register values. NEON state is omitted
+/// when Mach reports that the flavor is unavailable.
 ///
 /// ## Registers Read
 ///
@@ -83,65 +101,47 @@ use crate::{constants, ffi};
 /// - [thread_get_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_get_state/)
 pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 {
-    unsafe {
-        // Allocate array to hold thread state
-        // macOS returns registers as an array of natural_t (u32)
-        // We need 68 u32s to hold all ARM64 registers
-        let mut state_words: [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize] =
-            [0; constants::ARM_THREAD_STATE64_COUNT as usize];
-        let mut count: mach_msg_type_number_t = constants::ARM_THREAD_STATE64_COUNT;
+    let state_words = fetch_arm64_gpr_state(thread)?;
 
-        // Call thread_get_state to read registers
-        let result = ffi::thread_get_state(thread, constants::ARM_THREAD_STATE64, state_words.as_mut_ptr(), &mut count);
+    // macOS stores each 64-bit register as two little-endian words.
+    let read_u64 = |idx: usize| -> u64 {
+        let low = state_words[idx * 2];
+        let high = state_words[idx * 2 + 1];
+        (low as u64) | ((high as u64) << 32)
+    };
 
-        // Check if the call succeeded
-        if result != KERN_SUCCESS {
-            return Err(mach_failure("thread_get_state(ARM_THREAD_STATE64)", result).into());
-        }
+    let mut regs = Registers::new();
+    regs.set_architecture(Architecture::Arm64);
+    regs.pc = Address::from(read_u64(constants::ARM64_PC_INDEX));
+    regs.sp = Address::from(read_u64(constants::ARM64_SP_INDEX));
+    regs.fp = Address::from(read_u64(constants::ARM64_FP_INDEX));
+    regs.status = state_words[constants::ARM64_CPSR_INDEX] as u64;
+    regs.general = (0..=30).map(read_u64).collect();
 
-        // Helper function to read a u64 from two u32s
-        // macOS stores 64-bit registers as two 32-bit values in little-endian format:
-        // - Low 32 bits at index i * 2
-        // - High 32 bits at index i * 2 + 1
-        let read_u64 = |idx: usize| -> u64 {
-            let low = state_words[idx * 2];
-            let high = state_words[idx * 2 + 1];
-            (low as u64) | ((high as u64) << 32)
-        };
-
-        // Parse the register values from the state array
-        let mut regs = Registers::new();
-        regs.set_architecture(Architecture::Arm64);
-
-        // Program Counter: Points to the next instruction to execute
-        regs.pc = Address::from(read_u64(constants::ARM64_PC_INDEX));
-
-        // Stack Pointer: Points to the top of the stack
-        regs.sp = Address::from(read_u64(constants::ARM64_SP_INDEX));
-
-        // Frame Pointer: Points to the current stack frame
-        regs.fp = Address::from(read_u64(constants::ARM64_FP_INDEX));
-
-        // CPSR (Current Program Status Register): Contains flags
-        regs.status = state_words[constants::ARM64_CPSR_INDEX] as u64;
-
-        // General-purpose registers: X0-X30
-        regs.general = (0..=30).map(read_u64).collect();
-
-        if let Some(neon) = fetch_arm64_neon_state(thread)? {
-            regs.vector = neon.v.iter().map(|&value| VectorRegisterValue::from_u128(value)).collect();
-            regs.floating.fpsr = Some(neon.fpsr);
-            regs.floating.fpcr = Some(neon.fpcr);
-        }
-
-        Ok(regs)
+    if let Some(neon) = fetch_arm64_neon_state(thread)? {
+        regs.vector = neon.v.iter().map(|&value| VectorRegisterValue::from_u128(value)).collect();
+        regs.floating.fpsr = Some(neon.fpsr);
+        regs.floating.fpcr = Some(neon.fpcr);
     }
+
+    Ok(regs)
+}
+
+fn fetch_arm64_gpr_state(thread: thread_act_t) -> BackendResult<ArmGprState64>
+{
+    let mut state = [0; constants::ARM_THREAD_STATE64_COUNT as usize];
+    let mut count: mach_msg_type_number_t = constants::ARM_THREAD_STATE64_COUNT;
+    let result = unsafe { ffi::thread_get_state(thread, constants::ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count) };
+    if result != KERN_SUCCESS {
+        return Err(mach_failure("thread_get_state(ARM_THREAD_STATE64)", result));
+    }
+    Ok(state)
 }
 
 /// Write ARM64 registers to a thread
 ///
-/// This function writes CPU registers to an ARM64 thread using the
-/// `thread_set_state()` Mach API with the `ARM_THREAD_STATE64` flavor.
+/// Write general-purpose registers and any requested NEON state on a stopped ARM64
+/// thread. If Mach rejects the NEON write, restore the original general registers.
 ///
 /// ## Parameters
 ///
@@ -163,29 +163,44 @@ pub fn read_registers_arm64(thread: thread_act_t) -> Result<Registers>
 /// - NEON/SIMD registers (if available)
 /// - Floating-point status registers (FPSR, FPCR)
 ///
-/// ## Returns
-///
-/// `Ok(())` if the registers were successfully written, or an error if:
-/// - `thread_set_state()` failed
-/// - NEON state is not available (if attempting to write vector registers)
-///
 /// ## Errors
 ///
-/// - `DebuggerError::InvalidArgument`: `thread_set_state()` failed or NEON state unavailable
+/// - `DebuggerError::InvalidArgument` if requested NEON state is unavailable.
+/// - A categorized Mach error if `thread_get_state()` or `thread_set_state()` fails.
+///   A failed rollback adds detail to the original NEON error.
 ///
 /// ## See Also
 ///
 /// - [thread_set_state documentation](https://developer.apple.com/documentation/kernel/1418576-thread_set_state/)
 pub fn write_registers_arm64(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
+    // Consume an armed test fault on every call, so it never outlives this write.
+    let fault = NEON_WRITE_FAULT.take();
+    let Some(neon) = prepare_arm64_neon_state(thread, regs)? else {
+        return write_arm64_gpr_state(thread, regs);
+    };
+    // Keep the entire Mach payload, including format flags absent from `Registers`.
+    let original = fetch_arm64_gpr_state(thread)?;
     write_arm64_gpr_state(thread, regs)?;
-    write_arm64_neon_state(thread, regs)
+
+    let neon_thread = if fault.is_some() { MACH_PORT_NULL } else { thread };
+    let Err(error) = set_arm64_neon_state(neon_thread, &neon) else {
+        return Ok(());
+    };
+
+    let rollback_thread = if fault == Some(true) { MACH_PORT_NULL } else { thread };
+    let error = match set_arm64_gpr_state(rollback_thread, &original) {
+        Ok(()) => error,
+        Err(rollback) => reword(error, |message| {
+            format!("{message}. Restoring the original general registers of thread {thread} also failed ({rollback})")
+        }),
+    };
+    Err(error.into())
 }
 
 pub(crate) fn write_arm64_gpr_state(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
-    let mut state_words: [natural_t; constants::ARM_THREAD_STATE64_COUNT as usize] =
-        [0; constants::ARM_THREAD_STATE64_COUNT as usize];
+    let mut state_words = [0; constants::ARM_THREAD_STATE64_COUNT as usize];
 
     let mut write_u64 = |idx: usize, value: u64| {
         state_words[idx * 2] = (value & constants::U32_MASK) as natural_t;
@@ -208,17 +223,22 @@ pub(crate) fn write_arm64_gpr_state(thread: thread_act_t, regs: &Registers) -> R
     // Status/CPSR (single u32)
     state_words[constants::ARM64_CPSR_INDEX] = (regs.status & constants::U32_MASK) as natural_t;
 
-    unsafe {
-        let result = ffi::thread_set_state(
+    set_arm64_gpr_state(thread, &state_words).map_err(Into::into)
+}
+
+fn set_arm64_gpr_state(thread: thread_act_t, state: &ArmGprState64) -> BackendResult<()>
+{
+    let result = unsafe {
+        ffi::thread_set_state(
             thread,
             constants::ARM_THREAD_STATE64,
-            state_words.as_ptr(),
+            state.as_ptr(),
             constants::ARM_THREAD_STATE64_COUNT,
-        );
+        )
+    };
 
-        if result != KERN_SUCCESS {
-            return Err(mach_failure("thread_set_state(ARM_THREAD_STATE64)", result).into());
-        }
+    if result != KERN_SUCCESS {
+        return Err(mach_failure("thread_set_state(ARM_THREAD_STATE64)", result));
     }
 
     Ok(())
@@ -316,7 +336,8 @@ fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>
 ///
 /// ## Errors
 ///
-/// - `DebuggerError::InvalidArgument`: NEON state not available or `thread_set_state()` failed
+/// - `DebuggerError::InvalidArgument` if NEON state is unavailable.
+/// - A categorized Mach error if `thread_get_state()` or `thread_set_state()` fails.
 ///
 /// ## Mach API: thread_set_state()
 ///
@@ -324,8 +345,16 @@ fn fetch_arm64_neon_state(thread: thread_act_t) -> Result<Option<ArmNeonState64>
 /// **Count**: `ARM_NEON_STATE64_COUNT` = 132
 pub(crate) fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<()>
 {
+    if let Some(state) = prepare_arm64_neon_state(thread, regs)? {
+        set_arm64_neon_state(thread, &state)?;
+    }
+    Ok(())
+}
+
+fn prepare_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> Result<Option<ArmNeonState64>>
+{
     if regs.vector.is_empty() && regs.floating.fpsr.is_none() && regs.floating.fpcr.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut state = fetch_arm64_neon_state(thread)?
@@ -340,17 +369,21 @@ pub(crate) fn write_arm64_neon_state(thread: thread_act_t, regs: &Registers) -> 
     if let Some(fpcr) = regs.floating.fpcr {
         state.fpcr = fpcr;
     }
+    Ok(Some(state))
+}
 
+fn set_arm64_neon_state(thread: thread_act_t, state: &ArmNeonState64) -> BackendResult<()>
+{
     let kr = unsafe {
         ffi::thread_set_state(
             thread,
             constants::ARM_NEON_STATE64,
-            &state as *const _ as *const natural_t,
+            std::ptr::from_ref(state).cast(),
             constants::ARM_NEON_STATE64_COUNT,
         )
     };
     if kr != KERN_SUCCESS {
-        return Err(mach_failure("thread_set_state(ARM_NEON_STATE64)", kr).into());
+        return Err(mach_failure("thread_set_state(ARM_NEON_STATE64)", kr));
     }
 
     Ok(())

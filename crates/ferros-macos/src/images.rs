@@ -655,7 +655,7 @@ fn bootstrap_images(
     });
     images.extend(dyld);
     fill_uuids(task, &mut images, &uuids, cache, lookup, infos.and_then(image_list_timestamp));
-    Ok(images)
+    finish_image_list(images)
 }
 
 pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<LoadedImage>>
@@ -666,6 +666,7 @@ pub(crate) fn loaded_images(task: mach_port_t, pid: ProcessId) -> Result<Vec<Loa
     loaded_images_with(task, pid, &mut cache, UuidLookup::Cache)
 }
 
+/// Enumerate images with exactly one marked main executable on success.
 pub(crate) fn loaded_images_with(
     task: mach_port_t,
     pid: ProcessId,
@@ -751,6 +752,20 @@ pub(crate) fn loaded_images_with(
             cache.clear();
         }
         return Err(invalid("image list changed while reading"));
+    }
+    finish_image_list(images)
+}
+
+fn finish_image_list(images: Vec<LoadedImage>) -> Result<Vec<LoadedImage>>
+{
+    let mut mains = images.iter().filter(|image| image.role == ImageRole::MainExecutable);
+    let main = mains.next().ok_or_else(|| invalid("no main executable"))?;
+    if let Some(second) = mains.next() {
+        return Err(invalid(&format!(
+            "more than one main executable ({} and {})",
+            main.path.display(),
+            second.path.display()
+        )));
     }
     Ok(images)
 }
@@ -973,6 +988,36 @@ mod tests
             load_address: Address::new(address),
             build_id: BuildIdentity::Unknown,
             role: ImageRole::Library,
+        }
+    }
+
+    #[test]
+    fn two_marked_main_executables_are_reported()
+    {
+        let mut first = listed("/bin/first", 0x1000);
+        first.role = ImageRole::MainExecutable;
+        let mut second = listed("/bin/second", 0x3000);
+        second.role = ImageRole::MainExecutable;
+        let library = listed("/usr/lib/libSystem.B.dylib", 0x2000);
+        let error = finish_image_list(vec![first, library, second]).expect_err("two main executables");
+        assert!(matches!(
+            error,
+            DebuggerError::Os { code: -1, message }
+            if message == "dyld image list: more than one main executable (/bin/first and /bin/second)"
+        ));
+    }
+
+    #[test]
+    fn a_missing_main_executable_is_reported()
+    {
+        let library = listed("/usr/lib/libSystem.B.dylib", 0x1000);
+        for images in [vec![], vec![library]] {
+            let error = finish_image_list(images).expect_err("no main executable");
+            assert!(matches!(
+                error,
+                DebuggerError::Os { code: -1, message }
+                if message == "dyld image list: no main executable"
+            ));
         }
     }
 

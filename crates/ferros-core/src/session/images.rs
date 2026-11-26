@@ -457,13 +457,13 @@ impl Session
         };
         let inputs = match &mut image.failed_load {
             None if image.symbols.is_some() => return Ok(false),
-            None => self.symbols.load_inputs(&image.descriptor),
+            None => self.symbols.load_inputs(&image.descriptor, None),
             Some(failed) => {
                 if failed.checked == request {
                     return Ok(false);
                 }
                 failed.checked = request;
-                let inputs = self.symbols.load_inputs(&image.descriptor);
+                let inputs = self.symbols.load_inputs(&image.descriptor, Some(&failed.inputs));
                 if failed.inputs == inputs {
                     if image.symbols.is_none() {
                         failed.report(request, &image.descriptor.path)?;
@@ -503,7 +503,7 @@ impl Session
                 image.failed_load = loaded.debug_error().map(|error| FailedLoad {
                     reported: None,
                     checked: request,
-                    inputs,
+                    inputs: inputs.with_discovered_companions(&loaded),
                     error: error.duplicate(),
                 });
                 Ok(true)

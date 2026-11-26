@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use ferros_core::error::{DebuggerError, Result};
 use ferros_core::objfile::{
-    DWARF_SECTIONS, DebugInfoRetry, DebugSections, ImageContents, ImageSlice, RunTimeEndian, SectionData, SectionId,
+    DWARF_SECTIONS, DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, RunTimeEndian, SectionData,
+    SectionId,
 };
 use ferros_core::symbols::{ImageMapping, ImageSegment};
 use ferros_core::types::{Architecture, BuildId, BuildIdentity};
@@ -450,19 +451,22 @@ fn image_debug_info(
     options: &DebugInfoOptions,
 ) -> (Result<DebugSections>, Option<DebugInfoRetry>)
 {
-    let search = match debuginfo::CompanionSearch::for_executable(path, file) {
+    let search = match debuginfo::CompanionSearch::for_executable(path, file, options) {
         Ok(None) => return (debug_sections(file), None),
         Ok(Some(search)) => search,
         Err(error) => return (Err(error), None),
     };
-    let debug = companion_sections(path, search, options, || debuginfo::has_debug_map(file));
+    let inputs = LoadInputs::of([search.cache_path.clone()]);
+    let debug = companion_sections(path, &search, options, || debuginfo::has_debug_map(file));
     let retry: Option<DebugInfoRetry> = match &debug {
         Ok(_) => None,
         Err(_) => {
             let path = path.to_path_buf();
             let options = options.clone();
             let has_map = debuginfo::has_debug_map(file);
-            Some(Arc::new(move || companion_sections(&path, search, &options, || has_map)))
+            Some(DebugInfoRetry::new(inputs, move || {
+                companion_sections(&path, &search, &options, || has_map)
+            }))
         }
     };
     (debug, retry)
@@ -470,7 +474,7 @@ fn image_debug_info(
 
 fn companion_sections(
     path: &Path,
-    search: debuginfo::CompanionSearch,
+    search: &debuginfo::CompanionSearch,
     options: &DebugInfoOptions,
     has_map: impl FnOnce() -> bool,
 ) -> Result<DebugSections>

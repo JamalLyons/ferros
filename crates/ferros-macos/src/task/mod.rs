@@ -472,7 +472,8 @@ impl MacOSBackend
     /// Check if the debugger has permissions to attach to processes
     ///
     /// This function attempts to get a task port for the current process (self)
-    /// to verify that debugging permissions are available.
+    /// to verify that debugging permissions are available. The send right the probe
+    /// takes is released before returning.
     ///
     /// ## Returns
     ///
@@ -490,16 +491,21 @@ impl MacOSBackend
     /// Any `task_for_pid` failure other than `KERN_PROTECTION_FAILURE`.
     pub fn has_debugging_permissions(&self) -> Result<bool>
     {
-        unsafe {
-            let current_pid = libc::getpid();
-            let mut task: mach_port_t = 0;
-            let result = ffi::task_for_pid(mach_task_self(), current_pid, &mut task);
+        let mut task: mach_port_t = MACH_PORT_NULL;
+        // SAFETY: `getpid` cannot fail; `task` is valid for writes.
+        let result = unsafe { ffi::task_for_pid(mach_task_self(), libc::getpid(), &mut task) };
 
-            match result {
-                KERN_SUCCESS => Ok(true),
-                libc::KERN_PROTECTION_FAILURE => Ok(false),
-                _ => Err(DebuggerError::from(MachError::from(result))),
+        match result {
+            KERN_SUCCESS => {
+                // SAFETY: `task` is the send right task_for_pid just gave us (a user
+                // reference on our own task port), released once (issue #225).
+                unsafe {
+                    let _ = ffi::mach_port_deallocate(mach_task_self(), task);
+                }
+                Ok(true)
             }
+            libc::KERN_PROTECTION_FAILURE => Ok(false),
+            _ => Err(DebuggerError::from(MachError::from(result))),
         }
     }
 
@@ -623,3 +629,39 @@ mod handler;
 mod ptrace;
 mod state;
 mod thread_actions;
+
+#[cfg(test)]
+mod tests
+{
+    use mach2::traps::mach_task_self;
+
+    use super::MacOSBackend;
+    use crate::diagnostics::send_right_count;
+
+    /// `task_for_pid` on the calling process returns the name it already holds for its
+    /// own task port, adding a user reference. Several probes must leave that count where
+    /// it was. Other tests in this process may take and release the same right, so a leak
+    /// is a growth by at least one reference per probe, never an exact match.
+    #[test]
+    fn permission_probe_does_not_leak_a_send_right()
+    {
+        const PROBES: u32 = 16;
+        let backend = MacOSBackend::new().expect("backend");
+        // SAFETY: `mach_task_self` takes no arguments and only returns the cached name of
+        // this process's task port.
+        let name = unsafe { mach_task_self() };
+        let before = send_right_count(name).expect("refs before");
+        for _ in 0..PROBES {
+            assert!(
+                backend.has_debugging_permissions().expect("probe"),
+                "probing the calling task must succeed"
+            );
+        }
+        let after = send_right_count(name).expect("refs after");
+        assert!(
+            after < before + PROBES,
+            "{PROBES} probes left {} extra user references on the self task port ({before} before, {after} after)",
+            after.saturating_sub(before)
+        );
+    }
+}

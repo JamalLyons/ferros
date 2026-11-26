@@ -8,7 +8,7 @@ default:
 # Setup development environment for new contributors
 setup: check-prerequisites install-rust install-nightly verify-setup run-setup-tests
     @echo ""
-    @echo "🎉 Setup complete! You're ready to contribute to Ferros."
+    @echo "Setup complete! You're ready to contribute to Ferros."
     @echo ""
     @echo "Next steps:"
     @echo "  • Run 'just fmt' to format code"
@@ -19,84 +19,84 @@ setup: check-prerequisites install-rust install-nightly verify-setup run-setup-t
 # Run tests as part of setup (unit tests only, see `test`)
 run-setup-tests:
     @echo ""
-    @echo "🧪 Running tests..."
+    @echo "Running tests..."
     @cargo test --workspace --exclude ferros-tests --all-features
 
 # Check if prerequisites are installed
 check-prerequisites:
-    @echo "🦀 Setting up Ferros development environment..."
+    @echo "Setting up Ferros development environment..."
     @echo ""
-    @echo "📋 Checking prerequisites..."
-    @command -v git >/dev/null 2>&1 || { echo "❌ git is not installed. Please install git first."; exit 1; }
-    @echo "  ✓ git found"
-    @command -v rustup >/dev/null 2>&1 || { echo "  ⚠ rustup not found - will install"; exit 0; }
-    @echo "  ✓ rustup found"
-    @command -v cargo >/dev/null 2>&1 || { echo "  ⚠ cargo not found - will install with rustup"; exit 0; }
-    @echo "  ✓ cargo found"
-    @command -v cargo-ws >/dev/null 2>&1 || { echo "  ⚠ cargo-ws not found (optional, install with: cargo install cargo-workspaces)"; exit 0; }
-    @echo "  ✓ cargo-ws found"
+    @echo "Checking prerequisites..."
+    @command -v git >/dev/null 2>&1 || { echo "git is not installed. Please install git first."; exit 1; }
+    @echo "  git found"
+    @command -v rustup >/dev/null 2>&1 || { echo "  rustup not found - will install"; exit 0; }
+    @echo "  rustup found"
+    @command -v cargo >/dev/null 2>&1 || { echo "  cargo not found - will install with rustup"; exit 0; }
+    @echo "  cargo found"
+    @command -v cargo-ws >/dev/null 2>&1 || { echo "  cargo-ws not found (optional, install with: cargo install cargo-workspaces)"; exit 0; }
+    @echo "  cargo-ws found"
 
 # Install Rust toolchain via rustup
 install-rust:
     @echo ""
-    @echo "🔧 Installing Rust toolchain..."
+    @echo "Installing Rust toolchain..."
     @if ! command -v rustup >/dev/null 2>&1; then \
         echo "Installing rustup..."; \
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
         export PATH="$HOME/.cargo/bin:$PATH"; \
-        echo "  ✓ rustup installed"; \
+        echo "  rustup installed"; \
     else \
-        echo "  ✓ rustup already installed"; \
+        echo "  rustup already installed"; \
     fi
     @rustup toolchain install 1.100.0 --profile minimal --component clippy
     @if ! command -v cargo >/dev/null 2>&1; then \
-        echo "  ⚠ cargo not in PATH. Please run: source $HOME/.cargo/env"; \
+        echo "  cargo not in PATH. Please run: source $HOME/.cargo/env"; \
     fi
 
 # Install nightly only for the unstable formatting options in rustfmt.toml
 install-nightly:
     @echo ""
-    @echo "🌙 Installing nightly toolchain with rustfmt..."
+    @echo "Installing nightly toolchain with rustfmt..."
     @rustup toolchain install nightly --component rustfmt 2>&1 | grep -v "info:" || true
-    @echo "  ✓ nightly toolchain installed"
-    @rustup toolchain list | grep -q nightly || { echo "  ⚠ Failed to install nightly"; exit 1; }
+    @echo "  nightly toolchain installed"
+    @rustup toolchain list | grep -q nightly || { echo "  Failed to install nightly"; exit 1; }
 
 # Verify that everything is set up correctly
 verify-setup:
     @echo ""
-    @echo "✅ Verifying setup..."
+    @echo "Verifying setup..."
     @echo "Verifying Rust installation..."
-    @rustc --version || { echo "  ❌ rustc not found"; exit 1; }
-    @echo "  ✓ rustc: $(rustc --version | cut -d' ' -f2)"
+    @rustc --version || { echo "  rustc not found"; exit 1; }
+    @echo "  rustc: $(rustc --version | cut -d' ' -f2)"
     
     @echo "Verifying cargo..."
-    @cargo --version || { echo "  ❌ cargo not found"; exit 1; }
-    @echo "  ✓ cargo: $(cargo --version | cut -d' ' -f2)"
+    @cargo --version || { echo "  cargo not found"; exit 1; }
+    @echo "  cargo: $(cargo --version | cut -d' ' -f2)"
     
     @echo "Verifying nightly toolchain..."
-    @rustup toolchain list | grep -q nightly || { echo "  ❌ nightly toolchain not found"; exit 1; }
-    @echo "  ✓ nightly toolchain installed"
+    @rustup toolchain list | grep -q nightly || { echo "  nightly toolchain not found"; exit 1; }
+    @echo "  nightly toolchain installed"
     
     @echo "Verifying nightly rustfmt..."
-    @cargo +nightly fmt --version >/dev/null 2>&1 || { echo "  ❌ rustfmt not found"; exit 1; }
-    @echo "  ✓ rustfmt: $(cargo +nightly fmt --version | cut -d' ' -f2)"
+    @cargo +nightly fmt --version >/dev/null 2>&1 || { echo "  rustfmt not found"; exit 1; }
+    @echo "  rustfmt: $(cargo +nightly fmt --version | cut -d' ' -f2)"
     
     @echo "Verifying clippy..."
-    @cargo clippy --version >/dev/null 2>&1 || { echo "  ⚠ clippy not found (optional)"; exit 0; }
-    @echo "  ✓ clippy: $(cargo clippy --version | cut -d' ' -f2)"
+    @cargo clippy --version >/dev/null 2>&1 || { echo "  clippy not found (optional)"; exit 0; }
+    @echo "  clippy: $(cargo clippy --version | cut -d' ' -f2)"
     
     @echo "Verifying cargo-workspaces..."
-    @cargo ws --version >/dev/null 2>&1 || { echo "  ⚠ cargo-ws not found (optional)"; exit 0; }
-    @echo "  ✓ cargo-ws: $(cargo ws --version | cut -d' ' -f2)"
+    @cargo ws --version >/dev/null 2>&1 || { echo "  cargo-ws not found (optional)"; exit 0; }
+    @echo "  cargo-ws: $(cargo ws --version | cut -d' ' -f2)"
 
 # Format all code
 fmt:
-    @echo "🎨 Formatting code..."
+    @echo "Formatting code..."
     @"$(rustup which --toolchain nightly cargo-fmt)" --all
 
 # Check formatting without making changes
 fmt-check:
-    @echo "🔍 Checking code formatting..."
+    @echo "Checking code formatting..."
     @"$(rustup which --toolchain nightly cargo-fmt)" --all -- --check
 
 # Check the portable platform boundary
@@ -105,17 +105,17 @@ check-boundary:
 
 # Run clippy linter
 lint:
-    @echo "🔍 Running clippy..."
+    @echo "Running clippy..."
     @cargo clippy --all --all-targets -- -D warnings
 
 # Run clippy with auto-fix
 lint-fix:
-    @echo "🔧 Running clippy with auto-fix..."
+    @echo "Running clippy with auto-fix..."
     @cargo clippy --all --all-targets --fix --allow-dirty --allow-staged
 
 # Run unit tests (excludes ferros-tests, so they never need debugging permission)
 test:
-    @echo "🧪 Running tests..."
+    @echo "Running tests..."
     @cargo test --workspace --exclude ferros-tests --all-features
 
 # Run the integration tests in crates/ferros-tests. They launch real fixture
@@ -123,7 +123,7 @@ test:
 # (scripts/cargo-test-runner.sh, see .cargo/config.toml) signs the test binary
 # with the debugger entitlement first, so no sudo is needed.
 test-integration:
-    @echo "🧪 Running integration tests..."
+    @echo "Running integration tests..."
     @cargo test -p ferros-tests
 
 # Kill fixture processes leaked by this worktree only (other worktrees keep theirs)
@@ -132,44 +132,44 @@ kill-fixtures:
 
 # Run tests for a specific crate (usage: just test-crate ferros-core)
 test-crate CRATE:
-    @echo "🧪 Running tests for {{CRATE}}..."
+    @echo "Running tests for {{CRATE}}..."
     @cargo test -p {{CRATE}} --all-features
 
 # Build the project
 build:
-    @echo "🔨 Building project..."
+    @echo "Building project..."
     @cargo build --workspace --all-features
 
 # Build in release mode
 build-release:
-    @echo "🔨 Building release..."
+    @echo "Building release..."
     @cargo build --release --workspace --all-features
 
 # Build and open documentation
 docs:
-    @echo "📚 Building and opening documentation..."
+    @echo "Building and opening documentation..."
     @cargo doc --workspace --open --no-deps
 
 # Build documentation without opening
 docs-build:
-    @echo "📚 Building documentation..."
+    @echo "Building documentation..."
     @cargo doc --workspace --no-deps
 
 # Run all checks (fmt, clippy, test)
 check:
-    @echo "🔍 Running all checks..."
+    @echo "Running all checks..."
     @just fmt
     @just lint
     @just test
 
 # Clean build artifacts
 clean:
-    @echo "🧹 Cleaning build artifacts..."
+    @echo "Cleaning build artifacts..."
     @cargo clean
 
 # Show project information
 info:
-    @echo "🦀 Ferros Development Information"
+    @echo "Ferros Development Information"
     @echo ""
     @echo "Rust version: $(rustc --version)"
     @echo "Cargo version: $(cargo --version)"
@@ -180,31 +180,31 @@ info:
 
 # List workspace crates using cargo-ws
 list:
-    @echo "📦 Workspace crates:"
+    @echo "Workspace crates:"
     @cargo ws list 2>/dev/null || { \
-        echo "  ⚠ cargo-ws failed. This may be due to workspace configuration issues."; \
+        echo "  cargo-ws failed. This may be due to workspace configuration issues."; \
         echo "  Try running 'just clean' to remove build artifacts."; \
         exit 1; \
     }
 
 # List crates that have changed since last tagged release
 changed:
-    @echo "📝 Changed crates since last release:"
+    @echo "Changed crates since last release:"
     @cargo ws changed
 
 # Execute a command in each crate (usage: just exec "cargo test")
 exec COMMAND:
-    @echo "🔧 Executing '{{COMMAND}}' in each crate..."
+    @echo "Executing '{{COMMAND}}' in each crate..."
     @cargo ws exec {{COMMAND}}
 
 # Bump version of crates (usage: just version patch|minor|major)
 version LEVEL:
-    @echo "📌 Bumping {{LEVEL}} version across workspace..."
+    @echo "Bumping {{LEVEL}} version across workspace..."
     @cargo ws version {{LEVEL}}
 
 # Show publishing plan
 plan:
-    @echo "📋 Publishing order:"
+    @echo "Publishing order:"
     @cargo ws plan 2>&1 | grep -v "^error: config value" || true
 
 # Publish all crates in the workspace (with version bumping)
@@ -216,7 +216,7 @@ plan:
 #   just publish major        # Bump major version and publish
 # Note: For additional options (--yes, --allow-dirty, etc.), use cargo ws publish directly
 publish BUMP="":
-    @echo "📦 Publishing workspace crates..."
+    @echo "Publishing workspace crates..."
     @if [ -z "{{BUMP}}" ]; then \
         cargo ws publish; \
     else \
@@ -225,21 +225,21 @@ publish BUMP="":
 
 # Publish crates without versioning (from current git state)
 publish-as-is:
-    @echo "📦 Publishing workspace crates as-is (no version bump)..."
+    @echo "Publishing workspace crates as-is (no version bump)..."
     @cargo ws publish --publish-as-is
 
 # Publish with a delay between crates to avoid rate limiting
 # Usage: just publish-with-delay [BUMP] [SECONDS]
 # Example: just publish-with-delay patch 10
 publish-with-delay BUMP="patch" SECONDS="10":
-    @echo "📦 Publishing workspace crates with {{SECONDS}}s delay between publishes..."
+    @echo "Publishing workspace crates with {{SECONDS}}s delay between publishes..."
     @cargo ws publish {{BUMP}} --publish-interval {{SECONDS}}
 
 # Website development commands
 
 # Run website in development mode
 website-dev:
-    @echo "🌐 Starting website development server..."
+    @echo "Starting website development server..."
     @cd website && if command -v pnpm >/dev/null 2>&1; then \
         pnpm dev; \
     elif command -v npm >/dev/null 2>&1; then \
@@ -247,13 +247,13 @@ website-dev:
     elif command -v yarn >/dev/null 2>&1; then \
         yarn dev; \
     else \
-        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        echo "No package manager found. Please install pnpm, npm, or yarn."; \
         exit 1; \
     fi
 
 # Build website for production
 website-build:
-    @echo "🔨 Building website for production..."
+    @echo "Building website for production..."
     @cd website && if command -v pnpm >/dev/null 2>&1; then \
         pnpm build; \
     elif command -v npm >/dev/null 2>&1; then \
@@ -261,13 +261,13 @@ website-build:
     elif command -v yarn >/dev/null 2>&1; then \
         yarn build; \
     else \
-        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        echo "No package manager found. Please install pnpm, npm, or yarn."; \
         exit 1; \
     fi
 
 # Preview production build of website
 website-preview:
-    @echo "👀 Previewing website production build..."
+    @echo "Previewing website production build..."
     @cd website && if command -v pnpm >/dev/null 2>&1; then \
         pnpm preview; \
     elif command -v npm >/dev/null 2>&1; then \
@@ -275,7 +275,7 @@ website-preview:
     elif command -v yarn >/dev/null 2>&1; then \
         yarn preview; \
     else \
-        echo "❌ No package manager found. Please install pnpm, npm, or yarn."; \
+        echo "No package manager found. Please install pnpm, npm, or yarn."; \
         exit 1; \
     fi
 
@@ -285,25 +285,25 @@ website-preview:
 # Usage: just sign-debugger [BINARY_PATH]
 # Example: just sign-debugger target/debug/ferros
 sign-debugger BINARY_PATH="target/debug/ferros":
-    @echo "🔐 Signing debugger binary with entitlements..."
+    @echo "Signing debugger binary with entitlements..."
     @if [ ! -f "{{BINARY_PATH}}" ]; then \
-        echo "❌ Binary not found: {{BINARY_PATH}}"; \
+        echo "Binary not found: {{BINARY_PATH}}"; \
         echo "   Build it first with: cargo build"; \
         exit 1; \
     fi
     @if [ ! -f "crates/ferros-macos/ferros.entitlements" ]; then \
-        echo "❌ Entitlements file not found: crates/ferros-macos/ferros.entitlements"; \
+        echo "Entitlements file not found: crates/ferros-macos/ferros.entitlements"; \
         exit 1; \
     fi
     @codesign --entitlements crates/ferros-macos/ferros.entitlements --force --sign - "{{BINARY_PATH}}" || { \
-        echo "❌ Failed to sign binary. Make sure you have a code signing certificate."; \
+        echo "Failed to sign binary. Make sure you have a code signing certificate."; \
         echo "   Create one with: Keychain Access > Certificate Assistant > Create a Certificate"; \
         exit 1; \
     }
-    @echo "✅ Binary signed successfully: {{BINARY_PATH}}"
+    @echo "Binary signed successfully: {{BINARY_PATH}}"
 
 # Build and sign debugger binary (macOS only)
 build-sign:
-    @echo "🔨 Building and signing debugger..."
+    @echo "Building and signing debugger..."
     @just build
     @just sign-debugger target/debug/ferros

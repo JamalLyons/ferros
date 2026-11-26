@@ -14,6 +14,29 @@
 //! header the kernel mapped; dyld may later move itself (into the shared cache), and the
 //! list then follows the address dyld records.
 //!
+//! In the #270 live probe on macOS 27.2.1 (26B131, arm64), the `hello` fixture
+//! loaded a library via relative `DYLD_INSERT_LIBRARIES` entries in two orders
+//! and first loaded it via `@rpath` in a third launch. In each launch, `dlopen`
+//! also tried absolute, relative, symlink and hard-link paths. `Session::images()`
+//! at the fixture's `hello_print` marker returned 86 rows at 86 distinct addresses.
+//! All spellings returned the same base from
+//! `dladdr` and one row with the resolved path. A separate library with the same
+//! install name and a different UUID had its own row and address in every launch.
+//!
+//! Apple dyld 1378 resolves aliases to existing loaders by path, file identity or
+//! shared-cache index. It skips duplicate startup insertions and publishes one path
+//! and header address per newly reported loader. Ferros reads those paths directly.
+//! Disk images reserve their own virtual address ranges, and shared-cache images
+//! use their mapped header addresses.
+//! See [loader lookup], [VM reservation], [startup insertion], [load notification],
+//! and [list publication].
+//!
+//! [loader lookup]: https://github.com/apple-oss-distributions/dyld/blob/dyld-1378/dyld/Loader.cpp#L763-L1040
+//! [VM reservation]: https://github.com/apple-oss-distributions/dyld/blob/dyld-1378/dyld/Loader.cpp#L1663-L1670
+//! [startup insertion]: https://github.com/apple-oss-distributions/dyld/blob/dyld-1378/dyld/DyldRuntimeState.cpp#L646-L664
+//! [load notification]: https://github.com/apple-oss-distributions/dyld/blob/dyld-1378/dyld/DyldRuntimeState.cpp#L1716-L1742
+//! [list publication]: https://github.com/apple-oss-distributions/dyld/blob/dyld-1378/dyld/ExternallyViewableState.cpp#L456-L500
+//!
 //! Each image's Mach-O UUID comes from `uuidArray` in that same structure (version 8 and
 //! later), matched by load address. For images absent from the array, including shared-cache
 //! libraries, dyld and the executable at the bootstrap stop, read `LC_UUID` from the mapped

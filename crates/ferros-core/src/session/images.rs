@@ -285,13 +285,17 @@ impl Session
     /// fresh image starts, and its DWARF cache id is then absent from the set passed to
     /// [`SymbolCache::retain_ids`].
     ///
-    /// A build id is a property of the header mapped at a load address, not of the path the
-    /// loader lists it under, so a listing whose id is unknown takes the id another listing
-    /// reports at the same load address (#249). Two spellings of one mapping, such as a
-    /// relative and an absolute path, resolve to one [`SymbolCache`] entry; when only one of
-    /// them reports an id that contradicts the opened file, both learn it, both stop
-    /// serving that file ([`Self::forget_contradicted_file`]), and `retain_ids` drops the
-    /// entry.
+    /// Within a snapshot, a load address identifies one mapped header and its build id.
+    /// In the live probe for #270, relative, absolute, symbolic-link, hard-link and
+    /// search-path spellings of one file yielded one listing. A different build with the
+    /// same declared image name had its own address. See the platform backend's
+    /// image-list documentation for the probe results and loader behavior.
+    ///
+    /// If a backend lists two spellings of one mapping, a listing whose id is unknown
+    /// takes the id from the other listing at that address (#249). Two spellings that
+    /// resolve to one [`SymbolCache`] entry both stop serving the opened file when the
+    /// id contradicts it ([`Self::forget_contradicted_file`]), and `retain_ids` drops
+    /// the entry.
     pub(super) fn load_images(&mut self) -> Result<()>
     {
         let images = match self.backend.images() {

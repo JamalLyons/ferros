@@ -66,9 +66,9 @@ export function initRoadmap() {
             }
         );
 
-        // Pulsing animation for active milestones
+        // Pulse the milestone marked next. Done nodes stay lit and still.
         const node = milestone.querySelector('.milestone-node');
-        if (node && node.classList.contains('bg-[#d3752b]')) {
+        if (node && node.dataset.status === 'next') {
             gsap.to(node, {
                 scale: 1.2,
                 duration: 1.5,

@@ -9,7 +9,10 @@ impl MacOSBackend
     /// failures (used on teardown paths).
     pub(super) fn release_suspends(&mut self)
     {
-        let count = std::mem::take(&mut lock_shared(&self.exception_state).suspends);
+        // Detach can release these while its exception loop is still running.
+        // Serialize with the loop's task_suspend, just as for a normal resume.
+        let mut shared = lock_shared(&self.exception_state);
+        let count = std::mem::take(&mut shared.suspends);
         for _ in 0..count {
             unsafe {
                 let _ = task_resume(self.task);
@@ -19,6 +22,7 @@ impl MacOSBackend
 
     /// Balance the suspends owned by this resume. If it fails, put back those
     /// already balanced so the caller can restore the backend's stopped state.
+    /// The caller holds the exception state lock to serialize legacy task holds.
     ///
     /// When putting them back fails too, the task may already run: the error is
     /// [`ResumeTaskError::Partial`] with the suspends the backend still holds, and the

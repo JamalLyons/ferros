@@ -36,6 +36,9 @@ pub struct ReplyFaultInjector
     pub(crate) detach_handshake: Arc<AtomicBool>,
     detach_stop_wait: Arc<Mutex<Option<DetachStopWait>>>,
     pub(super) detach_suspend_probe: Arc<Mutex<Option<DetachSuspendProbe>>>,
+    /// Receives the signals the next detach held from its handshake and the ones it
+    /// replayed. Tests only (#311).
+    detach_replay_probe: Arc<Mutex<Option<mpsc::Sender<DetachReplay>>>>,
     /// 0 idle, 1 armed, 2 paused in the exception loop, 3 released by the test.
     pub(super) birth_step_off_hold: Arc<AtomicU8>,
     /// Fail the next `thread_suspend` of a newborn. Tests only.
@@ -81,6 +84,17 @@ pub struct ReplyFaultInjector
     /// The next resume takes one extra task suspend, its last `task_resume` resumes the
     /// task and then reports failure, and the re-suspend fails. Tests only (#250).
     pub(crate) resume_partway: Arc<AtomicBool>,
+}
+
+/// What a detach did with the client signals held during its handshake. Tests only (#311).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachReplay
+{
+    /// Signal numbers held when the handshake ended, in order.
+    pub held: Vec<i32>,
+    /// Signal numbers sent again to the released process, in order.
+    pub replayed: Vec<i32>,
 }
 
 /// Overrides the next detach's private stop waits. Tests only (#149, #282).
@@ -179,6 +193,24 @@ impl ReplyFaultInjector
             .take();
         if let Some(probe) = probe {
             let _ = probe.sample.send(crate::diagnostics::thread_suspend_count(probe.thread));
+        }
+    }
+
+    /// Report which client signals the next detach held from its handshake and which of
+    /// them it replayed after `PT_DETACH`. Tests only (#311).
+    pub fn observe_next_detach_replay(&self) -> mpsc::Receiver<DetachReplay>
+    {
+        let (probe, result) = mpsc::channel();
+        *self.detach_replay_probe.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+        result
+    }
+
+    /// Answer an armed [`Self::observe_next_detach_replay`].
+    pub(crate) fn report_detach_replay(&self, replay: impl FnOnce() -> DetachReplay)
+    {
+        let probe = self.detach_replay_probe.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(probe) = probe {
+            let _ = probe.send(replay());
         }
     }
 

@@ -267,7 +267,7 @@ mod stops;
 mod suspend;
 
 pub(crate) use event::{EXC_SOFT_SIGNAL, stop_event_from_exception, thread_state_flavor_for_arch};
-pub use fault_injector::{DEFAULT_STOP_PUBLICATION_DEADLINE, ReplyFaultInjector};
+pub use fault_injector::{DEFAULT_STOP_PUBLICATION_DEADLINE, DetachReplay, ReplyFaultInjector};
 #[allow(clippy::wildcard_imports)]
 use messages::*;
 pub(crate) use messages::{ExceptionLoopCommand, HeldException, RequeuedSignal, wake_loop};

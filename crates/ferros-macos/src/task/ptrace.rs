@@ -381,6 +381,16 @@ impl MacOSBackend
 
     /// Deliver signals that arrived during the private handshake on their original
     /// threads. Attach still owns a task suspend; detach still holds its private reply.
+    /// Signal numbers currently held from the detach handshake, in replay order.
+    fn held_handshake_signal_numbers(&self) -> Vec<i32>
+    {
+        lock_shared(&self.exception_state)
+            .handshake_signals
+            .as_ref()
+            .map(|signals| signals.iter().map(|signal| signal.signal).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn requeue_handshake_signals(&self, traced: bool) -> BackendResult<()>
     {
         let mut shared = lock_shared(&self.exception_state);
@@ -433,6 +443,21 @@ impl MacOSBackend
         // Replay and continuation belong to every successful PT_DETACH, including
         // fallback after a handshake error. Preserve that error in the return value.
         let replayed = if !self.traced {
+            let held = self.held_handshake_signal_numbers();
+            if private_stop_sent {
+                // Below, detach continues the released process with SIGCONT, which undoes
+                // any SIGSTOP; one cannot be caught, so replaying it changes nothing but
+                // lets its job-control stop take effect before the private one is even
+                // answered. Detach's wait would take that stop for its own and send its
+                // SIGCONT before the private stop lands, leaving the process stopped
+                // (#311). Drop it instead.
+                if let Some(signals) = lock_shared(&self.exception_state).handshake_signals.as_mut() {
+                    signals.retain(|signal| signal.signal != libc::SIGSTOP);
+                }
+            }
+            let replayed = self.held_handshake_signal_numbers();
+            self.reply_faults
+                .report_detach_replay(|| crate::exception::DetachReplay { held, replayed });
             self.requeue_handshake_signals(false)
         } else {
             Ok(())

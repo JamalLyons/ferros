@@ -1201,6 +1201,11 @@ fn detach_armed_before_a_suspend_retry_takes_no_fresh_suspend()
 /// target untraced and running. Taking the client SIGSTOP for the private one would
 /// satisfy the handshake before the detach raised its own, and the detach's real SIGSTOP
 /// would then land after `PT_DETACH`.
+///
+/// Nor may the client SIGSTOP stop the released process before its private stop is
+/// answered (#311): detach's wait would take that stop for its private one, send its
+/// SIGCONT early, and a private stop landing after it would leave the target stopped.
+/// Detach continues the process anyway, so it drops that SIGSTOP instead of replaying it.
 #[test]
 fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
 {
@@ -1233,6 +1238,7 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
         let awaited = faults.send_next_detach_stop_after_suspend_retry();
         wait_for_detach_stop_hold(&faults);
         faults.fail_thread_freezes(0);
+        let replay = faults.observe_next_detach_replay();
         let began = std::time::Instant::now();
         drop(backend);
         let took = began.elapsed();
@@ -1240,6 +1246,16 @@ fn unanswered_client_sigstop_does_not_satisfy_a_later_detach_handshake()
             awaited.try_recv(),
             Ok(true),
             "the held client SIGSTOP satisfied the detach handshake before its private SIGSTOP was sent"
+        );
+        let replay = replay.try_recv().expect("the detach reported its handshake signals");
+        assert!(
+            replay.held.contains(&SIGSTOP),
+            "the client SIGSTOP was not held by the handshake: {replay:?}"
+        );
+        assert!(
+            !replay.replayed.contains(&SIGSTOP),
+            "detach replayed the client SIGSTOP; its stop can land before the private one is answered and detach's wait \
+             would take it for its own: {replay:?}"
         );
         assert!(took < Duration::from_secs(3), "detach took {took:?}");
         assert_runs(pid.0);
@@ -1477,6 +1493,7 @@ fn soft_faults_location(marker: &str) -> ferros_core::BreakpointLocation
 
 /// `SIGUSR1` on macOS (`<sys/signal.h>`).
 const SIGUSR1: i32 = 30;
+const SIGSTOP: i32 = 17;
 
 /// A store through a null pointer is a memory access fault that holds no signal: a
 /// forwarding continue is not rejected as signal injection, and the store faults again

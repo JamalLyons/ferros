@@ -61,7 +61,7 @@ fn kill_cleanup_releases_thread_rights_and_allows_backend_reuse()
         let mut backend = MacOSBackend::new().expect("backend");
         backend.reply_fault_injector().reap_before_exit_watcher();
         backend.attach(target.pid()).expect("attach");
-        assert_ne!(backend.thread_ports(), []);
+        assert!(!backend.thread_ports().is_empty(), "attach found no thread rights");
         assert!(matches!(backend.kill(), Err(BackendError::KillCleanup(_))));
         assert!(backend.thread_ports().is_empty(), "thread rights retained after kill cleanup");
         assert!(matches!(

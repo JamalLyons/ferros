@@ -7,7 +7,7 @@ use ferros_macos::diagnostics;
 use ferros_tests::symbols::function_address;
 use ferros_tests::{Fixture, fixture, harness};
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// `function_address` resolves a fixture function from the symbol table: a trap planted
 /// there is hit with exactly that pc.

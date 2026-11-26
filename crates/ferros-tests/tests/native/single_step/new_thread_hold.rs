@@ -8,7 +8,7 @@ use ferros_tests::arm64::{Flow, flow};
 use ferros_tests::symbols::function_address;
 use ferros_tests::{fixture, harness};
 
-use crate::helpers::*;
+use super::helpers::*;
 
 /// The original regression: a thread created after a suspend snapshot used to run.
 /// It now stays at the pthread entry until a later continue, which then finishes the process.

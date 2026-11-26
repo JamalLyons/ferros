@@ -7,7 +7,8 @@ Integration test fixtures and test harness helpers for Ferros.
 Enough for the common case: one test that debugs a real fixture process. Read the reference
 sections below only when this does not cover your test.
 
-- Put the test in its own file `tests/<area>.rs`. Start it with `#![cfg(target_os = "macos")]`.
+- Put the test in the area's module `tests/native/<area>.rs` (a new area is a new module, declared
+  in `tests/native/main.rs`). Start each module with `#![cfg(target_os = "macos")]`.
 - Run the whole body inside `harness::run(|t| { ... })` (30 s deadline). `t.launch*` returns a
   `Debuggee` that derefs to `ferros_core::Session`; dropping it kills and reaps the process.
 - `fixture!("name")` resolves a fixture binary (names under [Fixtures](#fixtures)). Never write a
@@ -55,8 +56,9 @@ fn stops_at_loop_call_then_exits()
 Run one test (the cargo runner signs the executable; no sudo):
 
 ```sh
-cargo test -p ferros-tests --test <file> <test_name>   # one test
-just test-integration                                  # all of them
+cargo test -p ferros-tests --test native <area>::<test_name>   # one test
+cargo test -p ferros-tests --test native <area>::               # one area
+just test-integration                                          # all of them
 ```
 
 After any run, check for leaked fixtures. It prints nothing when clean (it also lists other
@@ -99,7 +101,7 @@ The crate defines twenty-one fixture binaries:
   frame pointer out of frame-record order (compact unwind `MODE_DWARF`: only its
   `__eh_frame` FDE describes it), then clears the frame pointer and points the link register
   at itself before a `nop`. Used for unwinding a copy stripped of its debug map and dSYM
-  (`tests/debuginfo.rs`). Find them with `ferros_tests::symbols::raw_symbol_address`.
+  (`tests/native/debuginfo.rs`). Find them with `ferros_tests::symbols::raw_symbol_address`.
 - `ferros-fixture-long_jump`: A C program (`fixtures/c/long_jump.c`, compiled and linked by
   `build.rs`; `fixtures/long_jump.rs` is a `#![no_main]` stub) whose markers live in the C
   source. Without arguments, `main` (marker `call_middle`) calls `middle` (marker
@@ -161,9 +163,9 @@ The crate defines twenty-one fixture binaries:
   exception handler and prints `exception reply: <code>` once answered. `--guard-page`
   maps a page of `0xa5` bytes followed by a `PROT_NONE` page, prints
   `boundary: 0x<protected page>` and sleeps. Used by `tests/exceptions.rs` (issue #244)
-  and `tests/memory_reads.rs` (issue #290).
+  and `tests/native/memory_reads.rs` (issue #290).
 - `ferros-fixture-read_line`: Reads one line from stdin (marker `read_stdin`) and prints `read: <line>`,
-  or `read: <eof>` at end of file. Used by `tests/cli.rs` to check which stdin `ferros launch` gives
+  or `read: <eof>` at end of file. Used by `tests/native/cli.rs` to check which stdin `ferros launch` gives
   the program (issue #95).
 
 ## Marker Convention
@@ -202,8 +204,15 @@ failure prints). If it is signed and still denied, check `DevToolsSecurity -stat
 
 ## Writing an integration test
 
-Put each area in its own file under `tests/`, gated with `#![cfg(target_os = "macos")]`, and run
-every test body under `harness::run` (30 second deadline) or `harness::run_with_timeout`:
+Real-process tests live in one test binary, `tests/native/`: `main.rs` declares one module per
+area (`tests/native/<area>.rs`, or a directory with `mod.rs` such as `single_step/`). Each module
+starts with `#![cfg(target_os = "macos")]`. One binary means an engine change relinks one test
+executable instead of one per area. libtest names a test `<area>::<test>`, so run one area with
+`cargo test -p ferros-tests --test native <area>::`. All areas share one process: a test must not
+depend on process-wide state (port counts, signal dispositions, environment variables, a global
+`tracing` subscriber) that tests in other modules also touch. A test that does lives in its own
+binary, as `tests/exceptions.rs` does. Run every test body under `harness::run` (30 second
+deadline) or `harness::run_with_timeout`:
 
 ```rust,ignore
 use std::time::Duration;
@@ -239,16 +248,16 @@ fn resume_runs_hello()
   is dropped.
 - Tests for behaviour that is not implemented yet stay in the suite as `#[ignore = "..."]`
   with a comment naming the issue. The external SIGKILL regressions for held signal
-  stops (`tests/lifecycle.rs`) and breakpoint stops (`tests/exceptions.rs`) are enabled,
+  stops (`tests/native/lifecycle.rs`) and breakpoint stops (`tests/exceptions.rs`) are enabled,
   including a signal deferred behind a breakpoint (issue #56). Client signal replies
   are answered early under task suspension; delivery decisions remain logical stops
   until resume requeues the selected signal on its original thread.
-- `tests/signal_tracing.rs` covers selective per-thread signal delivery and a late exception published
+- `tests/native/signal_tracing.rs` covers selective per-thread signal delivery and a late exception published
   between resume lock sections, as well as private ptrace handshake races (#57): application signals
   arriving before or with the attach/detach SIGSTOP, and dropping a running backend or session
   whose signal stop is already pending. A one-shot diagnostic hook forces actual kernel signal
   requests into the two handshake orderings; the drop cases use naturally pending signals.
-- `tests/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
+- `tests/native/lifecycle.rs` covers exit status and reaping, signals, interrupt/continue,
   timed waits, launch failures, ownership, drop, and death while stopped (issue #32).
   Process-gone assertions reject zombies.
 - When the deadline passes, the harness kills that test's processes and fails the test with a
@@ -261,12 +270,12 @@ fn resume_runs_hello()
   launching that path while another Cargo command runs could find it missing. The copy keeps the
   executable's file name, and `fixture.path()` is the path the loader reports. Copies are keyed
   by Mach-O UUID and DWARF content (line-only rebuilds can keep the UUID), and removed by
-  `cargo clean`. `tests/fixture_staging.rs` covers this.
-- `tests/single_step.rs` covers single-step and per-thread suspension in the backend (issue #33),
+  `cargo clean`. `tests/native/fixture_staging.rs` covers this.
+- `tests/native/single_step/` covers single-step and per-thread suspension in the backend (issue #33),
   driven through `d.session_mut().backend_mut()`. It finds fixture functions with
   `ferros_tests::symbols::function_address(&mut d, &fixture, "tick")` (any stopped `Session`), which reads the
   executable's Mach-O symbol table (no DWARF) and translates through the Session image mapping.
-- `tests/backtrace.rs` covers `Session::stack_trace` and the `backtrace`/`bt` command (issue #38):
+- `tests/native/backtrace.rs` covers `Session::stack_trace` and the `backtrace`/`bt` command (issue #38):
   call-site lines from the `nested_calls` `call_*` markers, a stop on a function's first instruction,
   a spawned thread's trace ending at its base, a 60-level `recursion` trace under one second, and
   every frame pc in an executable region, an inlined frame in `symbols`, and a stop inside the
@@ -274,14 +283,14 @@ fn resume_runs_hello()
   frameless `_frameless_spill` with a stack allocation (issue #130), and a stop in
   `pthread_once`'s `init_routine` that names the static `__pthread_once_handler` in the dyld
   shared cache from that image's symbol table (issue #121).
-- `tests/code_writes.rs` checks that code the backend writes is what the target executes next
+- `tests/native/code_writes.rs` checks that code the backend writes is what the target executes next
   (issue #80): a `brk` planted over an instruction the `hot_loop` threads have cached stops them.
-- `tests/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
+- `tests/native/breakpoints.rs` covers software breakpoints through `Session` (issue #33): hits and hit
   counts, stepping over a breakpoint on resume, `step_instruction`, consecutive and overlapping
   breakpoints, enable/disable/remove, threads, writes over a trap, and trap removal on detach and
   drop. `Session::read_memory` hides traps, so raw bytes are read through
   `session.backend_mut().read_memory`.
-- `tests/cli.rs` runs the real `ferros` binary (issue #36). `ferros_tests::transcript` builds it once
+- `tests/native/cli.rs` runs the real `ferros` binary (issue #36). `ferros_tests::transcript` builds it once
   per test process with `$CARGO build --package=ferros --message-format=json`, copies it next to
   itself and ad-hoc signs the copy with the debugger entitlement (set `FERROS_BIN` to use a signed
   binary instead). `transcript::launch_batch(&tag, &fixture, &args, &commands)` runs it with
@@ -296,8 +305,9 @@ fn resume_runs_hello()
 - `ferros_tests::arm64` decodes arm64 branches for tests that check where a step leaves the pc.
 - `tests/exceptions.rs` covers the Mach exception plumbing (simultaneous stops, port rights, exception
   port restore on detach, failed replies). It reads Mach state through the safe
-  `ferros_macos::diagnostics` module, and its tests run one at a time because they measure the
-  test process's own IPC space.
+  `ferros_macos::diagnostics` module, and its two tests that measure the test process's own IPC space
+  take an exclusive lock over the file's other tests. It is a separate binary, not a `native`
+  module, so tests of other areas cannot change those counts.
 
 ## Tests without a real process
 
@@ -379,7 +389,7 @@ running and the next `wait` reports the death
 
 ## Debug-info regressions
 
-`tests/debuginfo.rs` checks matching and mismatched dSYMs, a standalone plain-Cargo
+`tests/native/debuginfo.rs` checks matching and mismatched dSYMs, a standalone plain-Cargo
 build with the default unpacked profile, validated cache reuse, tool failures and
 timeouts, Session diagnostics and image refresh, and two distinct ASLR launches.
 The Cargo-build test uses an isolated temporary package and keeps its object files
@@ -393,7 +403,7 @@ The harness uses a shared `ChildCleanup` handle: only a detached, unreaped child
 permission to wait. The real failed Mach-send cleanup is tested with isolated ports in
 `ferros-macos`, without launching a fixture.
 
-- `tests/exit_watcher.rs` covers a competing debugger thread reaping a tracee before
+- `tests/native/exit_watcher.rs` covers a competing debugger thread reaping a tracee before
   its exit watcher (#57): errors remain observable after death and across repeated
   waits, and kill teardown releases backend resources and clears Session ownership.
 

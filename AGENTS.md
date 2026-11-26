@@ -78,11 +78,11 @@ Before committing, all five must pass: `just fmt-check`, `just lint`, `just test
 Every engine change lands with an integration test in `crates/ferros-tests` that fails without the change. Known-broken behaviour keeps its test as `#[ignore = "..."]` with a comment naming the fixing issue; never delete it.
 
 ## Writing an integration test
-One test file per area in `crates/ferros-tests/tests/`, gated with `#![cfg(target_os = "macos")]`. Run every test body inside `harness::run(|t| { ... })`. Resolve fixtures with `fixture!("name")` and breakpoint lines with `fixture.marker_line("<name>")`. Never hard-code line numbers or `target/...` paths. Full example and API: `crates/ferros-tests/README.md`.
+Real-process tests are one binary, `crates/ferros-tests/tests/native/`: one module per area (`tests/native/<area>.rs`, declared in `tests/native/main.rs`), each gated with `#![cfg(target_os = "macos")]`. Run one area with `cargo test -p ferros-tests --test native <area>::`. All areas share one process, so a test that depends on process-wide state (its own IPC port counts, signal dispositions, environment variables, a global `tracing` subscriber) gets its own binary instead, as `tests/exceptions.rs` does. Run every test body inside `harness::run(|t| { ... })`. Resolve fixtures with `fixture!("name")` and breakpoint lines with `fixture.marker_line("<name>")`. Never hard-code line numbers or `target/...` paths. Full example and API: `crates/ferros-tests/README.md`.
 
 Exceptions (tests that launch no fixture):
 - `tests/backend_mock/` (in-memory `MockBackend`), `tests/unwind_eh_frame.rs` (synthetic image in `MockObjectFormat`, fake memory), and `tests/platform_boundary.rs` (reads source files and `cargo metadata`) use neither the macOS gate nor the harness.
-- A test that launches nothing (for example attaching to a pid that has already exited, in `tests/macos_crate.rs`) may skip `harness::run`; it keeps the macOS gate and says why in a comment.
+- A test that launches nothing (for example attaching to a pid that has already exited, in `tests/native/macos_crate.rs`) may skip `harness::run`; it keeps the macOS gate and says why in a comment.
 
 ## Leaked processes
 A suspended fixture keeps inherited pipes open and can hang the next command. After any integration run, verify no orphaned fixtures remain:

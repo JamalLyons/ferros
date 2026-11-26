@@ -129,7 +129,9 @@
 //! ## Pointer authentication
 //!
 //! Every recovered return address (from memory or from the link register) goes through
-//! [`Arch::strip_pointer_auth`].
+//! [`Arch::strip_pointer_auth`]. How many address bits it keeps is the target's choice,
+//! made by the [`Arch`] the unwinder is given (the session passes the one its backend
+//! configured).
 //!
 //! ## Caller frames
 //!
@@ -148,8 +150,8 @@ use gimli::{
     RunTimeEndian, UnwindContext, UnwindSection,
 };
 
-use crate::arch::Arch;
 use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
+use crate::arch::{Arch, UndefinedReturnAddress};
 use crate::error::Result;
 use crate::objfile::UnwindHint;
 use crate::runtime::{NoRuntime, SignalContext, TargetRuntime, TrampolineFrame};
@@ -644,14 +646,24 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// (memory unreadable, unsupported expression); `Some(None)` when the caller's value
     /// is unknown.
     ///
-    /// For the return-address column, `Undefined` and `SameValue` both mean "still in
-    /// `x30`": Apple's CIEs leave that column undefined in the initial row, so before the
-    /// prologue saves it the return address is the link register, if this frame's `x30`
-    /// is known (the innermost frame). For any other register `Undefined` means unknown.
+    /// For the return-address column, `SameValue` means "still in `x30`", and so does
+    /// `Undefined` when the target's
+    /// [`undefined_return_address`](Arch::undefined_return_address) is
+    /// [`LinkRegister`](UndefinedReturnAddress::LinkRegister) (toolchains whose CIEs leave
+    /// that column undefined in the initial row): before the prologue saves it the return
+    /// address is the link register, if this frame's `x30` is known (the innermost frame).
+    /// Under [`EndOfStack`](UndefinedReturnAddress::EndOfStack) an undefined return
+    /// address ends the walk. For any other register `Undefined` means unknown.
     fn recover(&self, cursor: &Cursor, rule: &RegisterRule<usize>, cfa: u64, register: Register) -> Option<Option<u64>>
     {
+        let is_return = register == return_register(self.arch.architecture());
         match rule {
-            RegisterRule::Undefined | RegisterRule::SameValue if register == return_register(self.arch.architecture()) => {
+            RegisterRule::Undefined
+                if is_return && self.arch.undefined_return_address() == UndefinedReturnAddress::EndOfStack =>
+            {
+                None
+            }
+            RegisterRule::Undefined | RegisterRule::SameValue if is_return => {
                 if cursor.known & LINK_REGISTER == 0 {
                     return None;
                 }
@@ -1230,6 +1242,30 @@ mod tests
         assert_eq!(
             unwinder.recover(&cursor, &RegisterRule::SameValue, 0, Register(29)),
             Some(Some(0x1000))
+        );
+    }
+
+    /// #222: the meaning of an undefined return-address column is the target's: the
+    /// link register by default, the end of the stack where the target says so.
+    #[test]
+    fn an_undefined_return_address_follows_the_configured_rule()
+    {
+        let memory = FakeMemory::default();
+        let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
+        let cursor = innermost(regs(0x4000_0000, 0xf00, 0x1000, 0x4000_0abc));
+        let lr = Register(30);
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        assert_eq!(
+            unwinder.recover(&cursor, &RegisterRule::Undefined, 0, lr),
+            Some(Some(0x4000_0abc))
+        );
+        let end_of_stack = Arm64::new().with_undefined_return_address(UndefinedReturnAddress::EndOfStack);
+        let unwinder = StackUnwinder::new(&end_of_stack, &symbols, &memory);
+        assert_eq!(unwinder.recover(&cursor, &RegisterRule::Undefined, 0, lr), None);
+        assert_eq!(
+            unwinder.recover(&cursor, &RegisterRule::SameValue, 0, lr),
+            Some(Some(0x4000_0abc)),
+            "SameValue still means the link register"
         );
     }
 

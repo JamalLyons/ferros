@@ -1,6 +1,6 @@
 //! 64-bit ARM (AArch64).
 
-use super::Arch;
+use super::{Arch, UndefinedReturnAddress};
 use crate::backend::{BackendError, BackendResult};
 use crate::types::{Address, Architecture, Registers};
 
@@ -12,15 +12,24 @@ const LINK_REGISTER_INDEX: usize = 30;
 
 /// AArch64 architecture knowledge.
 ///
-/// Pointer-authentication stripping depends on how many low address bits are
-/// significant, which is an OS configuration; `Arm64` therefore holds
-/// `addressable_bits`. [`Arm64::new`] and [`Default`] use
-/// [`DEFAULT_ADDRESSABLE_BITS`](Self::DEFAULT_ADDRESSABLE_BITS); a platform with a
-/// different user address-space size constructs [`Arm64::with_addressable_bits`].
+/// Two answers depend on the target's conventions, not the CPU, so `Arm64` holds them:
+///
+/// - `addressable_bits`: how many low address bits are significant, which decides what
+///   pointer-authentication stripping clears.
+/// - [`undefined_return_address`](Arch::undefined_return_address): what an `Undefined`
+///   return-address rule in call frame information means.
+///
+/// [`Arm64::new`] and [`Default`] use
+/// [`DEFAULT_ADDRESSABLE_BITS`](Self::DEFAULT_ADDRESSABLE_BITS) and
+/// [`UndefinedReturnAddress::LinkRegister`]. A platform crate configures its targets
+/// explicitly with [`Arm64::with_addressable_bits`] and
+/// [`Arm64::with_undefined_return_address`] and hands the result to the session through
+/// [`Backend::arch`](crate::backend::Backend::arch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64
 {
     addressable_bits: u8,
+    undefined_return_address: UndefinedReturnAddress,
 }
 
 impl Arm64
@@ -37,10 +46,12 @@ impl Arm64
     {
         Self {
             addressable_bits: Self::DEFAULT_ADDRESSABLE_BITS,
+            undefined_return_address: UndefinedReturnAddress::LinkRegister,
         }
     }
 
-    /// Arm64 whose user pointers have `bits` significant bits.
+    /// Arm64 whose user pointers have `bits` significant bits, with the default
+    /// [`UndefinedReturnAddress::LinkRegister`] rule.
     ///
     /// `bits = 64` disables pointer-authentication stripping.
     ///
@@ -50,11 +61,24 @@ impl Arm64
     pub fn with_addressable_bits(bits: u8) -> BackendResult<Self>
     {
         if (1..=64).contains(&bits) {
-            Ok(Self { addressable_bits: bits })
+            Ok(Self {
+                addressable_bits: bits,
+                ..Self::new()
+            })
         } else {
             Err(BackendError::Unsupported(format!(
                 "arm64 addressable bits must be in 1..=64, got {bits}"
             )))
+        }
+    }
+
+    /// This arm64 with `rule` as the meaning of an `Undefined` return-address rule.
+    #[must_use]
+    pub const fn with_undefined_return_address(self, rule: UndefinedReturnAddress) -> Self
+    {
+        Self {
+            undefined_return_address: rule,
+            ..self
         }
     }
 
@@ -166,6 +190,11 @@ impl Arch for Arm64
         Ok(())
     }
 
+    fn undefined_return_address(&self) -> UndefinedReturnAddress
+    {
+        self.undefined_return_address
+    }
+
     /// After `BRK` the reported pc is the address of the `BRK` itself: no adjustment.
     fn pc_after_trap(&self, reported_pc: Address) -> Address
     {
@@ -259,6 +288,21 @@ mod tests
         assert_eq!(arch.architecture(), Architecture::Arm64);
         assert_eq!(Arm64::default(), arch);
         assert_eq!(arch.addressable_bits(), 47);
+        assert_eq!(arch.undefined_return_address(), UndefinedReturnAddress::LinkRegister);
+    }
+
+    #[test]
+    fn undefined_return_address_is_configurable()
+    {
+        let arch = Arm64::with_addressable_bits(52)
+            .expect("valid")
+            .with_undefined_return_address(UndefinedReturnAddress::EndOfStack);
+        assert_eq!(arch.undefined_return_address(), UndefinedReturnAddress::EndOfStack);
+        assert_eq!(arch.addressable_bits(), 52, "the rule keeps the address width");
+        assert_eq!(
+            Arm64::with_addressable_bits(39).expect("valid").undefined_return_address(),
+            UndefinedReturnAddress::LinkRegister
+        );
     }
 
     #[test]

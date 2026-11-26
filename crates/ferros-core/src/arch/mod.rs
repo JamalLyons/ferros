@@ -7,6 +7,12 @@
 //!
 //! Every implementation compiles on every host, so a debugger built for one machine can
 //! reason about a target of another architecture.
+//!
+//! Some answers depend on the target's conventions rather than the CPU alone: how many
+//! address bits a user pointer has, and what an undefined return-address rule in call
+//! frame information means. The backend that controls the target configures those
+//! ([`Backend::arch`](crate::backend::Backend::arch)), and the session asks it for every
+//! decision. [`for_architecture`] gives the unconfigured defaults.
 
 #![forbid(unsafe_code)]
 
@@ -170,6 +176,15 @@ pub trait Arch: Send + Sync + std::fmt::Debug
     /// None; infallible (wrapping arithmetic).
     fn pc_after_trap(&self, reported_pc: Address) -> Address;
 
+    /// What a call frame information row whose return-address column is
+    /// `Undefined` means for this target.
+    ///
+    /// The default is [`UndefinedReturnAddress::EndOfStack`], the DWARF meaning.
+    fn undefined_return_address(&self) -> UndefinedReturnAddress
+    {
+        UndefinedReturnAddress::EndOfStack
+    }
+
     /// Remove pointer-authentication bits from a code or data pointer.
     ///
     /// Architectures without pointer authentication return `address` unchanged.
@@ -182,6 +197,18 @@ pub trait Arch: Send + Sync + std::fmt::Debug
     ///
     /// None; infallible.
     fn strip_pointer_auth(&self, address: Address) -> Address;
+}
+
+/// Meaning of an `Undefined` return-address rule in a call frame information row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndefinedReturnAddress
+{
+    /// The frame has no caller (DWARF 5, section 6.4.4): the row gives no return address.
+    EndOfStack,
+    /// The return address is still in the link register, as before a prologue saves it.
+    /// Toolchains whose initial CIE rows leave the return-address column undefined use
+    /// this convention.
+    LinkRegister,
 }
 
 static DEFAULT_ARM64: Arm64 = Arm64::new();

@@ -839,6 +839,12 @@ impl MockBackend
         self.lock().failures.push_back((kind, nth, error));
     }
 
+    /// Forget every injected failure that has not fired yet.
+    pub fn clear_failures(&self)
+    {
+        self.lock().failures.clear();
+    }
+
     /// Every recorded call so far, oldest first.
     #[must_use]
     pub fn calls(&self) -> Vec<MockCall>

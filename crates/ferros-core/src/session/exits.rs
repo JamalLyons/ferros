@@ -16,7 +16,7 @@ use super::Session;
 use super::images::same_image;
 use super::stack::BackendTarget;
 use crate::backend::StopEvent;
-use crate::breakpoints::{BreakpointId, BreakpointKind, BreakpointRequest};
+use crate::breakpoints::{BreakpointId, BreakpointKind};
 use crate::error::Result;
 use crate::objfile::MappedSymbols;
 use crate::runtime::ExitSource;
@@ -75,6 +75,8 @@ pub(super) struct ExitHooks
     images: Vec<ExitImage>,
     hooks: Vec<Hook>,
     leaving: Option<Leaving>,
+    /// A restore failed. The remaining traps are kept for cleanup before the next run.
+    cleanup_pending: bool,
 }
 
 /// Where one instruction step of an exit left the thread.
@@ -93,20 +95,31 @@ pub(super) enum ExitStep
 
 impl ExitHooks
 {
-    /// Hooks of `thread` with nothing armed.
-    pub(super) fn empty(thread: ThreadId) -> Self
-    {
-        Self {
-            thread,
-            images: Vec::new(),
-            hooks: Vec::new(),
-            leaving: None,
-        }
-    }
-
     pub(super) fn thread(&self) -> ThreadId
     {
         self.thread
+    }
+
+    /// Whether the remaining traps are kept solely for cleanup.
+    pub(super) fn cleanup_pending(&self) -> bool
+    {
+        self.cleanup_pending
+    }
+
+    pub(super) fn cleanup_pending_at(&self, id: BreakpointId) -> bool
+    {
+        self.cleanup_pending
+            && self
+                .hooks
+                .iter()
+                .any(|hook| hook.id == id && !matches!(hook.owner, SiteOwner::User))
+    }
+
+    pub(super) fn claim_site(&mut self, id: BreakpointId)
+    {
+        for hook in self.hooks.iter_mut().filter(|hook| hook.id == id) {
+            hook.owner = SiteOwner::User;
+        }
     }
 
     /// Whether an exit of the thread is being stepped.
@@ -136,7 +149,7 @@ impl Session
             Some(_) => SiteOwner::Disabled,
             None => SiteOwner::Private,
         };
-        let id = self.add_breakpoint(BreakpointRequest::Software { address })?;
+        let id = self.add_software_breakpoint(address)?;
         self.enable_breakpoint(id)?;
         Ok((id, owner))
     }
@@ -144,7 +157,11 @@ impl Session
     pub(super) fn release_site(&mut self, id: BreakpointId, owner: &SiteOwner) -> Result<()>
     {
         // The user may have removed the breakpoint while cleanup was pending.
-        if self.breakpoints.get(id).is_none() {
+        let Some(address) = self.breakpoints.get(id).map(|entry| entry.info.address) else {
+            return Ok(());
+        };
+        // An enabled logical breakpoint can claim the still-armed site while cleanup is pending.
+        if self.logical_breakpoint_at(address).is_some() {
             return Ok(());
         }
         match owner {
@@ -171,6 +188,7 @@ impl Session
             images,
             hooks: Vec::new(),
             leaving: None,
+            cleanup_pending: false,
         });
         for (image, address) in entries {
             let (id, owner) = self.take_site(address)?;
@@ -184,14 +202,8 @@ impl Session
         Ok(())
     }
 
-    /// Release exit hooks when the caller owns them only for this attempt.
-    pub(super) fn release_exit_hooks(&mut self, mut exits: Option<ExitHooks>) -> Result<()>
-    {
-        self.restore_exit_hooks(&mut exits)
-    }
-
-    /// Attempt every hook restore, keeping only hooks whose restore failed. The first
-    /// failure is returned and the option is cleared once all hooks are released.
+    /// Attempt every hook restore, retaining failed hooks only for cleanup. Return the
+    /// first failure and clear the option once all hooks are released.
     pub(super) fn restore_exit_hooks(&mut self, exits: &mut Option<ExitHooks>) -> Result<()>
     {
         let Some(armed) = exits else { return Ok(()) };
@@ -207,6 +219,9 @@ impl Session
         });
         if armed.hooks.is_empty() {
             *exits = None;
+        } else {
+            armed.cleanup_pending = true;
+            armed.leaving = None;
         }
         result
     }

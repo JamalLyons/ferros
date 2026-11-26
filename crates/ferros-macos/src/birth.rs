@@ -29,16 +29,17 @@
 use std::fs;
 
 use ferros_core::backend::{ImageRole, LoadedImage, StopEvent};
-#[cfg(target_arch = "aarch64")]
-use ferros_core::error::DebuggerError;
 use ferros_core::types::{Address, Arm64Register, ProcessId, RegisterId, Registers};
+use ferros_core::{BackendError, BackendResult};
 use libc::{mach_port_t, thread_act_t};
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
 
+use crate::error::reword;
 use crate::memory::{read_memory, write_memory_all_or_nothing};
 #[cfg(target_arch = "aarch64")]
 use crate::memory::{read_memory_into, restore_failed_write, write_memory};
+use crate::task::backend_error;
 
 /// `brk #0`, the same trap the engine plants for software breakpoints.
 const BRK: [u8; 4] = [0x00, 0x00, 0x20, 0xD4];
@@ -67,6 +68,8 @@ pub enum BirthEntryWrite
     GeneralRegisters,
     /// The NEON register update.
     NeonRegisters,
+    /// Restoring the general-purpose registers after a NEON failure.
+    RestoreGeneralRegisters,
 }
 
 /// Why a birth trap could not be installed. The resume that needed it must fail.
@@ -196,21 +199,25 @@ impl BirthPolicy
     /// The entry is not the expected `stp`, or the thread or its stack cannot be updated.
     /// The original stack and register state is preserved. If the kernel also refuses
     /// a rollback, the error reports what could not be restored.
-    pub(crate) fn emulate_entry(&self, task: mach_port_t, thread: thread_act_t) -> Result<(), String>
+    pub(crate) fn emulate_entry(&self, task: mach_port_t, thread: thread_act_t) -> BackendResult<()>
     {
-        let registers = crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread)
-            .map_err(|err| format!("reading the registers of thread {thread} failed: {err}"))?;
+        let registers =
+            crate::task::read_registers_for_port(ferros_core::types::Architecture::Arm64, thread).map_err(|error| {
+                reword(backend_error(error), |message| {
+                    format!("reading the registers of thread {thread} failed: {message}")
+                })
+            })?;
         let pc = registers.pc.value();
         let site = self
             .sites
             .iter()
             .find(|site| site.entry && site.address == pc)
-            .ok_or_else(|| format!("thread {thread} is not at a pthread entry"))?;
+            .ok_or_else(|| BackendError::InvalidState(format!("thread {thread} is not at a pthread entry")))?;
         if site.original != STP_XZR_XZR_PREDEC {
-            return Err(format!(
+            return Err(BackendError::Unsupported(format!(
                 "the pthread entry at {pc:#x} is {:02x?}, not the stp this backend emulates",
                 site.original
-            ));
+            )));
         }
         emulate_entry_writes(task, thread, registers, |_| Ok(()))
     }
@@ -607,7 +614,7 @@ pub(crate) fn emulate_entry_writes(
     thread: thread_act_t,
     registers: Registers,
     mut check: impl FnMut(BirthEntryWrite) -> ferros_core::Result<()>,
-) -> Result<(), String>
+) -> BackendResult<()>
 {
     use crate::registers::arm64::{write_arm64_gpr_state, write_arm64_neon_state};
 
@@ -616,10 +623,13 @@ pub(crate) fn emulate_entry_writes(
         .value()
         .checked_sub(16)
         .map(Address::from)
-        .ok_or_else(|| format!("thread {thread} has no room on its stack"))?;
+        .ok_or_else(|| BackendError::InvalidState(format!("thread {thread} has no room on its stack")))?;
     let mut original_frame = [0; 16];
-    read_memory_into(task, sp, &mut original_frame)
-        .map_err(|err| format!("reading the entry frame of thread {thread} failed: {err}"))?;
+    read_memory_into(task, sp, &mut original_frame).map_err(|error| {
+        reword(backend_error(error), |message| {
+            format!("reading the entry frame of thread {thread} failed: {message}")
+        })
+    })?;
 
     let mut updated = registers.clone();
     updated.sp = sp;
@@ -641,17 +651,20 @@ pub(crate) fn emulate_entry_writes(
         else {
             return Ok(());
         };
-        match write_arm64_gpr_state(thread, &registers) {
+        match check(BirthEntryWrite::RestoreGeneralRegisters).and_then(|()| write_arm64_gpr_state(thread, &registers)) {
             Ok(()) => Err(error),
-            Err(rollback) => Err(DebuggerError::Io(std::io::Error::other(format!(
-                "{error}; restoring the original general registers of thread {thread} also failed ({rollback})"
-            )))),
+            Err(rollback) => Err(reword(backend_error(error), |message| {
+                format!("{message}; restoring the original general registers of thread {thread} also failed ({rollback})")
+            })
+            .into()),
         }
     })();
 
     result.map_err(|error| {
         let error = restore_failed_write(task, sp, &original_frame, error, write_frame);
-        format!("emulating the entry of thread {thread} failed: {error}")
+        reword(backend_error(error), |message| {
+            format!("emulating the entry of thread {thread} failed: {message}")
+        })
     })
 }
 
@@ -661,9 +674,11 @@ fn emulate_entry_writes(
     thread: thread_act_t,
     _registers: Registers,
     _check: impl FnMut(BirthEntryWrite) -> ferros_core::Result<()>,
-) -> Result<(), String>
+) -> BackendResult<()>
 {
-    Err(format!("arm64 thread {thread} cannot be updated by this build"))
+    Err(BackendError::Unsupported(format!(
+        "arm64 thread {thread} cannot be updated by this build"
+    )))
 }
 
 fn pthread_load_in_notification(task: mach_port_t, thread: thread_act_t) -> Option<u64>

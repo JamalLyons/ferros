@@ -369,6 +369,102 @@ fn failed_birth_entry_neon_write_leaves_the_thread_unchanged()
     assert_entry_write_leaves_thread_unchanged(diagnostics::BirthEntryWrite::NeonRegisters);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn failed_birth_entry_rollback_preserves_the_neon_error_category()
+{
+    use diagnostics::BirthEntryWrite;
+    use ferros_core::DebuggerError;
+
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (thread, _) = hold_a_newborn(&mut d, &fixture);
+        let port = u32::try_from(thread.raw()).expect("Mach thread port");
+
+        let error = diagnostics::emulate_birth_entry_with_faults(d.pid(), port, |write| match write {
+            BirthEntryWrite::NeonRegisters => Err(BackendError::PermissionDenied("injected NEON write failure".into())),
+            BirthEntryWrite::RestoreGeneralRegisters => Err(BackendError::Os {
+                code: 4,
+                message: "injected general register rollback failure".into(),
+            }),
+            _ => Ok(()),
+        })
+        .expect_err("the injected entry write must fail");
+
+        let DebuggerError::PermissionDenied(message) = error else {
+            panic!("expected the original permission error, got {error:?}");
+        };
+        assert!(message.contains("injected NEON write failure"), "{message}");
+        assert!(message.contains("restoring the original general registers"), "{message}");
+        assert!(
+            message.contains("also failed (OS error 4: injected general register rollback failure)"),
+            "{message}"
+        );
+    });
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn wait_preserves_the_continuing_birth_entry_error_category()
+{
+    use ferros_tests::arm64::NOP;
+
+    harness::run(|t| {
+        let fixture = fixture!("spawn_thread");
+        let mut d = t.launch(&fixture);
+        let (thread, entry) = hold_a_newborn(&mut d, &fixture);
+        let newborn = backend(&mut d).read_registers(thread).expect("read the newborn registers");
+        let original_entry = backend(&mut d).read_memory(entry, TRAP.len()).expect("read the entry");
+        backend(&mut d).write_memory(entry, &NOP).expect("replace the saved entry");
+        assert_eq!(raw_word(&d, entry), TRAP, "the entry must stay armed");
+
+        // A thread already at an armed entry steps off it during resume. Branch there
+        // after resume instead, as a continuing thread re-entering a workqueue would.
+        let branch = function_address(d.session_mut(), &fixture, "spawn_later");
+        let original_branch = backend(&mut d).read_memory(branch, TRAP.len()).expect("read spawn_later");
+        let br_x16 = 0xD61F_0200_u32.to_le_bytes();
+        backend(&mut d).write_memory(branch, &br_x16).expect("plant br x16");
+        let mut registers = newborn.clone();
+        registers.pc = branch;
+        registers.general[16] = entry.value();
+        backend(&mut d)
+            .write_registers(thread, &registers)
+            .expect("redirect the newborn");
+
+        let request = ResumeRequest::all(ThreadAction::Suspend).with_thread(thread, ThreadAction::Continue);
+        backend(&mut d)
+            .resume(&request)
+            .expect("continue the newborn with birth traps armed");
+        let error = backend(&mut d)
+            .wait(Some(STOP_TIMEOUT))
+            .expect_err("emulating the replaced entry must fail");
+        let BackendError::Unsupported(message) = error else {
+            panic!("expected Unsupported from entry emulation, got {error:?}");
+        };
+        assert!(
+            message.contains(&format!("thread {} could not pass its pthread entry", thread.raw())),
+            "{message}"
+        );
+        assert!(message.contains("not the stp this backend emulates"), "{message}");
+
+        interrupt(&mut d);
+        backend(&mut d)
+            .write_memory(branch, &original_branch)
+            .expect("restore spawn_later");
+        backend(&mut d)
+            .write_memory(entry, &original_entry)
+            .expect("restore the saved entry");
+        backend(&mut d)
+            .write_registers(thread, &newborn)
+            .expect("restore the newborn registers");
+        backend(&mut d)
+            .resume(&ResumeRequest::continue_all())
+            .expect("continue after restoring the entry");
+        assert!(d.wait_for_stdout("workers finished", STOP_TIMEOUT), "stdout: {}", d.stdout());
+    });
+}
+
 /// A write the backend refuses after planning it leaves a covered birth trap's saved
 /// instruction and client-breakpoint ownership as they were, and a later successful
 /// write is what disarm keeps.

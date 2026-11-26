@@ -52,10 +52,13 @@
 //! across a requested single-step of that thread. A software breakpoint on a
 //! pthread entry is reported and the newborn stays suspended. `read_memory` shows the
 //! instructions under these traps and an engine breakpoint written there survives
-//! their removal. A thread told to `Continue` is not held at an entry it re-enters as
-//! a reused workqueue thread. `ThreadAction::Step` as the default, and any thread
-//! started at another address, are outside this guarantee. On x86-64 such a resume is
-//! `BackendError::Unsupported`.
+//! their removal. At an armed entry with no software breakpoint, the backend emulates
+//! the entry instruction for a reused workqueue thread told to `Continue`. If emulation
+//! fails, the backend holds that thread and [`Backend::wait`] reports the error in its
+//! original category.
+//! The process remains running, including when emulation returns `BackendError::NotFound`.
+//! `ThreadAction::Step` as the default, and any thread started at another address, are
+//! outside this guarantee. On x86-64 such a resume is `BackendError::Unsupported`.
 //!
 //! ## Exception ports
 //!

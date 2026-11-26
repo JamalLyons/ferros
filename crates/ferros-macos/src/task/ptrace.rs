@@ -9,10 +9,8 @@ impl MacOSBackend
     /// failures (used on teardown paths).
     pub(super) fn release_suspends(&mut self)
     {
-        // Detach can release these while its exception loop is still running.
-        // Serialize with the loop's task_suspend, just as for a normal resume.
-        let mut shared = lock_shared(&self.exception_state);
-        let count = std::mem::take(&mut shared.suspends);
+        // PROOF: #357 lock dropped before task_resume. The #366 probe must fail.
+        let count = std::mem::take(&mut lock_shared(&self.exception_state).suspends);
         for _ in 0..count {
             // #366: sample the lock on the resume thread, immediately before the kernel
             // call. `shared` must still be alive here.

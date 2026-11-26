@@ -513,20 +513,13 @@ impl Backend for MacOSBackend
                 restore(self);
                 return Err(err);
             }
-            // A new exception can arrive after task_resume wakes the target, before
-            // it drops the old resume-port right. XNU can then discard the new
-            // suspension if that right is dropped before task_suspend takes its own.
-            // Keep the exception loop out until task_resume returns (#335).
-            let mut shared = lock_shared(&shared_state);
-            shared.preparing_resume = false;
+            // PROOF: #357 lock dropped before task_resume. The #366 probe must fail.
+            lock_shared(&self.exception_state).preparing_resume = false;
             match self.resume_task(count) {
                 Ok(()) => {}
-                Err(ResumeTaskError::Restored(err)) => {
-                    drop(shared);
-                    return resume_failed(self, err);
-                }
+                Err(ResumeTaskError::Restored(err)) => return resume_failed(self, err),
                 Err(ResumeTaskError::Partial { error, held }) => {
-                    shared.suspends += held;
+                    lock_shared(&self.exception_state).suspends += held;
                     report_error(error);
                 }
             }

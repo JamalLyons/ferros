@@ -25,6 +25,25 @@
 //! `Continue` is not held when it enters an entry again, as a reused workqueue
 //! thread does: its first instruction (`stp xzr, xzr, [sp, #-16]!`) is emulated
 //! and the thread goes on.
+//!
+//! ## Map of this file
+//!
+//! In source order:
+//!
+//! - Constants: the `brk` and `stp` encodings, the Mach-O header words, the pthread image
+//!   name and its `ENTRY_SYMBOLS`.
+//! - Types: `BirthEntryWrite`, `BirthInstallError`, `BirthSite`, `BirthSiteUpdate`, `BirthWrite`.
+//! - `BirthPolicy`: stop classification (`is_birth_breakpoint`, `is_notifier`,
+//!   `running_thread_entry`, `emulate_entry`); masking engine reads and writes (`mask_read`,
+//!   `plan_engine_write`, `commit_engine_write`); held, stepping-off and frozen threads
+//!   (`hold`, `note_step_off`, `take_frozen`, `take_owned`); trap installation (`arm`,
+//!   `install_entries`, the entry-notifier bridge) and removal (`disarm`, `disarm_address`,
+//!   `rearm_except`, `rearm_all`).
+//! - `patch`, `overlap`, `emulate_entry_writes`: byte patches and the emulated `stp`.
+//! - Site resolution: `pthread_load_in_notification`, `resolve_pthread_at`,
+//!   `resolve_main_entry` (`main_entryoff` reads `LC_MAIN`), `resolve_sites`, `sites_from_slice`.
+//! - Image identity: `image_identity`, `walk_uuid`, `matching_slice`, `macho_slices`, then
+//!   `defined_symbol`, `file_instruction`, `read_word`, `read_target`; unit tests in `mod tests`.
 
 use std::fs;
 

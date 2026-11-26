@@ -62,6 +62,23 @@
 //! `images()` calls and three traces: 72 µs and 0 header reads before #170, 246 µs and
 //! 88 header reads after, 103 µs and 0 header reads once the cache was warm. The trace
 //! was 1590 µs, 1747 µs, and 1590 µs for those three. A later run prints its own line.
+//!
+//! ## Map of this file
+//!
+//! In source order:
+//!
+//! - Remote reads: `read_target`, `array_header`, `remote_path`; the executable's path from
+//!   `vnode_path` or `exec_path` (`parse_exec_path`).
+//! - Header checks: `is_header_of_type`, `is_executable_header`.
+//! - `dyld_all_image_infos` fields: the offset constants, `dyld_fields`, `uuid_array_fields`,
+//!   `image_list_timestamp`, `decode_uuid_infos`, `image_uuids`.
+//! - Mapped-UUID cache: `UuidLookup`, `MappedUuidRead`, `MappedUuidCache`, then `mapped_uuid`,
+//!   `resolve_mapped_uuid`, `build_identity`, `assign_cached_uuids`, `fill_uuids`.
+//! - The list: `dyld_image`, `bootstrap_images`, `loaded_images`, `loaded_images_with`,
+//!   `finish_image_list`.
+//! - Measurement hooks for integration tests (thread-local): `UuidLookupGuard`,
+//!   `without_mapped_uuid_reads`, `reread_mapped_uuids`, `invalidate_mapped_uuid_cache`,
+//!   `mapped_uuid_header_reads`; unit tests in `mod tests`.
 
 use std::cell::Cell;
 use std::collections::HashMap;

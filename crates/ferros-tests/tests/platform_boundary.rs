@@ -1384,3 +1384,134 @@ fn target_roots_cover_every_cargo_target()
     }
     assert_eq!(roots.len(), 7, "{roots:?}");
 }
+
+/// Line budget for one implementation file. Past it, a reader needs a table of contents
+/// before opening the file, so its module docs must carry a `Map of this file` heading (#195).
+/// 1,000 lines fits every map-less implementation file in the workspace today; the largest
+/// files (about 1,100 to 1,900 lines) all carry a map.
+const FILE_LINE_BUDGET: usize = 1_000;
+
+/// Implementation files over budget that may go without a map, with the reason for each.
+/// Paths are relative to the workspace root. Empty: every large file has a map.
+const MAP_EXEMPT: &[(&str, &str)] = &[];
+
+/// Whether `relative` (a path under a crate's `src/`) holds only unit tests: a file named
+/// `tests.rs` or a file inside a `tests/` module directory. Such files are a list of
+/// independent cases, not code a reader navigates top-down, so the budget skips them.
+fn is_test_module(relative: &Path) -> bool
+{
+    relative.file_name().is_some_and(|name| name == "tests.rs")
+        || relative
+            .parent()
+            .is_some_and(|parent| parent.iter().any(|part| part == "tests"))
+}
+
+/// Whether the leading `//!` module docs of `text` contain a heading, at any level, whose
+/// text is `Map of this file`.
+fn has_file_map(text: &str) -> bool
+{
+    text.lines()
+        .map_while(|line| line.trim_start().strip_prefix("//!"))
+        .filter_map(|doc| doc.trim().strip_prefix('#'))
+        .any(|heading| heading.trim_start_matches('#').trim() == "Map of this file")
+}
+
+/// Every file in `files` (paths relative to `root`, with their text) that is over
+/// [`FILE_LINE_BUDGET`] lines, has no map, and is not in `exempt`, as `path: N lines`.
+fn files_missing_a_map(files: &[(PathBuf, String)], exempt: &[(&str, &str)]) -> Vec<String>
+{
+    files
+        .iter()
+        .filter_map(|(path, text)| {
+            let lines = text.lines().count();
+            let exempted = exempt.iter().any(|&(name, _)| path == Path::new(name));
+            (lines > FILE_LINE_BUDGET && !exempted && !has_file_map(text))
+                .then(|| format!("{}: {lines} lines", path.display()))
+        })
+        .collect()
+}
+
+/// The implementation files of every workspace member: Rust files under each crate's
+/// `src/`, without unit-test modules ([`is_test_module`]). Integration tests (`tests/`),
+/// fixtures, examples, benches and build scripts are outside `src/` and are not covered:
+/// they are test inputs or one-off programs, not engine code a reader navigates.
+/// `ferros-ui` is not a workspace member, so it is skipped too.
+fn implementation_files(root: &Path, metadata: &Value) -> Vec<(PathBuf, String)>
+{
+    let mut out = Vec::new();
+    for package in packages(metadata) {
+        let src = manifest_path(package).parent().expect("manifest directory").join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut paths = Vec::new();
+        rust_files(&src, &mut paths);
+        paths.sort_unstable();
+        for path in paths {
+            let relative = path.strip_prefix(&src).expect("path under src");
+            if is_test_module(relative) {
+                continue;
+            }
+            let text = read_text(&path);
+            out.push((path.strip_prefix(root).unwrap_or(&path).to_path_buf(), text));
+        }
+    }
+    out
+}
+
+#[test]
+fn large_files_have_a_map()
+{
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent().and_then(Path::parent).expect("workspace root");
+    let files = implementation_files(root, &cargo_metadata(root));
+    assert!(!files.is_empty(), "no implementation files found");
+    for &(name, reason) in MAP_EXEMPT {
+        assert!(!reason.is_empty(), "{name}: an exemption needs a reason");
+        assert!(
+            files.iter().any(|(path, _)| path == Path::new(name)),
+            "{name}: exempt file no longer exists"
+        );
+    }
+    let offending = files_missing_a_map(&files, MAP_EXEMPT);
+    assert!(
+        offending.is_empty(),
+        "\nThese files exceed {FILE_LINE_BUDGET} lines and their `//!` module docs have no `Map of this file` heading. Add \
+         one that names the items in source order, or split the file:\n{}",
+        offending.join("\n")
+    );
+}
+
+#[test]
+fn file_map_check_flags_only_large_files_without_a_map()
+{
+    let long_body = "fn f() {}\n".repeat(FILE_LINE_BUDGET);
+    let mapped = format!("//! Docs.\n//!\n//! # Map of this file\n//!\n//! - `f`.\n\n{long_body}");
+    let deep_heading = format!("//! Docs.\n//! ### Map of this file\n{long_body}");
+    let unmapped = format!("//! Docs.\n\n{long_body}");
+    let map_after_docs = format!("//! Docs.\n\n// ## Map of this file\n//! ## Map of this file\n{long_body}");
+    let prose_mention = format!("//! See the Map of this file below.\n{long_body}");
+    let files = vec![
+        (PathBuf::from("a/mapped.rs"), mapped),
+        (PathBuf::from("a/deep.rs"), deep_heading),
+        (PathBuf::from("a/unmapped.rs"), unmapped.clone()),
+        (PathBuf::from("a/late.rs"), map_after_docs),
+        (PathBuf::from("a/prose.rs"), prose_mention),
+        (PathBuf::from("a/exempt.rs"), unmapped),
+        (PathBuf::from("a/small.rs"), "//! Small.\nfn f() {}\n".to_owned()),
+    ];
+    let report = files_missing_a_map(&files, &[("a/exempt.rs", "reason")]);
+    let budget_plus = FILE_LINE_BUDGET + 2;
+    let late_lines = FILE_LINE_BUDGET + 4;
+    assert_eq!(
+        report,
+        vec![
+            format!("a/unmapped.rs: {budget_plus} lines"),
+            format!("a/late.rs: {late_lines} lines"),
+            format!("a/prose.rs: {} lines", FILE_LINE_BUDGET + 1),
+        ]
+    );
+    assert!(is_test_module(Path::new("session/tests.rs")));
+    assert!(is_test_module(Path::new("session/tests/stepping.rs")));
+    assert!(!is_test_module(Path::new("session/stepping.rs")));
+}

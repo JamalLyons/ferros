@@ -3,10 +3,10 @@
 use std::time::{Duration, Instant};
 
 use ferros_core::backend::mock::{MockBackend, MockCall, MockStop, arm64_registers};
-use ferros_core::backend::{LaunchSpec, ResumeRequest, StopEvent};
+use ferros_core::backend::{LaunchSpec, LoadedImage, ResumeRequest, StopEvent};
 use ferros_core::objfile::mock::MockObjectFormat;
-use ferros_core::types::{Address, ThreadId};
-use ferros_core::{Session, SessionState, arch};
+use ferros_core::types::{Address, Architecture, MemoryRegion, ProcessId, Registers, ThreadId};
+use ferros_core::{Backend, BackendResult, BreakpointRequest, Session, SessionState, arch};
 
 use crate::helpers::*;
 
@@ -20,8 +20,6 @@ const PEER_SITE: Address = Address::new(0x1_0000_0020);
 /// `PEER` runs elsewhere; `trap` says what is at `PEER_SITE`.
 fn step_over_process(two_sites: bool, trap: PeerTrap) -> (MockBackend, Session)
 {
-    use ferros_core::BreakpointRequest;
-
     let mut code = vec![0x1F; 64];
     if matches!(trap, PeerTrap::Program) {
         code[0x20..0x24].copy_from_slice(&BRK_1);
@@ -62,6 +60,142 @@ fn peer_stop() -> StopEvent
         thread: PEER,
         pc: PEER_SITE,
     }
+}
+
+const STALE_STEP_DELAY: Duration = Duration::from_millis(20);
+
+/// Simulate time spent waiting for the scripted single-step stop.
+struct DelayedStep(MockBackend);
+
+impl Backend for DelayedStep
+{
+    fn launch(&mut self, spec: &LaunchSpec) -> BackendResult<ProcessId>
+    {
+        self.0.launch(spec)
+    }
+
+    fn attach(&mut self, pid: ProcessId) -> BackendResult<()>
+    {
+        self.0.attach(pid)
+    }
+
+    fn detach(&mut self) -> BackendResult<()>
+    {
+        self.0.detach()
+    }
+
+    fn hold_attached_on_drop(&mut self)
+    {
+        self.0.hold_attached_on_drop();
+    }
+
+    fn kill(&mut self) -> BackendResult<()>
+    {
+        self.0.kill()
+    }
+
+    fn wait(&mut self, timeout: Option<Duration>) -> BackendResult<Option<StopEvent>>
+    {
+        let event = self.0.wait(timeout)?;
+        if matches!(event, Some(StopEvent::SingleStep { .. })) {
+            std::thread::sleep(STALE_STEP_DELAY);
+        }
+        Ok(event)
+    }
+
+    fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
+    {
+        self.0.resume(request)
+    }
+
+    fn interrupt(&mut self) -> BackendResult<()>
+    {
+        self.0.interrupt()
+    }
+
+    fn threads(&mut self) -> BackendResult<Vec<ThreadId>>
+    {
+        self.0.threads()
+    }
+
+    fn read_registers(&mut self, thread: ThreadId) -> BackendResult<Registers>
+    {
+        self.0.read_registers(thread)
+    }
+
+    fn write_registers(&mut self, thread: ThreadId, registers: &Registers) -> BackendResult<()>
+    {
+        self.0.write_registers(thread, registers)
+    }
+
+    fn read_memory(&mut self, address: Address, len: usize) -> BackendResult<Vec<u8>>
+    {
+        self.0.read_memory(address, len)
+    }
+
+    fn write_memory(&mut self, address: Address, data: &[u8]) -> BackendResult<()>
+    {
+        self.0.write_memory(address, data)
+    }
+
+    fn memory_regions(&mut self) -> BackendResult<Vec<MemoryRegion>>
+    {
+        self.0.memory_regions()
+    }
+
+    fn images(&mut self) -> BackendResult<Vec<LoadedImage>>
+    {
+        self.0.images()
+    }
+
+    fn architecture(&self) -> Architecture
+    {
+        self.0.architecture()
+    }
+
+    fn arch(&self) -> BackendResult<std::sync::Arc<dyn arch::Arch>>
+    {
+        self.0.arch()
+    }
+}
+
+/// #227: a late completion of an abandoned step spends part of the caller's wait budget.
+#[test]
+fn wait_uses_the_remaining_timeout_after_a_stale_single_step()
+{
+    let mut registers = arm64_registers();
+    registers.pc = BREAKPOINT;
+    let mock = MockBackend::new()
+        .with_thread(THREAD, registers)
+        .with_region(BREAKPOINT, "r-x", vec![0x1F; 8]);
+    let mut session = Session::new(Box::new(DelayedStep(mock.clone())), MockObjectFormat::shared());
+    session.launch(&LaunchSpec::new("/bin/prog")).expect("launch");
+    session
+        .add_breakpoint(BreakpointRequest::Software { address: BREAKPOINT })
+        .expect("breakpoint");
+
+    let interrupted = StopEvent::Interrupted { thread: None };
+    mock.script_simultaneous(vec![
+        MockStop::new(interrupted.clone()).expect_resume(ResumeRequest::step(THREAD)),
+        MockStop::new(StopEvent::SingleStep { thread: THREAD }).set_pc(THREAD, BREAKPOINT + 4),
+    ]);
+    session.resume().expect("resume");
+    assert_eq!(session.wait(None).expect("wait for interrupt"), Some(interrupted));
+    let _ = mock.take_calls();
+
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    assert_eq!(session.wait(Some(timeout)).expect("wait after interrupt"), None);
+    let elapsed = started.elapsed();
+    let calls = mock.take_calls();
+    let [MockCall::Wait(Some(first)), MockCall::Wait(Some(second))] = calls.as_slice() else {
+        panic!("expected two timed backend waits, got {calls:?}");
+    };
+    assert_eq!(*first, timeout);
+    assert!(
+        (timeout.saturating_sub(elapsed)..=timeout.saturating_sub(STALE_STEP_DELAY)).contains(second),
+        "second backend wait received {second:?} after spending at least {STALE_STEP_DELAY:?} of {timeout:?}"
+    );
 }
 
 /// #158: the stop that completes the internal step off the breakpoint at the pc also

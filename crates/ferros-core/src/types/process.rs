@@ -160,11 +160,11 @@ pub enum StopReason
     Suspended,
     /// Stopped because a specific signal was delivered
     ///
-    /// The `i32` value is the signal number (e.g., SIGSTOP = 19, SIGINT = 2).
+    /// The `i32` value is the target platform's signal number.
     /// Common signals that stop processes:
-    /// - `SIGSTOP` (19): Stop signal (cannot be caught or ignored)
-    /// - `SIGTSTP` (20): Terminal stop signal
-    /// - `SIGINT` (2): Interrupt signal (Ctrl+C)
+    /// - `SIGSTOP`: Stop signal (cannot be caught or ignored)
+    /// - `SIGTSTP`: Terminal stop signal
+    /// - `SIGINT`: Interrupt signal (Ctrl+C)
     ///
     /// See: [signal(3) man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/signal.3.html)
     Signal(i32),

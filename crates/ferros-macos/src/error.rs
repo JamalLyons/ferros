@@ -146,7 +146,7 @@ impl From<libc::kern_return_t> for MachError
 /// whose thread has exited), not a bad argument from the debugger's caller, so it keeps
 /// its code instead of becoming `DebuggerError::InvalidArgument` (which the `Backend`
 /// boundary reports as `Unsupported`). Code that still knows the operation uses
-/// [`mach_failure`] instead, which also names it.
+/// `mach_failure` instead, which also names it.
 impl From<MachError> for ferros_core::DebuggerError
 {
     fn from(err: MachError) -> Self

@@ -48,7 +48,7 @@ impl Session
     /// # Errors
     ///
     /// [`DebuggerError::AlreadyAttached`] while a process exists, or the backend's
-    /// error (a [`BackendError::PermissionDenied`](crate::backend::BackendError::PermissionDenied)
+    /// error (a [`BackendError::PermissionDenied`]
     /// surfaces as [`DebuggerError::PermissionDenied`]).
     pub fn launch(&mut self, spec: &LaunchSpec) -> Result<ProcessId>
     {

@@ -3,9 +3,7 @@
 //! Functions to read/write CPU debug registers for hardware breakpoints, watchpoints
 //! and hardware single-step ([`set_single_step`]).
 //!
-//! This module provides low-level access to CPU debug registers used for hardware
-//! breakpoints. Unlike general-purpose registers (see [arm64](arm64) and [x86_64](x86_64)),
-//! debug registers are special CPU registers dedicated to breakpoint and watchpoint control.
+//! Debug registers control hardware breakpoints and watchpoints.
 //!
 //! ## Flavors
 //!
@@ -14,9 +12,9 @@
 //!
 //! ## See Also
 //!
-//! - `arm64` module - General-purpose ARM64 register access
-//! - `x86_64` module - General-purpose x86-64 register access
-//! - [breakpoints](../breakpoints) - High-level breakpoint management
+//! - [`crate::breakpoints`] for high-level breakpoint management
+#![cfg_attr(target_arch = "aarch64", doc = "- [`super::arm64`] for general-purpose ARM64 registers")]
+#![cfg_attr(target_arch = "x86_64", doc = "- [`super::x86_64`] for general-purpose x86-64 registers")]
 
 use ferros_core::breakpoints::WatchpointAccess;
 use ferros_core::error::{DebuggerError, Result};

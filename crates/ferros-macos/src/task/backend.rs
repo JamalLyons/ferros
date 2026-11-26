@@ -295,8 +295,7 @@ impl Backend for MacOSBackend
     ///
     /// A stop the exception loop received but could not publish because its own
     /// `task_suspend` failed (#191) is a pending stop too: the resume is refused with
-    /// [`BackendError::StopPending`] after that stop is published (see
-    /// [`publish_held_batch`](Self::publish_held_batch)), so the next `wait` returns it
+    /// [`BackendError::StopPending`] after that stop is published, so the next `wait` returns it
     /// rather than reporting it after this resume, which it does not belong to.
     fn resume(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {

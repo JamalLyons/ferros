@@ -25,7 +25,7 @@
 //! [`MockObjectFile::FILE_MAGIC`], four bytes of zero, the file address of the image's
 //! first byte, the size of its one segment and the number of entries; then each entry as
 //! its kind, address and length followed by that many bytes. An entry is a DWARF section
-//! (kind = its index in [`DWARF_SECTIONS`](super::DWARF_SECTIONS)), `eh_frame`,
+//! (kind = its index in [`DWARF_SECTIONS`]), `eh_frame`,
 //! `eh_frame_hdr`, `debug_frame`, an unwind hint for the function at its address, or the
 //! file's build id. A file without `.debug_info` has no debug information: its
 //! `eh_frame`, `eh_frame_hdr` and hints are still returned for unwinding, and its

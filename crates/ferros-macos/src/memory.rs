@@ -219,7 +219,7 @@ impl MemoryCache
 ///
 /// ## Errors
 ///
-/// The error wraps a [`BackendError`](ferros_core::BackendError), classified while the
+/// The error wraps a [`BackendError`], classified while the
 /// kernel's answer is still known:
 /// - `NotFound` if any byte of the range is unmapped
 /// - `PermissionDenied` (as [`DebuggerError::PermissionDenied`]) if a byte is mapped but

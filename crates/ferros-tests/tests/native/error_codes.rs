@@ -1,8 +1,8 @@
 //! Mach failures reach the `Backend` caller as a typed category that keeps the real
 //! `kern_return_t` (issues #226 and #340).
 //!
-//! The macOS helpers used to report a failed `thread_get_state`, `vm_write` or
-//! `mach_vm_protect` as `DebuggerError` text, which the `Backend` boundary turned into
+//! The macOS helpers used to report a failed `thread_get_state`, `vm_write`,
+//! `mach_vm_protect` or `mach_vm_region_recurse` as `DebuggerError` text, which the `Backend` boundary turned into
 //! `BackendError::Os { code: -1 }`: the category and the code were both lost.
 #![cfg(target_os = "macos")]
 

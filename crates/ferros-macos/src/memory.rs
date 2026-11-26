@@ -9,7 +9,7 @@
 //!
 //! - **vm_read()**: Read memory from a target process
 //! - **vm_write()**: Write memory to a target process
-//! - **mach_vm_region()**: Enumerate memory regions in a process
+//! - **mach_vm_region_recurse()**: Enumerate memory regions in a process
 //! - **mach_vm_protect()**: Change memory protection flags
 //!
 //! ## References
@@ -556,8 +556,8 @@ fn flush_caches(task: mach_port_t, addr: Address, len: usize) -> Result<()>
 ///
 /// ## Errors
 ///
-/// Returns a categorized Mach error if the query fails, for example because the task
-/// port is invalid or the caller lacks permission.
+/// Returns a categorized Mach error that keeps the `kern_return_t` if the query fails,
+/// for example `MACH_SEND_INVALID_DEST` once the task has exited.
 ///
 /// ## Implementation Details
 ///

@@ -16,8 +16,10 @@
 // second `PROT_NONE`, prints `boundary: 0x<address of the second page>` and sleeps
 // forever, so a debugger can read across a readable-to-protected page boundary.
 // `--guard-page-with-tail` adds a readable third page filled with 0x5a.
+// `--read-only-page` publishes a permanent read-only page for a refused debugger write.
 
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -106,6 +108,29 @@ static int raise_software_exception(void)
     return 0;
 }
 
+static int hold_read_only_page(void)
+{
+    mach_port_t task = mach_task_self();
+    mach_vm_address_t address = 0;
+    // A permanent mapping prevents VM_PROT_COPY from adding write access back.
+    kern_return_t kr = mach_vm_allocate(task, &address, vm_page_size, VM_FLAGS_ANYWHERE | VM_FLAGS_PERMANENT);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "allocate permanent page: %d\n", kr);
+        return 1;
+    }
+    memset((void *)address, 0xa5, vm_page_size);
+    kr = mach_vm_protect(task, address, vm_page_size, TRUE, VM_PROT_READ);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "set maximum protection to read-only: %d\n", kr);
+        return 1;
+    }
+    printf("read-only page: 0x%llx\n", address);
+    fflush(stdout);
+    for (;;) {
+        sleep(1);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--null-store") == 0) {
@@ -121,6 +146,9 @@ int main(int argc, char **argv)
     }
     if (argc > 1 && strcmp(argv[1], "--software-exception") == 0) {
         return raise_software_exception();
+    }
+    if (argc > 1 && strcmp(argv[1], "--read-only-page") == 0) {
+        return hold_read_only_page();
     }
     int readable_tail = argc > 1 && strcmp(argv[1], "--guard-page-with-tail") == 0;
     if (readable_tail || (argc > 1 && strcmp(argv[1], "--guard-page") == 0)) {
@@ -141,6 +169,6 @@ int main(int argc, char **argv)
             sleep(1);
         }
     }
-    printf("usage: --null-store | --handler-once | --software-exception | --guard-page | --guard-page-with-tail\n");
+    printf("usage: --null-store | --handler-once | --software-exception | --guard-page | --guard-page-with-tail | --read-only-page\n");
     return 2;
 }

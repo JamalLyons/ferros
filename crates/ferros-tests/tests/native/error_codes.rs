@@ -6,8 +6,10 @@
 //! `BackendError::Os { code: -1 }`: the category and the code were both lost.
 #![cfg(target_os = "macos")]
 
-use ferros_core::{Address, BackendError, DebuggerError, MemoryRegion};
-use ferros_macos::MacOSBackend;
+use std::time::Duration;
+
+use ferros_core::{Address, BackendError, DebuggerError, MemoryRegion, StopEvent};
+use ferros_macos::{MacOSBackend, diagnostics};
 use ferros_tests::{fixture, harness};
 
 /// `MACH_SEND_INVALID_DEST`: what a Mach call on `MACH_PORT_NULL` returns.
@@ -97,5 +99,47 @@ fn write_that_runs_into_an_unmapped_hole_is_not_found()
             .write_memory(at, &[0; SPAN])
             .expect_err("write into the hole");
         assert!(matches!(error, BackendError::NotFound(_)), "write at {at}: {error:?}");
+    });
+}
+
+#[test]
+fn refused_memory_protection_change_is_permission_denied_and_preserves_bytes()
+{
+    harness::run(|t| {
+        let mut d = t.launch_with_args(&fixture!("soft_faults"), &["--read-only-page"]);
+        let timeout = Duration::from_secs(5);
+        d.resume().expect("run until the read-only page is ready");
+        assert!(
+            d.wait_for_stdout("\n", timeout),
+            "fixture did not publish the page: {}",
+            d.stderr()
+        );
+        d.interrupt().expect("interrupt the fixture");
+        let stop = d.wait(Some(timeout)).expect("wait for the interrupt");
+        assert!(matches!(stop, Some(StopEvent::Interrupted { .. })), "got {stop:?}");
+
+        let stdout = d.stdout();
+        let hex = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("read-only page: 0x"))
+            .expect("page address line");
+        let address = Address::from(u64::from_str_radix(hex, 16).expect("page address"));
+        let pid = d.pid();
+        let before = diagnostics::raw_memory(pid, address, SPAN).expect("read the original bytes");
+        assert_eq!(before, [0xa5; SPAN]);
+
+        let error = d
+            .session_mut()
+            .backend_mut()
+            .write_memory(address, &[0x5a; SPAN])
+            .expect_err("write to the permanent read-only page");
+        // Require the kernel's KERN_PROTECTION_FAILURE from mach_vm_protect itself.
+        assert!(
+            matches!(error, BackendError::PermissionDenied(ref message)
+                if message.starts_with("mach_vm_protect ") && message.ends_with("(kern_return_t 2)")),
+            "write at {address}: {error:?}"
+        );
+        let after = diagnostics::raw_memory(pid, address, SPAN).expect("reread the target bytes without the cache");
+        assert_eq!(after, before, "failed write changed target memory");
     });
 }

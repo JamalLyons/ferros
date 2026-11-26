@@ -135,15 +135,15 @@ test-crate CRATE:
     @echo "Running tests for {{CRATE}}..."
     @cargo test -p {{CRATE}} --all-features
 
-# Build the project
+# Build the project with default features. Test hooks are enabled by test builds.
 build:
     @echo "Building project..."
-    @cargo build --workspace --all-features
+    @cargo build --workspace
 
 # Build in release mode
 build-release:
     @echo "Building release..."
-    @cargo build --release --workspace --all-features
+    @cargo build --release --workspace
 
 # Build and open documentation
 docs:

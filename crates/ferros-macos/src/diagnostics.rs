@@ -16,6 +16,8 @@ use mach2::kern_return::{KERN_INVALID_NAME, KERN_INVALID_RIGHT, KERN_SUCCESS};
 use mach2::port::{MACH_PORT_DEAD, MACH_PORT_NULL, MACH_PORT_RIGHT_SEND};
 use mach2::traps::mach_task_self;
 
+#[doc(hidden)]
+pub use crate::birth::BirthEntryWrite;
 use crate::error::MachError;
 use crate::exception::get_exception_ports;
 use crate::ffi;
@@ -139,18 +141,49 @@ pub fn send_right_count(name: u32) -> Result<u32>
 /// before issue #216 (see that function for why there is no `Io` adapter).
 pub fn raw_memory(pid: ProcessId, address: Address, len: usize) -> Result<Vec<u8>>
 {
+    with_task(pid, |task| crate::memory::read_memory(task, address, len))
+}
+
+/// Test hook: emulate a stopped thread's pthread entry and fail the selected write.
+#[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
+pub fn emulate_birth_entry_with_fault(pid: ProcessId, thread: u32, fault: BirthEntryWrite) -> Result<()>
+{
+    with_task(pid, |task| {
+        let registers = crate::registers::read_registers_arm64(thread)?;
+        crate::birth::emulate_entry_writes(task, thread, registers, |write| {
+            if write == fault {
+                return Err(DebuggerError::Io(std::io::Error::other(format!(
+                    "injected {fault:?} write failure"
+                ))));
+            }
+            Ok(())
+        })
+        .map_err(|error| DebuggerError::Io(std::io::Error::other(error)))
+    })
+}
+
+/// Test hook: attempt a write with a rollback snapshot one byte short.
+#[doc(hidden)]
+pub fn write_with_short_snapshot(pid: ProcessId, address: Address, data: &[u8]) -> Result<()>
+{
+    with_task(pid, |task| crate::memory::write_with_short_snapshot(task, address, data))
+}
+
+fn with_task<T>(pid: ProcessId, operation: impl FnOnce(mach_port_t) -> Result<T>) -> Result<T>
+{
     let mut task: mach_port_t = MACH_PORT_NULL;
     // SAFETY: `task` is valid for writes.
     let kr = unsafe { ffi::task_for_pid(mach_task_self(), pid.0 as c_int, &mut task) };
     if kr != KERN_SUCCESS {
         return Err(DebuggerError::from(MachError::from(kr)));
     }
-    let bytes = crate::memory::read_memory(task, address, len);
+    let result = operation(task);
     // SAFETY: `task` is the send right task_for_pid gave us, released once.
     unsafe {
         let _ = ffi::mach_port_deallocate(mach_task_self(), task);
     }
-    bytes
+    result
 }
 
 /// The handler of one group of exception types, as seen from the calling process.

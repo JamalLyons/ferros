@@ -37,6 +37,8 @@ pub(super) struct LinePlan
     run_to: Option<RunTo>,
     /// Traps on non-local exits, armed while a call runs to its return.
     exits: Option<ExitHooks>,
+    /// The step ended but some sites still need restoring.
+    cleanup_pending: bool,
 }
 
 impl Session
@@ -126,6 +128,7 @@ impl Session
                 return Ok(());
             }
         }
+        self.retry_line_cleanup()?;
         // `stale_step` is kept until a resume of this step starts: an abandoned step's
         // completion can still arrive after the drains (the backend then refuses the
         // resume), and it belongs to no request of this step either.
@@ -143,6 +146,7 @@ impl Session
             prologue_end: None,
             run_to: None,
             exits: None,
+            cleanup_pending: false,
         };
         let result = if mode == Mode::Out {
             let frames = self.stack_trace(32)?;
@@ -160,7 +164,7 @@ impl Session
         };
         if let Err(error) = result {
             self.state = SessionState::Stopped;
-            self.release_after_error(&mut plan);
+            self.release_after_error(plan);
             return Err(error);
         }
         self.line_plan = Some(plan);
@@ -224,12 +228,12 @@ impl Session
                     // died after the refusal fails these writes; its terminal event is
                     // still the one to report (#155). If it has not come yet the session
                     // runs, and a later `wait` takes it.
-                    if let Some(site) = plan.run_to.take() {
-                        let released = self.release_site(site.id, &site.owner);
-                        self.note_refusal_cleanup(released);
-                    }
+                    let released = self.release_line_return(plan);
+                    plan.cleanup_pending = released.is_err();
+                    self.note_refusal_cleanup(released);
                     if arm_exits {
-                        let released = self.release_exit_hooks(plan.exits.take());
+                        let released = self.restore_exit_hooks(&mut plan.exits);
+                        plan.cleanup_pending |= released.is_err();
                         self.note_refusal_cleanup(released);
                     }
                     match self.refusal()? {
@@ -284,17 +288,30 @@ impl Session
         }
     }
 
-    /// Release the return trap and the exit hooks. Every site is released even when one
-    /// fails; the first failure is returned.
+    fn release_line_return(&mut self, plan: &mut LinePlan) -> Result<()>
+    {
+        if let Some(site) = &plan.run_to {
+            self.release_site(site.id, &site.owner)?;
+            plan.run_to = None;
+        }
+        Ok(())
+    }
+
+    /// Attempt every site restore, keeping failed sites for retry and returning the
+    /// first error.
     fn release_line_site(&mut self, plan: &mut LinePlan) -> Result<()>
     {
-        let mut result = Ok(());
-        if let Some(site) = plan.run_to.take() {
-            result = self.release_site(site.id, &site.owner);
-        }
-        let released = self.release_exit_hooks(plan.exits.take());
-        if result.is_ok() {
-            result = released;
+        let return_site = self.release_line_return(plan);
+        let exits = self.restore_exit_hooks(&mut plan.exits);
+        return_site.and(exits)
+    }
+
+    fn finish_line_cleanup(&mut self, mut plan: LinePlan) -> Result<()>
+    {
+        let result = self.release_line_site(&mut plan);
+        if result.is_err() {
+            plan.cleanup_pending = true;
+            self.line_plan = Some(plan);
         }
         result
     }
@@ -324,11 +341,9 @@ impl Session
                 if let Some(id) = self.breakpoints.id_for_kind(pc, BreakpointKind::Software)
                     && self.breakpoints.get(id).is_some_and(|entry| entry.info.enabled)
                 {
-                    self.release_line_site(plan)?;
                     return Ok(Some(StopEvent::Breakpoint { thread, pc }));
                 }
                 if sp >= guarded {
-                    self.release_line_site(plan)?;
                     return Ok(Some(StopEvent::SingleStep { thread }));
                 }
             }
@@ -337,20 +352,29 @@ impl Session
         self.continue_line_thread(thread)
     }
 
-    /// Release the plan's temporary site after another error, keeping that error: a
+    /// Release the plan's temporary sites after another error, keeping that error: a
     /// cleanup failure is logged rather than replacing it.
-    fn release_after_error(&mut self, plan: &mut LinePlan)
+    fn release_after_error(&mut self, plan: LinePlan)
     {
-        if let Err(cleanup) = self.release_line_site(plan) {
+        if let Err(cleanup) = self.finish_line_cleanup(plan) {
             tracing::warn!("could not remove a temporary step breakpoint: {cleanup}");
         }
     }
 
     pub(super) fn cancel_line_step(&mut self) -> Result<()>
     {
-        if let Some(mut plan) = self.line_plan.take() {
+        if let Some(plan) = self.line_plan.take() {
             self.state = SessionState::Stopped;
-            self.release_line_site(&mut plan)?;
+            self.finish_line_cleanup(plan)?;
+        }
+        Ok(())
+    }
+
+    /// Clear any traps left by an earlier source step before resuming execution.
+    pub(super) fn retry_line_cleanup(&mut self) -> Result<()>
+    {
+        if self.line_plan.as_ref().is_some_and(|plan| plan.cleanup_pending) {
+            self.cancel_line_step()?;
         }
         Ok(())
     }
@@ -368,7 +392,11 @@ impl Session
         // Inspection uses the ordinary stopped-session APIs. The backend is already
         // stopped here; restore the public running state before returning to wait.
         self.state = SessionState::Stopped;
-        let result = self.line_stopped(&mut plan, event);
+        let result = if plan.cleanup_pending {
+            Ok(Some(event))
+        } else {
+            self.line_stopped(&mut plan, event)
+        };
         match result {
             Ok(None) => {
                 self.line_plan = Some(plan);
@@ -376,12 +404,12 @@ impl Session
                 Ok(None)
             }
             Ok(Some(event)) => {
-                self.release_line_site(&mut plan)?;
+                self.finish_line_cleanup(plan)?;
                 self.state = SessionState::Running;
                 Ok(Some(event))
             }
             Err(error) => {
-                self.release_after_error(&mut plan);
+                self.release_after_error(plan);
                 Err(error)
             }
         }
@@ -449,10 +477,10 @@ impl Session
                     // the private trap and continue waiting for the guarded frame.
                     return self.continue_line_thread(thread);
                 }
-                self.release_line_site(plan)?;
                 if plan.mode == Mode::Out {
                     return Ok(Some(StopEvent::SingleStep { thread }));
                 }
+                self.release_line_site(plan)?;
             } else if self.stale_trap(Some(plan.thread), &event)? {
                 self.advance_line(plan)?;
                 return Ok(None);

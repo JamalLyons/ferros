@@ -24,6 +24,18 @@
 //! than its link-time address. The `BinaryImage` handles this relocation by
 //! computing a "slide" (offset) between the file's virtual addresses and the
 //! runtime addresses.
+//!
+//! ## Map of this file
+//!
+//! - `ImageDescriptor`: what a caller supplies to load an image.
+//! - `ImageMapping`, `ImageSegment`: file-to-runtime address translation (`relocate`,
+//!   `file_address`, `runtime_address`).
+//! - `ImageId`: stable identity of a loaded image.
+//! - `BinaryImage`: construction (`from_contents`), layout queries, call frame sections
+//!   (`eh_frame_section`, `debug_frame_section`), `unwind_hints`, `symbolicate`, and
+//!   `describe_type`. Line and function lookups on `BinaryImage` live in `lines.rs` and
+//!   `functions.rs`.
+//! - Mapping tests in `mod mapping_tests`.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

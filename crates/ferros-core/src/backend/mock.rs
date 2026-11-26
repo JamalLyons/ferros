@@ -60,6 +60,21 @@
 //! assert_eq!(mock.calls().len(), 3);
 //! assert!(matches!(mock.calls()[0], MockCall::Launch(_)));
 //! ```
+//!
+//! ## Map of this file
+//!
+//! In source order:
+//!
+//! - `arm64_registers`, `MockState`, `MockRegisters`: helpers and the observable state.
+//! - `MockCall`, `MockCallKind`: the recorded call log.
+//! - `MockStop`: one scripted stop and its side effects (`set_pc`, `add_thread`,
+//!   `write_memory`, `expect_resume`, ...).
+//! - `Inner`: memory regions, threads, script, pending events; byte helpers
+//!   `read_bytes` / `write_bytes`.
+//! - `impl MockBackend`: builders (`with_thread`, `with_region`, `with_image`, ...), scripting
+//!   (`script`, `script_simultaneous`, `die`, `stop_before_nth_resume`, ...), failure injection
+//!   (`fail_next`, `fail_on_nth`), and inspection (`calls`, `take_calls`, `peek_*`).
+//! - `impl Backend for MockBackend`: the contract implementation; unit tests in `mod tests`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

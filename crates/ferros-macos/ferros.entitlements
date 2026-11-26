@@ -10,7 +10,7 @@
         - Read/write memory in other processes
         - Control thread execution in other processes
         
-        Without this entitlement, you must run the debugger with sudo.
+        From the repository root, run just sign-debugger to apply this entitlement.
         
         See: https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.debugger
     -->

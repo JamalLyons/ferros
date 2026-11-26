@@ -125,10 +125,9 @@ pub(super) fn continue_running_thread(
     }
     if let Err(err) = state.birth.emulate_entry(task, exception.thread) {
         error!("a continuing thread entered a pthread entry and could not pass it: {err}");
-        let _ = events.send(Err(BackendError::Os {
-            code: -1,
-            message: format!("thread {} could not pass its pthread entry: {err}", exception.thread),
-        }));
+        let _ = events.send(Err(crate::error::reword(err, |message| {
+            format!("thread {} could not pass its pthread entry: {message}", exception.thread)
+        })));
         return suspend_newborn(state, exception, faults, events, false);
     }
     if let Err(err) = reply_to_held(exception, faults) {

@@ -31,11 +31,12 @@
 //! so it holds across runs; a failure leaves it pending with the reason. Address
 //! breakpoints mean nothing in another process and are deleted when the process ends.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::Session;
 use super::location::{BreakpointLocation, BreakpointSite};
-use crate::arch::{self, Arch};
+use crate::arch::Arch;
 use crate::backend::BackendError;
 use crate::breakpoints::{
     BreakpointEntry, BreakpointId, BreakpointInfo, BreakpointKind, BreakpointPayload, BreakpointRequest, BreakpointState,
@@ -114,9 +115,13 @@ const NO_PROCESS: &str = "the program is not running";
 
 impl Session
 {
-    pub(super) fn arch(&self) -> Result<&'static dyn Arch>
+    /// Architecture knowledge for the target, as its backend configured it
+    /// ([`Backend::arch`](crate::backend::Backend::arch)). The single source of every
+    /// architecture decision the session makes: trap bytes, pc after a trap, pointer
+    /// stripping and unwind conventions.
+    pub(super) fn arch(&self) -> Result<Arc<dyn Arch>>
     {
-        Ok(arch::for_architecture(self.backend.architecture())?)
+        Ok(self.backend.arch()?)
     }
 
     /// Add a breakpoint and insert its trap.

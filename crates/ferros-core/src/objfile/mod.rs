@@ -118,15 +118,15 @@ pub trait ObjectFormat: Send + Sync
     ///
     /// # Errors
     /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the format
-    /// cannot tell which part of the file is mapped (the session keeps it while the image
-    /// stays loaded); any other error for a file that cannot be read, does not parse, or is
-    /// another build (the session retries once [`load_inputs`](Self::load_inputs)
-    /// change).
+    /// cannot tell which part of the file is mapped; other errors for a file that cannot
+    /// be read, does not parse, or is another build. The session retries when
+    /// [`load_inputs`](Self::load_inputs) change or it learns the mapped build id.
     fn open_image(&self, path: &Path, load_address: u64, slice: Option<&ImageSlice>) -> crate::Result<ImageContents>;
 
-    /// Open the image and, after a retryable companion error, optionally supply an
-    /// operation to re-read just the companion for the same executable. The default
-    /// opens the image without supplying a separate retry.
+    /// Open the image and, when companion discovery or extraction fails, optionally
+    /// supply an operation to repeat discovery for the same cached executable. This
+    /// includes a search that found no companion. The default opens the image without
+    /// supplying a separate retry.
     ///
     /// # Errors
     /// The same errors as [`open_image`](Self::open_image).

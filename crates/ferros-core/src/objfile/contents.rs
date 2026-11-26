@@ -139,10 +139,9 @@ pub struct ImageContents
     /// format found, or why there is none.
     ///
     /// [`DebuggerError::NoDebugInfo`](crate::DebuggerError::NoDebugInfo) when the image
-    /// has no usable debug information (the session keeps that while the image stays
-    /// loaded); any other error for debug information that could not be read or parsed
-    /// (the session retries once the format's
-    /// [`load_inputs`](super::ObjectFormat::load_inputs) change).
+    /// has no usable debug information; other errors for debug information that could
+    /// not be read or parsed. The session checks the format's
+    /// [`load_inputs`](super::ObjectFormat::load_inputs) before reusing either failure.
     pub debug: crate::Result<DebugSections>,
 }
 

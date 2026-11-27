@@ -24,9 +24,9 @@
 //!    and its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
 //!    allocation). Elsewhere the instructions are analysed first (see *Prologues and
 //!    epilogues* below), so a stop after the epilogue released the allocation gets the
-//!    caller's `sp` right. After allocation the hint locates any saved general registers
-//!    below the caller's `sp`. A frameless leaf makes no calls, so it cannot be a caller frame;
-//!    there the walk stops instead of guessing.
+//!    caller's `sp` right. If analysis fails, registers that the leaf may save are
+//!    unknown because the stores may not have executed. A frameless leaf makes no calls,
+//!    so it cannot be a caller frame; there the walk stops instead of guessing.
 //! 3. **[`UnwindHint::FrameRecord`]**: the frame-pointer chain: the record at `fp` holds
 //!    the caller's `fp` and the return address. The hint describes general register
 //!    saves below that record and gives a CFA of `fp + 16` after the frame is built.
@@ -429,7 +429,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                     return self.entry_step(cursor);
                 }
                 self.code_step(cursor, self.function_start(image, cursor, start))
-                    .or_else(|| self.frameless_step(cursor, stack_size, saved))
+                    .or_else(|| self.frameless_step(cursor, stack_size, saved.mask))
             }
             Hinted::Hint {
                 hint: UnwindHint::FrameRecord { saved },
@@ -707,7 +707,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// plus the leaf's stack allocation. A frameless leaf makes no calls, so it cannot be a
     /// caller frame with a valid return address: as a caller (or without `x30`) the walk
     /// stops here rather than guessing through the frame-pointer chain.
-    fn frameless_step(&self, cursor: &Cursor, stack_size: u64, saved: SavedRegisterSlots) -> Option<UnwindStep>
+    fn frameless_step(&self, cursor: &Cursor, stack_size: u64, saved_mask: u32) -> Option<UnwindStep>
     {
         if cursor.is_caller || cursor.known & LINK_REGISTER == 0 {
             return None;
@@ -715,15 +715,15 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let link = self.arch.link_register(&cursor.regs)?;
         let mut next = cursor.regs.clone();
         next.pc = self.arch.strip_pointer_auth(link);
-        let caller_sp = cursor.regs.sp.value().checked_add(stack_size)?;
-        next.sp = Address::new(caller_sp);
-        let mut step = UnwindStep {
+        next.sp = Address::new(cursor.regs.sp.value().checked_add(stack_size)?);
+        // The innermost PC may be between stack allocation and the spill instructions.
+        // Preserve only registers the hint says the leaf leaves untouched.
+        let unchanged = FRAME_POINTER | (self.arch.callee_saved_register_mask() & !saved_mask);
+        Some(UnwindStep {
             next,
-            known: cursor.known & FRAME_POINTER,
+            known: cursor.known & unchanged,
             status: FrameStatus::CfiFallback,
-        };
-        self.restore_saved_registers(cursor, caller_sp, saved, &mut step);
-        Some(step)
+        })
     }
 
     /// Innermost frame on a function's first instruction: nothing was pushed, so the
@@ -825,7 +825,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         Some(UnwindStep {
             next,
             known: caller.known & self.arch.callee_saved_register_mask(),
-            status: FrameStatus::CfiFallback,
+            status: FrameStatus::InstructionAnalysis,
         })
     }
 
@@ -1275,20 +1275,16 @@ mod tests
         regs.general[3] = 33;
         regs.general[19] = 19;
         regs.general[20] = 20;
-        let saved = SavedRegisterSlots {
-            mask: (1 << 19) | (1 << 20),
-            first_offset: -8,
-        };
+        let saved_mask = (1 << 19) | (1 << 20);
         let step = unwinder
-            .frameless_step(&innermost(regs.clone()), 32, saved)
+            .frameless_step(&innermost(regs.clone()), 32, saved_mask)
             .expect("innermost frameless");
         assert_eq!(step.next.pc, Address::new(0x4000_0abc), "PAC bits stripped");
         assert_eq!(step.next.sp, Address::new(0xf20));
         assert_eq!(step.next.fp, Address::new(0x1000), "a leaf leaves fp alone");
         assert_eq!(step.known & (1 << 3), 0, "x3 is caller-saved");
-        assert_ne!(step.known & (1 << 19), 0, "x19 was recovered");
-        assert_eq!(step.next.general[19], 190);
-        assert_eq!(step.known & (1 << 20), 0, "the saved x20 slot is unreadable");
+        assert_eq!(step.known & saved_mask, 0, "saved slots may not have been written");
+        assert_ne!(step.known & (1 << 21), 0, "the leaf leaves x21 alone");
         assert_eq!(step.known & LINK_REGISTER, 0);
         let entry = unwinder.entry_step(&innermost(regs.clone())).expect("no allocation");
         assert_ne!(entry.known & (1 << 20), 0, "x20 is known before any allocation");
@@ -1298,7 +1294,7 @@ mod tests
             ..innermost(regs)
         };
         assert!(
-            unwinder.frameless_step(&caller, 32, saved).is_none(),
+            unwinder.frameless_step(&caller, 32, saved_mask).is_none(),
             "a leaf is never a caller"
         );
     }

@@ -26,6 +26,11 @@ _frameless_spill:
 	.cfi_startproc
 	sub	sp, sp, #0x20
 	.cfi_def_cfa_offset 32
+	// Conditional branches put the pre-save stop outside both instruction analyses.
+	cbz	x0, 1f
+1:	mov	x9, x9
+	cbz	x0, 2f
+2:
 	stp	x20, x19, [sp, #16]
 	.cfi_offset w19, -8
 	.cfi_offset w20, -16

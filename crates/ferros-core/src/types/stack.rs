@@ -314,9 +314,8 @@ impl FrameKind
 /// let frame_status = FrameStatus::Complete;
 /// match frame_status {
 ///     FrameStatus::Complete => println!("recovered with DWARF CFI"),
-///     FrameStatus::CfiFallback => {
-///         println!("recovered from the frame-pointer chain or the link register")
-///     }
+///     FrameStatus::CfiFallback => println!("recovered from unwind hints, FP or LR"),
+///     FrameStatus::InstructionAnalysis => println!("recovered by decoding instructions"),
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,9 +324,10 @@ pub enum FrameStatus
     /// The innermost frame, or a frame recovered with DWARF CFI (`eh_frame` or
     /// `.debug_frame`).
     Complete,
-    /// No CFI covered the callee: recovered from the frame-pointer chain, or from the link
-    /// register when the innermost frame was stopped on a function's first instruction.
+    /// Recovered from an unwind hint, the frame-pointer chain, or the link register.
     CfiFallback,
+    /// Recovered by analysing the callee's prologue or epilogue instructions.
+    InstructionAnalysis,
 }
 
 /// Logical stack frame (physical or inline).

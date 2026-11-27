@@ -53,7 +53,7 @@ impl PrettyPrinter for StringPrinter
     }
 }
 
-fn format_string(address: Address, len: u64, formatter: &mut ValueFormatter<'_>) -> String
+pub(super) fn format_string(address: Address, len: u64, formatter: &mut ValueFormatter<'_>) -> String
 {
     if address == Address::ZERO {
         return unavailable("null string data pointer");

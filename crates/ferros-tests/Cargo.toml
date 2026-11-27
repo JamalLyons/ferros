@@ -175,3 +175,8 @@ test = false
 name = "ferros-fixture-values_std"
 path = "fixtures/values_std.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-values_shared"
+path = "fixtures/values_shared.rs"
+test = false

@@ -1,6 +1,7 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
 mod enums;
+mod shared;
 mod strings;
 mod vec;
 
@@ -30,6 +31,8 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &vec::SlicePrinter,
     &vec::VecPrinter,
     &vec::BoxPrinter,
+    &shared::SharedPrinter,
+    &shared::CellPrinter,
 ];
 
 fn field<'a>(value: ValueView<'a>, name: &str, types: &TypeTable) -> Option<ValueView<'a>>

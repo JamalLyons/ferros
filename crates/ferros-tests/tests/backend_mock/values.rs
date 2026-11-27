@@ -779,3 +779,44 @@ fn linked_list_stops_at_a_repeated_or_missing_node()
         "[10, 20, <unavailable: LinkedList has fewer nodes than its length>] (len: 3)"
     );
 }
+
+#[test]
+fn vec_into_iter_rejects_a_reversed_range_and_truncates_at_max_elements()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    // Marks `u8` unsigned.
+    raw_vec_types(unit, byte);
+    let data = pointer_to(unit, "*const u8", byte);
+    // IntoIter<u8> { ptr @0, end @8 }; the allocation fields are not read.
+    let iter = named_struct(
+        unit,
+        unit.root(),
+        "alloc::vec::into_iter::IntoIter<u8, alloc::alloc::Global>",
+        16,
+    );
+    element_param(unit, iter, byte);
+    add_member(unit, iter, "ptr", data, 0);
+    add_member(unit, iter, "end", data, 8);
+    let iter_at = Address::new(BASE + 0x200);
+    static_local(unit, function, "iter", iter, iter_at);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let buffer = Address::new(BASE + 0x300);
+    session.write_memory(buffer, &[1, 2, 3, 4]).expect("store elements");
+    let mut render = |ptr: u64, end: u64, options: FormatOptions| {
+        session.write_memory(iter_at, &words(&[ptr, end])).expect("store iterator");
+        let vars = session.selected_frame_variables().expect("iterator local");
+        session.format_variable(&vars[0], options).1
+    };
+    let start = buffer.value();
+    assert_eq!(render(start + 1, start + 4, FormatOptions::default()), "[2, 3, 4]");
+    let limited = FormatOptions {
+        max_elements: 2,
+        ..FormatOptions::default()
+    };
+    assert_eq!(render(start, start + 4, limited), "[1, 2, ...]");
+    // `end` before `ptr` is no valid range, so the raw fields show.
+    let reversed = render(start + 2, start, FormatOptions::default());
+    assert!(reversed.ends_with(" <unrecognized layout>"), "{reversed}");
+}

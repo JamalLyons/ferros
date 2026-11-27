@@ -579,6 +579,10 @@ fn unknown_standard_library_layouts_show_raw_fields()
         "std::collections::hash::map::HashMap<u8, u8>",
         "std::collections::hash::set::HashSet<u8>",
         "alloc::collections::btree::map::BTreeMap<u8, u8>",
+        "alloc::collections::btree::set::BTreeSet<u8>",
+        "alloc::collections::vec_deque::VecDeque<u8>",
+        "alloc::collections::linked_list::LinkedList<u8>",
+        "alloc::collections::binary_heap::BinaryHeap<u8>",
     ];
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
     let unit = &mut dwarf.unit;

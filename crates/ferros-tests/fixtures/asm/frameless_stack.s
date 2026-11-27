@@ -80,9 +80,62 @@ _unwind_only_caller:
 	ret
 	.cfi_endproc
 
+	// Both functions use saved FP/LR in reverse order to require DWARF CFI.
+	.globl	_frame_registers_callee
+	.p2align	2
+_frame_registers_callee:
+	.cfi_startproc
+	stp	x30, x29, [sp, #-32]!
+	.cfi_def_cfa_offset 32
+	.cfi_offset w30, -32
+	.cfi_offset w29, -24
+	stp	x19, x20, [sp, #16]
+	.cfi_offset w19, -16
+	.cfi_offset w20, -8
+	mov	x19, #0x5151
+	mov	x20, #0x6161
+	mov	x0, #0x7171
+	nop
+	ldp	x19, x20, [sp, #16]
+	ldp	x30, x29, [sp], #32
+	.cfi_def_cfa_offset 0
+	.cfi_restore w19
+	.cfi_restore w20
+	.cfi_restore w29
+	.cfi_restore w30
+	ret
+	.cfi_endproc
+
+	.globl	_frame_registers_caller
+	.p2align	2
+_frame_registers_caller:
+	.cfi_startproc
+	stp	x30, x29, [sp, #-48]!
+	.cfi_def_cfa_offset 48
+	.cfi_offset w30, -48
+	.cfi_offset w29, -40
+	stp	x19, x20, [sp, #16]
+	.cfi_offset w19, -32
+	.cfi_offset w20, -24
+	mov	x29, sp
+	mov	x19, #0x3131
+	mov	x20, xzr
+	mov	x0, #0x4141
+	bl	_frame_registers_callee
+	ldp	x19, x20, [sp, #16]
+	ldp	x30, x29, [sp], #48
+	.cfi_def_cfa_offset 0
+	.cfi_restore w19
+	.cfi_restore w20
+	.cfi_restore w29
+	.cfi_restore w30
+	ret
+	.cfi_endproc
+
 	.section	__DATA,__mod_init_func,mod_init_funcs
 	.p2align	3
 	.quad	_frameless_caller
 	.quad	_unwind_only_caller
+	.quad	_frame_registers_caller
 
 	.subsections_via_symbols

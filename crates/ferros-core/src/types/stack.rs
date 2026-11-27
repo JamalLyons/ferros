@@ -3,8 +3,55 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use gimli::AArch64;
+
 use super::symbols::{FunctionParameter, SourceLocation, SymbolName};
 use super::{Address, ThreadId};
+
+const FRAME_REGISTER_COUNT: usize = AArch64::PC.0 as usize + 1;
+
+/// Registers known for one physical stack frame. Inline frames share this state.
+///
+/// Values are indexed by AArch64 DWARF register number. Ordinary caller frames expose
+/// recovered callee-saved registers, SP and PC. A frame restored from a signal context
+/// can also expose the registers that would be volatile across an ordinary call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRegisters
+{
+    values: [u64; FRAME_REGISTER_COUNT],
+    known: u64,
+    cfa: Option<Address>,
+}
+
+impl FrameRegisters
+{
+    pub(crate) fn new(cfa: Option<Address>, read: impl Fn(u16) -> Option<u64>) -> Self
+    {
+        let mut values = [0; FRAME_REGISTER_COUNT];
+        let mut known = 0;
+        for (register, slot) in (0..).zip(&mut values) {
+            if let Some(value) = read(register) {
+                *slot = value;
+                known |= 1 << register;
+            }
+        }
+        Self { values, known, cfa }
+    }
+
+    /// The value of AArch64 DWARF register `number` (`0`–`30` for X0–X30, `31` for SP,
+    /// `32` for PC). Returns `None` for unavailable or unsupported registers.
+    pub fn dwarf_register(&self, number: u16) -> Option<u64>
+    {
+        let value = self.values.get(usize::from(number))?;
+        (self.known & (1 << number) != 0).then_some(*value)
+    }
+
+    /// The canonical frame address computed from this frame's CFI, if available.
+    pub fn cfa(&self) -> Option<Address>
+    {
+        self.cfa
+    }
+}
 
 /// Stable identifier for a logical stack frame.
 ///

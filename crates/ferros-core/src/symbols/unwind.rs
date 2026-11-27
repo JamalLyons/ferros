@@ -82,8 +82,10 @@
 //! ## Registers in caller frames
 //!
 //! A caller frame keeps the known callee-saved registers selected by its
-//! [`Arch`] plus registers its CFI restores. Unknown general registers read as zero.
-//! Rules that use an unknown register fail.
+//! [`Arch`] plus registers its CFI restores for subsequent unwind steps. Rules that
+//! use an unknown register fail. The frame register view exposes only callee-saved
+//! general registers for ordinary callers and records the CFA of the frame whose
+//! CFI computed it. Inline frames share their physical frame's register view.
 //!
 //! ## Signal handler frames
 //!
@@ -141,8 +143,11 @@
 //! ## Map of this file
 //!
 //! - `MemoryAccess`: the memory the walk reads.
-//! - `StackUnwinder`: `new`, `with_runtime`, `unwind`; the per-step logic is in its `impl`
-//!   (`unwind_with_lookups` and the CFI, leaf and frame-record steps described above).
+//! - `StackUnwinder` and its default runtime.
+//! - `UnwoundStack` and `PhysicalFrame`: logical frames, lookup addresses and physical registers.
+//! - `Cursor`, `CodeStep`, register masks, `UnwindStep`, `Hinted`: state during the walk.
+//! - `StackUnwinder` methods: `new`, `with_runtime`, `unwind`, `unwind_stack`, and the
+//!   CFI, leaf, frame-record, signal and register helpers described above.
 //! - `hinted`: which [`UnwindHint`] applies to a lookup address.
 //! - `append_logical_frames`: inlined frames for one physical frame.
 //! - Register helpers (`general_bit`, `read_register_value`, `return_register`); tests in
@@ -154,17 +159,19 @@
 //! - [gimli crate documentation](https://docs.rs/gimli/latest/gimli/)
 
 use gimli::{
-    BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset, EndianSlice, Register, RegisterRule,
+    AArch64, BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, EhFrameOffset, EndianSlice, Register, RegisterRule,
     RunTimeEndian, UnwindContext, UnwindSection,
 };
 
-use crate::arch::arm64_frame::{self, FrameRegisters, Prologue};
+use crate::arch::arm64_frame::{self, FrameRegisters as CodeRegisters, Prologue};
 use crate::arch::{Arch, Arm64, UndefinedReturnAddress};
 use crate::error::Result;
 use crate::objfile::UnwindHint;
 use crate::runtime::{NoRuntime, SignalContext, TargetRuntime, TrampolineFrame};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
-use crate::types::{Address, Architecture, FrameId, FrameKind, FrameStatus, Registers, StackFrame, ThreadId};
+use crate::types::{
+    Address, Architecture, FrameId, FrameKind, FrameRegisters, FrameStatus, Registers, StackFrame, ThreadId,
+};
 
 /// Minimal memory accessor required for stack unwinding.
 ///
@@ -212,6 +219,30 @@ pub struct StackUnwinder<'a, M>
 
 /// The runtime of an unwinder that was given none.
 static NO_RUNTIME: NoRuntime = NoRuntime;
+
+pub(crate) struct UnwoundStack
+{
+    pub(crate) frames: Vec<StackFrame>,
+    /// The physical frame's lookup address, repeated for each of its inline frames.
+    pub(crate) lookups: Vec<Address>,
+    physical_frames: Vec<PhysicalFrame>,
+}
+
+impl UnwoundStack
+{
+    pub(crate) fn frame_registers(&self, index: usize) -> Option<&FrameRegisters>
+    {
+        let physical = self.physical_frames.partition_point(|frame| frame.logical_end <= index);
+        self.physical_frames.get(physical).map(|frame| &frame.registers)
+    }
+}
+
+struct PhysicalFrame
+{
+    /// Exclusive end of the logical frames produced for this physical frame.
+    logical_end: usize,
+    registers: FrameRegisters,
+}
 
 /// Register state of one physical frame while walking.
 #[derive(Clone)]
@@ -301,27 +332,19 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// the walk with an error in the future.
     pub fn unwind(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<Vec<StackFrame>>
     {
-        Ok(self.unwind_with_lookups(thread, regs, max_frames)?.0)
+        Ok(self.unwind_stack(thread, regs, max_frames)?.frames)
     }
 
-    /// Like [`unwind`](Self::unwind), also returning each frame's lookup address, in the
-    /// same order: the address the unwinder symbolicated that frame's physical frame at.
-    /// It is the call instruction for a caller frame, and the pc itself for the innermost
-    /// frame and for a frame a signal interrupted, which no call reached. Inlined frames
-    /// share their physical frame's.
+    /// Like [`unwind`](Self::unwind), also returning lookup addresses and registers.
     ///
     /// # Errors
     ///
     /// As [`unwind`](Self::unwind).
-    pub(crate) fn unwind_with_lookups(
-        &self,
-        thread: ThreadId,
-        regs: &Registers,
-        max_frames: usize,
-    ) -> Result<(Vec<StackFrame>, Vec<Address>)>
+    pub(crate) fn unwind_stack(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<UnwoundStack>
     {
         let mut frames = Vec::new();
         let mut lookups = Vec::new();
+        let mut physical_frames = Vec::new();
         let mut cursor = Cursor {
             regs: regs.clone(),
             known: ALL_GENERAL,
@@ -340,12 +363,13 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             let signal = self
                 .signal_frame_step(&cursor)
                 .filter(|step| !(moved_down && step.next.sp < cursor.regs.sp));
+            let mut cfa = None;
             let (next, interrupted) = match signal {
                 Some(step) => {
                     moved_down |= step.next.sp < cursor.regs.sp;
                     (Some(step), true)
                 }
-                None => (self.step(&cursor), false),
+                None => (self.step(&cursor, lookup, &mut cfa), false),
             };
             let return_address = next.as_ref().map(|step| step.next.pc);
             append_logical_frames(
@@ -359,6 +383,10 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 return_address,
             );
             lookups.resize(frames.len(), lookup);
+            physical_frames.push(PhysicalFrame {
+                logical_end: frames.len(),
+                registers: self.frame_registers(&cursor, cfa),
+            });
 
             let Some(step) = next else {
                 break;
@@ -381,7 +409,11 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             depth += 1;
         }
 
-        Ok((frames, lookups))
+        Ok(UnwoundStack {
+            frames,
+            lookups,
+            physical_frames,
+        })
     }
 
     /// The address used for symbolication and unwind lookup: the call instruction for a
@@ -402,25 +434,30 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
 
     /// Find the caller of `cursor`'s frame, or `None` at the end of the stack. The order
     /// of sources is described in the module documentation.
-    fn step(&self, cursor: &Cursor) -> Option<UnwindStep>
+    fn step(&self, cursor: &Cursor, lookup: Address, cfa: &mut Option<Address>) -> Option<UnwindStep>
     {
-        let lookup = self.lookup_address(cursor);
         let step = match self.symbols.image_for_address(lookup) {
-            Some(image) => self.image_step(&image, cursor, lookup),
+            Some(image) => self.image_step(&image, cursor, lookup, cfa),
             None => self.frame_pointer_step(cursor),
         }?;
         self.accept(cursor, step)
     }
 
     /// Steps 1-4 of the module documentation for a pc inside a loaded image.
-    fn image_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
+    fn image_step(
+        &self,
+        image: &BinaryImage,
+        cursor: &Cursor,
+        lookup: Address,
+        cfa: &mut Option<Address>,
+    ) -> Option<UnwindStep>
     {
         match hinted(image, lookup) {
             Hinted::Hint {
                 hint: UnwindHint::Cfi { eh_frame_offset },
                 ..
             } => self
-                .eh_frame_fde_step(image, cursor, lookup, eh_frame_offset)
+                .eh_frame_fde_step(image, cursor, lookup, eh_frame_offset, cfa)
                 .or_else(|| self.frame_pointer_step(cursor)),
             Hinted::Hint {
                 hint: UnwindHint::Leaf { stack_size },
@@ -453,7 +490,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 }
             }
             Hinted::Absent => self
-                .scan_cfi_step(image, cursor, lookup)
+                .scan_cfi_step(image, cursor, lookup, cfa)
                 .or_else(|| self.dwarf_entry_step(image, cursor))
                 .or_else(|| self.frame_pointer_step(cursor)),
         }
@@ -500,6 +537,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         cursor: &Cursor,
         lookup: Address,
         fde_offset: usize,
+        cfa: &mut Option<Address>,
     ) -> Option<UnwindStep>
     {
         let (section, bases) = Self::eh_frame(image, self.arch.architecture().pointer_size_bytes())?;
@@ -510,7 +548,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             .ok()?;
         let mut ctx = UnwindContext::<usize>::new();
         let row = fde.unwind_info_for_address(&section, &bases, &mut ctx, lookup.value()).ok()?;
-        self.apply_row(cursor, row)
+        self.apply_row(cursor, row, cfa)
     }
 
     /// Without a hint: `.eh_frame_hdr`, then a linear scan of `eh_frame`, then
@@ -520,16 +558,20 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// section's runtime base); `.debug_frame` may live in an unslid companion file, so its
     /// ranges are file addresses. Each section is searched with its own address form only: trying the
     /// other one could match an unrelated function's FDE.
-    fn scan_cfi_step(&self, image: &BinaryImage, cursor: &Cursor, lookup: Address) -> Option<UnwindStep>
+    fn scan_cfi_step(
+        &self,
+        image: &BinaryImage,
+        cursor: &Cursor,
+        lookup: Address,
+        cfa: &mut Option<Address>,
+    ) -> Option<UnwindStep>
     {
         let pointer_size = self.arch.architecture().pointer_size_bytes();
         if let Some((section, bases)) = Self::eh_frame(image, pointer_size) {
-            if let Some((_, hdr_bytes)) = image.eh_frame_hdr_section()
-                && let Some(step) = self.unwind_with_eh_frame_hdr(&section, hdr_bytes, &bases, image, cursor, lookup)
-            {
+            if let Some(step) = self.unwind_with_eh_frame_hdr(&section, &bases, image, cursor, lookup, cfa) {
                 return Some(step);
             }
-            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, lookup.value()) {
+            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, lookup.value(), cfa) {
                 return Some(step);
             }
         }
@@ -539,7 +581,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             let bases = BaseAddresses::default();
             let mut section = DebugFrame::new(bytes, image.endian());
             section.set_address_size(pointer_size);
-            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, file) {
+            if let Some(step) = self.unwind_with_section(&section, &bases, cursor, file, cfa) {
                 return Some(step);
             }
         }
@@ -554,6 +596,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         bases: &BaseAddresses,
         cursor: &Cursor,
         address: u64,
+        cfa: &mut Option<Address>,
     ) -> Option<UnwindStep>
     where
         R: gimli::Reader<Offset = usize>,
@@ -572,7 +615,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 continue;
             }
             let row = fde.unwind_info_for_address(section, bases, &mut ctx, address).ok()?;
-            return self.apply_row(cursor, row);
+            return self.apply_row(cursor, row, cfa);
         }
         None
     }
@@ -581,13 +624,14 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     fn unwind_with_eh_frame_hdr(
         &self,
         section: &EhFrame<EndianSlice<'_, RunTimeEndian>>,
-        hdr_bytes: &[u8],
         bases: &BaseAddresses,
         image: &BinaryImage,
         cursor: &Cursor,
         lookup: Address,
+        cfa: &mut Option<Address>,
     ) -> Option<UnwindStep>
     {
+        let (_, hdr_bytes) = image.eh_frame_hdr_section()?;
         let header = EhFrameHdr::new(hdr_bytes, image.endian())
             .parse(bases, self.arch.architecture().pointer_size_bytes())
             .ok()?;
@@ -596,7 +640,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let row = table
             .unwind_info_for_address(section, bases, &mut ctx, lookup.value(), EhFrame::cie_from_offset)
             .ok()?;
-        self.apply_row(cursor, row)
+        self.apply_row(cursor, row, cfa)
     }
 
     /// Build the caller's registers from a CFI row.
@@ -604,7 +648,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// The caller keeps only the callee-saved registers (`SameValue` by default) plus
     /// whatever the row restores; caller-saved registers become unknown, and so does any
     /// register whose rule is `Undefined`.
-    fn apply_row(&self, cursor: &Cursor, row: &gimli::UnwindTableRow<usize>) -> Option<UnwindStep>
+    fn apply_row(
+        &self,
+        cursor: &Cursor,
+        row: &gimli::UnwindTableRow<usize>,
+        frame_cfa: &mut Option<Address>,
+    ) -> Option<UnwindStep>
     {
         let regs = &cursor.regs;
         let cfa = match row.cfa() {
@@ -616,7 +665,14 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         };
 
         let return_register = return_register(self.arch.architecture());
-        let return_address = self.recover(cursor, &row.register(return_register), cfa, return_register)??;
+        let return_address = self.recover(cursor, &row.register(return_register), cfa, return_register);
+
+        // Keep the CFA even if the row cannot unwind to a caller. If another row
+        // succeeds during the search, its CFA takes precedence.
+        if frame_cfa.is_none() || matches!(return_address, Some(Some(_))) {
+            *frame_cfa = Some(Address::new(cfa));
+        }
+        let return_address = return_address??;
 
         let mut next = regs.clone();
         let mut known = cursor.known & self.arch.callee_saved_register_mask();
@@ -775,7 +831,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             *slot = *value;
         }
         x[Arm64::FRAME_POINTER_INDEX] = regs.fp.value();
-        let current = FrameRegisters {
+        let current = CodeRegisters {
             x,
             sp: regs.sp.value(),
             known: ALL_GENERAL,
@@ -880,13 +936,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         };
 
         let mut next = cursor.regs.clone();
+        next.general.resize(Arm64::GENERAL_REGISTER_COUNT, 0);
         for (slot, &value) in next.general.iter_mut().zip(&context.general).take(Arm64::FRAME_POINTER_INDEX) {
             *slot = value;
         }
         self.arch.set_fp(&mut next, Address::new(context.fp));
-        if let Some(slot) = next.general.get_mut(Arm64::LINK_REGISTER_INDEX) {
-            *slot = context.lr;
-        }
+        next.general[Arm64::LINK_REGISTER_INDEX] = context.lr;
         next.sp = Address::new(sp);
         next.pc = self.arch.strip_pointer_auth(Address::new(context.pc));
         let step = UnwindStep {
@@ -927,6 +982,26 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             return None;
         }
         read_register_value(self.arch.architecture(), &cursor.regs, register)
+    }
+
+    fn frame_registers(&self, cursor: &Cursor, cfa: Option<Address>) -> FrameRegisters
+    {
+        let architecture = self.arch.architecture();
+        let known = if cursor.is_caller {
+            cursor.known & self.arch.callee_saved_register_mask()
+        } else {
+            cursor.known
+        };
+        FrameRegisters::new(cfa, |number| {
+            let register = Register(number);
+            if architecture != Architecture::Arm64 || general_bit(register).is_some_and(|bit| known & bit == 0) {
+                return None;
+            }
+            if register == AArch64::PC {
+                return Some(cursor.regs.pc.value());
+            }
+            read_register_value(architecture, &cursor.regs, register)
+        })
     }
 
     fn set_register_value(&self, regs: &mut Registers, register: Register, value: u64)
@@ -1319,11 +1394,12 @@ mod tests
         let memory = signal_stack();
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
-        let trampoline = Cursor {
+        let mut trampoline = Cursor {
             known: 1 << 29,
             is_caller: true,
             ..innermost(regs(0x5000_0044, 0x10f0, 0x1100, 0))
         };
+        trampoline.regs.general.clear();
         let step = unwinder.signal_frame_step(&trampoline).expect("a signal frame");
         assert_eq!(step.known, ALL_GENERAL);
         assert_eq!(step.next.general[0], 0x100);
@@ -1660,9 +1736,11 @@ mod tests
             is_caller: false,
         };
         let image = symbols.image_for_address(Address::new(interrupted_pc)).expect("image");
+        let mut cfa = None;
         let row = unwinder
-            .scan_cfi_step(&image, &interrupted, Address::new(interrupted_pc))
+            .scan_cfi_step(&image, &interrupted, Address::new(interrupted_pc), &mut cfa)
             .expect("a CFI step");
+        assert_eq!(cfa, Some(Address::new(0x1f10)));
         assert_eq!(row.next.sp, Address::new(0x1f10));
         assert_eq!(row.status, FrameStatus::Complete);
         assert!(unwinder.accept(&interrupted, row).is_none());

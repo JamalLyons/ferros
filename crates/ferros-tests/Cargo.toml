@@ -165,3 +165,8 @@ test = false
 name = "ferros-fixture-values_types"
 path = "fixtures/values_types.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-values_enums"
+path = "fixtures/values_enums.rs"
+test = false

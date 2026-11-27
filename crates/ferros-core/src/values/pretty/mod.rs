@@ -1,5 +1,7 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
+mod enums;
+
 use super::format::{ValueFormatter, ValueView};
 use super::types::{Type, TypeTable};
 
@@ -15,4 +17,4 @@ pub trait PrettyPrinter: Sync
 }
 
 /// Built-in printers in matching order. Unmatched types use the generic formatter.
-pub static PRINTERS: &[&dyn PrettyPrinter] = &[];
+pub static PRINTERS: &[&dyn PrettyPrinter] = &[&enums::EnumPrinter];

@@ -36,3 +36,4 @@ mod symbols;
 mod types;
 mod universal_images;
 mod values;
+mod values_enums;

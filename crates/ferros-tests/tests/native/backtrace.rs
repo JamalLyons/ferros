@@ -1062,7 +1062,7 @@ fn frame_hint_recovers_packed_register_saves()
         let fixture = fixture!("frameless_stack");
         let mut d = t.launch(&fixture);
         let entry = raw_symbol_address(&mut d, &fixture, "_compact_registers_callee");
-        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop
+        let child = raw_symbol_address(&mut d, &fixture, "_compact_unbuilt_frame");
         let save = find_instruction(&mut d, entry, |insn| insn == 0xA900_4FF4); // stp x20, x19, [sp]
         run_to(&mut d, save);
         let before_save = d.stack_trace_with_registers(2).expect("stack trace during the prologue");
@@ -1070,21 +1070,43 @@ fn frame_hint_recovers_packed_register_saves()
         assert_eq!(caller.dwarf_register(19), Some(0x3131));
         assert_eq!(caller.dwarf_register(20), Some(0));
 
-        run_to(&mut d, stop);
+        run_to(&mut d, child);
 
         let trace = d.stack_trace_with_registers(3).expect("stack trace");
-        let current = trace.frame_registers(0).expect("callee registers");
-        assert_eq!(current.dwarf_register(19), Some(0x5252));
-        assert_eq!(current.dwarf_register(20), Some(0x6262));
-        let caller = trace.frame_registers(1).expect("caller registers");
-        assert_eq!(caller.dwarf_register(19), Some(0x3131));
-        assert_eq!(caller.dwarf_register(20), Some(0));
-        assert_eq!(current.cfa(), Some(trace.frames()[1].sp));
+        let middle = trace.frame_registers(1).expect("callee registers");
+        assert_eq!(middle.dwarf_register(19), Some(0x5252));
+        assert_eq!(middle.dwarf_register(20), Some(0x6262));
+        let parent = trace.frame_registers(2).expect("caller registers");
+        assert_eq!(parent.dwarf_register(19), Some(0x3131));
+        assert_eq!(parent.dwarf_register(20), Some(0));
+        assert_eq!(middle.cfa(), Some(trace.frames()[2].sp));
     });
 }
 
 #[test]
-fn allocating_leaf_fallback_does_not_expose_caller_callee_saved_values()
+fn unverified_frame_record_fallback_keeps_cfa_and_saved_registers_unknown()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_compact_unbuilt_frame");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let current = trace.frame_registers(0).expect("live registers");
+        assert_eq!(current.dwarf_register(19), Some(0x5252));
+        let fallback = trace.frame_registers(1).expect("frame-pointer fallback");
+        assert_eq!(
+            (current.cfa(), fallback.dwarf_register(19)),
+            (None, None),
+            "the live FP and save slots belong to the caller's frame"
+        );
+    });
+}
+
+#[test]
+fn allocating_leaf_fallback_recovers_saved_x19_instead_of_the_live_value()
 {
     harness::run(|t| {
         let fixture = fixture!("frameless_stack");
@@ -1101,12 +1123,32 @@ fn allocating_leaf_fallback_does_not_expose_caller_callee_saved_values()
         let current = trace.frame_registers(0).expect("callee registers");
         assert_eq!(current.dwarf_register(19), Some(0x5151));
         let caller = trace.frame_registers(1).expect("caller registers");
-        assert_eq!(caller.dwarf_register(19), None);
+        assert_eq!(caller.dwarf_register(19), Some(0x1919));
         assert_eq!(trace.frames()[1].sp, trace.frames()[0].sp + 32);
         let saved_x19 = d
             .read_memory(Address::new(trace.frames()[1].sp.value() - 8), 8)
             .expect("saved x19");
         assert_eq!(saved_x19, 0x1919_u64.to_le_bytes());
+    });
+}
+
+#[test]
+fn allocating_leaf_fallback_preserves_unsaved_registers()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_frameless_locals");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        run_to(&mut d, stop);
+        let mut registers = d.read_registers().expect("leaf registers");
+        registers.general[19] = 0x1920;
+        d.write_registers(&registers).expect("set x19");
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(trace.frames()[1].sp, trace.frames()[0].sp + 16);
+        assert_eq!(caller.dwarf_register(19), Some(0x1920));
     });
 }
 

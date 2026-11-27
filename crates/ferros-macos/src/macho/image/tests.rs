@@ -586,6 +586,7 @@ fn open_reads_unwind_info_and_eh_frame_sections()
             start: Address::new(0x5_0000_1040),
             hint: UnwindHint::Leaf {
                 stack_size: u64::from((0x0200_1000_u32 >> 12) & 0xFFF) * 16,
+                saved: Default::default(),
             },
         })
     );

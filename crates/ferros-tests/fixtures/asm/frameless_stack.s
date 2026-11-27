@@ -41,6 +41,19 @@ _frameless_spill:
 	ret
 	.cfi_endproc
 
+	.globl	_frameless_locals
+	.p2align	2
+_frameless_locals:
+	.cfi_startproc
+	sub	sp, sp, #16
+	.cfi_def_cfa_offset 16
+	cbz	x0, 1f
+1:	nop
+	cbz	x0, 2f
+2:	add	sp, sp, #16
+	ret
+	.cfi_endproc
+
 	.globl	_frameless_caller
 	.p2align	2
 _frameless_caller:
@@ -52,6 +65,7 @@ _frameless_caller:
 	.cfi_offset w29, -16
 	mov	x0, #41
 	bl	_frameless_spill
+	bl	_frameless_locals
 	ldp	x29, x30, [sp], #16
 	ret
 	.cfi_endproc
@@ -141,8 +155,8 @@ _frame_registers_caller:
 	ret
 	.cfi_endproc
 
-	// Standard frame record with a saved x19/x20 pair. The conditional branches on
-	// either side of the nop force the unwinder to use the frame record hint.
+	// Standard frame record with a saved x19/x20 pair. Stop in its child to
+	// recover these slots from the hint for a caller frame.
 	.globl	_compact_registers_callee
 	.p2align	2
 _compact_registers_callee:
@@ -158,12 +172,38 @@ _compact_registers_callee:
 	.cfi_offset w20, -32
 	mov	x19, #0x5252
 	mov	x20, #0x6262
+	bl	_compact_unbuilt_frame
+	ldp	x20, x19, [sp]
+	ldp	x29, x30, [sp, #16]
+	add	sp, sp, #32
+	ret
+	.cfi_endproc
+
+	// The branches around the nop defeat both instruction decoders before FP is
+	// installed. The live FP still points to _compact_registers_callee's frame.
+	.globl	_compact_unbuilt_frame
+	.p2align	2
+_compact_unbuilt_frame:
+	.cfi_startproc
 	cbz	x0, 3f
 3:	nop
 	cbz	x0, 4f
-4:	ldp	x20, x19, [sp]
-	ldp	x29, x30, [sp, #16]
-	add	sp, sp, #32
+4:	sub	sp, sp, #48
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
+	.cfi_def_cfa w29, 16
+	.cfi_offset w30, -8
+	.cfi_offset w29, -16
+	stp	x20, x19, [sp, #16]
+	.cfi_offset w19, -24
+	.cfi_offset w20, -32
+	stp	x22, x21, [sp]
+	.cfi_offset w21, -40
+	.cfi_offset w22, -48
+	ldp	x22, x21, [sp]
+	ldp	x20, x19, [sp, #16]
+	ldp	x29, x30, [sp, #32]
+	add	sp, sp, #48
 	ret
 	.cfi_endproc
 

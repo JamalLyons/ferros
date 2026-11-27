@@ -24,7 +24,8 @@
 //!    and its `sp` is `sp + stack_size` (`sp` itself on the first instruction, before the
 //!    allocation). Elsewhere the instructions are analysed first (see *Prologues and
 //!    epilogues* below), so a stop after the epilogue released the allocation gets the
-//!    caller's `sp` right. A frameless leaf makes no calls, so it cannot be a caller frame;
+//!    caller's `sp` right. After allocation the hint locates any saved general registers
+//!    below the caller's `sp`. A frameless leaf makes no calls, so it cannot be a caller frame;
 //!    there the walk stops instead of guessing.
 //! 3. **[`UnwindHint::FrameRecord`]**: the frame-pointer chain: the record at `fp` holds
 //!    the caller's `fp` and the return address. The hint describes general register
@@ -34,7 +35,9 @@
 //!    hint, so a first instruction is recognized from the entry or from the DWARF function
 //!    index. Elsewhere in the innermost frame the instructions are analysed first (see
 //!    *Prologues and epilogues*), which covers the rest of the prologue, the epilogue after
-//!    `x29`/`x30` are reloaded, and a shrink-wrapped path before the record is built.
+//!    `x29`/`x30` are reloaded, and a shrink-wrapped path before the record is built. If
+//!    analysis fails in the innermost frame, the bare chain advances the trace with CFA
+//!    and general register saves unavailable.
 //! 4. **No hint** (no table, no entry, or an entry without information): `.eh_frame_hdr`
 //!    lookup, else a linear scan of `eh_frame` (FDE ranges as runtime addresses), then of
 //!    `.debug_frame` (FDE ranges as file addresses, since it may live in an unslid
@@ -417,16 +420,16 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 .eh_frame_fde_step(image, cursor, lookup, eh_frame_offset, cfa)
                 .or_else(|| self.frame_pointer_step(cursor)),
             Hinted::Hint {
-                hint: UnwindHint::Leaf { stack_size },
+                hint: UnwindHint::Leaf { stack_size, saved },
                 at_entry,
                 start,
             } => {
                 // On the first instruction the leaf has not allocated its stack yet.
                 if at_entry || self.is_dwarf_function_start(image, cursor) {
-                    return self.frameless_step(cursor, 0);
+                    return self.entry_step(cursor);
                 }
                 self.code_step(cursor, self.function_start(image, cursor, start))
-                    .or_else(|| self.frameless_step(cursor, stack_size))
+                    .or_else(|| self.frameless_step(cursor, stack_size, saved))
             }
             Hinted::Hint {
                 hint: UnwindHint::FrameRecord { saved },
@@ -436,12 +439,16 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 // A table may give one entry to a run of adjacent functions with the same
                 // hint, so only the first of them is recognized from the entry; the others
                 // are recognized from the DWARF function index.
-                let step = if at_entry || self.is_dwarf_function_start(image, cursor) {
-                    self.entry_step(cursor)
+                let step = if cursor.is_caller {
+                    self.frame_record_step(cursor, saved)?
+                } else if at_entry || self.is_dwarf_function_start(image, cursor) {
+                    self.entry_step(cursor)?
+                } else if let Some(step) = self.code_step(cursor, self.function_start(image, cursor, start)) {
+                    step
                 } else {
-                    self.code_step(cursor, self.function_start(image, cursor, start))
-                        .or_else(|| self.frame_record_step(cursor, saved))
-                }?;
+                    // An unverified FP can still point to the caller's frame record.
+                    return self.frame_pointer_step(cursor);
+                };
                 *cfa = Some(step.next.sp);
                 Some(step)
             }
@@ -700,7 +707,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// plus the leaf's stack allocation. A frameless leaf makes no calls, so it cannot be a
     /// caller frame with a valid return address: as a caller (or without `x30`) the walk
     /// stops here rather than guessing through the frame-pointer chain.
-    fn frameless_step(&self, cursor: &Cursor, stack_size: u64) -> Option<UnwindStep>
+    fn frameless_step(&self, cursor: &Cursor, stack_size: u64, saved: SavedRegisterSlots) -> Option<UnwindStep>
     {
         if cursor.is_caller || cursor.known & LINK_REGISTER == 0 {
             return None;
@@ -708,19 +715,15 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let link = self.arch.link_register(&cursor.regs)?;
         let mut next = cursor.regs.clone();
         next.pc = self.arch.strip_pointer_auth(link);
-        next.sp = Address::new(cursor.regs.sp.value().checked_add(stack_size)?);
-        // A leaf with stack storage can save and reuse callee-saved registers. At
-        // entry or in a zero-allocation leaf, no such spills have taken place.
-        let preserved = if stack_size == 0 {
-            self.arch.callee_saved_register_mask()
-        } else {
-            FRAME_POINTER
-        };
-        Some(UnwindStep {
+        let caller_sp = cursor.regs.sp.value().checked_add(stack_size)?;
+        next.sp = Address::new(caller_sp);
+        let mut step = UnwindStep {
             next,
-            known: cursor.known & preserved,
+            known: cursor.known & FRAME_POINTER,
             status: FrameStatus::CfiFallback,
-        })
+        };
+        self.restore_saved_registers(cursor, caller_sp, saved, &mut step);
+        Some(step)
     }
 
     /// Innermost frame on a function's first instruction: nothing was pushed, so the
@@ -863,6 +866,12 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     fn frame_record_step(&self, cursor: &Cursor, saved: SavedRegisterSlots) -> Option<UnwindStep>
     {
         let mut step = self.frame_pointer_step(cursor)?;
+        self.restore_saved_registers(cursor, cursor.regs.fp.value(), saved, &mut step);
+        Some(step)
+    }
+
+    fn restore_saved_registers(&self, cursor: &Cursor, base: u64, saved: SavedRegisterSlots, step: &mut UnwindStep)
+    {
         let callee_saved = self.arch.callee_saved_register_mask() & !FRAME_POINTER;
         step.known |= cursor.known & callee_saved & !saved.mask;
 
@@ -874,7 +883,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             pending &= !bit;
             if callee_saved & bit != 0
                 && offset <= -8
-                && let Some(slot) = cursor.regs.fp.value().checked_add_signed(offset)
+                && let Some(slot) = base.checked_add_signed(offset)
                 && slot >= cursor.regs.sp.value()
                 && let Ok(value) = self.memory.read_u64(Address::new(slot))
             {
@@ -883,7 +892,6 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             }
             offset -= 8;
         }
-        Some(step)
     }
 
     /// A caller frame in the platform's signal trampoline: the frame the signal
@@ -1259,29 +1267,40 @@ mod tests
     #[test]
     fn frameless_leaf_returns_through_the_link_register_only_when_innermost()
     {
-        let memory = FakeMemory::default();
+        let mut memory = FakeMemory::default();
+        memory.words.insert(0xf18, 190);
         let symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
         let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory).with_runtime(&*RUNTIME);
         let mut regs = regs(0x4000_0000, 0xf00, 0x1000, 0x8012_0000_4000_0abc);
         regs.general[3] = 33;
+        regs.general[19] = 19;
         regs.general[20] = 20;
+        let saved = SavedRegisterSlots {
+            mask: (1 << 19) | (1 << 20),
+            first_offset: -8,
+        };
         let step = unwinder
-            .frameless_step(&innermost(regs.clone()), 32)
+            .frameless_step(&innermost(regs.clone()), 32, saved)
             .expect("innermost frameless");
         assert_eq!(step.next.pc, Address::new(0x4000_0abc), "PAC bits stripped");
         assert_eq!(step.next.sp, Address::new(0xf20));
         assert_eq!(step.next.fp, Address::new(0x1000), "a leaf leaves fp alone");
         assert_eq!(step.known & (1 << 3), 0, "x3 is caller-saved");
-        assert_eq!(step.known & (1 << 20), 0, "an allocating leaf can reuse x20");
+        assert_ne!(step.known & (1 << 19), 0, "x19 was recovered");
+        assert_eq!(step.next.general[19], 190);
+        assert_eq!(step.known & (1 << 20), 0, "the saved x20 slot is unreadable");
         assert_eq!(step.known & LINK_REGISTER, 0);
-        let entry = unwinder.frameless_step(&innermost(regs.clone()), 0).expect("no allocation");
+        let entry = unwinder.entry_step(&innermost(regs.clone())).expect("no allocation");
         assert_ne!(entry.known & (1 << 20), 0, "x20 is known before any allocation");
 
         let caller = Cursor {
             is_caller: true,
             ..innermost(regs)
         };
-        assert!(unwinder.frameless_step(&caller, 32).is_none(), "a leaf is never a caller");
+        assert!(
+            unwinder.frameless_step(&caller, 32, saved).is_none(),
+            "a leaf is never a caller"
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@ use ferros_tests::transcript::{self, Transcript};
 
 /// `up` twice from `level_c` selects `level_a` at its call of `level_b`. `down` past
 /// frame 0 is an error and leaves that frame selected. A later `thread`, `next`, and
-/// `continue` each return the selection to frame 0, and `help` lists the commands.
+/// `continue` (the last reached by `up` from the new stop) each return the selection to
+/// frame 0, and `help` lists the commands.
 #[test]
 fn up_selects_the_grandparent_and_the_selection_resets()
 {
@@ -37,6 +38,7 @@ fn up_selects_the_grandparent_and_the_selection_resets()
             "up",
             "next",
             "frame",
+            "up",
             "continue",
             "frame",
             "help",
@@ -70,6 +72,12 @@ fn up_selects_the_grandparent_and_the_selection_resets()
         assert!(after_next.starts_with("#0 "), "{after_next}");
         assert!(!after_next.contains("::level_a "), "{after_next}");
 
+        // `continue` must clear a frame selected after `next`, not only a selection that is already 0.
+        let before_continue = frame_line(&replies, "up", 4);
+        assert!(
+            !before_continue.starts_with("#0 "),
+            "continue was not reached from an outer frame: {before_continue}"
+        );
         let after_continue = frame_line(&replies, "frame", 4);
         assert!(after_continue.starts_with("#0 "), "{after_continue}");
         assert!(after_continue.contains("::main "), "{after_continue}");

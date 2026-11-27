@@ -87,3 +87,73 @@ fn step_instruction_resets_the_selected_frame()
     session.wait(None).expect("wait");
     assert_eq!(session.selected_frame(), 0);
 }
+
+fn framed_registers(pc: u64) -> Registers
+{
+    let mut registers = regs_at(pc);
+    registers.fp = Address::new(0x2000);
+    registers.sp = Address::new(0x2000);
+    registers
+}
+
+/// Two threads, a breakpoint at `BP`, and one caller frame above each thread.
+fn framed_process() -> MockBackend
+{
+    let mut stack = vec![0u8; 16];
+    stack[8..].copy_from_slice(&0x1004u64.to_le_bytes());
+    MockBackend::new()
+        .with_pid(ProcessId(42))
+        .with_thread(T1, framed_registers(BP))
+        .with_thread(T2, framed_registers(CODE + 4))
+        .with_region(Address::new(CODE), "r-x", (0u8..32).collect::<Vec<_>>())
+        .with_region(Address::new(0x2000), "rw-", stack)
+}
+
+/// A peer stop is reported while a signal handler's return is still queued. Selecting a
+/// caller and polling `wait` lets that return resume the process internally; the selected
+/// frame does not survive the resume.
+#[test]
+fn handler_return_resume_clears_a_frame_selected_after_the_peer_stop()
+{
+    let mock = framed_process();
+    let mut session = launched(&mock);
+    session.add_breakpoint(software(BP)).expect("breakpoint");
+    session.add_breakpoint(software(BP2)).expect("peer breakpoint");
+    session.write_registers_for(T1, &framed_registers(BP)).expect("registers");
+    session.last_stop = Some(StopEvent::Signal { thread: T1, signal: 11 });
+
+    let signal_resume = ResumeRequest::all(ThreadAction::Suspend)
+        .with_thread(T1, ThreadAction::Continue)
+        .with_signal(T1, 11);
+    mock.script(
+        MockStop::new(StopEvent::Signal { thread: T1, signal: 14 })
+            .set_registers(T1, framed_registers(0x3000))
+            .expect_resume(signal_resume),
+    );
+    session.resume_with_signal().expect("deliver the signal");
+    let stopped = session.wait(None).expect("wait").expect("the handler stopped");
+    assert!(matches!(stopped, StopEvent::Signal { signal: 14, .. }), "{stopped:?}");
+
+    mock.script_simultaneous([
+        MockStop::new(StopEvent::Breakpoint {
+            thread: T2,
+            pc: Address::new(BP2),
+        })
+        .expect_resume(ResumeRequest::continue_all()),
+        MockStop::new(StopEvent::Breakpoint {
+            thread: T1,
+            pc: Address::new(BP),
+        })
+        .set_registers(T1, framed_registers(BP))
+        .expect_resume(ResumeRequest::continue_all()),
+    ]);
+    session.resume().expect("continue while the handler is stopped");
+    let peer = session.wait(None).expect("wait").expect("the peer stop");
+    assert!(matches!(peer, StopEvent::Breakpoint { thread: T2, .. }), "{peer:?}");
+    assert_eq!(session.state(), SessionState::Stopped);
+
+    session.select_frame(1).expect("outer frame");
+    assert_eq!(session.selected_frame(), 1);
+    assert_eq!(session.wait(Some(Duration::ZERO)).expect("poll"), None);
+    assert_eq!(session.selected_frame(), 0);
+}

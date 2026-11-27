@@ -36,10 +36,12 @@ impl ReplCommand for Frame
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
     {
-        if !args.is_empty() {
-            ctx.session().select_frame(parse_index(args)?)?;
+        if args.is_empty() {
+            return print_selected(ctx);
         }
-        print_selected(ctx)
+        let frame = ctx.session().select_frame(parse_index(args)?)?;
+        writeln!(ctx.out, "{}", format_frame(&frame, true))?;
+        Ok(Flow::Continue)
     }
 }
 
@@ -102,17 +104,29 @@ fn move_frame(ctx: &mut Ctx<'_>, direction: Direction, count: usize) -> CommandR
 {
     let current = ctx.session().selected_frame();
     let target = match direction {
-        Direction::Up => current
-            .checked_add(count)
-            .ok_or_else(|| CommandError::new("already at the oldest frame"))?,
-        Direction::Down => current
-            .checked_sub(count)
-            .ok_or_else(|| CommandError::new("already at the newest frame"))?,
+        Direction::Up => match current.checked_add(count) {
+            Some(target) => target,
+            None => return end_of_stack_if_stopped(ctx, "already at the oldest frame"),
+        },
+        Direction::Down => match current.checked_sub(count) {
+            Some(target) => target,
+            None => return end_of_stack_if_stopped(ctx, "already at the newest frame"),
+        },
     };
-    if let Err(error) = ctx.session().select_frame(target) {
-        return Err(end_of_stack(error, direction));
-    }
-    print_selected(ctx)
+    let frame = match ctx.session().select_frame(target) {
+        Ok(frame) => frame,
+        Err(error) => return Err(end_of_stack(error, direction)),
+    };
+    writeln!(ctx.out, "{}", format_frame(&frame, true))?;
+    Ok(Flow::Continue)
+}
+
+/// `at_end` only when a stopped process really is at that end of the stack. A missing
+/// or running process reports that error instead.
+fn end_of_stack_if_stopped(ctx: &mut Ctx<'_>, at_end: &str) -> CommandResult
+{
+    ctx.session().selected_stack_frame()?;
+    Err(CommandError::new(at_end))
 }
 
 fn end_of_stack(error: DebuggerError, direction: Direction) -> CommandError

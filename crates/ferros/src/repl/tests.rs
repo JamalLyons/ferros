@@ -209,6 +209,17 @@ fn memory_read_failure_is_an_error()
 }
 
 #[test]
+fn down_after_the_process_exits_reports_that_nothing_is_attached()
+{
+    let mock = mock();
+    mock.script(MockStop::new(StopEvent::Exited { code: 0 }));
+    let commands = ["continue", "down"];
+    let t = batch(&mock, &commands);
+    assert!(t.err.contains("error: Not attached to a process\n"), "{}", t.err);
+    assert!(!t.err.contains("newest frame"), "{}", t.err);
+}
+
+#[test]
 fn frame_commands_print_the_only_frame_and_stop_at_the_ends()
 {
     let mock = mock();

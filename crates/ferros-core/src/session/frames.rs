@@ -22,9 +22,10 @@ impl Session
     ///
     /// `0` is the innermost frame. Inline frames count, in the same order as
     /// [`stack_trace`](Self::stack_trace). The index is `0` after [`launch`](Self::launch),
-    /// [`attach`](Self::attach), every resume and step, every stop, and
-    /// [`select_thread`](Self::select_thread). Reading it does not require a stopped
-    /// process: while the process is running the index is already `0`.
+    /// [`attach`](Self::attach), every resume and step (including an internal resume the
+    /// caller does not make itself), every stop, and [`select_thread`](Self::select_thread).
+    /// Reading it does not require a stopped process: while the process is running the
+    /// index is already `0`.
     #[must_use]
     pub fn selected_frame(&self) -> usize
     {
@@ -35,7 +36,8 @@ impl Session
     ///
     /// `0` is the innermost frame. Inline frames count, as in
     /// [`stack_trace`](Self::stack_trace). An index past the last frame leaves the
-    /// selection unchanged.
+    /// selection unchanged. On success the returned frame is that selection, from the
+    /// same unwind that checked the index.
     ///
     /// # Errors
     ///
@@ -43,11 +45,11 @@ impl Session
     /// while running, [`DebuggerError::NoThreadSelected`] if the process has no
     /// thread, [`DebuggerError::InvalidArgument`] if `index` is past the last frame,
     /// or an error from unwinding the stack.
-    pub fn select_frame(&mut self, index: usize) -> Result<()>
+    pub fn select_frame(&mut self, index: usize) -> Result<StackFrame>
     {
-        self.frames_through(index)?;
+        let mut frames = self.frames_through(index)?;
         self.selected_frame = index;
-        Ok(())
+        Ok(frames.swap_remove(index))
     }
 
     /// The selected frame of the selected thread.

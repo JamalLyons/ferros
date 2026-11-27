@@ -102,11 +102,18 @@ impl Session
     }
 
     /// A successful resume consumes held signals for the threads it starts.
+    ///
+    /// This is every resume the backend actually starts, including an internal
+    /// continue or step the caller does not make itself (a handler return, a
+    /// breakpoint step-over, a line-step continuation). The process is running
+    /// again, so a frame selected at the previous stop no longer applies. A refused
+    /// resume ran nothing and leaves the selection as it was.
     fn resume_backend(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         self.backend.resume(request)?;
         self.carried_signals
             .retain(|(thread, _)| request.action_for(*thread) == ThreadAction::Suspend);
+        self.reset_selected_frame();
         Ok(())
     }
 

@@ -142,6 +142,7 @@ registry! {
     inspect: [Registers, Memory],
     threads: [Threads, Thread],
     stack: [Backtrace],
+    frame: [Frame, Up, Down],
     images: [Images],
     help: [Help],
 }

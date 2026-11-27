@@ -25,11 +25,11 @@ impl ReplCommand for Backtrace
 
     fn help(&self) -> &'static str
     {
-        "backtrace [n] (alias: bt)\n\nPrint the selected thread's frames, innermost first, at most n (default \
-         256), one per line as '#<index> <pc> in <function> at <file>:<line>'. A caller's pc is its return \
-         address; its line is the call site. Functions inlined into a frame are listed before it and marked \
-         '[inlined]'. A frame whose code has no debug info is named from its image's symbol table (the \
-         nearest symbol before its pc) and printed with no location; a frame with neither prints '??'."
+        "backtrace [n] (alias: bt)\n\nPrint the selected thread's frames, innermost first, at most n (default 256), one per \
+         line as '#<index> <pc> in <function> at <file>:<line>'. The selected frame has '*' after its address. A caller's \
+         pc is its return address; its line is the call site. Functions inlined into a frame are listed before it and \
+         marked '[inlined]'. A frame whose code has no debug info is named from its image's symbol table (the nearest \
+         symbol before its pc) and printed with no location; a frame with neither prints '??'."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -42,22 +42,31 @@ impl ReplCommand for Backtrace
                 .filter(|&n| n > 0)
                 .ok_or_else(|| CommandError::new("the frame count must be at least 1"))?
         };
+        let selected = ctx.session().selected_frame();
         let frames = ctx.session().stack_trace(limit)?;
         for frame in &frames {
-            writeln!(ctx.out, "{}", format_frame(frame))?;
+            writeln!(ctx.out, "{}", format_frame(frame, frame.index == selected))?;
         }
         Ok(Flow::Continue)
     }
 }
 
-/// `#<index> <pc> in <function> at <file>:<line>[ [inlined]]`.
-fn format_frame(frame: &StackFrame) -> String
+/// `#<index> <pc>[ *] in <function> at <file>:<line>[ [inlined]]`.
+///
+/// `*` after the address marks the selected frame.
+pub(super) fn format_frame(frame: &StackFrame, selected: bool) -> String
 {
     let function = frame
         .symbol
         .as_ref()
         .map_or_else(|| "??".to_owned(), |symbol| symbol.display_name().to_owned());
-    let mut line = format!("#{} {:#018x} in {function}", frame.index, frame.pc.value());
+    // Built in pieces: one `format!` with the name as well trips `large_stack_arrays`.
+    let mut line = format!("#{} {:#018x}", frame.index, frame.pc.value());
+    if selected {
+        line.push_str(" *");
+    }
+    line.push_str(" in ");
+    line.push_str(&function);
     if let Some(location) = &frame.location {
         line.push_str(" at ");
         line.push_str(&location.file);
@@ -75,9 +84,16 @@ fn format_frame(frame: &StackFrame) -> String
 #[cfg(test)]
 mod tests
 {
-    use ferros_core::{Address, FrameId, FrameKind, FrameStatus, SourceLocation, StackFrame, SymbolLanguage, SymbolName, ThreadId};
+    use ferros_core::{
+        Address, FrameId, FrameKind, FrameStatus, SourceLocation, StackFrame, SymbolLanguage, SymbolName, ThreadId,
+    };
 
     use super::format_frame;
+
+    fn show(frame: &StackFrame) -> String
+    {
+        format_frame(frame, false)
+    }
 
     fn frame(kind: FrameKind, name: Option<&str>, line: Option<u32>) -> StackFrame
     {
@@ -105,19 +121,21 @@ mod tests
     #[test]
     fn frames_format_with_location_and_inlined_marker()
     {
+        let main = frame(FrameKind::Physical, Some("app::main"), Some(7));
+        assert_eq!(show(&main), "#3 0x0000000000001000 in app::main at src/main.rs:7");
         assert_eq!(
-            format_frame(&frame(FrameKind::Physical, Some("app::main"), Some(7))),
-            "#3 0x0000000000001000 in app::main at src/main.rs:7"
+            format_frame(&main, true),
+            "#3 0x0000000000001000 * in app::main at src/main.rs:7"
         );
         let physical = FrameId::new(ThreadId::from(1), 0, 0, Address::new(0x1000), Address::new(0x2000));
         assert_eq!(
-            format_frame(&frame(FrameKind::Inlined { physical, depth: 0 }, Some("app::f"), Some(2))),
+            show(&frame(FrameKind::Inlined { physical, depth: 0 }, Some("app::f"), Some(2))),
             "#3 0x0000000000001000 in app::f at src/main.rs:2 [inlined]"
         );
-        assert_eq!(format_frame(&frame(FrameKind::Physical, None, None)), "#3 0x0000000000001000 in ??");
+        assert_eq!(show(&frame(FrameKind::Physical, None, None)), "#3 0x0000000000001000 in ??");
         // A name from the symbol table only has no location to print.
         assert_eq!(
-            format_frame(&frame(FrameKind::Physical, Some("_pthread_start"), None)),
+            show(&frame(FrameKind::Physical, Some("_pthread_start"), None)),
             "#3 0x0000000000001000 in _pthread_start"
         );
     }

@@ -150,6 +150,7 @@ impl Session
                 self.deferred = Some(event);
                 self.state = SessionState::Running;
                 self.last_stop = None;
+                self.reset_selected_frame();
                 return Ok(());
             }
         }
@@ -194,6 +195,7 @@ impl Session
             return Err(error);
         }
         self.line_plan = Some(plan);
+        self.reset_selected_frame();
         Ok(())
     }
 
@@ -280,6 +282,7 @@ impl Session
         }
         self.state = SessionState::Running;
         self.last_stop = None;
+        self.reset_selected_frame();
         Ok(())
     }
 
@@ -427,11 +430,13 @@ impl Session
             Ok(None) => {
                 self.line_plan = Some(plan);
                 self.state = SessionState::Running;
+                self.reset_selected_frame();
                 Ok(None)
             }
             Ok(Some(event)) => {
                 self.finish_line_cleanup(plan)?;
                 self.state = SessionState::Running;
+                self.reset_selected_frame();
                 Ok(Some(event))
             }
             Err(error) => {

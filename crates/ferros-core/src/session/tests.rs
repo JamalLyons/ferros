@@ -109,3 +109,6 @@ mod symbol_tables;
 
 #[path = "tests/process_control.rs"]
 mod process_control;
+
+#[path = "tests/frames.rs"]
+mod frames;

@@ -110,6 +110,7 @@ impl PrettyPrinter for SharedPrinter
         let pointee = match layout.pointee {
             Pointee::Sized(ty) => formatter.format_at(ty, address),
             Pointee::Str(len) => strings::format_string(address, len, formatter),
+            Pointee::ByteStr(len, is_c) => strings::format_byte_string(address, len, is_c, formatter),
             Pointee::Slice(element, len) => formatter.format_sequence(Some(element), &[Some(len)], Some(address), None),
         };
         let name = match layout.kind {
@@ -137,6 +138,8 @@ enum Pointee
 {
     Sized(TypeId),
     Str(u64),
+    /// An `OsStr`, `Path` or (when `true`) `CStr` of this many bytes.
+    ByteStr(u64, bool),
     Slice(TypeId, u64),
 }
 
@@ -169,6 +172,11 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
     let pointee = match len {
         None if types.get(ty)?.size.is_some() => Pointee::Sized(ty),
         Some(len) => {
+            let byte_string = types
+                .get(types.strip_aliases(ty))?
+                .name
+                .as_deref()
+                .and_then(strings::unsized_byte_string_kind);
             let ty = types.get(unwrap_slice_wrappers(ty, types)?)?;
             let TypeKind::Array(array) = &ty.kind else {
                 return None;
@@ -177,7 +185,21 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
                 return None;
             }
             let element = array.element?;
-            if args == "str>" || args.starts_with("str,") {
+            let is_byte = types.get(types.strip_aliases(element)).is_some_and(|byte| {
+                byte.size == Some(1)
+                    && matches!(
+                        byte.kind,
+                        TypeKind::Base(
+                            BaseEncoding::Unsigned
+                                | BaseEncoding::UnsignedChar
+                                | BaseEncoding::Signed
+                                | BaseEncoding::SignedChar
+                        )
+                    )
+            });
+            if let Some(is_c) = byte_string.filter(|_| is_byte) {
+                Pointee::ByteStr(len, is_c)
+            } else if args == "str>" || args.starts_with("str,") {
                 let byte = types.get(types.strip_aliases(element))?;
                 if byte.name.as_deref() != Some("u8") || byte.size != Some(1) {
                     return None;

@@ -1,8 +1,10 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
+mod collections;
 mod dyn_trait;
 mod enums;
 mod maps;
+mod newtypes;
 mod shared;
 mod strings;
 mod sync;
@@ -10,6 +12,7 @@ mod vec;
 
 use gimli::RunTimeEndian;
 
+pub(super) use self::enums::{variant_for_tag, variant_payload};
 pub(crate) use self::sync::LockPrinter;
 pub(super) use self::vec::layout as vec_layout;
 use super::format::{ValueFormatter, ValueView, format_raw, unsigned};
@@ -33,8 +36,12 @@ pub trait PrettyPrinter: Sync
 pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &enums::EnumPrinter,
     &strings::StringPrinter,
+    &strings::ByteStringPrinter,
     &vec::SlicePrinter,
+    &vec::RawSlicePrinter,
     &vec::VecPrinter,
+    &vec::IntoIterPrinter,
+    &vec::ArrayIntoIterPrinter,
     &dyn_trait::DynTraitPrinter,
     &vec::BoxPrinter,
     &shared::SharedPrinter,
@@ -45,6 +52,11 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &sync::UnsafeCellPrinter,
     &sync::PinPrinter,
     &maps::MapPrinter,
+    &collections::CollectionPrinter,
+    &newtypes::NewtypePrinter,
+    &newtypes::DurationPrinter,
+    &newtypes::MaybeUninitPrinter,
+    &newtypes::PhantomPrinter,
 ];
 
 fn field<'a>(value: ValueView<'a>, name: &str, types: &TypeTable) -> Option<ValueView<'a>>

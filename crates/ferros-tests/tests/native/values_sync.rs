@@ -29,10 +29,10 @@ fn print_shows_synchronized_values_and_their_state()
         ("arc_dangling", "Weak(dangling)"),
         ("rc_new", "Weak(dangling)"),
         ("pinned", "5"),
-        // Unsized payloads that wrap a byte slice show the bytes.
-        ("rc_path", "Rc(strong: 1, weak: 0) [47, 116, 109, 112]"),
-        ("arc_os_str", "Arc(strong: 1, weak: 0) [111, 115]"),
-        ("rc_c_str", "Rc(strong: 1, weak: 0) [99, 115, 0]"),
+        // Unsized OS and C string payloads show quoted text.
+        ("rc_path", r#"Rc(strong: 1, weak: 0) "/tmp""#),
+        ("arc_os_str", r#"Arc(strong: 1, weak: 0) "os""#),
+        ("rc_c_str", r#"Rc(strong: 1, weak: 0) c"cs""#),
     ];
     let _ = transcript::ferros_bin();
     harness::run(|t| {

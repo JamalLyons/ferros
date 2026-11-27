@@ -287,6 +287,8 @@ impl<'a> ValueFormatter<'a>
             TypeKind::Base(encoding) => format_base(*encoding, name, self.endian, value.bytes),
             TypeKind::Struct(fields) if !ty.declaration => self.format_members(value, &fields.members, Some(name)),
             TypeKind::Tuple(fields) if !ty.declaration => self.format_members(value, &fields.members, None),
+            // Every member is a view of the same bytes; show each reading.
+            TypeKind::Union(fields) if !ty.declaration => self.format_members(value, &fields.members, Some(name)),
             TypeKind::Array(array) => self.format_sequence(array.element, &array.lengths, address, Some(bytes)),
             TypeKind::Pointer(pointer) => self.format_pointer(value, pointer),
             TypeKind::Enum(_) | TypeKind::Enumeration(_) => format!("<enum {name}>"),
@@ -436,6 +438,12 @@ impl<'a> ValueFormatter<'a>
             return unavailable("invalid pointer bytes");
         };
         let text = format!("{address:#x}");
+        if self.points_to_function(pointer) {
+            return match self.function_name(Address::new(address)) {
+                Some(name) => format!("{text} <{name}>"),
+                None => text,
+            };
+        }
         if !matches!(pointer.kind, PointerKind::Reference { .. }) || self.in_pointee {
             return text;
         }
@@ -447,6 +455,28 @@ impl<'a> ValueFormatter<'a>
         };
         self.in_pointee = false;
         format!("{text} -> {pointee}")
+    }
+}
+
+impl ValueFormatter<'_>
+{
+    fn points_to_function(&self, pointer: &PointerType) -> bool
+    {
+        let types = self.types();
+        pointer
+            .pointee
+            .and_then(|pointee| types.get(types.strip_aliases(pointee)))
+            .is_some_and(|pointee| matches!(pointee.kind, TypeKind::Function(_)))
+    }
+
+    /// The function whose entry is `address`, from the debug info of the image mapped there.
+    fn function_name(&mut self, address: Address) -> Option<String>
+    {
+        if address == Address::ZERO {
+            return None;
+        }
+        let image = self.image_at(address)?;
+        image.function_name_at(address).map(str::to_owned)
     }
 }
 

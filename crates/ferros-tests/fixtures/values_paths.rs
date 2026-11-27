@@ -1,6 +1,7 @@
 //! Values reached by `print <path>`: fields, tuple fields, indexes and dereferences.
 #![expect(dead_code, reason = "the debugger reads these fields; the program does not")]
 
+use std::cmp::Ordering;
 use std::hint::black_box;
 
 struct Inner
@@ -22,6 +23,29 @@ struct Named
 }
 
 struct Wrapper(u8, Inner);
+
+enum Shape
+{
+    Circle
+    {
+        r: f64,
+    },
+    Square(u32, Inner),
+    Empty,
+}
+
+enum Single
+{
+    Value(u16),
+}
+
+/// Over the debugger's 1 MiB value cap, so only the active variant can be read.
+#[expect(clippy::large_enum_variant, reason = "the size is what the test needs")]
+enum Huge
+{
+    Small(u8),
+    Large([u8; 2 << 20]),
+}
 
 fn main()
 {
@@ -51,9 +75,24 @@ fn main()
     let boxed_slice: Box<[u16]> = Box::new([11, 12, 13]);
     let mut storage = [5_i16, -6, 7];
     let mut_slice: &mut [i16] = &mut storage;
+    let shape = Shape::Circle { r: 2.5 };
+    let sq = Shape::Square(7, Inner { x: 70, y: 71 });
+    let empty_shape = Shape::Empty;
+    let opt = Some(42_u32);
+    let none: Option<u32> = None;
+    let res_ok: Result<u16, i32> = Ok(61);
+    let res_err: Result<u16, i32> = Err(-71);
+    let opt_ref = Some(&named);
+    let ordering = Ordering::Less;
+    let maybe_order = Some(Ordering::Greater);
+    let opt_ptr = &opt;
+    let single = Single::Value(51);
+    let huge: Box<Huge> = Box::new(Huge::Small(5));
 
     black_box(&p); // BREAK: inspect
     black_box((&v, &boxed, &t, &named, &r, &rr, &arr, &slice, &raw, &null));
     black_box((&wrapper, &boxed_point, &grid, &empty, &count));
     black_box((&vr, &boxed_slice, &mut_slice));
+    black_box((&shape, &sq, &empty_shape, &opt, &none, &res_ok, &res_err, &opt_ref, &ordering));
+    black_box((&maybe_order, &opt_ptr, &single, &huge));
 }

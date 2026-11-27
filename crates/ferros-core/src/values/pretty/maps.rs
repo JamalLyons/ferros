@@ -14,6 +14,7 @@ const STD_SET: &str = "std::collections::hash::set::HashSet<";
 const HASH_MAP: &str = "hashbrown::map::HashMap<";
 const HASH_SET: &str = "hashbrown::set::HashSet<";
 const TREE_MAP: &str = "alloc::collections::btree::map::BTreeMap<";
+const TREE_SET: &str = "alloc::collections::btree::set::BTreeSet<";
 const MAX_CONTROL_BYTES: u64 = 64 * 1024;
 const CONTROL_CHUNK: u64 = 4096;
 // A valid tree with a 64-bit element count cannot have this many levels.
@@ -25,6 +26,7 @@ enum MapKind
     HashMap,
     HashSet,
     BTreeMap,
+    BTreeSet,
 }
 
 impl MapKind
@@ -38,6 +40,8 @@ impl MapKind
             Some(Self::HashSet)
         } else if name.starts_with(TREE_MAP) {
             Some(Self::BTreeMap)
+        } else if name.starts_with(TREE_SET) {
+            Some(Self::BTreeSet)
         } else {
             None
         }
@@ -61,6 +65,12 @@ impl PrettyPrinter for MapPrinter
         };
         let preview = match kind {
             MapKind::BTreeMap => tree_preview(value, limit, formatter),
+            // A set is a map whose zero-sized values are not shown.
+            MapKind::BTreeSet => field(value, "map", formatter.types()).and_then(|map| {
+                let (len, entries) = tree_preview(map, limit, formatter)?;
+                let keys = entries.map(|entries| entries.into_iter().map(|entry| Entry { value: None, ..entry }).collect());
+                Some((len, keys))
+            }),
             kind => hash_preview(value, kind, limit, formatter),
         };
         let Some((len, entries)) = preview else {

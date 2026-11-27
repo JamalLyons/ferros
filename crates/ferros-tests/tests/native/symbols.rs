@@ -45,6 +45,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("thread_signals"),
         fixture!("threads"),
         fixture!("values_basic"),
+        fixture!("values_collections"),
         fixture!("values_dyn"),
         fixture!("values_enums"),
         fixture!("values_ffi_strings"),

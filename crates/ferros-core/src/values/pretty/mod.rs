@@ -1,5 +1,6 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
+mod collections;
 mod dyn_trait;
 mod enums;
 mod maps;
@@ -41,6 +42,7 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &shared::SharedPrinter,
     &shared::CellPrinter,
     &maps::MapPrinter,
+    &collections::CollectionPrinter,
     &newtypes::NewtypePrinter,
     &newtypes::DurationPrinter,
     &newtypes::MaybeUninitPrinter,

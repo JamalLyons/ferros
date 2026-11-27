@@ -62,7 +62,7 @@
 //! - `FunctionIndex`: built by `FunctionIndex::build` from `index_die`, `resolve_name`,
 //!   `function_code`, `entry_base`, and `after_prologue`.
 //! - Name normalization: `normalize`, `normalize_type`, `split_top`, `strip_generics`.
-//! - `impl BinaryImage`: `function_index`, `function_addresses`, `function_containing`.
+//! - `impl BinaryImage`: `function_name_at`, `function_index`, `function_addresses`, `function_containing`.
 //! - Tests in `mod tests`.
 
 use std::collections::{BTreeSet, HashMap};
@@ -132,6 +132,8 @@ pub(crate) struct FunctionIndex
     /// Every concrete function by entry, including those whose name does not normalize to
     /// a path (`path` is then empty): what [`containing`](Self::containing) searches.
     by_address: Vec<FunctionEntry>,
+    /// Entry addresses shared by functions with distinct display names, before path deduplication.
+    ambiguous_entries: BTreeSet<u64>,
     by_last: HashMap<String, Vec<usize>>,
     /// Sorted, distinct entry addresses of every indexed function.
     starts: Vec<u64>,
@@ -236,6 +238,11 @@ impl FunctionIndex
             })
             .collect();
         by_address.sort_by(|a, b| (a.entry, &a.path, &a.name).cmp(&(b.entry, &b.path, &b.name)));
+        let ambiguous_entries = by_address
+            .windows(2)
+            .filter(|pair| pair[0].entry == pair[1].entry && pair[0].name != pair[1].name)
+            .map(|pair| pair[0].entry)
+            .collect();
         by_address.dedup_by(|a, b| a.entry == b.entry && a.path == b.path);
         let mut functions: Vec<FunctionEntry> = by_address
             .iter()
@@ -255,6 +262,7 @@ impl FunctionIndex
         Self {
             functions,
             by_address,
+            ambiguous_entries,
             by_last,
             starts,
             fragments,
@@ -288,6 +296,16 @@ impl FunctionIndex
     {
         let below = self.by_address.partition_point(|function| function.entry <= address);
         self.by_address[..below].iter().rev().find(|function| address < function.end)
+    }
+
+    fn name_at_entry(&self, address: u64) -> Option<&str>
+    {
+        if self.ambiguous_entries.contains(&address) {
+            return None;
+        }
+        let start = self.by_address.partition_point(|function| function.entry < address);
+        let function = self.by_address.get(start).filter(|function| function.entry == address)?;
+        Some(&function.name)
     }
 
     /// Every function matching `query` (see the module documentation), sorted by entry.
@@ -674,7 +692,7 @@ fn split_top(name: &str) -> Option<Vec<&str>>
 }
 
 /// Byte index of the bracket closing the one that opens `text`.
-fn group_end(text: &str) -> Option<usize>
+pub(crate) fn group_end(text: &str) -> Option<usize>
 {
     let bytes = text.as_bytes();
     let mut depth = 0_usize;
@@ -695,7 +713,7 @@ fn group_end(text: &str) -> Option<usize>
 }
 
 /// Byte index of the first `needle` outside brackets.
-fn find_top(text: &str, needle: &str) -> Option<usize>
+pub(crate) fn find_top(text: &str, needle: &str) -> Option<usize>
 {
     let bytes = text.as_bytes();
     let mut depth = 0_usize;
@@ -704,7 +722,7 @@ fn find_top(text: &str, needle: &str) -> Option<usize>
             b'<' | b'(' | b'[' => depth += 1,
             b'>' if at > 0 && bytes[at - 1] == b'-' => {}
             b'>' | b')' | b']' => depth = depth.saturating_sub(1),
-            _ if depth == 0 && text[at..].starts_with(needle) => return Some(at),
+            _ if depth == 0 && text.get(at..).is_some_and(|tail| tail.starts_with(needle)) => return Some(at),
             _ => {}
         }
     }
@@ -737,6 +755,12 @@ fn attr_string(dwarf: &OwnedDwarf, unit: &Unit<OwnedReader>, value: AttributeVal
 
 impl BinaryImage
 {
+    /// Return the function name at an exact entry address when the DWARF names agree.
+    pub(crate) fn function_name_at(&self, address: Address) -> Option<&str>
+    {
+        self.function_index().ok()?.name_at_entry(self.file_address(address)?)
+    }
+
     /// The image's function index, built on first use from every compilation unit that can
     /// be parsed. The result is cached, including a failure to load the DWARF sections (see
     /// the module documentation).
@@ -1160,6 +1184,16 @@ mod tests
             ("my_crate::main::{{closure}}", vec![(0x1020, 0x1040)], None),
             ("split", vec![(0x3000, 0x3040), (0x2000, 0x2010)], None),
             ("<my_crate::Gate<'<'> as my_crate::Bump>::bump", vec![(0x4000, 0x4010)], None),
+            (
+                "<my_crate::Counter<u8> as my_crate::Bump>::bump",
+                vec![(0x5000, 0x5010)],
+                None,
+            ),
+            (
+                "<my_crate::Counter<i8> as my_crate::Bump>::bump",
+                vec![(0x5000, 0x5010)],
+                None,
+            ),
         ];
         let dwarf = write(&[unit]).load();
         let index = FunctionIndex::build(&dwarf);
@@ -1176,6 +1210,13 @@ mod tests
         assert_eq!(name(0x4008), Some("<my_crate::Gate<'<'> as my_crate::Bump>::bump"));
         assert_eq!(name(0x0fff), None);
         assert_eq!(name(0x1040), None);
+        assert_eq!(index.name_at_entry(0x1000), name(0x1000));
+        assert_eq!(index.name_at_entry(0x101c), None);
+        assert_eq!(
+            index.name_at_entry(0x5000),
+            None,
+            "folded methods have an ambiguous self type"
+        );
     }
 
     #[test]
@@ -1204,6 +1245,7 @@ mod tests
         let index = FunctionIndex {
             functions,
             by_address: Vec::new(),
+            ambiguous_entries: BTreeSet::new(),
             by_last,
             starts: Vec::new(),
             fragments: Vec::new(),

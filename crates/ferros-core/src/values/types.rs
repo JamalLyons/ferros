@@ -2,7 +2,7 @@
 //!
 //! A [`TypeTable`] belongs to one [`BinaryImage`](crate::symbols::BinaryImage) and is built
 //! on the first call to [`BinaryImage::types`](crate::symbols::BinaryImage::types). Building
-//! it walks every compilation unit once to index the qualified names of the type entries;
+//! it walks every compilation unit once to index type names and Rust vtable locations;
 //! the types themselves are resolved lazily, the first time something asks for them:
 //!
 //! - by DIE offset: [`TypeTable::type_at`] for a type entry, [`TypeTable::type_of`] for the
@@ -54,9 +54,9 @@
 //!   `Enumerator`, `ArrayType`, `PointerType`, `PointerKind`, `Qualifier`, `FunctionType`.
 //! - Table storage: `IndexedUnit`, `Arena`, `TypeTable`.
 //! - `TypeTable`: `build`, `skipped`, `len`, `is_empty`, `get`, `type_at`, `type_of`,
-//!   `type_named`, `array_named`, `strip_aliases`, `unit_at`, `resolve`, `read_type`,
+//!   `concrete_type_for_vtable`, `type_named`, `array_named`, `strip_aliases`, `unit_at`, `resolve`, `read_type`,
 //!   `read_entry`, `composite`, `variant_part`, `member`, `scalar_info`.
-//! - Name indexing: `index_unit`.
+//! - Name and vtable indexing: `index_unit`, `vtable_address`.
 //! - Derived type metadata: `derive_name`, `derive_size`, `variant_template_params`, `unreadable`, `qualified`.
 //! - Attribute helpers: `own_name`, `udata`, `flag`, `type_ref`, `die_ref`, `member_location`,
 //!   `raw_bits`, `cut`, `discriminant_list`, `base_encoding`, `pointer_kind`, `is_type_tag`.
@@ -502,6 +502,8 @@ pub struct TypeTable
     /// `(element entry, array entry)` of every unnamed array entry, in offset order: rustc
     /// names no array, so [`type_named`](Self::type_named) finds `[T; N]` through these.
     arrays: Vec<(usize, usize)>,
+    /// Vtable type entries by link-time address of the vtable variable.
+    vtables: HashMap<u64, Vec<usize>>,
     skipped: Vec<SkippedDebugInfo>,
     arena: RwLock<Arena>,
 }
@@ -528,6 +530,7 @@ impl TypeTable
         let mut names = HashMap::new();
         let mut by_name = HashMap::<String, Vec<(bool, usize)>>::new();
         let mut arrays = Vec::new();
+        let mut vtables = HashMap::new();
         let mut skipped = Vec::new();
         let mut headers = dwarf.units();
         loop {
@@ -550,8 +553,17 @@ impl TypeTable
                     continue;
                 }
             };
-            index_unit(&dwarf, &unit, start, &mut names, &mut by_name, &mut arrays, &mut skipped);
-            units.push(IndexedUnit { start, end, unit });
+            let unit = IndexedUnit { start, end, unit };
+            index_unit(
+                &dwarf,
+                &unit,
+                &mut names,
+                &mut by_name,
+                &mut arrays,
+                &mut vtables,
+                &mut skipped,
+            );
+            units.push(unit);
         }
         units.sort_by_key(|unit| unit.start);
         let by_name = by_name
@@ -568,6 +580,7 @@ impl TypeTable
             names,
             by_name,
             arrays,
+            vtables,
             skipped,
             arena: RwLock::new(Arena::default()),
         }
@@ -623,6 +636,23 @@ impl TypeTable
         let entry = unit.unit.entry(UnitOffset(offset - unit.start)).ok()?;
         let target = type_ref(&entry, unit.start).ok()??;
         self.type_at(DieOffset(target as u64))
+    }
+
+    /// Follow the vtable structure's DW_AT_containing_type to the concrete Rust type.
+    pub(super) fn concrete_type_for_vtable(&self, address: u64) -> Option<TypeId>
+    {
+        let mut concrete = None;
+        for &offset in self.vtables.get(&address)? {
+            let unit = self.unit_at(offset)?;
+            let entry = unit.unit.entry(UnitOffset(offset - unit.start)).ok()?;
+            let target = die_ref(entry.attr_value(constants::DW_AT_containing_type).ok()?, unit.start).ok()??;
+            let ty = self.type_at(DieOffset(target as u64))?;
+            if concrete.is_some_and(|previous| previous != ty) {
+                return None;
+            }
+            concrete = Some(ty);
+        }
+        concrete
     }
 
     /// The type whose qualified name is `name` (a leading `::` is ignored): the definition
@@ -1058,14 +1088,16 @@ impl TypeTable
 /// Record the qualified name of every named type entry of `unit`.
 fn index_unit(
     dwarf: &OwnedDwarf,
-    unit: &Unit,
-    start: usize,
+    indexed: &IndexedUnit,
     names: &mut HashMap<usize, String>,
     by_name: &mut HashMap<String, Vec<(bool, usize)>>,
     arrays: &mut Vec<(usize, usize)>,
+    vtables: &mut HashMap<u64, Vec<usize>>,
     skipped: &mut Vec<SkippedDebugInfo>,
 )
 {
+    let IndexedUnit { start, unit, .. } = indexed;
+    let start = *start;
     let unit_offset = Some(start as u64);
     let mut scopes = Vec::<Option<String>>::new();
     let mut depth = 0_isize;
@@ -1101,6 +1133,13 @@ fn index_unit(
         {
             arrays.push((element, offset));
         }
+        if tag == constants::DW_TAG_variable
+            && name.as_deref().is_some_and(|name| name.ends_with("::{vtable}"))
+            && let Some(address) = vtable_address(dwarf, unit, entry)
+            && let Ok(Some(ty)) = type_ref(entry, start)
+        {
+            vtables.entry(address).or_default().push(ty);
+        }
         if is_type_tag(tag)
             && let Some(name) = &name
         {
@@ -1126,6 +1165,20 @@ fn index_unit(
         .flatten();
         scopes.push(scope);
     }
+}
+
+fn vtable_address(dwarf: &OwnedDwarf, unit: &Unit, entry: &Entry<'_, '_>) -> Option<u64>
+{
+    let AttributeValue::Exprloc(expression) = entry.attr_value(constants::DW_AT_location).ok()?? else {
+        return None;
+    };
+    let mut operations = expression.operations(unit.encoding());
+    let address = match operations.next().ok()?? {
+        gimli::Operation::Address { address } => address,
+        gimli::Operation::AddressIndex { index } => dwarf.address(unit, index).ok()?,
+        _ => return None,
+    };
+    (address != 0 && operations.next().ok()?.is_none()).then_some(address)
 }
 
 /// The name of `id` in `lookup`: its own, or one derived from its element or pointee.

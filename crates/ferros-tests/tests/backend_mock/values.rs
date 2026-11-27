@@ -167,6 +167,65 @@ fn oversized_piece_is_unavailable_through_session()
 }
 
 #[test]
+fn trait_objects_use_exact_dwarf_vtable_locations_or_show_both_addresses()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let root = unit.root();
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let concrete = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(concrete)
+        .set(gimli::DW_AT_name, Attr::String(b"Reading".to_vec()));
+    unit.get_mut(concrete).set(gimli::DW_AT_byte_size, Attr::Udata(1));
+    let count = variable(unit, concrete, gimli::DW_TAG_member, Attr::String(b"count".to_vec()), byte);
+    unit.get_mut(count).set(gimli::DW_AT_data_member_location, Attr::Udata(0));
+
+    let storage = Address::new(BASE + 0x400);
+    let data = Address::new(BASE + 0x450);
+    let table = Address::new(BASE + 0x500);
+    let vtable_type = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(vtable_type)
+        .set(gimli::DW_AT_containing_type, Attr::UnitRef(concrete));
+    let vtable = variable(
+        unit,
+        root,
+        gimli::DW_TAG_variable,
+        Attr::String(b"<Reading as Marker>::{vtable}".to_vec()),
+        vtable_type,
+    );
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(table.value()));
+    unit.get_mut(vtable).set(gimli::DW_AT_location, Attr::Exprloc(location));
+
+    let pointer = unit.add(root, gimli::DW_TAG_pointer_type);
+    unit.get_mut(pointer).set(gimli::DW_AT_type, Attr::UnitRef(byte));
+    let trait_object = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(trait_object)
+        .set(gimli::DW_AT_name, Attr::String(b"&dyn Marker".to_vec()));
+    unit.get_mut(trait_object).set(gimli::DW_AT_byte_size, Attr::Udata(16));
+    for (name, offset) in [(b"pointer".as_slice(), 0), (b"vtable".as_slice(), 8)] {
+        let field = variable(unit, trait_object, gimli::DW_TAG_member, Attr::String(name.to_vec()), pointer);
+        unit.get_mut(field)
+            .set(gimli::DW_AT_data_member_location, Attr::Udata(offset));
+    }
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(storage.value()));
+    local(unit, function, "object", trait_object, location);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    session.write_memory(data, &[42]).expect("store object data");
+    let unknown = table + 8;
+    let addresses = format!("dyn {{ data: {data}, vtable: {unknown} }}");
+    for (vtable, expected) in [(table, "Reading { count: 42 }"), (unknown, addresses.as_str())] {
+        let bytes = [data.value().to_le_bytes(), vtable.value().to_le_bytes()].concat();
+        session.write_memory(storage, &bytes).expect("store fat pointer");
+        let vars = session.selected_frame_variables().expect("read locals");
+        assert_eq!(session.format_variable(&vars[0], FormatOptions::default()).1, expected);
+    }
+}
+
+#[test]
 fn bad_variable_name_leaves_its_neighbors_readable()
 {
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));

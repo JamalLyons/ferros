@@ -317,7 +317,7 @@ pub struct BinaryImage
     context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
     /// Built on the first type lookup (see `values::types`); a failure to load the DWARF
     /// sections is cached too.
-    types: OnceCell<std::result::Result<TypeTable, SourceLookupError>>,
+    types: OnceCell<std::result::Result<Arc<TypeTable>, SourceLookupError>>,
     /// Built on the first source lookup (see `symbols::lines`); a failure to load the
     /// DWARF sections is cached too.
     line_index: OnceCell<std::result::Result<LineIndex, SourceLookupError>>,
@@ -818,6 +818,11 @@ impl BinaryImage
     /// DWARF sections cannot be loaded.
     pub fn types(&self) -> std::result::Result<&TypeTable, SourceLookupError>
     {
+        self.type_table().map(Arc::as_ref)
+    }
+
+    pub(crate) fn type_table(&self) -> std::result::Result<&Arc<TypeTable>, SourceLookupError>
+    {
         self.types
             .get_or_init(|| {
                 let sections = self
@@ -827,7 +832,7 @@ impl BinaryImage
                     .map_err(|error| SourceLookupError::DebugInfo(format!("failed to load DWARF: {error}")))?;
                 let table = TypeTable::build(dwarf, self.executable.endian);
                 super::lines::warn_skipped(self, "type", table.skipped());
-                Ok(table)
+                Ok(Arc::new(table))
             })
             .as_ref()
             .map_err(Clone::clone)

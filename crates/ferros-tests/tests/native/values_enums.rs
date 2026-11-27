@@ -22,7 +22,7 @@ fn print_shows_active_variants_and_their_fields()
         ("tagged_none", "None"),
         ("ref_some", "Some(0x<hex> -> -25)"),
         ("ref_none", "None"),
-        ("box_some", "Some(0x<hex>)"),
+        ("box_some", "Some(88)"),
         ("box_none", "None"),
         (
             "nonzero_some",

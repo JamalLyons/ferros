@@ -484,3 +484,32 @@ fn unavailable_pointee_preserves_the_rest_of_the_value()
     );
     assert!(text.ends_with(">, byte: 42 }"), "{text}");
 }
+
+#[test]
+fn unknown_standard_library_layouts_show_raw_fields()
+{
+    const NAMES: &[&str] = &["&str", "alloc::vec::Vec<u8, alloc::alloc::Global>"];
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    for name in NAMES {
+        let structure = unit.add(unit.root(), gimli::DW_TAG_structure_type);
+        unit.get_mut(structure)
+            .set(gimli::DW_AT_name, Attr::String(name.as_bytes().to_vec()));
+        unit.get_mut(structure).set(gimli::DW_AT_byte_size, Attr::Udata(1));
+        let field = variable(unit, structure, gimli::DW_TAG_member, Attr::String(b"unknown".to_vec()), byte);
+        unit.get_mut(field).set(gimli::DW_AT_data_member_location, Attr::Udata(0));
+        local(unit, function, name, structure, register_location());
+    }
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let vars = session.selected_frame_variables().expect("mock values");
+    for name in NAMES {
+        let var = vars.iter().find(|var| var.name == *name).expect(name);
+        assert_eq!(
+            session.format_variable(var, FormatOptions::default()).1,
+            format!("{name} {{ unknown: 7 }} <unrecognized layout>")
+        );
+    }
+}

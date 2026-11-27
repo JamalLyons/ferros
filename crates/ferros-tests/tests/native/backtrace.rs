@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ferros_core::{
-    Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, Session, StackFrame, StopEvent, SymbolSource,
+    Address, BreakpointLocation, BreakpointRequest, DebuggerError, FrameKind, FrameStatus, Session, StackFrame, StopEvent,
+    SymbolSource,
 };
 use ferros_tests::harness::{self, TestContext};
 use ferros_tests::stripped::StrippedFixture;
@@ -512,6 +513,13 @@ fn inlined_function_is_its_own_frame_before_the_physical_frame()
         assert_eq!(owner, physical.id);
         assert!(!physical.is_inlined(), "{frames:#?}");
         assert_eq!(physical.pc, inlined.pc);
+        let inline_registers = d.frame_registers(inlined.index).expect("unwind").expect("inline registers");
+        let physical_registers = d
+            .frame_registers(physical.index)
+            .expect("unwind")
+            .expect("physical registers");
+        assert_eq!(inline_registers, physical_registers);
+        assert_eq!(inline_registers.dwarf_register(31), Some(physical.sp.value()));
         let summary = &summary[at..];
         let calls = [
             fixture.marker_line("call_inlined_first"),
@@ -522,6 +530,40 @@ fn inlined_function_is_its_own_frame_before_the_physical_frame()
             summary[1].1.is_some_and(|line| calls.contains(&line)),
             "main is at one of the calls {calls:?}: {summary:#?}"
         );
+    });
+}
+
+#[test]
+fn inline_caller_shares_its_physical_callers_registers_and_lookup_address()
+{
+    harness::run(|t| {
+        let fixture = fixture!("symbols");
+        let mut d = t.launch(&fixture);
+        let stop = marker_address(&mut d, &fixture, "in_inline_child");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(MAX_FRAMES).expect("stack trace");
+        let frames = trace.frames();
+        assert_sane(&mut d, frames);
+        let inlined = frames
+            .iter()
+            .find(|frame| fixture_function(frame, &fixture) == Some("always_inlined_call"))
+            .expect("inline caller frame");
+        let FrameKind::Inlined { physical, .. } = inlined.kind else {
+            panic!("expected an inline caller: {frames:#?}");
+        };
+        let owner = &frames[inlined.index + 1];
+        assert!(inlined.index > 0);
+        assert_eq!(owner.id, physical);
+        let registers = trace.frame_registers(inlined.index).expect("inline registers");
+        let owner_registers = trace.frame_registers(owner.index).expect("physical registers");
+        assert!(std::ptr::eq(registers, owner_registers));
+        assert_eq!(registers.dwarf_register(31), Some(owner.sp.value()));
+        assert_eq!(registers.dwarf_register(32), Some(owner.pc.value()));
+        assert_ne!(registers.dwarf_register(32), Some(stop.value()));
+        assert_eq!(trace.lookup_address(inlined.index), Some(Address::new(owner.pc.value() - 4)));
+        assert_eq!(trace.lookup_address(inlined.index), trace.lookup_address(owner.index));
+        assert_eq!(trace.lookup_address(0), Some(stop));
     });
 }
 
@@ -704,7 +746,7 @@ fn backtrace_in_a_signal_handler_shows_the_interrupted_function()
             Some(StopEvent::Signal { signal: SIGUSR1, .. }) => {}
             other => panic!("expected the SIGUSR1 stop, got {other:?}"),
         }
-        let interrupted = d.read_registers().expect("registers at the signal").pc;
+        let interrupted = d.read_registers().expect("registers at the signal");
         d.resume_with_signal().expect("deliver SIGUSR1");
         match d.wait(Some(STOP_TIMEOUT)).expect("wait for the handler") {
             Some(StopEvent::Breakpoint { pc, thread }) if pc == in_handler => {
@@ -735,8 +777,18 @@ fn backtrace_in_a_signal_handler_shows_the_interrupted_function()
         );
         // The interrupted frame's pc is the instruction the signal interrupted, a pc in
         // the spin loop, not a return address.
-        assert_eq!(frames[2].pc, interrupted, "{frames:#?}");
+        assert_eq!(frames[2].pc, interrupted.pc, "{frames:#?}");
         assert_eq!(frames[1].return_address, Some(frames[2].pc), "{frames:#?}");
+        let saved = d
+            .frame_registers(frames[2].index)
+            .expect("unwind")
+            .expect("interrupted registers");
+        for (number, &value) in (0u16..).zip(&interrupted.general) {
+            assert_eq!(saved.dwarf_register(number), Some(value), "x{number}");
+        }
+        assert_eq!(saved.dwarf_register(29), Some(interrupted.fp.value()));
+        assert_eq!(saved.dwarf_register(31), Some(interrupted.sp.value()));
+        assert_eq!(saved.dwarf_register(32), Some(interrupted.pc.value()));
         d.kill().expect("kill");
     });
 }
@@ -943,6 +995,197 @@ fn is_branch_with_link(insn: u32) -> bool
     insn & 0xFC00_0000 == 0x9400_0000
 }
 
+#[test]
+fn caller_registers_and_cfa_come_from_their_own_frame()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let inner = raw_symbol_address(&mut d, &fixture, "_frame_registers_callee");
+        let outer = raw_symbol_address(&mut d, &fixture, "_frame_registers_caller");
+        let stop = find_instruction(&mut d, inner, |insn| insn == 0xD503_201F); // nop
+        let return_address = find_instruction(&mut d, outer, is_branch_with_link) + 4;
+        run_to(&mut d, stop);
+
+        let frames = d.stack_trace(2).expect("stack trace");
+        assert_eq!(frames[0].pc, stop);
+        assert_eq!(frames[1].pc, return_address);
+        let caller_sp = frames[0].sp + 32;
+        let live = d.frame_registers(0).expect("unwind").expect("callee registers");
+        assert_eq!(live.dwarf_register(0), Some(0x7171));
+        assert_eq!(live.dwarf_register(19), Some(0x5151));
+        assert_eq!(live.dwarf_register(20), Some(0x6161));
+        assert_eq!(live.cfa(), Some(caller_sp));
+
+        let recovered = d.frame_registers(1).expect("unwind").expect("caller registers");
+        assert_eq!(recovered.dwarf_register(0), None, "x0 is caller-saved");
+        assert_eq!(recovered.dwarf_register(19), Some(0x3131));
+        assert_eq!(recovered.dwarf_register(20), Some(0), "x20 was saved as zero");
+        assert_eq!(recovered.dwarf_register(29), Some(caller_sp.value()));
+        assert_eq!(recovered.dwarf_register(31), Some(caller_sp.value()));
+        assert_eq!(recovered.cfa(), Some(caller_sp + 48));
+        assert_eq!(recovered.dwarf_register(u16::MAX), None);
+        assert!(d.frame_registers(usize::MAX).expect("unwind").is_none());
+    });
+}
+
+#[test]
+fn rust_frame_record_gives_a_callers_saved_register_and_cfa()
+{
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let call = marker_address(&mut d, &fixture, "call_c");
+        run_to(&mut d, call);
+        let mut before_call = d.read_registers().expect("caller registers");
+        let x19 = 0x1919_1938;
+        before_call.general[19] = x19;
+        d.write_registers(&before_call).expect("set x19");
+        let stop = marker_address(&mut d, &fixture, "in_c");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(3).expect("stack trace");
+        let frames = trace.frames();
+        assert_eq!(fixture_function(&frames[1], &fixture), Some("level_b"));
+        assert_eq!(fixture_function(&frames[2], &fixture), Some("level_a"));
+        let registers = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(registers.dwarf_register(19), Some(x19));
+        assert_eq!(registers.dwarf_register(31), Some(before_call.sp.value()));
+        assert_eq!(registers.cfa(), Some(before_call.fp + 16));
+        assert_eq!(registers.cfa(), Some(frames[2].sp));
+    });
+}
+
+#[test]
+fn frame_hint_recovers_packed_register_saves()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_compact_registers_callee");
+        let child = raw_symbol_address(&mut d, &fixture, "_compact_unbuilt_frame");
+        let save = find_instruction(&mut d, entry, |insn| insn == 0xA900_4FF4); // stp x20, x19, [sp]
+        run_to(&mut d, save);
+        let before_save = d.stack_trace_with_registers(2).expect("stack trace during the prologue");
+        let caller = before_save.frame_registers(1).expect("caller registers before the save");
+        assert_eq!(caller.dwarf_register(19), Some(0x3131));
+        assert_eq!(caller.dwarf_register(20), Some(0));
+
+        run_to(&mut d, child);
+
+        let trace = d.stack_trace_with_registers(3).expect("stack trace");
+        let middle = trace.frame_registers(1).expect("callee registers");
+        assert_eq!(middle.dwarf_register(19), Some(0x5252));
+        assert_eq!(middle.dwarf_register(20), Some(0x6262));
+        let parent = trace.frame_registers(2).expect("caller registers");
+        assert_eq!(parent.dwarf_register(19), Some(0x3131));
+        assert_eq!(parent.dwarf_register(20), Some(0));
+        assert_eq!(middle.cfa(), Some(trace.frames()[2].sp));
+    });
+}
+
+#[test]
+fn unverified_frame_record_fallback_keeps_cfa_and_saved_registers_unknown()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_compact_unbuilt_frame");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let current = trace.frame_registers(0).expect("live registers");
+        assert_eq!(current.dwarf_register(19), Some(0x5252));
+        let fallback = trace.frame_registers(1).expect("frame-pointer fallback");
+        assert_eq!(
+            (current.cfa(), fallback.dwarf_register(19)),
+            (None, None),
+            "the live FP and save slots belong to the caller's frame"
+        );
+    });
+}
+
+#[test]
+fn allocating_leaf_fallback_leaves_x19_unknown_before_its_save()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_frameless_spill");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xAA09_03E9); // mov x9, x9
+        run_to(&mut d, entry);
+        let entry_sp = d.read_registers().expect("leaf entry registers").sp;
+        run_to(&mut d, stop);
+        let sp = d.read_registers().expect("leaf registers before the save").sp;
+        assert_eq!(sp + 32, entry_sp);
+        d.write_memory(sp + 24, &0x5A5A_u64.to_le_bytes())
+            .expect("seed the unused x19 slot");
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        assert_eq!(trace.frames()[1].status, FrameStatus::CfiFallback);
+        assert_eq!(trace.frames()[1].sp, entry_sp);
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(caller.dwarf_register(19), None, "the leaf has yet to save x19");
+    });
+}
+
+#[test]
+fn allocating_leaf_recovers_saved_x19_only_when_instructions_are_understood()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_frameless_spill");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        let reload = find_instruction(&mut d, stop, |insn| insn == 0xA941_4FF4); // ldp x20, x19, [sp, #16]
+        run_to(&mut d, entry);
+        let mut registers = d.read_registers().expect("registers before the leaf saves x19");
+        registers.general[19] = 0x1919;
+        d.write_registers(&registers).expect("set x19");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let current = trace.frame_registers(0).expect("callee registers");
+        assert_eq!(current.dwarf_register(19), Some(0x5151));
+        assert_eq!(trace.frames()[1].status, FrameStatus::CfiFallback);
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(caller.dwarf_register(19), None);
+        assert_eq!(trace.frames()[1].sp, trace.frames()[0].sp + 32);
+        let saved_x19 = d
+            .read_memory(Address::new(trace.frames()[1].sp.value() - 8), 8)
+            .expect("saved x19");
+        assert_eq!(saved_x19, 0x1919_u64.to_le_bytes());
+
+        run_to(&mut d, reload);
+        let trace = d.stack_trace_with_registers(2).expect("stack trace at the reload");
+        assert_eq!(trace.frames()[1].status, FrameStatus::InstructionAnalysis);
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(caller.dwarf_register(19), Some(0x1919));
+    });
+}
+
+#[test]
+fn allocating_leaf_fallback_preserves_unsaved_registers()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_frameless_locals");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        run_to(&mut d, stop);
+        let mut registers = d.read_registers().expect("leaf registers");
+        registers.general[19] = 0x1920;
+        d.write_registers(&registers).expect("set x19");
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(trace.frames()[1].status, FrameStatus::CfiFallback);
+        assert_eq!(trace.frames()[1].sp, trace.frames()[0].sp + 16);
+        assert_eq!(caller.dwarf_register(19), Some(0x1920));
+    });
+}
+
 /// `frameless_spill` of `frameless_stack` is a leaf with a 32-byte stack allocation and no
 /// frame record (compact unwind `MODE_FRAMELESS`, stack size 32, no FDE), called from the
 /// initializer `frameless_caller`. Stopped on its `add sp` the allocation is still there,
@@ -973,7 +1216,10 @@ fn backtrace_after_the_epilogue_of_a_frameless_function_keeps_the_callers_sp()
             let frames = d.stack_trace(MAX_FRAMES).expect("stack trace");
             assert_sane(&mut d, &frames);
             assert_eq!(frames[0].pc, stop, "{frames:#?}");
+            let leaf_registers = d.frame_registers(0).expect("unwind").expect("leaf registers");
+            assert_eq!(leaf_registers.cfa(), None, "the leaf has no CFI");
             assert!(frames.len() >= 2, "the caller is missing: {frames:#?}");
+            assert_eq!(frames[1].status, FrameStatus::InstructionAnalysis);
             assert_eq!(
                 frames[1].pc, return_address,
                 "stopped at {stop}, the caller is `frameless_caller` after its call: {frames:#?}"

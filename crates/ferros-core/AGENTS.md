@@ -6,6 +6,7 @@ Open first: `src/session/mod.rs` (state-machine table), then `src/backend/mod.rs
 
 ## Modules (`src/`)
 - `session/`: `Session`, the policy engine. `lifecycle`, `breakpoints`, `stepping`, `line_stepping`, `location`, `stack`, `images`, `exits`: one row each in the root key-interfaces table.
+  - `stack.rs`: stack traces and symbolication. `Session::stack_trace_with_registers` returns each frame's `FrameRegisters` and DWARF lookup address from the same unwind.
 - `session/tests.rs` + `session/tests/<area>.rs`: `Session` unit tests on `MockBackend`. Shared helpers live in `tests.rs`.
 - `backend/`: `Backend` trait (`mod.rs`), `StopEvent`/`LaunchSpec`/`ResumeRequest` (`types.rs`), `BackendError` (`error.rs`), `MockBackend` (`mock.rs`, `test-util`).
 - `objfile/`: `ObjectFormat`, the format-neutral image trait (ADR 0001). `contents.rs`: what a format reads. `mock.rs`: `MockObjectFormat`.

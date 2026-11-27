@@ -43,7 +43,8 @@ use gimli::{RunTimeEndian, SectionId};
 
 use super::{
     DWARF_SECTIONS, DebugSections, FunctionUnwind, ImageContents, ImageMapping, ImageProbe, ImageSegment, ImageSlice,
-    MappedImage, MappedSymbols, ObjectFormat, SectionData, SymbolIndex, SymbolKey, TargetMemory, UnwindHint, UnwindHints,
+    MappedImage, MappedSymbols, ObjectFormat, SavedRegisterSlots, SectionData, SymbolIndex, SymbolKey, TargetMemory,
+    UnwindHint, UnwindHints,
 };
 use crate::error::{DebuggerError, Result as EngineResult};
 use crate::types::{Address, Architecture, BuildId, BuildIdentity};
@@ -362,6 +363,19 @@ const HINT_CFI: u64 = 0x200;
 const HINT_LEAF: u64 = 0x201;
 const HINT_FRAME_RECORD: u64 = 0x202;
 
+fn encode_saved_slots(saved: SavedRegisterSlots) -> u64
+{
+    u64::from(saved.mask) | (u64::from(saved.first_offset.cast_unsigned()) << 32)
+}
+
+fn decode_saved_slots(value: u64) -> SavedRegisterSlots
+{
+    SavedRegisterSlots {
+        mask: value as u32,
+        first_offset: ((value >> 32) as u32).cast_signed(),
+    }
+}
+
 impl MockObjectFile
 {
     /// First word of a file.
@@ -423,12 +437,16 @@ impl MockObjectFile
     #[must_use]
     pub fn with_hint(mut self, start: u64, hint: UnwindHint) -> Self
     {
-        let (kind, value) = match hint {
-            UnwindHint::Cfi { eh_frame_offset } => (HINT_CFI, eh_frame_offset as u64),
-            UnwindHint::Leaf { stack_size } => (HINT_LEAF, stack_size),
-            UnwindHint::FrameRecord => (HINT_FRAME_RECORD, 0),
+        let (kind, value, extra) = match hint {
+            UnwindHint::Cfi { eh_frame_offset } => (HINT_CFI, eh_frame_offset as u64, None),
+            UnwindHint::Leaf { stack_size, saved } => (HINT_LEAF, stack_size, Some(encode_saved_slots(saved))),
+            UnwindHint::FrameRecord { saved } => (HINT_FRAME_RECORD, encode_saved_slots(saved), None),
         };
-        self.entries.push((kind, start, value.to_le_bytes().to_vec()));
+        let mut data = value.to_le_bytes().to_vec();
+        if let Some(extra) = extra {
+            data.extend(extra.to_le_bytes());
+        }
+        self.entries.push((kind, start, data));
         self
     }
 
@@ -498,20 +516,33 @@ impl MockObjectFile
                 address,
                 data: data.clone(),
             };
-            let value = || data.get(..8).and_then(|word| word.try_into().ok()).map(u64::from_le_bytes);
+            let word_at = |offset: usize| {
+                data.get(offset..offset + 8)
+                    .and_then(|word| word.try_into().ok())
+                    .map(u64::from_le_bytes)
+            };
             match kind {
                 EH_FRAME => eh_frame = Some(section()),
                 EH_FRAME_HDR => eh_frame_hdr = Some(section()),
                 DEBUG_FRAME => debug_frame = Some(section()),
                 BUILD_ID => build_id = BuildId::new(&data).map(BuildIdentity::Known).ok_or_else(invalid)?,
                 HINT_CFI | HINT_LEAF | HINT_FRAME_RECORD => {
-                    let value = value().ok_or_else(invalid)?;
+                    let value = word_at(0).ok_or_else(invalid)?;
                     let hint = match kind {
                         HINT_CFI => UnwindHint::Cfi {
                             eh_frame_offset: usize::try_from(value).map_err(|_| invalid())?,
                         },
-                        HINT_LEAF => UnwindHint::Leaf { stack_size: value },
-                        _ => UnwindHint::FrameRecord,
+                        HINT_LEAF => UnwindHint::Leaf {
+                            stack_size: value,
+                            saved: if data.len() == 8 {
+                                SavedRegisterSlots::default()
+                            } else {
+                                decode_saved_slots(word_at(8).ok_or_else(invalid)?)
+                            },
+                        },
+                        _ => UnwindHint::FrameRecord {
+                            saved: decode_saved_slots(value),
+                        },
                     };
                     let start = mapping.relocate(address).ok_or_else(invalid)?;
                     hints.push((start, hint));

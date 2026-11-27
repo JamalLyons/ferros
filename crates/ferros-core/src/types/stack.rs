@@ -3,8 +3,110 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use gimli::AArch64;
+
 use super::symbols::{FunctionParameter, SourceLocation, SymbolName};
 use super::{Address, ThreadId};
+
+const FRAME_REGISTER_COUNT: usize = AArch64::PC.0 as usize + 1;
+
+/// Registers known for one physical stack frame. Inline frames share this state.
+///
+/// Values are indexed by AArch64 DWARF register number. Ordinary caller frames expose
+/// recovered callee-saved registers, SP and PC. A frame restored from a signal context
+/// can also expose the registers that would be volatile across an ordinary call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameRegisters
+{
+    values: [u64; FRAME_REGISTER_COUNT],
+    known: u64,
+    cfa: Option<Address>,
+}
+
+impl FrameRegisters
+{
+    pub(crate) fn new(cfa: Option<Address>, read: impl Fn(u16) -> Option<u64>) -> Self
+    {
+        let mut values = [0; FRAME_REGISTER_COUNT];
+        let mut known = 0;
+        for (register, slot) in (0..).zip(&mut values) {
+            if let Some(value) = read(register) {
+                *slot = value;
+                known |= 1 << register;
+            }
+        }
+        Self { values, known, cfa }
+    }
+
+    /// The value of AArch64 DWARF register `number` (`0`–`30` for X0–X30, `31` for SP,
+    /// `32` for PC). Returns `None` for unavailable or unsupported registers.
+    ///
+    /// An ordinary caller's PC holds the return address. Use
+    /// [`StackTrace::lookup_address`] for the call instruction when consulting DWARF
+    /// location lists. An innermost or signal-interrupted frame uses its stopped PC.
+    pub fn dwarf_register(&self, number: u16) -> Option<u64>
+    {
+        let value = self.values.get(usize::from(number))?;
+        (self.known & (1 << number) != 0).then_some(*value)
+    }
+
+    /// The canonical frame address from CFI or a function's frame-record hint, if available.
+    pub fn cfa(&self) -> Option<Address>
+    {
+        self.cfa
+    }
+}
+
+/// Logical and physical frame data from one unwind of a stopped thread.
+#[derive(Debug, Default)]
+pub struct StackTrace
+{
+    pub(crate) frames: Vec<StackFrame>,
+    pub(crate) lookups: Vec<Address>,
+    physical_frames: Vec<PhysicalFrame>,
+}
+
+#[derive(Debug)]
+struct PhysicalFrame
+{
+    /// Exclusive end of the logical frames produced for this physical frame.
+    logical_end: usize,
+    registers: FrameRegisters,
+}
+
+impl StackTrace
+{
+    /// Logical frames, including inline frames, innermost first.
+    pub fn frames(&self) -> &[StackFrame]
+    {
+        &self.frames
+    }
+
+    /// The registers for logical frame `index`, shared with other frames inlined into
+    /// the same physical frame.
+    pub fn frame_registers(&self, index: usize) -> Option<&FrameRegisters>
+    {
+        let physical = self.physical_frames.partition_point(|frame| frame.logical_end <= index);
+        self.physical_frames.get(physical).map(|frame| &frame.registers)
+    }
+
+    /// The address used for symbol and DWARF lookups for logical frame `index`.
+    /// This is the call instruction for an ordinary caller, and the stopped PC for
+    /// an innermost or signal-interrupted frame. Inline frames use their owner's address.
+    pub fn lookup_address(&self, index: usize) -> Option<Address>
+    {
+        self.lookups.get(index).copied()
+    }
+
+    pub(crate) fn record_physical_frame(&mut self, lookup: Address, registers: FrameRegisters)
+    {
+        self.lookups.resize(self.frames.len(), lookup);
+        self.physical_frames.push(PhysicalFrame {
+            logical_end: self.frames.len(),
+            registers,
+        });
+    }
+}
 
 /// Stable identifier for a logical stack frame.
 ///
@@ -212,9 +314,8 @@ impl FrameKind
 /// let frame_status = FrameStatus::Complete;
 /// match frame_status {
 ///     FrameStatus::Complete => println!("recovered with DWARF CFI"),
-///     FrameStatus::CfiFallback => {
-///         println!("recovered from the frame-pointer chain or the link register")
-///     }
+///     FrameStatus::CfiFallback => println!("recovered from unwind hints, FP or LR"),
+///     FrameStatus::InstructionAnalysis => println!("recovered by decoding instructions"),
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +324,10 @@ pub enum FrameStatus
     /// The innermost frame, or a frame recovered with DWARF CFI (`eh_frame` or
     /// `.debug_frame`).
     Complete,
-    /// No CFI covered the callee: recovered from the frame-pointer chain, or from the link
-    /// register when the innermost frame was stopped on a function's first instruction.
+    /// Recovered from an unwind hint, the frame-pointer chain, or the link register.
     CfiFallback,
+    /// Recovered by analysing the callee's prologue or epilogue instructions.
+    InstructionAnalysis,
 }
 
 /// Logical stack frame (physical or inline).

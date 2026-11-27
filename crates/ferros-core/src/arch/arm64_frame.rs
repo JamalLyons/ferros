@@ -10,8 +10,8 @@
 //!   unconditional `b`. Straight-line code up to a `ret` runs next, so the registers at the
 //!   `ret` are the caller's.
 //! - [`prologue`]: from the function's first instruction forward to the pc, recording
-//!   how far `sp` moved and where registers were stored, until an instruction sets `x29`
-//!   to the new frame ([`Prologue::FrameBuilt`]).
+//!   how far `sp` moved and where registers were stored, including stores after `x29`
+//!   is set to the new frame.
 //!
 //! Both are conservative: an instruction that is not understood ([`decode`] returns
 //! `None`), a conditional or indirect branch or a call (any branch, for [`prologue`]), or an instruction that writes `sp`, `x29` or `x30` in an
@@ -475,16 +475,6 @@ pub(crate) fn epilogue(
     None
 }
 
-/// What [`prologue`] found between a function's first instruction and the pc.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Prologue
-{
-    /// An instruction set `x29` to the new frame: the frame record is built.
-    FrameBuilt,
-    /// The frame is not built yet: the caller's registers.
-    Caller(Box<FrameRegisters>),
-}
-
 /// Follow the instructions from the function's first instruction `start` up to (not
 /// including) `pc`, the pc of the innermost frame, tracking the stack allocated below the
 /// caller's `sp` and where registers were stored, and return the caller's registers: `sp`
@@ -502,7 +492,7 @@ pub(crate) fn prologue(
     registers: &FrameRegisters,
     read_code: impl Fn(u64) -> Option<u32>,
     read_stack: impl Fn(u64) -> Option<u64>,
-) -> Option<Prologue>
+) -> Option<FrameRegisters>
 {
     let distance = pc.checked_sub(start)?;
     if distance % 4 != 0 || distance / 4 > PROLOGUE_LIMIT {
@@ -524,7 +514,7 @@ pub(crate) fn prologue(
                 }
             }
             FrameOp::AdjustSp(delta) => allocated = allocated.checked_add_signed(delta.checked_neg()?)?,
-            FrameOp::FpFromSp(_) => return Some(Prologue::FrameBuilt),
+            FrameOp::FpFromSp(_) => clobbered |= bit(FP),
             FrameOp::SpAccess {
                 load: true,
                 registers,
@@ -589,7 +579,7 @@ pub(crate) fn prologue(
         }
     }
     caller.known &= !(clobbered & !saved_mask(&saved));
-    Some(Prologue::Caller(Box::new(caller)))
+    Some(caller)
 }
 
 fn saved_mask(saved: &[Option<u64>; 31]) -> u32
@@ -779,7 +769,7 @@ mod tests
             epilogue(CODE + index * 4, registers, self.read_code(), self.read_stack())
         }
 
-        fn prologue(&self, index: u64, registers: &FrameRegisters) -> Option<Prologue>
+        fn prologue(&self, index: u64, registers: &FrameRegisters) -> Option<FrameRegisters>
         {
             prologue(CODE, CODE + index * 4, registers, self.read_code(), self.read_stack())
         }
@@ -795,14 +785,6 @@ mod tests
             x,
             sp,
             known: (1 << 31) - 1,
-        }
-    }
-
-    fn caller(state: Option<Prologue>) -> FrameRegisters
-    {
-        match state {
-            Some(Prologue::Caller(caller)) => *caller,
-            other => panic!("expected the caller, got {other:?}"),
         }
     }
 
@@ -826,15 +808,16 @@ mod tests
     {
         let mut machine = rustc_frame();
         // After `sub sp`: nothing stored yet.
-        let state = caller(machine.prologue(1, &registers(0xfe0, 0x2000, 0x4444)));
+        let state = machine.prologue(1, &registers(0xfe0, 0x2000, 0x4444)).expect("caller");
         assert_eq!((state.sp, state.x[29], state.x[30]), (0x1000, 0x2000, 0x4444));
         // After the `stp`: x29 and x30 come from their slots.
         machine.stack.insert(0xff0, 0x2000);
         machine.stack.insert(0xff8, 0x5555);
-        let state = caller(machine.prologue(2, &registers(0xfe0, 0x2000, 0x9999)));
+        let state = machine.prologue(2, &registers(0xfe0, 0x2000, 0x9999)).expect("caller");
         assert_eq!((state.sp, state.x[29], state.x[30]), (0x1000, 0x2000, 0x5555));
-        // After `add x29`: the frame-pointer chain applies.
-        assert_eq!(machine.prologue(3, &registers(0xfe0, 0xff0, 0)), Some(Prologue::FrameBuilt));
+        // After `add x29` the saved frame pointer still supplies the caller's value.
+        let state = machine.prologue(3, &registers(0xfe0, 0xff0, 0)).expect("caller");
+        assert_eq!((state.sp, state.x[29], state.x[30]), (0x1000, 0x2000, 0x5555));
     }
 
     #[test]
@@ -843,11 +826,12 @@ mod tests
         let mut machine = Machine::new(&[PACIBSP, STP_FP_LR_PRE_M0X10, MOV_FP_SP]);
         machine.stack.insert(0xff0, 0x2000);
         machine.stack.insert(0xff8, 0x8000_0000_0000_5555);
-        let state = caller(machine.prologue(1, &registers(0x1000, 0x2000, 0x5555)));
+        let state = machine.prologue(1, &registers(0x1000, 0x2000, 0x5555)).expect("caller");
         assert_eq!(state.sp, 0x1000, "pacibsp moves nothing");
-        let state = caller(machine.prologue(2, &registers(0xff0, 0x2000, 0)));
+        let state = machine.prologue(2, &registers(0xff0, 0x2000, 0)).expect("caller");
         assert_eq!((state.sp, state.x[30]), (0x1000, 0x8000_0000_0000_5555));
-        assert_eq!(machine.prologue(3, &registers(0xff0, 0xff0, 0)), Some(Prologue::FrameBuilt));
+        let state = machine.prologue(3, &registers(0xff0, 0xff0, 0)).expect("caller");
+        assert_eq!((state.sp, state.x[29], state.x[30]), (0x1000, 0x2000, 0x8000_0000_0000_5555));
     }
 
     #[test]
@@ -856,7 +840,7 @@ mod tests
         let mut machine = Machine::new(&[MOV_X8_X0, STP_X20_X19_PRE_M0X20, STP_FP_LR_SP_0X10, ADD_FP_SP_0X10]);
         machine.stack.insert(0xfe0, 0x2020);
         machine.stack.insert(0xfe8, 0x1919_0000);
-        let state = caller(machine.prologue(2, &registers(0xfe0, 0x2000, 0x4444)));
+        let state = machine.prologue(2, &registers(0xfe0, 0x2000, 0x4444)).expect("caller");
         assert_eq!(state.sp, 0x1000);
         assert_eq!((state.x[19], state.x[20], state.x[30]), (0x1919_0000, 0x2020, 0x4444));
         assert_eq!(state.known & (1 << 8), 0, "x8 was overwritten");
@@ -967,7 +951,7 @@ mod tests
         const STR_X30_SP_8: u32 = 0xF900_07FE;
         let mut machine = Machine::new(&[SUB_SP_0X10, STR_X30_SP_8, NOP]);
         machine.stack.insert(0xff8, 0x5555);
-        let state = caller(machine.prologue(2, &registers(0xff0, 0x2000, 0x7777)));
+        let state = machine.prologue(2, &registers(0xff0, 0x2000, 0x7777)).expect("caller");
         assert_eq!((state.sp, state.x[30]), (0x1000, 0x5555));
     }
 }

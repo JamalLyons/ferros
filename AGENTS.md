@@ -32,7 +32,7 @@ Read before changing engine behavior; module docs carry the contracts. Paths und
 | `session::stepping` | `ferros-core/src/session/stepping.rs` | Resumable, serial step-over of software breakpoints. |
 | `session::line_stepping` | `ferros-core/src/session/line_stepping.rs` | Source-line step over, into, out. |
 | `session::location` | `ferros-core/src/session/location.rs` | Resolves a `BreakpointLocation` to sites in the main executable. |
-| `session::stack` | `ferros-core/src/session/stack.rs` | Stack traces and symbolication. Asks `ObjectFormat` for symbol tables and unlisted images. |
+| `session::stack` | `ferros-core/src/session/stack.rs` | Stack traces and symbolication. `Session::stack_trace_with_registers` returns logical frames, their `FrameRegisters`, and DWARF lookup addresses from one unwind. Asks `ObjectFormat` for symbol tables and unlisted images. |
 | `ObjectFormat` | `ferros-core/src/objfile/` | Format-neutral image trait (ADR 0001): mapped layout, build identity, symbol tables, DWARF/CFI bytes, unwind hints. `mock.rs`: `MockObjectFormat` (`test-util`). `ferros_macos::macho::MachOFormat` is the Mach-O implementor; `ferros_macos::new_session` pairs it with `MacOSBackend`. |
 | `session::images` | `ferros-core/src/session/images.rs` | Loads `Backend::images` into the symbol cache. Reuses an image while `types::same_build` holds: two different known build ids are a new build, `BuildIdentity::Unknown` is no evidence, `Absent` never matches. |
 | `session::exits` | `ferros-core/src/session/exits.rs` | Non-local exits (panic landing pads, `longjmp`) so step-out sees a frame leave. Images and entry symbols come from the session's `TargetRuntime`. |

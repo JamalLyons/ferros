@@ -3,6 +3,7 @@
 use ferros_core::Session;
 use ferros_core::backend::LaunchSpec;
 use ferros_core::backend::mock::{MockBackend, arm64_registers};
+use ferros_core::objfile::SavedRegisterSlots;
 use ferros_core::objfile::mock::{MockObjectFormat, MockObjectImage};
 use ferros_core::types::Address;
 
@@ -46,7 +47,13 @@ fn late_id_file(name: &str, build_id: &[u8]) -> Vec<u8>
         .with_dwarf(SectionId::DebugInfo, &info)
         .with_dwarf(SectionId::DebugAbbrev, &abbrev)
         .with_dwarf(SectionId::DebugLine, &[0])
-        .with_hint(LATE_ID_FUNCTION.value(), UnwindHint::Leaf { stack_size: 0 })
+        .with_hint(
+            LATE_ID_FUNCTION.value(),
+            UnwindHint::Leaf {
+                stack_size: 0,
+                saved: SavedRegisterSlots::default(),
+            },
+        )
         .with_build_id(ferros_core::BuildId::new(build_id).expect("build id"))
         .to_bytes()
 }

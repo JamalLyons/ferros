@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use ferros_core::objfile::{FunctionUnwind, UnwindHint, UnwindHints};
+use ferros_core::objfile::{FunctionUnwind, SavedRegisterSlots, UnwindHint, UnwindHints};
 use ferros_core::types::Address;
 
 /// An image's `__unwind_info`, as the engine's [`UnwindHints`].
@@ -51,11 +51,11 @@ impl UnwindHints for CompactUnwind
         let entry = lookup(&self.section, offset).filter(|entry| entry.encoding != 0)?;
         let hint = match Arm64Mode::decode(entry.encoding) {
             Arm64Mode::None => return None,
-            Arm64Mode::Frameless { stack_size } => UnwindHint::Leaf { stack_size },
+            Arm64Mode::Frameless { stack_size, saved } => UnwindHint::Leaf { stack_size, saved },
             Arm64Mode::Dwarf { fde_offset } => UnwindHint::Cfi {
                 eh_frame_offset: fde_offset,
             },
-            Arm64Mode::Frame => UnwindHint::FrameRecord,
+            Arm64Mode::Frame { saved } => UnwindHint::FrameRecord { saved },
         };
         Some(FunctionUnwind {
             start: Address::new(self.header + u64::from(entry.function_offset)),
@@ -187,6 +187,8 @@ pub(crate) enum Arm64Mode
     {
         /// Bytes allocated on the stack.
         stack_size: u64,
+        /// General register slots below the caller's stack pointer.
+        saved: SavedRegisterSlots,
     },
     /// `UNWIND_ARM64_MODE_DWARF`: the function's FDE is at this offset in `__eh_frame`.
     Dwarf
@@ -195,7 +197,11 @@ pub(crate) enum Arm64Mode
         fde_offset: usize,
     },
     /// `UNWIND_ARM64_MODE_FRAME`: a standard frame record at `x29`.
-    Frame,
+    Frame
+    {
+        /// General register slots below the frame record.
+        saved: SavedRegisterSlots,
+    },
 }
 
 impl Arm64Mode
@@ -206,14 +212,34 @@ impl Arm64Mode
         match encoding & 0x0F00_0000 {
             0x0200_0000 => Self::Frameless {
                 stack_size: u64::from((encoding >> 12) & 0xFFF) * 16,
+                saved: saved_register_slots(encoding),
             },
             0x0300_0000 => Self::Dwarf {
                 fde_offset: (encoding & 0x00FF_FFFF) as usize,
             },
-            0x0400_0000 => Self::Frame,
+            0x0400_0000 => Self::Frame {
+                saved: saved_register_slots(encoding),
+            },
             _ => Self::None,
         }
     }
+}
+
+fn saved_register_slots(encoding: u32) -> SavedRegisterSlots
+{
+    // UNWIND_ARM64_FRAME_X19_X20_PAIR through UNWIND_ARM64_FRAME_X27_X28_PAIR.
+    let mut mask = 0;
+    for pair in 0..5 {
+        if encoding & (1 << pair) != 0 {
+            mask |= 0b11 << (19 + 2 * pair);
+        }
+    }
+    if mask == 0 {
+        return SavedRegisterSlots::default();
+    }
+    // The first saved GPR is eight bytes below FP (frame mode) or the caller's SP
+    // (frameless mode). Each later GPR is eight bytes lower. Floating-point saves follow.
+    SavedRegisterSlots { mask, first_offset: -8 }
 }
 
 #[cfg(test)]
@@ -293,12 +319,17 @@ pub(crate) mod tests
             hint(0x1004),
             Some(FunctionUnwind {
                 start: Address::new(0x5_0000_1000),
-                hint: UnwindHint::FrameRecord,
+                hint: UnwindHint::FrameRecord {
+                    saved: Default::default()
+                },
             })
         );
         assert_eq!(
             hint(0x1044).map(|entry| entry.hint),
-            Some(UnwindHint::Leaf { stack_size: 16 })
+            Some(UnwindHint::Leaf {
+                stack_size: 16,
+                saved: Default::default(),
+            })
         );
         assert_eq!(
             hint(0x2abc).map(|entry| entry.hint),
@@ -320,10 +351,40 @@ pub(crate) mod tests
     fn arm64_modes_decode()
     {
         assert_eq!(Arm64Mode::decode(0), Arm64Mode::None);
-        assert_eq!(Arm64Mode::decode(0x0200_1000), Arm64Mode::Frameless { stack_size: 16 });
+        assert_eq!(
+            Arm64Mode::decode(0x0200_1000),
+            Arm64Mode::Frameless {
+                stack_size: 16,
+                saved: Default::default(),
+            }
+        );
+        assert_eq!(
+            Arm64Mode::decode(0x0200_2001),
+            Arm64Mode::Frameless {
+                stack_size: 32,
+                saved: SavedRegisterSlots {
+                    mask: 0b11 << 19,
+                    first_offset: -8,
+                },
+            }
+        );
         assert_eq!(Arm64Mode::decode(0x0300_0158), Arm64Mode::Dwarf { fde_offset: 0x158 });
         // Personality and LSDA bits do not change the mode.
         assert_eq!(Arm64Mode::decode(0x5300_0158), Arm64Mode::Dwarf { fde_offset: 0x158 });
-        assert_eq!(Arm64Mode::decode(0x0400_0000), Arm64Mode::Frame);
+        assert_eq!(
+            Arm64Mode::decode(0x0400_0000),
+            Arm64Mode::Frame {
+                saved: Default::default()
+            }
+        );
+        assert_eq!(
+            Arm64Mode::decode(0x0400_0F05),
+            Arm64Mode::Frame {
+                saved: SavedRegisterSlots {
+                    mask: (0b11 << 19) | (0b11 << 23),
+                    first_offset: -8,
+                },
+            }
+        );
     }
 }

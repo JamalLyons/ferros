@@ -13,7 +13,7 @@ use crate::objfile::{ImageProbe, MappedSymbols, TargetMemory};
 use crate::symbols::Symbolication;
 use crate::symbols::demangle::make_symbol_name;
 use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
-use crate::types::{Address, MemoryRegion, StackFrame, SymbolName, SymbolSource};
+use crate::types::{Address, FrameRegisters, MemoryRegion, StackFrame, StackTrace, SymbolName, SymbolSource};
 
 /// [`MemoryAccess`] over a backend.
 ///
@@ -123,6 +123,42 @@ impl Session
     /// [`Backend::images`]: crate::backend::Backend::images
     pub fn stack_trace(&mut self, max_frames: usize) -> Result<Vec<StackFrame>>
     {
+        Ok(self.stack_trace_with_registers(max_frames)?.frames)
+    }
+
+    /// Unwind frames, their registers and their DWARF lookup addresses together.
+    /// All entries in the result refer to the same walk and its image list. See
+    /// [`stack_trace`](Self::stack_trace) for the ordering and frame limit.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`stack_trace`](Self::stack_trace).
+    pub fn stack_trace_with_registers(&mut self, max_frames: usize) -> Result<StackTrace>
+    {
+        let mut stack = self.unwind_stack(max_frames)?;
+        self.name_frames_from_symbol_tables(&mut stack.frames, &stack.lookups);
+        Ok(stack)
+    }
+
+    /// Read the selected stopped thread's registers for a logical stack frame.
+    ///
+    /// `index` follows [`stack_trace`](Self::stack_trace), starting at zero and including
+    /// inline frames. An inline frame uses its physical frame's registers and CFA.
+    /// Returns `None` if the trace ends before `index`. Indices refer to the current stop.
+    /// Use [`stack_trace_with_registers`](Self::stack_trace_with_registers) to read
+    /// multiple frames from one unwind.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`stack_trace`](Self::stack_trace).
+    pub fn frame_registers(&mut self, index: usize) -> Result<Option<FrameRegisters>>
+    {
+        let stack = self.unwind_stack(index.saturating_add(1))?;
+        Ok(stack.frame_registers(index).cloned())
+    }
+
+    fn unwind_stack(&mut self, max_frames: usize) -> Result<StackTrace>
+    {
         self.require_stopped()?;
         let thread = self.selected_or_error()?;
         let registers = self.backend.read_registers(thread)?;
@@ -138,24 +174,22 @@ impl Session
         // pass missed. A failed load is not retried within this request, so a bad image
         // is read at most once per trace.
         loop {
-            let (frames, lookups) = {
+            let stack = {
                 let traps = self.trap_originals();
                 let memory = BackendMemory::new(self.backend.as_mut(), traps);
                 StackUnwinder::new(&*arch, &self.symbols, &memory)
                     .with_runtime(self.runtime.as_ref())
-                    .unwind_with_lookups(thread, &registers, max_frames)?
+                    .unwind_stack(thread, &registers, max_frames)?
             };
             let mut added = false;
-            for (frame, &lookup) in frames.iter().zip(&lookups) {
+            for (frame, &lookup) in stack.frames.iter().zip(&stack.lookups) {
                 added |= self.load_symbols_for_frame(frame.pc);
                 // A caller is symbolicated at its call instruction, which can lie in the
                 // previous image when the call was the image's last instruction.
                 added |= self.load_symbols_for_frame(lookup);
             }
             if !added {
-                let mut frames = frames;
-                self.name_frames_from_symbol_tables(&mut frames, &lookups);
-                return Ok(frames);
+                return Ok(stack);
             }
         }
     }

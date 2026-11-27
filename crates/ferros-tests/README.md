@@ -99,8 +99,8 @@ The crate defines twenty-two fixture binaries:
   `leaf_mix` is a frameless leaf (compact unwind `MODE_FRAMELESS`, no `__eh_frame` FDE) called
   from `main` at marker `call_leaf`.
 - `ferros-fixture-frameless_stack`: Before `main`, a dyld initializer `_frameless_caller` calls
-  `_frameless_spill`, a leaf with a 32-byte stack allocation and an epilogue (compact unwind
-  `MODE_FRAMELESS`, encoding `0x02002000`, no `__eh_frame` FDE). Both are assembly from
+  `_frameless_spill`, a leaf with a 32-byte stack allocation and an x19/x20 save pair (compact
+  unwind `MODE_FRAMELESS`, encoding `0x02002001`, no `__eh_frame` FDE). Both are assembly from
   `fixtures/asm/frameless_stack.s`, assembled and linked into this fixture only by `build.rs`
   (rustc gives such Rust leaves DWARF CFI in a debug build). Used for a backtrace stopped
   after the epilogue released the stack (issue #130). A second initializer

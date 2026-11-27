@@ -28,10 +28,13 @@ impl PrettyPrinter for StringPrinter
         let endian = formatter.endian();
         let owned = types.get(value.ty).is_some_and(|ty| ty.name.as_deref() == Some(STRING_NAME));
         let layout = if owned {
-            field(value, "vec", types)
-                .and_then(|field| vec::layout(field, types, endian))
-                .filter(|vec| vec.len <= vec.capacity)
-                .map(|vec| (vec.address, vec.len, vec.element))
+            let Some(vec) = field(value, "vec", types).and_then(|field| vec::layout(field, types, endian)) else {
+                return raw_layout(value, formatter);
+            };
+            if vec.len > vec.capacity {
+                return unavailable(format!("string length {} exceeds capacity {}", vec.len, vec.capacity));
+            }
+            Some((vec.address, vec.len, vec.element))
         } else {
             fat_pointer(value, types, endian)
         };

@@ -46,7 +46,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::extractor::TypeSummary;
 use super::image::{BinaryImage, ImageDescriptor, ImageId};
 use super::load_inputs::LoadInputs;
 use crate::error::{DebuggerError, Result};
@@ -424,30 +423,6 @@ impl SymbolCache
     pub fn symbolicate(&self, address: Address) -> Option<Symbolication>
     {
         self.image_for_address(address).and_then(|image| image.symbolicate(address))
-    }
-
-    /// Describe a type by name using DWARF type information.
-    ///
-    /// Searches through all cached images to find type definitions matching the
-    /// given name. Returns a summary of the type's structure (fields, variants, etc.).
-    ///
-    /// ## Parameters
-    ///
-    /// - `name`: The type name to look up (e.g., "std::option::Option")
-    ///
-    /// ## Returns
-    ///
-    /// `Ok(Some(summary))` if the type is found, `Ok(None)` if not found,
-    /// or an error if DWARF parsing fails.
-    pub fn describe_type(&self, name: &str) -> Result<Option<Arc<TypeSummary>>>
-    {
-        // An image kept only for unwinding has no types to describe.
-        for image in self.images.values().filter(|image| image.has_debug_info()) {
-            if let Some(summary) = image.describe_type(name)? {
-                return Ok(Some(summary));
-            }
-        }
-        Ok(None)
     }
 }
 

@@ -60,6 +60,7 @@ pub mod runtime;
 pub mod session;
 pub mod symbols;
 pub mod types;
+pub mod values;
 
 pub use arch::Arch;
 pub use backend::{Backend, BackendError, BackendResult, FaultKind, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};
@@ -71,7 +72,7 @@ pub use session::{
     BreakpointHit, BreakpointLocation, BreakpointSite, DROP_STOP_TIMEOUT, LogicalBreakpoint, LogicalBreakpointId,
     ProcessOwnership, SIGKILL, Session, SessionState, SourcePosition,
 };
-pub use symbols::{SymbolCache, SymbolFrame, Symbolication, TypeField, TypeKind, TypeSummary, TypeVariant};
+pub use symbols::{SymbolCache, SymbolFrame, Symbolication};
 pub use types::{
     Address, Architecture, BuildId, BuildIdentity, FloatingPointState, FrameId, FrameKind, FrameRegisters, FrameStatus,
     MemoryRegion, MemoryRegionId, ProcessId, RegisterId, Registers, SourceLocation, StackFrame, StackTrace, StopReason,

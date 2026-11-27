@@ -22,7 +22,6 @@
 
 use rustc_demangle::try_demangle;
 
-use crate::error::DebuggerError;
 use crate::types::{SymbolLanguage, SymbolName, SymbolSource};
 
 /// Create a `SymbolName` from a raw mangled symbol string.
@@ -62,53 +61,4 @@ pub(crate) fn make_symbol_name(raw: String, source: SymbolSource) -> SymbolName
     };
 
     SymbolName::new(raw, demangled, language, source)
-}
-
-/// Check if a type name represents a Rust trait object.
-///
-/// This function uses heuristics to detect trait objects by looking for the
-/// `dyn` keyword in the type name. Trait objects in Rust are represented as
-/// `dyn Trait` or `(dyn Trait)`.
-///
-/// ## Parameters
-///
-/// - `name`: The type name to check
-///
-/// ## Returns
-///
-/// `true` if the name appears to be a trait object, `false` otherwise.
-///
-/// ## Example
-///
-/// ```rust,no_run
-/// // Note: This function is internal to the crate.
-/// // Examples of trait object patterns:
-/// // - "dyn std::fmt::Display"
-/// // - "(dyn std::fmt::Display)"
-/// // - "std::boxed::Box<dyn std::fmt::Display>"
-/// // - "std::string::String" (not a trait object)
-/// ```
-pub(crate) fn is_trait_object(name: &str) -> bool
-{
-    let trimmed = name.trim();
-    trimmed.starts_with("dyn ") || trimmed.starts_with("(dyn ") || trimmed.contains(" as dyn ") || trimmed.contains(" dyn ")
-}
-
-/// Map a gimli DWARF error to a `DebuggerError` with context.
-///
-/// This helper function wraps gimli errors with additional context about what
-/// operation was being performed when the error occurred.
-///
-/// ## Parameters
-///
-/// - `context`: A description of what operation was being performed (e.g., "parsing .debug_info")
-/// - `err`: The gimli error that occurred
-///
-/// ## Returns
-///
-/// A `DebuggerError::InvalidArgument` with a formatted message combining the
-/// context and error details.
-pub(crate) fn map_dwarf_error(context: &str, err: gimli::Error) -> DebuggerError
-{
-    DebuggerError::InvalidArgument(format!("{context}: {err}"))
 }

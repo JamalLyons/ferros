@@ -22,6 +22,10 @@ rustc-demangle = "0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# Doctests use `objfile::mock`, so plain `cargo test -p ferros-core` enables `test-util` too.
+ferros-core = { path = ".", features = ["test-util"] }
+
 # ferros-core holds no OS-specific code and no `unsafe` (the Mach FFI lives in
 # ferros-macos). Mirror the workspace lints minus clippy pedantic (to avoid churn
 # in ferros-core; revisit later).

@@ -45,4 +45,5 @@ mod values_misc;
 mod values_newtypes;
 mod values_paths;
 mod values_shared;
+mod values_statics;
 mod values_std;

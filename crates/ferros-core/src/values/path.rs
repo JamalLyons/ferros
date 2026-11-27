@@ -7,7 +7,10 @@
 //! path    := '*' path | postfix
 //! postfix := primary ( '.' name | '.' integer | '[' integer ']' )*
 //! primary := name | '(' path ')'
+//! name    := '::'? identifier ( '::' identifier )*
 //! ```
+//!
+//! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`).
 //!
 //! As in Rust, `*a.b` dereferences `a.b`; write `(*a).b` to dereference `a` first. `.0`
 //! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
@@ -226,22 +229,18 @@ fn tokenize(text: &str) -> Result<Vec<(Token<'_>, usize)>, PathError>
             ')' => Token::CloseParen,
             '[' => Token::OpenBracket,
             ']' => Token::CloseBracket,
-            ch if ch.is_ascii_digit() || ch == '_' || ch.is_alphabetic() => {
-                let mut end = start + ch.len_utf8();
-                while let Some(&(next, ch)) = chars.peek() {
-                    if !(ch.is_alphanumeric() || ch == '_') {
-                        break;
-                    }
-                    end = next + ch.len_utf8();
-                    chars.next();
-                }
-                let word = &text[start..end];
-                if ch.is_ascii_digit() {
-                    Token::Integer(word)
-                } else {
-                    Token::Name(word)
-                }
+            ch if ch.is_ascii_digit() => {
+                let end = word_end(text, start);
+                while chars.next_if(|&(next, _)| next < end).is_some() {}
+                Token::Integer(&text[start..end])
             }
+            ch if is_name_start(ch) || (ch == ':' && text[start..].starts_with("::")) => match name_end(text, start) {
+                Some(end) => {
+                    while chars.next_if(|&(next, _)| next < end).is_some() {}
+                    Token::Name(&text[start..end])
+                }
+                None => Token::Other(ch),
+            },
             other => Token::Other(other),
         };
         tokens.push((token, column));
@@ -250,6 +249,42 @@ fn tokenize(text: &str) -> Result<Vec<(Token<'_>, usize)>, PathError>
         return Err(PathError::syntax("expected a variable name"));
     }
     Ok(tokens)
+}
+
+fn is_name_start(ch: char) -> bool
+{
+    ch == '_' || ch.is_alphabetic()
+}
+
+/// The end of the run of identifier characters at `start`.
+fn word_end(text: &str, start: usize) -> usize
+{
+    text[start..]
+        .char_indices()
+        .find(|&(_, ch)| !(ch.is_alphanumeric() || ch == '_'))
+        .map_or(text.len(), |(offset, _)| start + offset)
+}
+
+/// The end of the name at `start`: identifiers joined by `::`, optionally after a leading
+/// `::`, as in a static's qualified name (`::my_crate::config::LIMIT`). `None` when `::`
+/// at `start` is not followed by an identifier.
+fn name_end(text: &str, start: usize) -> Option<usize>
+{
+    let segment = |at: usize| {
+        let rest = text.get(at..)?;
+        rest.starts_with(is_name_start).then(|| word_end(text, at))
+    };
+    let mut end = if text[start..].starts_with("::") {
+        segment(start + 2)?
+    } else {
+        segment(start)?
+    };
+    while text[end..].starts_with("::")
+        && let Some(next) = segment(end + 2)
+    {
+        end = next;
+    }
+    Some(end)
 }
 
 fn unexpected(token: Token<'_>, column: usize) -> PathError
@@ -799,6 +834,23 @@ mod tests
     }
 
     #[test]
+    fn a_qualified_name_is_one_root()
+    {
+        let path = Path::parse("app::config::LIMIT").unwrap();
+        assert!(path.is_variable());
+        assert_eq!(path.root(), "app::config::LIMIT");
+        let path = Path::parse("app::TABLE[2]").unwrap();
+        assert_eq!(path.root(), "app::TABLE");
+        assert_eq!(path.to_string(), "app::TABLE[2]");
+        assert_eq!(Path::parse("(*app::P).x").unwrap().root(), "app::P");
+        assert_eq!(Path::parse("::app::LIMIT").unwrap().root(), "::app::LIMIT");
+        assert_eq!(rejected("::"), "unexpected `:` at column 1");
+        assert_eq!(rejected("app::"), "unexpected `:` at column 4");
+        assert_eq!(rejected("app::1"), "unexpected `:` at column 4");
+        assert_eq!(rejected("a:b"), "unexpected `:` at column 2");
+    }
+
+    #[test]
     fn dereference_binds_looser_than_postfix_operators()
     {
         let path = Path::parse("*a.b").unwrap();
@@ -856,7 +908,7 @@ mod tests
             rejected("0"),
             "unexpected `0` at column 1: a path starts with a variable name"
         );
-        assert_eq!(rejected("a::b"), "unexpected `:` at column 2");
+        assert_eq!(rejected("a: :b"), "unexpected `:` at column 2");
         assert_eq!(rejected("a.*"), "unexpected `*` at column 3");
         assert!(rejected("v[99999999999999999999999]").starts_with("invalid index"));
         assert!(rejected("t.1x").starts_with("invalid index"));

@@ -12,6 +12,7 @@ fn print_shows_newtypes_as_their_inner_value()
         ("no_non_zero", "None"),
         ("duration", "1.5s"),
         ("wrapping", "Wrapping(5)"),
+        ("saturating", "Saturating(9)"),
         ("manually_drop", "6"),
         ("maybe_uninit", "MaybeUninit(<maybe uninit> 0x00000007)"),
         ("thread_id", "ThreadId(1)"),

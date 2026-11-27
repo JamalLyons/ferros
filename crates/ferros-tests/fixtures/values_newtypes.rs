@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit};
-use std::num::{NonZeroU32, Wrapping};
+use std::num::{NonZeroU32, Saturating, Wrapping};
 use std::time::Duration;
 
 fn main()
@@ -13,6 +13,7 @@ fn main()
     let no_non_zero: Option<NonZeroU32> = None;
     let duration = Duration::new(1, 500_000_000);
     let wrapping = Wrapping(5_u8);
+    let saturating = Saturating(9_i16);
     let manually_drop = ManuallyDrop::new(6_u32);
     let maybe_uninit = MaybeUninit::new(7_u32);
     let thread_id = std::thread::current().id();
@@ -21,5 +22,5 @@ fn main()
 
     black_box(&non_zero); // BREAK: inspect
     black_box((&some_non_zero, &no_non_zero, &duration, &wrapping, &manually_drop));
-    black_box((&maybe_uninit, &thread_id, &phantom, &ids));
+    black_box((&maybe_uninit, &thread_id, &phantom, &ids, &saturating));
 }

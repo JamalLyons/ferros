@@ -138,7 +138,7 @@ fn decimal(whole: u128, fraction: u64, scale: u64, unit: &str) -> String
     format!("{whole}.{}{unit}", digits.trim_end_matches('0'))
 }
 
-/// Renders `MaybeUninit` as its raw bytes, most significant first in the target's byte
+/// Renders `MaybeUninit` as its raw bytes, read as one hex integer in the target's byte
 /// order, because the bytes need not be a valid `T`.
 pub(super) struct MaybeUninitPrinter;
 

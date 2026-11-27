@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use gimli::RunTimeEndian;
 
-use super::{PrettyPrinter, field, raw_layout, thin_pointer, usize_value, vec_layout, word};
+use super::{PrettyPrinter, field, raw_layout, usize_value, vec, vec_layout, word};
 use crate::types::Address;
 use crate::values::format::{ELLIPSIS, ValueFormatter, ValueView, unavailable};
 use crate::values::types::{Type, TypeId, TypeKind, TypeTable};
@@ -114,7 +114,7 @@ fn ring_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -
     // Recent releases wrap the physical head index in a newtype.
     let head = usize_value(field(head, "__0", types).unwrap_or(head), types, endian)?;
     let len = usize_value(value.member(layout.member("len")?, types)?, types, endian)?;
-    let (address, capacity) = raw_buffer(value.member(layout.member("buf")?, types)?, stride, types, endian)?;
+    let (address, capacity) = vec::raw_buffer(value.member(layout.member("buf")?, types)?, stride, types, endian)?;
     Some(Ring {
         address,
         head,
@@ -123,28 +123,6 @@ fn ring_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -
         element,
         stride,
     })
-}
-
-/// The allocation pointer and capacity of a `RawVec`.
-fn raw_buffer(buf: ValueView<'_>, stride: u64, types: &TypeTable, endian: RunTimeEndian) -> Option<(Address, u64)>
-{
-    // Recent RawVecs place the allocation fields in RawVecInner.
-    let raw = field(buf, "inner", types).unwrap_or(buf);
-    let ptr = field(raw, "ptr", types)?;
-    // The raw pointer may be wrapped in Unique and/or NonNull.
-    let ptr = field(ptr, "pointer", types).unwrap_or(ptr);
-    let ptr = field(ptr, "pointer", types).unwrap_or(ptr);
-    let (address, _) = thin_pointer(ptr, types, endian)?;
-    let cap = field(raw, "cap", types)?;
-    let cap = field(cap, "__0", types).unwrap_or(cap);
-    let capacity = usize_value(cap, types, endian)?;
-    // Zero-sized elements have a capacity of usize::MAX, irrespective of the stored one.
-    let capacity = if stride == 0 {
-        u64::MAX >> (8 * (8 - cap.bytes.len()))
-    } else {
-        capacity
-    };
-    Some((address, capacity))
 }
 
 impl Ring
@@ -220,7 +198,7 @@ fn list_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -
         head,
         len,
         next_offset: next.offset?,
-        next_size: usize::try_from(types.get(next_ty)?.size?).ok()?,
+        next_size: usize::try_from(types.get(types.strip_aliases(next_ty))?.size?).ok()?,
         element: element.ty?,
         element_offset: element.offset?,
     })
@@ -297,13 +275,5 @@ fn format_heap(value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> Opti
 {
     let types = formatter.types();
     let data = vec_layout(field(value, "data", types)?, types, formatter.endian())?;
-    let (len, capacity) = (data.len, data.capacity);
-    if len > capacity {
-        return Some(unavailable(format!("heap length {len} exceeds capacity {capacity}")));
-    }
-    if data.address == Address::ZERO {
-        return Some(unavailable("null element data pointer"));
-    }
-    let elements = formatter.format_sequence(Some(data.element), &[Some(len)], Some(data.address), None);
-    Some(format!("{elements} (len: {len}, capacity: {capacity})"))
+    Some(vec::format_contents(&data, "heap", formatter))
 }

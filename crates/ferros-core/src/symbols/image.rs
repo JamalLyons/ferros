@@ -49,7 +49,7 @@ use super::cache::{SymbolFrame, Symbolication};
 use super::demangle::make_symbol_name;
 use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
-use super::{OwnedDwarf, OwnedReader};
+use super::{OwnedDwarf, OwnedReader, dwarf_frame_name};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
@@ -664,7 +664,7 @@ impl BinaryImage
         EndianArcSlice::new(data, self.executable.endian)
     }
 
-    fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
+    pub(crate) fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
     {
         let sections = self.debug_sections()?;
         self.context_cache.get_or_try_init(|| {
@@ -756,11 +756,7 @@ impl BinaryImage
         };
 
         while let Ok(Some(frame)) = frame_iter.next() {
-            let symbol_name = frame
-                .function
-                .as_ref()
-                .and_then(|func| func.raw_name().ok())
-                .map(|raw| make_symbol_name(raw.to_string(), SymbolSource::DebugInfo));
+            let symbol_name = dwarf_frame_name(&frame).map(|raw| make_symbol_name(raw.to_string(), SymbolSource::DebugInfo));
             let location = frame.location.as_ref().and_then(|loc| {
                 loc.file.as_ref().map(|file| SourceLocation {
                     file: file.to_string(),

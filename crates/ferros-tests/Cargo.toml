@@ -157,6 +157,11 @@ path = "fixtures/dyld_aliases.rs"
 test = false
 
 [[bin]]
+name = "ferros-fixture-values_basic"
+path = "fixtures/values_basic.rs"
+test = false
+
+[[bin]]
 name = "ferros-fixture-values_types"
 path = "fixtures/values_types.rs"
 test = false

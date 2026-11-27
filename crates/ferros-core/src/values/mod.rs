@@ -1,3 +1,5 @@
-//! Values in a stopped target: the types its debug information describes.
+//! DWARF types, variable scopes, and storage locations.
 
+pub mod location;
+pub mod scope;
 pub mod types;

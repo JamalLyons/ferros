@@ -113,6 +113,34 @@ fn register_location() -> Expression
     expression
 }
 
+fn index_type(unit: &mut Unit, encoding: gimli::DwAte, byte_size: u64) -> UnitEntryId
+{
+    let ty = unit.add(unit.root(), gimli::DW_TAG_base_type);
+    unit.get_mut(ty).set(gimli::DW_AT_encoding, Attr::Encoding(encoding));
+    unit.get_mut(ty).set(gimli::DW_AT_byte_size, Attr::Udata(byte_size));
+    ty
+}
+
+fn array_with_bounds(
+    unit: &mut Unit,
+    element: UnitEntryId,
+    index: Option<UnitEntryId>,
+    lower: Attr,
+    upper: Attr,
+) -> UnitEntryId
+{
+    let array = unit.add(unit.root(), gimli::DW_TAG_array_type);
+    unit.get_mut(array).set(gimli::DW_AT_type, Attr::UnitRef(element));
+    let range = unit.add(array, gimli::DW_TAG_subrange_type);
+    let entry = unit.get_mut(range);
+    if let Some(index) = index {
+        entry.set(gimli::DW_AT_type, Attr::UnitRef(index));
+    }
+    entry.set(gimli::DW_AT_lower_bound, lower);
+    entry.set(gimli::DW_AT_upper_bound, upper);
+    array
+}
+
 #[test]
 fn oversized_piece_is_unavailable_through_session()
 {
@@ -265,31 +293,37 @@ fn array_bounds_use_signed_sentinels_and_apply_element_stride()
 {
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
     let unit = &mut dwarf.unit;
+    let signed_byte_index = index_type(unit, gimli::DW_ATE_signed, 1);
+    let signed_word_index = index_type(unit, gimli::DW_ATE_signed, 2);
     let bounds = vec![
         (
             "byte_stride",
-            Attr::Data1(u8::MAX),
-            Attr::Data1(1),
+            Some(signed_byte_index),
+            Attr::Data1(u8::MAX - 1),
+            Attr::Data1(0),
             Some((gimli::DW_AT_byte_stride, 2)),
         ),
         (
             "bit_stride",
+            Some(signed_word_index),
             Attr::Data2(u16::MAX),
             Attr::Data2(1),
             Some((gimli::DW_AT_bit_stride, 16)),
         ),
-        ("empty", Attr::Data4(0), Attr::Data4(u32::MAX), None),
-        ("packed", Attr::Data1(0), Attr::Data1(1), Some((gimli::DW_AT_bit_stride, 7))),
+        ("empty", None, Attr::Data4(0), Attr::Data4(u32::MAX), None),
+        (
+            "packed",
+            None,
+            Attr::Data1(0),
+            Attr::Data1(1),
+            Some((gimli::DW_AT_bit_stride, 7)),
+        ),
     ];
-    for (name, lower, upper, stride) in bounds {
-        let array = unit.add(unit.root(), gimli::DW_TAG_array_type);
-        unit.get_mut(array).set(gimli::DW_AT_type, Attr::UnitRef(byte));
+    for (name, index, lower, upper, stride) in bounds {
+        let array = array_with_bounds(unit, byte, index, lower, upper);
         if let Some((attribute, value)) = stride {
             unit.get_mut(array).set(attribute, Attr::Udata(value));
         }
-        let subrange = unit.add(array, gimli::DW_TAG_subrange_type);
-        unit.get_mut(subrange).set(gimli::DW_AT_lower_bound, lower);
-        unit.get_mut(subrange).set(gimli::DW_AT_upper_bound, upper);
         local(unit, function, name, array, register_location());
     }
 
@@ -299,4 +333,34 @@ fn array_bounds_use_signed_sentinels_and_apply_element_stride()
     assert_eq!(vars[1].value.bytes.as_deref(), Ok(&[7, 0, 0, 0, 0, 0][..]));
     assert_eq!(vars[2].value.bytes.as_deref(), Ok(&[][..]));
     assert_eq!(vars[3].value.bytes, Err(Unavailable::SizeUnknown));
+}
+
+#[test]
+fn all_ones_byte_upper_bound_uses_index_signedness()
+{
+    const CASES: &[(&str, Option<gimli::DwAte>)] = &[
+        ("unsigned", Some(gimli::DW_ATE_unsigned)),
+        ("signed", Some(gimli::DW_ATE_signed)),
+        ("untyped", None),
+    ];
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let contents = (0..=u8::MAX).collect::<Vec<_>>();
+    let unit = &mut dwarf.unit;
+    for &(name, encoding) in CASES {
+        let index = encoding.map(|encoding| index_type(unit, encoding, 1));
+        let array = array_with_bounds(unit, byte, index, Attr::Data1(0), Attr::Data1(u8::MAX));
+        let mut location = Expression::new();
+        location.op_implicit_value(contents.clone().into_boxed_slice());
+        local(unit, function, name, array, location);
+    }
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let vars = session.selected_frame_variables().expect("array locals");
+    assert_eq!(vars[0].name, "unsigned");
+    assert_eq!(vars[0].value.bytes.as_ref().map(Vec::len), Ok(256));
+    assert_eq!(vars[0].value.bytes.as_deref(), Ok(contents.as_slice()));
+    assert_eq!(vars[1].name, "signed");
+    assert_eq!(vars[1].value.bytes.as_deref(), Ok(&[][..]));
+    assert_eq!(vars[2].name, "untyped");
+    assert_eq!(vars[2].value.bytes.as_deref(), Ok(contents.as_slice()));
 }

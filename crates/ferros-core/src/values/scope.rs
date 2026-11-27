@@ -459,9 +459,11 @@ fn subrange_count(unit: Unit<'_>, entry: &Entry<'_, '_>) -> DwarfResult<Option<u
     if let Some(count) = entry.attr_value(gimli::DW_AT_count)? {
         return Ok(count.udata_value());
     }
-    let upper = entry.attr_value(gimli::DW_AT_upper_bound)?.and_then(integer_bound);
+    let index_type = entry.attr_value(gimli::DW_AT_type)?;
+    let untyped = index_type.is_none();
+    let signed = with_reference(unit, index_type, |unit, offset| signed_index_type(unit, offset, 0))?.unwrap_or(false);
     let lower = match entry.attr_value(gimli::DW_AT_lower_bound)? {
-        Some(lower) => integer_bound(lower),
+        Some(lower) => integer_bound(lower, signed),
         None => {
             let mut entries = unit.entries();
             let Some((_, root)) = entries.next_dfs()? else {
@@ -473,17 +475,44 @@ fn subrange_count(unit: Unit<'_>, entry: &Entry<'_, '_>) -> DwarfResult<Option<u
             }
         }
     };
+    let upper = match entry.attr_value(gimli::DW_AT_upper_bound)? {
+        // Untyped fixed-width bounds are unsigned. Preserve LLVM's -1 sentinel
+        // for a zero-based range only when a 32- or 64-bit all-ones upper bound
+        // would otherwise imply at least 2^32 elements.
+        Some(Attr::Data4(u32::MAX) | Attr::Data8(u64::MAX)) if untyped && lower == Some(0) => Some(-1),
+        other => other.and_then(|upper| integer_bound(upper, signed)),
+    };
     Ok(upper
         .zip(lower)
         .and_then(|(upper, lower)| u64::try_from(upper - lower + 1).ok()))
 }
 
-fn integer_bound(attr: Attr) -> Option<i128>
+fn signed_index_type(unit: Unit<'_>, offset: UnitOffset<usize>, depth: usize) -> DwarfResult<bool>
+{
+    let ty = unit.entry(offset)?;
+    if ty.tag() == gimli::DW_TAG_base_type {
+        return Ok(matches!(
+            ty.attr_value(gimli::DW_AT_encoding)?,
+            Some(Attr::Encoding(
+                gimli::DW_ATE_signed | gimli::DW_ATE_signed_char | gimli::DW_ATE_signed_fixed
+            ))
+        ));
+    }
+    if depth == MAX_REFERENCE_DEPTH {
+        return Ok(false);
+    }
+    Ok(with_reference(unit, ty.attr_value(gimli::DW_AT_type)?, |unit, offset| {
+        signed_index_type(unit, offset, depth + 1)
+    })?
+    .unwrap_or(false))
+}
+
+fn integer_bound(attr: Attr, signed: bool) -> Option<i128>
 {
     match attr {
-        // LLVM can emit -1 in a fixed-width form without an explicit sign.
-        Attr::Data1(u8::MAX) | Attr::Data2(u16::MAX) | Attr::Data4(u32::MAX) => Some(-1),
         Attr::Sdata(value) => Some(i128::from(value)),
+        Attr::Udata(value) => Some(i128::from(value)),
+        other if signed => other.sdata_value().map(i128::from),
         other => other.udata_value().map(i128::from),
     }
 }

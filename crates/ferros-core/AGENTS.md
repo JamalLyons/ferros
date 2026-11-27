@@ -17,7 +17,9 @@ Open first: `src/session/mod.rs` (state-machine table), then `src/backend/mod.rs
   - `lines.rs`: line tables, `file:line` to addresses and back.
   - `functions.rs`: function name to entry and post-prologue address.
   - `unwind.rs`: stack walk (CFI, unwind hints, frame-pointer chain).
-  - `extractor.rs`: DWARF type extraction. `demangle.rs`: Rust/C++ demangling. `load_inputs.rs`: retry stamps for failed loads.
+  - `demangle.rs`: Rust/C++ demangling. `load_inputs.rs`: retry stamps for failed loads.
+- `values/`: value inspection.
+  - `types.rs`: DWARF type model. `TypeTable` is a per-image arena of `TypeId`s, resolved lazily by DIE offset or by qualified Rust name (`BinaryImage::types`).
 - `arch/`: instruction-set knowledge. `arm64.rs`, `arm64_frame.rs` (prologue/epilogue analysis for `unwind.rs`), `x86_64.rs` (placeholder).
 - `breakpoints/`: breakpoint and watchpoint bookkeeping; `builder.rs`.
 - `types/`: `Address`, build identity, process/thread, registers, stack frames, symbols.

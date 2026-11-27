@@ -40,16 +40,71 @@ impl FrameRegisters
 
     /// The value of AArch64 DWARF register `number` (`0`–`30` for X0–X30, `31` for SP,
     /// `32` for PC). Returns `None` for unavailable or unsupported registers.
+    ///
+    /// An ordinary caller's PC holds the return address. Use
+    /// [`StackTrace::lookup_address`] for the call instruction when consulting DWARF
+    /// location lists. An innermost or signal-interrupted frame uses its stopped PC.
     pub fn dwarf_register(&self, number: u16) -> Option<u64>
     {
         let value = self.values.get(usize::from(number))?;
         (self.known & (1 << number) != 0).then_some(*value)
     }
 
-    /// The canonical frame address computed from this frame's CFI, if available.
+    /// The canonical frame address from CFI or a function's frame-record hint, if available.
     pub fn cfa(&self) -> Option<Address>
     {
         self.cfa
+    }
+}
+
+/// Logical and physical frame data from one unwind of a stopped thread.
+#[derive(Debug, Default)]
+pub struct StackTrace
+{
+    pub(crate) frames: Vec<StackFrame>,
+    pub(crate) lookups: Vec<Address>,
+    physical_frames: Vec<PhysicalFrame>,
+}
+
+#[derive(Debug)]
+struct PhysicalFrame
+{
+    /// Exclusive end of the logical frames produced for this physical frame.
+    logical_end: usize,
+    registers: FrameRegisters,
+}
+
+impl StackTrace
+{
+    /// Logical frames, including inline frames, innermost first.
+    pub fn frames(&self) -> &[StackFrame]
+    {
+        &self.frames
+    }
+
+    /// The registers for logical frame `index`, shared with other frames inlined into
+    /// the same physical frame.
+    pub fn frame_registers(&self, index: usize) -> Option<&FrameRegisters>
+    {
+        let physical = self.physical_frames.partition_point(|frame| frame.logical_end <= index);
+        self.physical_frames.get(physical).map(|frame| &frame.registers)
+    }
+
+    /// The address used for symbol and DWARF lookups for logical frame `index`.
+    /// This is the call instruction for an ordinary caller, and the stopped PC for
+    /// an innermost or signal-interrupted frame. Inline frames use their owner's address.
+    pub fn lookup_address(&self, index: usize) -> Option<Address>
+    {
+        self.lookups.get(index).copied()
+    }
+
+    pub(crate) fn record_physical_frame(&mut self, lookup: Address, registers: FrameRegisters)
+    {
+        self.lookups.resize(self.frames.len(), lookup);
+        self.physical_frames.push(PhysicalFrame {
+            logical_end: self.frames.len(),
+            registers,
+        });
     }
 }
 

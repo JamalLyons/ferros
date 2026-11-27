@@ -574,7 +574,9 @@ fn open_reads_unwind_info_and_eh_frame_sections()
         hint(0x1004),
         Some(FunctionUnwind {
             start: Address::new(0x5_0000_1000),
-            hint: UnwindHint::FrameRecord,
+            hint: UnwindHint::FrameRecord {
+                saved: Default::default()
+            },
         })
     );
     // 0x0200_1000: frameless, ((encoding >> 12) & 0xfff) * 16 bytes of stack.
@@ -626,7 +628,9 @@ fn open_gives_no_hint_for_an_entry_with_encoding_zero()
     assert_eq!(hints.lookup(Address::new(0x5_0000_2abc)), None);
     assert_eq!(
         hints.lookup(Address::new(0x5_0000_1004)).map(|entry| entry.hint),
-        Some(UnwindHint::FrameRecord),
+        Some(UnwindHint::FrameRecord {
+            saved: Default::default()
+        }),
         "the other entries still give hints"
     );
 }

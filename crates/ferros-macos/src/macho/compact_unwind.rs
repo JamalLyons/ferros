@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use ferros_core::objfile::{FunctionUnwind, UnwindHint, UnwindHints};
+use ferros_core::objfile::{FunctionUnwind, SavedRegisterSlots, UnwindHint, UnwindHints};
 use ferros_core::types::Address;
 
 /// An image's `__unwind_info`, as the engine's [`UnwindHints`].
@@ -55,7 +55,7 @@ impl UnwindHints for CompactUnwind
             Arm64Mode::Dwarf { fde_offset } => UnwindHint::Cfi {
                 eh_frame_offset: fde_offset,
             },
-            Arm64Mode::Frame => UnwindHint::FrameRecord,
+            Arm64Mode::Frame { saved } => UnwindHint::FrameRecord { saved },
         };
         Some(FunctionUnwind {
             start: Address::new(self.header + u64::from(entry.function_offset)),
@@ -195,7 +195,11 @@ pub(crate) enum Arm64Mode
         fde_offset: usize,
     },
     /// `UNWIND_ARM64_MODE_FRAME`: a standard frame record at `x29`.
-    Frame,
+    Frame
+    {
+        /// General register slots below the frame record.
+        saved: SavedRegisterSlots,
+    },
 }
 
 impl Arm64Mode
@@ -210,10 +214,29 @@ impl Arm64Mode
             0x0300_0000 => Self::Dwarf {
                 fde_offset: (encoding & 0x00FF_FFFF) as usize,
             },
-            0x0400_0000 => Self::Frame,
+            0x0400_0000 => Self::Frame {
+                saved: frame_saved_registers(encoding),
+            },
             _ => Self::None,
         }
     }
+}
+
+fn frame_saved_registers(encoding: u32) -> SavedRegisterSlots
+{
+    // UNWIND_ARM64_FRAME_X19_X20_PAIR through UNWIND_ARM64_FRAME_X27_X28_PAIR.
+    let mut mask = 0;
+    for pair in 0..5 {
+        if encoding & (1 << pair) != 0 {
+            mask |= 0b11 << (19 + 2 * pair);
+        }
+    }
+    if mask == 0 {
+        return SavedRegisterSlots::default();
+    }
+    // X19 (or the first saved register) is eight bytes below FP. Each subsequent
+    // saved register is eight bytes lower. Floating-point saves follow the GPRs.
+    SavedRegisterSlots { mask, first_offset: -8 }
 }
 
 #[cfg(test)]
@@ -293,7 +316,9 @@ pub(crate) mod tests
             hint(0x1004),
             Some(FunctionUnwind {
                 start: Address::new(0x5_0000_1000),
-                hint: UnwindHint::FrameRecord,
+                hint: UnwindHint::FrameRecord {
+                    saved: Default::default()
+                },
             })
         );
         assert_eq!(
@@ -324,6 +349,20 @@ pub(crate) mod tests
         assert_eq!(Arm64Mode::decode(0x0300_0158), Arm64Mode::Dwarf { fde_offset: 0x158 });
         // Personality and LSDA bits do not change the mode.
         assert_eq!(Arm64Mode::decode(0x5300_0158), Arm64Mode::Dwarf { fde_offset: 0x158 });
-        assert_eq!(Arm64Mode::decode(0x0400_0000), Arm64Mode::Frame);
+        assert_eq!(
+            Arm64Mode::decode(0x0400_0000),
+            Arm64Mode::Frame {
+                saved: Default::default()
+            }
+        );
+        assert_eq!(
+            Arm64Mode::decode(0x0400_0F05),
+            Arm64Mode::Frame {
+                saved: SavedRegisterSlots {
+                    mask: (0b11 << 19) | (0b11 << 23),
+                    first_offset: -8,
+                },
+            }
+        );
     }
 }

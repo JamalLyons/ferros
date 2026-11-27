@@ -532,6 +532,40 @@ fn inlined_function_is_its_own_frame_before_the_physical_frame()
     });
 }
 
+#[test]
+fn inline_caller_shares_its_physical_callers_registers_and_lookup_address()
+{
+    harness::run(|t| {
+        let fixture = fixture!("symbols");
+        let mut d = t.launch(&fixture);
+        let stop = marker_address(&mut d, &fixture, "in_inline_child");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(MAX_FRAMES).expect("stack trace");
+        let frames = trace.frames();
+        assert_sane(&mut d, frames);
+        let inlined = frames
+            .iter()
+            .find(|frame| fixture_function(frame, &fixture) == Some("always_inlined_call"))
+            .expect("inline caller frame");
+        let FrameKind::Inlined { physical, .. } = inlined.kind else {
+            panic!("expected an inline caller: {frames:#?}");
+        };
+        let owner = &frames[inlined.index + 1];
+        assert!(inlined.index > 0);
+        assert_eq!(owner.id, physical);
+        let registers = trace.frame_registers(inlined.index).expect("inline registers");
+        let owner_registers = trace.frame_registers(owner.index).expect("physical registers");
+        assert!(std::ptr::eq(registers, owner_registers));
+        assert_eq!(registers.dwarf_register(31), Some(owner.sp.value()));
+        assert_eq!(registers.dwarf_register(32), Some(owner.pc.value()));
+        assert_ne!(registers.dwarf_register(32), Some(stop.value()));
+        assert_eq!(trace.lookup_address(inlined.index), Some(Address::new(owner.pc.value() - 4)));
+        assert_eq!(trace.lookup_address(inlined.index), trace.lookup_address(owner.index));
+        assert_eq!(trace.lookup_address(0), Some(stop));
+    });
+}
+
 /// Stopped inside `leaf_mix`, a frameless leaf (compact unwind `MODE_FRAMELESS`, no
 /// `__eh_frame` FDE, `fp` still `main`'s), the caller is `main` at the call, not `main`'s
 /// own caller as the frame-pointer chain would give.
@@ -991,6 +1025,88 @@ fn caller_registers_and_cfa_come_from_their_own_frame()
         assert_eq!(recovered.cfa(), Some(caller_sp + 48));
         assert_eq!(recovered.dwarf_register(u16::MAX), None);
         assert!(d.frame_registers(usize::MAX).expect("unwind").is_none());
+    });
+}
+
+#[test]
+fn rust_frame_record_gives_a_callers_saved_register_and_cfa()
+{
+    harness::run(|t| {
+        let fixture = fixture!("nested_calls");
+        let mut d = t.launch(&fixture);
+        let call = marker_address(&mut d, &fixture, "call_c");
+        run_to(&mut d, call);
+        let mut before_call = d.read_registers().expect("caller registers");
+        let x19 = 0x1919_1938;
+        before_call.general[19] = x19;
+        d.write_registers(&before_call).expect("set x19");
+        let stop = marker_address(&mut d, &fixture, "in_c");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(3).expect("stack trace");
+        let frames = trace.frames();
+        assert_eq!(fixture_function(&frames[1], &fixture), Some("level_b"));
+        assert_eq!(fixture_function(&frames[2], &fixture), Some("level_a"));
+        let registers = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(registers.dwarf_register(19), Some(x19));
+        assert_eq!(registers.dwarf_register(31), Some(before_call.sp.value()));
+        assert_eq!(registers.cfa(), Some(before_call.fp + 16));
+        assert_eq!(registers.cfa(), Some(frames[2].sp));
+    });
+}
+
+#[test]
+fn frame_hint_recovers_packed_register_saves()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_compact_registers_callee");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop
+        let save = find_instruction(&mut d, entry, |insn| insn == 0xA900_4FF4); // stp x20, x19, [sp]
+        run_to(&mut d, save);
+        let before_save = d.stack_trace_with_registers(2).expect("stack trace during the prologue");
+        let caller = before_save.frame_registers(1).expect("caller registers before the save");
+        assert_eq!(caller.dwarf_register(19), Some(0x3131));
+        assert_eq!(caller.dwarf_register(20), Some(0));
+
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(3).expect("stack trace");
+        let current = trace.frame_registers(0).expect("callee registers");
+        assert_eq!(current.dwarf_register(19), Some(0x5252));
+        assert_eq!(current.dwarf_register(20), Some(0x6262));
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(caller.dwarf_register(19), Some(0x3131));
+        assert_eq!(caller.dwarf_register(20), Some(0));
+        assert_eq!(current.cfa(), Some(trace.frames()[1].sp));
+    });
+}
+
+#[test]
+fn allocating_leaf_fallback_does_not_expose_caller_callee_saved_values()
+{
+    harness::run(|t| {
+        let fixture = fixture!("frameless_stack");
+        let mut d = t.launch(&fixture);
+        let entry = raw_symbol_address(&mut d, &fixture, "_frameless_spill");
+        let stop = find_instruction(&mut d, entry, |insn| insn == 0xD503_201F); // nop between branches
+        run_to(&mut d, entry);
+        let mut registers = d.read_registers().expect("registers before the leaf saves x19");
+        registers.general[19] = 0x1919;
+        d.write_registers(&registers).expect("set x19");
+        run_to(&mut d, stop);
+
+        let trace = d.stack_trace_with_registers(2).expect("stack trace");
+        let current = trace.frame_registers(0).expect("callee registers");
+        assert_eq!(current.dwarf_register(19), Some(0x5151));
+        let caller = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(caller.dwarf_register(19), None);
+        assert_eq!(trace.frames()[1].sp, trace.frames()[0].sp + 32);
+        let saved_x19 = d
+            .read_memory(Address::new(trace.frames()[1].sp.value() - 8), 8)
+            .expect("saved x19");
+        assert_eq!(saved_x19, 0x1919_u64.to_le_bytes());
     });
 }
 

@@ -42,8 +42,8 @@ use std::sync::Arc;
 pub use gimli::{RunTimeEndian, SectionId};
 
 pub use self::contents::{
-    DWARF_SECTIONS, DebugInfoRetry, DebugSections, FunctionUnwind, ImageContents, ImageSlice, MappedImage, SectionData,
-    UnwindHint, UnwindHints,
+    DWARF_SECTIONS, DebugInfoRetry, DebugSections, FunctionUnwind, ImageContents, ImageSlice, MappedImage,
+    SavedRegisterSlots, SectionData, UnwindHint, UnwindHints,
 };
 pub use crate::symbols::image::{ImageMapping, ImageSegment};
 pub use crate::symbols::load_inputs::{FileIdentity, FileIdentityReader, LoadInputs};

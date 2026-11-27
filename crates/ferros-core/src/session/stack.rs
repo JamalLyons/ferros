@@ -12,8 +12,8 @@ use crate::error::{DebuggerError, Result};
 use crate::objfile::{ImageProbe, MappedSymbols, TargetMemory};
 use crate::symbols::Symbolication;
 use crate::symbols::demangle::make_symbol_name;
-use crate::symbols::unwind::{MemoryAccess, StackUnwinder, UnwoundStack};
-use crate::types::{Address, FrameRegisters, MemoryRegion, StackFrame, SymbolName, SymbolSource};
+use crate::symbols::unwind::{MemoryAccess, StackUnwinder};
+use crate::types::{Address, FrameRegisters, MemoryRegion, StackFrame, StackTrace, SymbolName, SymbolSource};
 
 /// [`MemoryAccess`] over a backend.
 ///
@@ -123,9 +123,21 @@ impl Session
     /// [`Backend::images`]: crate::backend::Backend::images
     pub fn stack_trace(&mut self, max_frames: usize) -> Result<Vec<StackFrame>>
     {
+        Ok(self.stack_trace_with_registers(max_frames)?.frames)
+    }
+
+    /// Unwind frames, their registers and their DWARF lookup addresses together.
+    /// All entries in the result refer to the same walk and its image list. See
+    /// [`stack_trace`](Self::stack_trace) for the ordering and frame limit.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`stack_trace`](Self::stack_trace).
+    pub fn stack_trace_with_registers(&mut self, max_frames: usize) -> Result<StackTrace>
+    {
         let mut stack = self.unwind_stack(max_frames)?;
         self.name_frames_from_symbol_tables(&mut stack.frames, &stack.lookups);
-        Ok(stack.frames)
+        Ok(stack)
     }
 
     /// Read the selected stopped thread's registers for a logical stack frame.
@@ -133,6 +145,8 @@ impl Session
     /// `index` follows [`stack_trace`](Self::stack_trace), starting at zero and including
     /// inline frames. An inline frame uses its physical frame's registers and CFA.
     /// Returns `None` if the trace ends before `index`. Indices refer to the current stop.
+    /// Use [`stack_trace_with_registers`](Self::stack_trace_with_registers) to read
+    /// multiple frames from one unwind.
     ///
     /// # Errors
     ///
@@ -143,7 +157,7 @@ impl Session
         Ok(stack.frame_registers(index).cloned())
     }
 
-    fn unwind_stack(&mut self, max_frames: usize) -> Result<UnwoundStack>
+    fn unwind_stack(&mut self, max_frames: usize) -> Result<StackTrace>
     {
         self.require_stopped()?;
         let thread = self.selected_or_error()?;

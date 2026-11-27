@@ -1,8 +1,8 @@
 // Code for the `frameless_stack` fixture, assembled and linked by `build.rs` (arm64 macOS).
 //
 // `frameless_spill` is a leaf that allocates stack and has no frame record. Its CFI
-// only says `CFA = sp + 32` after the `sub`, which the linker turns into the compact
-// unwind encoding 0x02002000 (`UNWIND_ARM64_MODE_FRAMELESS`, stack size 32) with no
+// describes a 32-byte allocation and the x19/x20 saves. The linker turns it into
+// 0x02002001 (`UNWIND_ARM64_MODE_FRAMELESS`, stack size 32, x19/x20 saved) with no
 // `__eh_frame` FDE. That encoding is wrong between the `add sp` and the `ret`, where the
 // caller's `sp` is the current `sp`, not `sp + 32`. Check it with
 // `objdump --unwind-info` on the fixture binary. rustc gives Rust leaves like this DWARF
@@ -26,9 +26,17 @@ _frameless_spill:
 	.cfi_startproc
 	sub	sp, sp, #0x20
 	.cfi_def_cfa_offset 32
+	stp	x20, x19, [sp, #16]
+	.cfi_offset w19, -8
+	.cfi_offset w20, -16
+	mov	x19, #0x5151
 	str	x0, [sp, #8]
 	ldr	x0, [sp, #8]
 	add	x0, x0, #1
+	cbz	x0, 1f
+1:	nop
+	cbz	x0, 2f
+2:	ldp	x20, x19, [sp, #16]
 	add	sp, sp, #0x20
 	ret
 	.cfi_endproc
@@ -122,6 +130,7 @@ _frame_registers_caller:
 	mov	x20, xzr
 	mov	x0, #0x4141
 	bl	_frame_registers_callee
+	bl	_compact_registers_callee
 	ldp	x19, x20, [sp, #16]
 	ldp	x30, x29, [sp], #48
 	.cfi_def_cfa_offset 0
@@ -129,6 +138,32 @@ _frame_registers_caller:
 	.cfi_restore w20
 	.cfi_restore w29
 	.cfi_restore w30
+	ret
+	.cfi_endproc
+
+	// Standard frame record with a saved x19/x20 pair. The conditional branches on
+	// either side of the nop force the unwinder to use the frame record hint.
+	.globl	_compact_registers_callee
+	.p2align	2
+_compact_registers_callee:
+	.cfi_startproc
+	sub	sp, sp, #32
+	stp	x29, x30, [sp, #16]
+	add	x29, sp, #16
+	.cfi_def_cfa w29, 16
+	.cfi_offset w30, -8
+	.cfi_offset w29, -16
+	stp	x20, x19, [sp]
+	.cfi_offset w19, -24
+	.cfi_offset w20, -32
+	mov	x19, #0x5252
+	mov	x20, #0x6262
+	cbz	x0, 3f
+3:	nop
+	cbz	x0, 4f
+4:	ldp	x20, x19, [sp]
+	ldp	x29, x30, [sp, #16]
+	add	sp, sp, #32
 	ret
 	.cfi_endproc
 

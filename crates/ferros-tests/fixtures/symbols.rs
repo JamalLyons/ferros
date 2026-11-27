@@ -64,6 +64,20 @@ fn always_inlined(value: u64) -> u64
     std::hint::black_box(value.wrapping_add(7)) // BREAK: in_inlined
 }
 
+#[inline(never)]
+fn inline_child(value: u64) -> u64
+{
+    std::hint::black_box(value) // BREAK: in_inline_child
+}
+
+#[expect(clippy::inline_always, reason = "the fixture needs an inlined caller frame")]
+#[inline(always)]
+fn always_inlined_call(value: u64) -> u64
+{
+    let value = inline_child(value); // BREAK: call_inline_child
+    std::hint::black_box(value)
+}
+
 #[path = "symbols/left/twin.rs"]
 mod left;
 #[path = "symbols/right/twin.rs"]
@@ -89,6 +103,7 @@ fn main()
     let first = always_inlined(std::hint::black_box(10)); // BREAK: call_inlined_first
     let second = always_inlined(std::hint::black_box(first)); // BREAK: call_inlined_second
     let gap = with_gap(5);
+    let through_inline = always_inlined_call(gap);
     let twins = left::twin(6).wrapping_add(right::twin(7));
     let total = wide
         .wrapping_add(u64::from(narrow))
@@ -97,7 +112,7 @@ fn main()
         .wrapping_add(bumped)
         .wrapping_add(area)
         .wrapping_add(second)
-        .wrapping_add(gap)
+        .wrapping_add(through_inline)
         .wrapping_add(twins);
     println!("symbols: {total}");
 }

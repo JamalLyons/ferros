@@ -426,7 +426,10 @@ impl MockObjectFile
         let (kind, value) = match hint {
             UnwindHint::Cfi { eh_frame_offset } => (HINT_CFI, eh_frame_offset as u64),
             UnwindHint::Leaf { stack_size } => (HINT_LEAF, stack_size),
-            UnwindHint::FrameRecord => (HINT_FRAME_RECORD, 0),
+            UnwindHint::FrameRecord { saved } => (
+                HINT_FRAME_RECORD,
+                u64::from(saved.mask) | (u64::from(saved.first_offset.cast_unsigned()) << 32),
+            ),
         };
         self.entries.push((kind, start, value.to_le_bytes().to_vec()));
         self
@@ -511,7 +514,12 @@ impl MockObjectFile
                             eh_frame_offset: usize::try_from(value).map_err(|_| invalid())?,
                         },
                         HINT_LEAF => UnwindHint::Leaf { stack_size: value },
-                        _ => UnwindHint::FrameRecord,
+                        _ => UnwindHint::FrameRecord {
+                            saved: super::SavedRegisterSlots {
+                                mask: value as u32,
+                                first_offset: ((value >> 32) as u32).cast_signed(),
+                            },
+                        },
                     };
                     let start = mapping.relocate(address).ok_or_else(invalid)?;
                     hints.push((start, hint));

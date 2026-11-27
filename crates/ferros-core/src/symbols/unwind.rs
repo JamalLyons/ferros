@@ -27,8 +27,9 @@
 //!    caller's `sp` right. A frameless leaf makes no calls, so it cannot be a caller frame;
 //!    there the walk stops instead of guessing.
 //! 3. **[`UnwindHint::FrameRecord`]**: the frame-pointer chain: the record at `fp` holds
-//!    the caller's `fp` and the return address. On the function's first instruction
-//!    (innermost frame only) the record is not built yet, so the caller is the link
+//!    the caller's `fp` and the return address. The hint describes general register
+//!    saves below that record and gives a CFA of `fp + 16` after the frame is built.
+//!    On the function's first instruction (innermost frame only), the caller is the link
 //!    register. A table may give one entry to a run of adjacent functions with the same
 //!    hint, so a first instruction is recognized from the entry or from the DWARF function
 //!    index. Elsewhere in the innermost frame the instructions are analysed first (see
@@ -54,9 +55,8 @@
 //!    address in `x30`, `sp`, `x29` and the reloaded `x19`-`x28`.
 //! 2. **Prologue**: otherwise, from the function's start up to the pc. The start is the
 //!    later of the hint's start and the nearest DWARF function start (a table may merge
-//!    entries). If an instruction sets `x29` from `sp`, the record is built
-//!    and the frame-pointer chain applies. Otherwise the caller's `sp` is `sp` plus what
-//!    the code allocated, and `x29`, `x30`, `x19`-`x28` come from where it stored them,
+//!    entries). The caller's `sp` is `sp` plus what the code allocated, and `x29`, `x30`,
+//!    `x19`-`x28` come from where it stored them,
 //!    else they still hold the caller's values.
 //! 3. If neither is understood (a branch or call on the way, an instruction that is not
 //!    decoded, an unreadable word), the hint's rule above applies unchanged.
@@ -70,7 +70,8 @@
 //!
 //! Images whose files could not be loaded (for example system libraries the loader maps
 //! from a shared region rather than from a file) have none of this, and use the
-//! frame-pointer chain.
+//! frame-pointer chain. A bare frame record can advance the walk but cannot establish
+//! that the function's CFA is exactly above that record.
 //!
 //! Before any of these, a caller frame is checked for a signal trampoline (see
 //! [Signal handler frames](#signal-handler-frames)).
@@ -144,8 +145,7 @@
 //!
 //! - `MemoryAccess`: the memory the walk reads.
 //! - `StackUnwinder` and its default runtime.
-//! - `UnwoundStack` and `PhysicalFrame`: logical frames, lookup addresses and physical registers.
-//! - `Cursor`, `CodeStep`, register masks, `UnwindStep`, `Hinted`: state during the walk.
+//! - `Cursor`, register masks, `UnwindStep`, `Hinted`: state during the walk.
 //! - `StackUnwinder` methods: `new`, `with_runtime`, `unwind`, `unwind_stack`, and the
 //!   CFI, leaf, frame-record, signal and register helpers described above.
 //! - `hinted`: which [`UnwindHint`] applies to a lookup address.
@@ -163,14 +163,14 @@ use gimli::{
     RunTimeEndian, UnwindContext, UnwindSection,
 };
 
-use crate::arch::arm64_frame::{self, FrameRegisters as CodeRegisters, Prologue};
+use crate::arch::arm64_frame::{self, FrameRegisters as CodeRegisters};
 use crate::arch::{Arch, Arm64, UndefinedReturnAddress};
 use crate::error::Result;
-use crate::objfile::UnwindHint;
+use crate::objfile::{SavedRegisterSlots, UnwindHint};
 use crate::runtime::{NoRuntime, SignalContext, TargetRuntime, TrampolineFrame};
 use crate::symbols::{BinaryImage, SymbolCache, SymbolFrame, Symbolication};
 use crate::types::{
-    Address, Architecture, FrameId, FrameKind, FrameRegisters, FrameStatus, Registers, StackFrame, ThreadId,
+    Address, Architecture, FrameId, FrameKind, FrameRegisters, FrameStatus, Registers, StackFrame, StackTrace, ThreadId,
 };
 
 /// Minimal memory accessor required for stack unwinding.
@@ -220,30 +220,6 @@ pub struct StackUnwinder<'a, M>
 /// The runtime of an unwinder that was given none.
 static NO_RUNTIME: NoRuntime = NoRuntime;
 
-pub(crate) struct UnwoundStack
-{
-    pub(crate) frames: Vec<StackFrame>,
-    /// The physical frame's lookup address, repeated for each of its inline frames.
-    pub(crate) lookups: Vec<Address>,
-    physical_frames: Vec<PhysicalFrame>,
-}
-
-impl UnwoundStack
-{
-    pub(crate) fn frame_registers(&self, index: usize) -> Option<&FrameRegisters>
-    {
-        let physical = self.physical_frames.partition_point(|frame| frame.logical_end <= index);
-        self.physical_frames.get(physical).map(|frame| &frame.registers)
-    }
-}
-
-struct PhysicalFrame
-{
-    /// Exclusive end of the logical frames produced for this physical frame.
-    logical_end: usize,
-    registers: FrameRegisters,
-}
-
 /// Register state of one physical frame while walking.
 #[derive(Clone)]
 struct Cursor
@@ -255,15 +231,6 @@ struct Cursor
     known: u32,
     /// Whether this frame's pc is a return address (every frame but the innermost).
     is_caller: bool,
-}
-
-/// What [`StackUnwinder::code_step`] found.
-enum CodeStep
-{
-    /// The caller, from the epilogue or the prologue.
-    Caller(UnwindStep),
-    /// The prologue built the frame record: the frame-pointer chain applies.
-    FrameBuilt,
 }
 
 const ALL_GENERAL: u32 = (1 << Arm64::GENERAL_REGISTER_COUNT) - 1;
@@ -340,11 +307,9 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// # Errors
     ///
     /// As [`unwind`](Self::unwind).
-    pub(crate) fn unwind_stack(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<UnwoundStack>
+    pub(crate) fn unwind_stack(&self, thread: ThreadId, regs: &Registers, max_frames: usize) -> Result<StackTrace>
     {
-        let mut frames = Vec::new();
-        let mut lookups = Vec::new();
-        let mut physical_frames = Vec::new();
+        let mut trace = StackTrace::default();
         let mut cursor = Cursor {
             regs: regs.clone(),
             known: ALL_GENERAL,
@@ -357,7 +322,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         // into frames already walked, so it is not taken.
         let mut moved_down = false;
 
-        while frames.len() < max_frames && cursor.regs.pc != Address::ZERO {
+        while trace.frames.len() < max_frames && cursor.regs.pc != Address::ZERO {
             let lookup = self.lookup_address(&cursor);
             let symbolication = self.symbols.symbolicate(lookup);
             let signal = self
@@ -373,7 +338,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             };
             let return_address = next.as_ref().map(|step| step.next.pc);
             append_logical_frames(
-                &mut frames,
+                &mut trace.frames,
                 max_frames,
                 thread,
                 depth,
@@ -382,11 +347,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 status,
                 return_address,
             );
-            lookups.resize(frames.len(), lookup);
-            physical_frames.push(PhysicalFrame {
-                logical_end: frames.len(),
-                registers: self.frame_registers(&cursor, cfa),
-            });
+            trace.record_physical_frame(lookup, self.frame_registers(&cursor, cfa));
 
             let Some(step) = next else {
                 break;
@@ -409,11 +370,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             depth += 1;
         }
 
-        Ok(UnwoundStack {
-            frames,
-            lookups,
-            physical_frames,
-        })
+        Ok(trace)
     }
 
     /// The address used for symbolication and unwind lookup: the call instruction for a
@@ -468,26 +425,25 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
                 if at_entry || self.is_dwarf_function_start(image, cursor) {
                     return self.frameless_step(cursor, 0);
                 }
-                match self.code_step(cursor, self.function_start(image, cursor, start)) {
-                    Some(CodeStep::Caller(step)) => Some(step),
-                    _ => self.frameless_step(cursor, stack_size),
-                }
+                self.code_step(cursor, self.function_start(image, cursor, start))
+                    .or_else(|| self.frameless_step(cursor, stack_size))
             }
             Hinted::Hint {
-                hint: UnwindHint::FrameRecord,
+                hint: UnwindHint::FrameRecord { saved },
                 at_entry,
                 start,
             } => {
                 // A table may give one entry to a run of adjacent functions with the same
                 // hint, so only the first of them is recognized from the entry; the others
                 // are recognized from the DWARF function index.
-                if at_entry || self.is_dwarf_function_start(image, cursor) {
-                    return self.entry_step(cursor);
-                }
-                match self.code_step(cursor, self.function_start(image, cursor, start)) {
-                    Some(CodeStep::Caller(step)) => Some(step),
-                    _ => self.frame_pointer_step(cursor),
-                }
+                let step = if at_entry || self.is_dwarf_function_start(image, cursor) {
+                    self.entry_step(cursor)
+                } else {
+                    self.code_step(cursor, self.function_start(image, cursor, start))
+                        .or_else(|| self.frame_record_step(cursor, saved))
+                }?;
+                *cfa = Some(step.next.sp);
+                Some(step)
             }
             Hinted::Absent => self
                 .scan_cfi_step(image, cursor, lookup, cfa)
@@ -753,9 +709,16 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let mut next = cursor.regs.clone();
         next.pc = self.arch.strip_pointer_auth(link);
         next.sp = Address::new(cursor.regs.sp.value().checked_add(stack_size)?);
+        // A leaf with stack storage can save and reuse callee-saved registers. At
+        // entry or in a zero-allocation leaf, no such spills have taken place.
+        let preserved = if stack_size == 0 {
+            self.arch.callee_saved_register_mask()
+        } else {
+            FRAME_POINTER
+        };
         Some(UnwindStep {
             next,
-            known: cursor.known & self.arch.callee_saved_register_mask(),
+            known: cursor.known & preserved,
             status: FrameStatus::CfiFallback,
         })
     }
@@ -820,7 +783,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
     /// module documentation, *Prologues and epilogues*): the epilogue from the pc to the
     /// `ret`, else the prologue from `start` to the pc. `None` for a caller frame, a
     /// non-arm64 target, or code that is not understood.
-    fn code_step(&self, cursor: &Cursor, start: Address) -> Option<CodeStep>
+    fn code_step(&self, cursor: &Cursor, start: Address) -> Option<UnwindStep>
     {
         if cursor.is_caller || cursor.known != ALL_GENERAL || self.arch.architecture() != Architecture::Arm64 {
             return None;
@@ -841,10 +804,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         let pc = regs.pc.value();
         let caller = match arm64_frame::epilogue(pc, &current, read_code, read_stack) {
             Some(caller) => caller,
-            None => match arm64_frame::prologue(start.value(), pc, &current, read_code, read_stack)? {
-                Prologue::FrameBuilt => return Some(CodeStep::FrameBuilt),
-                Prologue::Caller(caller) => *caller,
-            },
+            None => arm64_frame::prologue(start.value(), pc, &current, read_code, read_stack)?,
         };
         if caller.known & LINK_REGISTER == 0 {
             return None;
@@ -859,15 +819,16 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         next.pc = self
             .arch
             .strip_pointer_auth(Address::new(caller.x[Arm64::LINK_REGISTER_INDEX]));
-        Some(CodeStep::Caller(UnwindStep {
+        Some(UnwindStep {
             next,
             known: caller.known & self.arch.callee_saved_register_mask(),
             status: FrameStatus::CfiFallback,
-        }))
+        })
     }
 
     /// Follow the frame record at `fp`: `[fp]` is the caller's `fp`, `[fp + 8]` the return
-    /// address.
+    /// address. Without a function's frame hint, neither the save slots below that
+    /// record nor the exact CFA are known.
     fn frame_pointer_step(&self, cursor: &Cursor) -> Option<UnwindStep>
     {
         let regs = &cursor.regs;
@@ -886,7 +847,7 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
         }
         let mut next = regs.clone();
         self.arch.set_fp(&mut next, Address::new(saved_fp));
-        next.sp = Address::new(fp + 16);
+        next.sp = Address::new(fp.checked_add(16)?);
         next.pc = self.arch.strip_pointer_auth(Address::new(saved_lr));
         // Registers saved below the frame record are not described, so only `fp` is known
         // beyond what the callee left untouched; a frame-record function may have saved and
@@ -896,6 +857,33 @@ impl<'a, M: MemoryAccess> StackUnwinder<'a, M>
             known: FRAME_POINTER,
             status: FrameStatus::CfiFallback,
         })
+    }
+
+    /// Follow a frame record whose hint describes its packed register saves.
+    fn frame_record_step(&self, cursor: &Cursor, saved: SavedRegisterSlots) -> Option<UnwindStep>
+    {
+        let mut step = self.frame_pointer_step(cursor)?;
+        let callee_saved = self.arch.callee_saved_register_mask() & !FRAME_POINTER;
+        step.known |= cursor.known & callee_saved & !saved.mask;
+
+        let mut offset = i64::from(saved.first_offset);
+        let mut pending = saved.mask;
+        while pending != 0 {
+            let register = pending.trailing_zeros();
+            let bit = 1 << register;
+            pending &= !bit;
+            if callee_saved & bit != 0
+                && offset <= -8
+                && let Some(slot) = cursor.regs.fp.value().checked_add_signed(offset)
+                && slot >= cursor.regs.sp.value()
+                && let Ok(value) = self.memory.read_u64(Address::new(slot))
+            {
+                self.set_register_value(&mut step.next, Register(register as u16), value);
+                step.known |= bit;
+            }
+            offset -= 8;
+        }
+        Some(step)
     }
 
     /// A caller frame in the platform's signal trampoline: the frame the signal
@@ -1284,8 +1272,10 @@ mod tests
         assert_eq!(step.next.sp, Address::new(0xf20));
         assert_eq!(step.next.fp, Address::new(0x1000), "a leaf leaves fp alone");
         assert_eq!(step.known & (1 << 3), 0, "x3 is caller-saved");
-        assert_ne!(step.known & (1 << 20), 0, "x20 is callee-saved");
+        assert_eq!(step.known & (1 << 20), 0, "an allocating leaf can reuse x20");
         assert_eq!(step.known & LINK_REGISTER, 0);
+        let entry = unwinder.frameless_step(&innermost(regs.clone()), 0).expect("no allocation");
+        assert_ne!(entry.known & (1 << 20), 0, "x20 is known before any allocation");
 
         let caller = Cursor {
             is_caller: true,
@@ -1684,9 +1674,9 @@ mod tests
         // FDE at offset 24 for [CFI_FUNCTION, +0x100).
         let pc_begin_field = EH_FRAME + 24 + 8;
         let pc_begin = i32::try_from(CFI_FUNCTION.cast_signed() - pc_begin_field.cast_signed()).unwrap();
-        u32s(&mut eh_frame, &[20, 28, pc_begin.cast_unsigned(), 0x100]);
-        // def_cfa x29, 16; offset x30 at cfa - 8; offset x29 at cfa - 16.
-        eh_frame.extend_from_slice(&[0, 0x0c, 29, 16, 0x9e, 1, 0x9d, 2]);
+        u32s(&mut eh_frame, &[24, 28, pc_begin.cast_unsigned(), 0x100]);
+        // def_cfa x29, 16; offsets x30 at cfa - 8, x29 at cfa - 16, x0 at cfa - 24.
+        eh_frame.extend_from_slice(&[0, 0x0c, 29, 16, 0x9e, 1, 0x9d, 2, 0x80, 3, 0, 0]);
         u32s(&mut eh_frame, &[0]);
 
         crate::objfile::mock::MockObjectFile::new(CFI_BASE, 0x1_0000)
@@ -1695,6 +1685,32 @@ mod tests
             .with_dwarf(gimli::SectionId::DebugAbbrev, &[0xaa; 8])
             .with_dwarf(gimli::SectionId::DebugLine, &[0xaa; 8])
             .to_bytes()
+    }
+
+    #[test]
+    fn cfi_recovered_caller_saved_registers_stay_internal()
+    {
+        let path = std::env::temp_dir().join(format!("ferros-unwind-cfi-registers-{}.mock", std::process::id()));
+        std::fs::write(&path, cfi_image()).expect("write synthetic image");
+        let mut symbols = SymbolCache::new(crate::objfile::mock::MockObjectFormat::shared());
+        let loaded = symbols.load_image(crate::symbols::ImageDescriptor {
+            path: path.clone(),
+            load_address: CFI_BASE,
+        });
+        let _ = std::fs::remove_file(&path);
+        loaded.expect("load synthetic image");
+
+        let mut memory = FakeMemory::default();
+        memory.words.extend([(0x20f8, 0x1234), (0x2100, 0), (0x2108, 0x4000_0100)]);
+        let unwinder = StackUnwinder::new(&ARCH, &symbols, &memory);
+        let cursor = innermost(regs(CFI_FUNCTION + 4, 0x2000, 0x2100, 0));
+        let step = unwinder.step(&cursor, cursor.regs.pc, &mut None).expect("CFI step");
+        assert_eq!(step.next.general[0], 0x1234);
+        assert_eq!(step.known & 1, 1, "CFI restored x0 for subsequent unwind rules");
+
+        let trace = unwinder.unwind_stack(ThreadId::from(1), &cursor.regs, 2).expect("trace");
+        let recovered = trace.frame_registers(1).expect("caller registers");
+        assert_eq!(recovered.dwarf_register(0), None, "x0 is caller-saved");
     }
 
     #[test]

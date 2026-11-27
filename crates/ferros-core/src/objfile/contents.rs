@@ -261,5 +261,20 @@ pub enum UnwindHint
         stack_size: u64,
     },
     /// The function keeps a standard frame record at the frame pointer.
-    FrameRecord,
+    FrameRecord
+    {
+        /// Saved general registers below the frame record.
+        saved: SavedRegisterSlots,
+    },
+}
+
+/// Packed, pointer-sized register saves in a frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SavedRegisterSlots
+{
+    /// Bit `n` identifies DWARF register `n`. Registers occupy consecutive slots in
+    /// ascending register order, from higher to lower addresses.
+    pub mask: u32,
+    /// The first slot's signed byte offset from the frame pointer. Ignored for an empty mask.
+    pub first_offset: i32,
 }

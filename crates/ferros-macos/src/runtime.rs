@@ -50,15 +50,35 @@
 //! interrupted `sp` against the end of the signal frame (see
 //! `ferros_core::symbols::unwind`).
 //!
+//! ## System mutexes
+//!
+//! Rust's standard library on macOS keeps a `Mutex` in a boxed `pthread_mutex_t`.
+//! libpthread's 64-bit `struct pthread_mutex_s` (`src/types_internal.h`) is 64 bytes:
+//!
+//! | offset | size | field |
+//! |-------:|-----:|-------|
+//! | 0      | 8    | `sig`: `MUTX` or `MUTZ` once initialized, `0x32AAABA?` for a static initializer |
+//! | 12     | 4    | `mtxopts`: bit 14 `ulock`, bit 11 `misalign` |
+//! | 24     | 24   | `psynch` (`m_tid[2]`, `m_seq[2]`, `m_mis[2]`) or `ulock` (`uval`) |
+//!
+//! A psynch mutex holds its owner's 64-bit thread id at `m_tid` rounded up to 8 bytes
+//! (`MUTEX_GETTID_ADDR`): 0 when unlocked, the owner's id or `PTHREAD_MTX_TID_SWITCHING`
+//! (all ones, a handoff to a waiter) when locked. A ulock mutex holds 0 in `uval` when
+//! unlocked and the owner's thread port name (with a waiters bit) when locked. Checked on
+//! this machine: an unlocked mutex reads `mtxopts` `0x20a0` (psynch) and `m_tid` 0; one
+//! held by another thread reads that thread's `pthread_threadid_np` id.
+//!
 //! ## References
 //!
 //! - [xnu `bsd/dev/arm/unix_signal.c`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/dev/arm/unix_signal.c)
 //!   (`sendsig`, `struct user_sigframe64`)
+//! - [libpthread `src/types_internal.h`, `src/pthread_mutex.c`](https://github.com/apple-oss-distributions/libpthread)
+//!   (`struct pthread_mutex_s`, `MUTEX_GETTID_ADDR`, the ulock owner value)
 
 use std::sync::{Arc, LazyLock};
 
 use ferros_core::arch::Arm64;
-use ferros_core::runtime::{ExitSource, SignalContext, TargetRuntime, TrampolineFrame};
+use ferros_core::runtime::{ExitSource, LockState, SignalContext, TargetRuntime, TrampolineFrame};
 use ferros_core::symbols::unwind::MemoryAccess;
 use ferros_core::types::{Address, Architecture};
 
@@ -140,6 +160,66 @@ impl TargetRuntime for MacOSRuntime
             pc: at(mcontext, sigframe::SS_PC)?,
             frame_end: Address::new(mcontext.checked_add(sigframe::MCONTEXT_SIZE)?),
         })
+    }
+
+    fn system_mutex_state(&self, address: Address, bytes: &[u8]) -> Option<LockState>
+    {
+        pthread_mutex::state(address.value(), bytes)
+    }
+}
+
+/// libpthread's 64-bit `struct pthread_mutex_s` (see
+/// [System mutexes](self#system-mutexes)).
+pub mod pthread_mutex
+{
+    use ferros_core::runtime::LockState;
+
+    /// `sizeof(pthread_mutex_t)`.
+    pub const SIZE: usize = 64;
+    /// `mtxopts`.
+    pub const OPTIONS: usize = 12;
+    /// The `psynch` and `ulock` union.
+    pub const LOCK_WORDS: usize = 24;
+    /// `mtxopts.options.ulock`.
+    pub const OPTION_ULOCK: u32 = 1 << 14;
+    /// `_PTHREAD_MUTEX_SIG_MASK` and `_PTHREAD_MUTEX_SIG_CMP`: `MUTX` or `MUTZ`.
+    pub const SIG_MASK: u32 = 0xffff_fffd;
+    /// See [`SIG_MASK`].
+    pub const SIG_CMP: u32 = 0x4d55_5458;
+    /// `_PTHREAD_MUTEX_SIG_init_MASK` and `_PTHREAD_MUTEX_SIG_init_CMP`: a static
+    /// initializer the first lock has not yet replaced.
+    pub const SIG_INIT_MASK: u32 = 0xffff_fff0;
+    /// See [`SIG_INIT_MASK`].
+    pub const SIG_INIT_CMP: u32 = 0x32aa_aba0;
+
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32>
+    {
+        Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+    }
+
+    /// Whether the mutex at `address`, whose bytes are `bytes`, is held.
+    #[must_use]
+    pub fn state(address: u64, bytes: &[u8]) -> Option<LockState>
+    {
+        if bytes.len() != SIZE || u32_at(bytes, 4)? != 0 {
+            return None;
+        }
+        let sig = u32_at(bytes, 0)?;
+        if sig & SIG_INIT_MASK == SIG_INIT_CMP {
+            return Some(LockState::Unlocked);
+        }
+        if sig & SIG_MASK != SIG_CMP {
+            return None;
+        }
+        let owner = if u32_at(bytes, OPTIONS)? & OPTION_ULOCK != 0 {
+            u64::from(u32_at(bytes, LOCK_WORDS)?)
+        } else {
+            // `MUTEX_GETTID_ADDR`: `m_tid` rounded up to 8 bytes, in the 24-byte union.
+            let field = address.checked_add(LOCK_WORDS as u64)?;
+            let tid = usize::try_from((field.checked_add(7)? & !7) - address).ok()?;
+            u64::from(u32_at(bytes, tid)?) | (u64::from(u32_at(bytes, tid + 4)?) << 32)
+        };
+        Some(if owner == 0 { LockState::Unlocked } else { LockState::Locked })
     }
 }
 
@@ -287,6 +367,51 @@ mod tests
                 ..trampoline()
             }
         ));
+    }
+
+    /// A `pthread_mutex_t` read from a stopped Rust process: `MUTZ`, psynch options, and
+    /// `owner` in `m_tid`.
+    fn psynch_mutex(owner: u64) -> Vec<u8>
+    {
+        let mut bytes = vec![0_u8; pthread_mutex::SIZE];
+        bytes[..4].copy_from_slice(b"ZTUM");
+        bytes[12..16].copy_from_slice(&0x20a0_u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(b"ZTUM");
+        bytes[24..32].copy_from_slice(&owner.to_le_bytes());
+        bytes[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn pthread_mutex_owner_decides_lock_state()
+    {
+        let runtime = MacOSRuntime;
+        let at = Address::new(0x1000);
+        assert_eq!(runtime.system_mutex_state(at, &psynch_mutex(0)), Some(LockState::Unlocked));
+        assert_eq!(
+            runtime.system_mutex_state(at, &psynch_mutex(0xd1_44ac)),
+            Some(LockState::Locked)
+        );
+        assert_eq!(
+            runtime.system_mutex_state(at, &psynch_mutex(u64::MAX)),
+            Some(LockState::Locked)
+        );
+        // A misaligned mutex keeps its owner at the next 8-byte boundary.
+        let mut misaligned = psynch_mutex(0);
+        misaligned[28..36].copy_from_slice(&7_u64.to_le_bytes());
+        assert_eq!(
+            runtime.system_mutex_state(Address::new(0x1004), &misaligned),
+            Some(LockState::Locked)
+        );
+        let mut ulock = psynch_mutex(0);
+        ulock[12..16].copy_from_slice(&(0x20a0 | pthread_mutex::OPTION_ULOCK).to_le_bytes());
+        ulock[24..28].copy_from_slice(&0x1303_u32.to_le_bytes());
+        assert_eq!(runtime.system_mutex_state(at, &ulock), Some(LockState::Locked));
+        let mut initializer = vec![0_u8; pthread_mutex::SIZE];
+        initializer[..4].copy_from_slice(&0x32aa_aba7_u32.to_le_bytes());
+        assert_eq!(runtime.system_mutex_state(at, &initializer), Some(LockState::Unlocked));
+        assert_eq!(runtime.system_mutex_state(at, &[0; pthread_mutex::SIZE]), None);
+        assert_eq!(runtime.system_mutex_state(at, &psynch_mutex(0)[..32]), None);
     }
 
     #[test]

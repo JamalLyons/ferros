@@ -579,6 +579,16 @@ fn unknown_standard_library_layouts_show_raw_fields()
         "std::collections::hash::map::HashMap<u8, u8>",
         "std::collections::hash::set::HashSet<u8>",
         "alloc::collections::btree::map::BTreeMap<u8, u8>",
+        "std::sync::poison::mutex::Mutex<u8>",
+        "std::sync::poison::rwlock::RwLock<u8>",
+        "core::sync::atomic::Atomic<u8>",
+        "core::sync::atomic::Atomic<bool>",
+        "core::cell::once::OnceCell<u8>",
+        "std::sync::once_lock::OnceLock<u8>",
+        "core::cell::UnsafeCell<u8>",
+        "core::pin::Pin<&u8>",
+        "alloc::rc::Weak<u8, alloc::alloc::Global>",
+        "alloc::sync::Weak<u8, alloc::alloc::Global>",
     ];
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
     let unit = &mut dwarf.unit;

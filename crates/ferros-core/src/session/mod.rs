@@ -86,6 +86,7 @@ mod stack;
 mod stepping;
 #[cfg(test)]
 mod tests;
+mod variables;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

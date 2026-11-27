@@ -34,3 +34,4 @@ mod source_breakpoints;
 mod stepping;
 mod symbols;
 mod universal_images;
+mod values;

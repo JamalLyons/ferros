@@ -1,8 +1,12 @@
-//! Render the active variant described by DWARF.
+//! Render the active variant described by DWARF, and find it for `print <path>`.
+
+use std::fmt;
+
+use gimli::RunTimeEndian;
 
 use super::PrettyPrinter;
 use crate::values::format::{ValueFormatter, ValueView, unavailable, unsigned};
-use crate::values::types::{Discriminant, RustEnum, Type, TypeKind, TypeTable, Variant};
+use crate::values::types::{Composite, Discriminant, Member, RustEnum, Type, TypeKind, TypeTable, Variant};
 
 pub(super) struct EnumPrinter;
 
@@ -43,27 +47,77 @@ fn format_rust_enum(
     formatter: &mut ValueFormatter<'_>,
 ) -> String
 {
-    let variant = if let Some(discriminant) = &layout.discriminant {
-        let Some(raw) = value
-            .member(discriminant, formatter.types())
-            .and_then(|tag| unsigned(tag.bytes, formatter.endian()))
-        else {
-            return unavailable("enum discriminant layout or bytes unknown");
-        };
-        let Some(variant) = layout.variant_for(raw) else {
-            return unknown_variant(raw);
-        };
-        variant
-    } else {
-        let [variant] = layout.variants.as_slice() else {
-            return unavailable("enum has no readable discriminant");
-        };
-        if variant.discriminant != Discriminant::Default {
-            return unavailable("enum has no readable discriminant");
+    match active_variant(value, layout, formatter.types(), formatter.endian()) {
+        Ok(variant) => format_variant(value, enum_name, variant, formatter),
+        Err(VariantError::Unknown(raw)) => unknown_variant(raw),
+        Err(VariantError::Unreadable(reason)) => unavailable(reason),
+    }
+}
+
+/// Why [`active_variant`] found no variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::values) enum VariantError
+{
+    /// The discriminant's layout or bytes cannot be read.
+    Unreadable(&'static str),
+    /// No variant claims the discriminant's raw bits.
+    Unknown(u128),
+}
+
+impl fmt::Display for VariantError
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        match self {
+            Self::Unreadable(reason) => f.write_str(reason),
+            Self::Unknown(raw) => write!(f, "unknown variant: {raw:#x}"),
         }
-        variant
+    }
+}
+
+/// The variant `value`, an enum with `layout`, holds: the one its discriminant (an explicit
+/// tag or a niche) selects, or the only variant of an enum without a discriminant.
+pub(in crate::values) fn active_variant<'l>(
+    value: ValueView<'_>,
+    layout: &'l RustEnum,
+    types: &TypeTable,
+    endian: RunTimeEndian,
+) -> Result<&'l Variant, VariantError>
+{
+    if let Some(discriminant) = &layout.discriminant {
+        let raw = value
+            .member(discriminant, types)
+            .and_then(|tag| unsigned(tag.bytes, endian))
+            .ok_or(VariantError::Unreadable("enum discriminant layout or bytes unknown"))?;
+        return layout.variant_for(raw).ok_or(VariantError::Unknown(raw));
+    }
+    match layout.variants.as_slice() {
+        [variant] if variant.discriminant == Discriminant::Default => Ok(variant),
+        _ => Err(VariantError::Unreadable("enum has no readable discriminant")),
+    }
+}
+
+/// The struct rustc wraps a variant's fields in, named after the variant: the variant's
+/// one member, whose type it is, and the struct's fields, at offsets from that member.
+/// `None` when the variant is not described that way.
+pub(in crate::values) fn variant_payload<'v>(
+    variant: &'v Variant,
+    enum_name: Option<&str>,
+    types: &TypeTable,
+) -> Option<(&'v Member, Composite)>
+{
+    let ([member], Some(enum_name)) = (variant.members.as_slice(), enum_name) else {
+        return None;
     };
-    format_variant(value, enum_name, variant, formatter)
+    let ty = types.get(member.ty?)?;
+    let qualified = ty.name.as_deref()?;
+    if qualified.strip_prefix(enum_name)?.strip_prefix("::") != Some(variant.name.as_deref()?) || ty.declaration {
+        return None;
+    }
+    let TypeKind::Struct(payload) = &ty.kind else {
+        return None;
+    };
+    Some((member, payload.clone()))
 }
 
 fn format_variant(
@@ -74,18 +128,9 @@ fn format_variant(
 ) -> String
 {
     let name = variant.name.as_deref().unwrap_or("?");
-    // rustc wraps each variant's fields in a nested struct named after the variant.
-    // Flatten that wrapper so the field formatter applies the enum's depth and element limits.
-    if let ([member], Some(enum_name)) = (variant.members.as_slice(), enum_name)
-        && let Some(ty) = member.ty.and_then(|id| formatter.types().get(id))
-        && ty
-            .name
-            .as_deref()
-            .and_then(|qualified| qualified.strip_prefix(enum_name)?.strip_prefix("::"))
-            == Some(name)
-        && !ty.declaration
-        && let TypeKind::Struct(payload) = &ty.kind
-    {
+    // Flatten the payload wrapper so the field formatter applies the enum's depth and
+    // element limits.
+    if let Some((member, payload)) = variant_payload(variant, enum_name, formatter.types()) {
         if payload.members.is_empty() {
             return name.to_owned();
         }

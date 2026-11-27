@@ -8,6 +8,7 @@ use crate::values::format::{ValueFormatter, ValueView, unavailable};
 use crate::values::types::{PointerKind, Type, TypeId, TypeKind, TypeTable};
 
 const VEC_NAME: &str = "alloc::vec::Vec<";
+const INTO_ITER_NAME: &str = "alloc::vec::into_iter::IntoIter<";
 
 pub(super) struct VecPrinter;
 
@@ -104,6 +105,72 @@ impl PrettyPrinter for SlicePrinter
         };
         format_elements(address, len, element, formatter)
     }
+}
+
+pub(super) struct RawSlicePrinter;
+
+impl PrettyPrinter for RawSlicePrinter
+{
+    fn matches(&self, ty: &Type, _types: &TypeTable) -> bool
+    {
+        !matches!(ty.kind, TypeKind::Pointer(_))
+            && ty
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("*const [") || name.starts_with("*mut ["))
+    }
+
+    // A raw pointer may dangle, so its elements are not read.
+    fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        let Some((address, len, _)) = fat_pointer(value, formatter.types(), formatter.endian()) else {
+            return raw_layout(value, formatter);
+        };
+        format!("{:#x} (len: {len})", address.value())
+    }
+}
+
+pub(super) struct IntoIterPrinter;
+
+impl PrettyPrinter for IntoIterPrinter
+{
+    fn matches(&self, ty: &Type, _types: &TypeTable) -> bool
+    {
+        matches!(ty.kind, TypeKind::Struct(_)) && ty.name.as_deref().is_some_and(|name| name.starts_with(INTO_ITER_NAME))
+    }
+
+    fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        let Some((address, len, element)) = into_iter_layout(value, formatter.types(), formatter.endian()) else {
+            return raw_layout(value, formatter);
+        };
+        format_elements(address, len, element, formatter)
+    }
+}
+
+// The elements not yet yielded are `ptr..end`. For zero-sized elements `end` is `ptr` plus
+// the remaining count.
+fn into_iter_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<(Address, u64, TypeId)>
+{
+    let ty = types.get(types.strip_aliases(value.ty))?;
+    let TypeKind::Struct(layout) = &ty.kind else {
+        return None;
+    };
+    let element = layout.template_param("T")?.ty?;
+    let size = types.get(element)?.size?;
+    let pointer = |name| {
+        let member = value.member(layout.member(name)?, types)?;
+        let member = field(member, "pointer", types).unwrap_or(member);
+        thin_pointer(member, types, endian).map(|(address, _)| address)
+    };
+    let (ptr, end) = (pointer("ptr")?, pointer("end")?);
+    let distance = end.value().checked_sub(ptr.value())?;
+    let len = if size == 0 {
+        distance
+    } else {
+        (distance % size == 0).then_some(distance / size)?
+    };
+    Some((ptr, len, element))
 }
 
 pub(super) struct BoxPrinter;

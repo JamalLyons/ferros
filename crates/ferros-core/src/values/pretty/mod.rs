@@ -4,6 +4,7 @@ mod collections;
 mod dyn_trait;
 mod enums;
 mod maps;
+mod newtypes;
 mod shared;
 mod strings;
 mod vec;
@@ -40,6 +41,10 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &shared::CellPrinter,
     &maps::MapPrinter,
     &collections::CollectionPrinter,
+    &newtypes::NewtypePrinter,
+    &newtypes::DurationPrinter,
+    &newtypes::MaybeUninitPrinter,
+    &newtypes::PhantomPrinter,
 ];
 
 fn field<'a>(value: ValueView<'a>, name: &str, types: &TypeTable) -> Option<ValueView<'a>>

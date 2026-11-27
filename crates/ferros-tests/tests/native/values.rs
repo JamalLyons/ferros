@@ -207,6 +207,10 @@ fn print_formats_aggregates_references_and_raw_pointers()
             ),
         ),
         ("print tuple_local", "tuple_local: (char, i16, bool) = ('λ', -3, false)\n"),
+        (
+            "print distance",
+            "distance: ferros_fixture_values_basic::Meters = ferros_fixture_values_basic::Meters(5)\n",
+        ),
         ("print array_local", "array_local: [i16; 3] = [-2, 0, 7]\n"),
         ("print number", "number: i32 = -17\n"),
         ("print reference", "reference: &i32 = 0x<hex> -> -17\n"),
@@ -215,6 +219,13 @@ fn print_formats_aggregates_references_and_raw_pointers()
         (
             "print large_array",
             "large_array: [u8; 32] = [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, ...]\n",
+        ),
+        (
+            "print large_reference",
+            concat!(
+                "large_reference: &[u8; 2000000] = 0x<hex> -> ",
+                "[77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, 77, ...]\n"
+            ),
         ),
     ];
     let _ = transcript::ferros_bin();

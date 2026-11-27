@@ -7,7 +7,7 @@ use gimli::RunTimeEndian;
 
 use super::location::{Unavailable, value_size};
 use super::pretty::{PRINTERS, PrettyPrinter};
-use super::types::{ArrayType, BaseEncoding, Composite, PointerKind, PointerType, TypeId, TypeKind, TypeTable};
+use super::types::{ArrayType, BaseEncoding, Composite, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
 
@@ -72,6 +72,7 @@ pub struct ValueFormatter<'a>
     options: FormatOptions,
     read: &'a mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
     printers: &'a [&'a dyn PrettyPrinter],
+    // Printers can follow links and render a value already on the stack.
     active: HashSet<(TypeId, Address)>,
     depth: usize,
     remaining: usize,
@@ -180,21 +181,7 @@ impl<'a> ValueFormatter<'a>
             return "<cycle>".to_owned();
         }
         self.depth += 1;
-        let text = if let Some(bytes) = bytes {
-            self.render_view(ValueView { ty, bytes, address })
-        } else if let Some(address) = address {
-            let size = value_size(self.types.get(ty).and_then(|ty| ty.size));
-            match size.and_then(|size| self.read_memory(address, size)) {
-                Ok(bytes) => self.render_view(ValueView {
-                    ty,
-                    bytes: &bytes,
-                    address: Some(address),
-                }),
-                Err(reason) => unavailable(reason),
-            }
-        } else {
-            unavailable("no storage")
-        };
+        let text = self.render_value(ty, address, bytes);
         self.depth -= 1;
         if let Some(key) = key {
             self.active.remove(&key);
@@ -202,35 +189,55 @@ impl<'a> ValueFormatter<'a>
         text
     }
 
-    fn render_view(&mut self, mut value: ValueView<'_>) -> String
+    fn render_value(&mut self, mut id: TypeId, address: Option<Address>, bytes: Option<&[u8]>) -> String
     {
-        let Some(mut ty) = self.types.get(value.ty) else {
+        let Some(mut ty) = self.types.get(id) else {
             return unavailable("type unknown");
         };
-        if let Some(printer) = self.printers.iter().find(|printer| printer.matches(&ty, self.types)) {
-            return printer.format(value, self);
-        }
-        let underlying = self.types.strip_aliases(value.ty);
-        if underlying != value.ty
-            && let Some(base) = self.types.get(underlying)
-        {
-            ty = base;
-            value.ty = underlying;
-            if let Some(printer) = self.printers.iter().find(|printer| printer.matches(&ty, self.types)) {
-                return printer.format(value, self);
+        let mut printer = self.printer(&ty);
+        if printer.is_none() {
+            let underlying = self.types.strip_aliases(id);
+            if underlying != id
+                && let Some(base) = self.types.get(underlying)
+            {
+                ty = base;
+                id = underlying;
+                printer = self.printer(&ty);
             }
         }
-        if let Some(size) = ty.size
-            && size != value.bytes.len() as u64
+        // The generic array renderer can work with a prefix. Printers get a complete value.
+        if printer.is_none()
+            && let (None, Some(_), TypeKind::Array(array)) = (bytes, address, &ty.kind)
         {
-            return unavailable(format!("expected {size} value bytes, got {}", value.bytes.len()));
+            return self.format_array(array, address, None);
+        }
+        let owned;
+        let bytes = match (bytes, address) {
+            (Some(bytes), _) => bytes,
+            (None, Some(address)) => {
+                owned = match value_size(ty.size).and_then(|size| self.read_memory(address, size)) {
+                    Ok(bytes) => bytes,
+                    Err(reason) => return unavailable(reason),
+                };
+                &owned
+            }
+            (None, None) => return unavailable("no storage"),
+        };
+        if let Some(size) = ty.size
+            && size != bytes.len() as u64
+        {
+            return unavailable(format!("expected {size} value bytes, got {}", bytes.len()));
+        }
+        let value = ValueView { ty: id, bytes, address };
+        if let Some(printer) = printer {
+            return printer.format(value, self);
         }
         let name = ty.name.as_deref().unwrap_or("?");
         match &ty.kind {
             TypeKind::Base(encoding) => format_base(*encoding, name, self.endian, value.bytes),
             TypeKind::Struct(fields) if !ty.declaration => self.format_composite(value, fields, Some(name)),
             TypeKind::Tuple(fields) if !ty.declaration => self.format_composite(value, fields, None),
-            TypeKind::Array(array) => self.format_array(value, array),
+            TypeKind::Array(array) => self.format_array(array, address, Some(bytes)),
             TypeKind::Pointer(pointer) => self.format_pointer(value, pointer),
             TypeKind::Enum(_) | TypeKind::Enumeration(_) => format!("<enum {name}>"),
             TypeKind::Unreadable(reason) => unavailable(reason),
@@ -238,8 +245,24 @@ impl<'a> ValueFormatter<'a>
         }
     }
 
+    fn printer(&self, ty: &Type) -> Option<&'a dyn PrettyPrinter>
+    {
+        self.printers.iter().copied().find(|printer| printer.matches(ty, self.types))
+    }
+
     fn format_composite(&mut self, value: ValueView<'_>, fields: &Composite, name: Option<&str>) -> String
     {
+        // Rust describes tuple-struct fields with sequential names such as `__0`.
+        let tuple_struct = name.is_some()
+            && !fields.members.is_empty()
+            && fields.members.iter().enumerate().all(|(index, member)| {
+                member
+                    .name
+                    .as_deref()
+                    .and_then(|name| name.strip_prefix("__"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    == Some(index)
+            });
         let mut children = Vec::new();
         for member in &fields.members {
             if children.len() == self.options.max_elements || self.depth >= self.options.max_depth || self.remaining == 0 {
@@ -260,12 +283,14 @@ impl<'a> ValueFormatter<'a>
                     unavailable("member layout or bytes unknown")
                 }
             };
-            children.push(match name {
-                Some(_) => format!("{}: {text}", member.name.as_deref().unwrap_or("?")),
-                None => text,
+            children.push(if name.is_some() && !tuple_struct {
+                format!("{}: {text}", member.name.as_deref().unwrap_or("?"))
+            } else {
+                text
             });
         }
         match (name, children.as_slice()) {
+            (Some(name), _) if tuple_struct => format!("{name}({})", children.join(", ")),
             (Some(name), []) => format!("{name} {{}}"),
             (Some(name), _) => format!("{name} {{ {} }}", children.join(", ")),
             (None, [child]) if fields.members.len() == 1 && child != ELLIPSIS => format!("({child},)"),
@@ -273,7 +298,7 @@ impl<'a> ValueFormatter<'a>
         }
     }
 
-    fn format_array(&mut self, value: ValueView<'_>, array: &ArrayType) -> String
+    fn format_array(&mut self, array: &ArrayType, address: Option<Address>, bytes: Option<&[u8]>) -> String
     {
         let Some(element) = array.element else {
             return unavailable("array element type unknown");
@@ -281,16 +306,46 @@ impl<'a> ValueFormatter<'a>
         let Some(size) = self.types.get(element).and_then(|ty| ty.size) else {
             return unavailable("array element size unknown");
         };
-        self.format_dimensions(value, element, size, &array.lengths)
+        self.format_dimensions(address, bytes, element, size, &array.lengths)
     }
 
-    fn format_dimensions(&mut self, value: ValueView<'_>, element: TypeId, size: u64, lengths: &[Option<u64>]) -> String
+    fn format_dimensions(
+        &mut self,
+        address: Option<Address>,
+        bytes: Option<&[u8]>,
+        element: TypeId,
+        size: u64,
+        lengths: &[Option<u64>],
+    ) -> String
     {
         let Some((&Some(len), inner)) = lengths.split_first() else {
             return unavailable("array length unknown");
         };
         let Some(stride) = inner.iter().try_fold(size, |stride, len| stride.checked_mul((*len)?)) else {
             return unavailable("invalid array layout");
+        };
+        let owned;
+        let bytes = match (bytes, address) {
+            (Some(bytes), _) => bytes,
+            (None, Some(address)) => {
+                let count = len.min(self.options.max_elements.min(self.remaining) as u64);
+                let read_size = if self.depth >= self.options.max_depth {
+                    Some(0)
+                } else {
+                    count.checked_mul(stride)
+                };
+                owned = match value_size(read_size).and_then(|size| self.read_memory(address, size)) {
+                    Ok(bytes) => bytes,
+                    Err(reason) => return unavailable(reason),
+                };
+                &owned
+            }
+            (None, None) => return unavailable("no storage"),
+        };
+        let value = ValueView {
+            ty: element,
+            bytes,
+            address,
         };
         let mut children = Vec::new();
         for index in 0..len {
@@ -310,7 +365,7 @@ impl<'a> ValueFormatter<'a>
                 Some(child) => {
                     self.remaining -= 1;
                     self.depth += 1;
-                    let text = self.format_dimensions(child, element, size, inner);
+                    let text = self.format_dimensions(child.address, Some(child.bytes), element, size, inner);
                     self.depth -= 1;
                     text
                 }

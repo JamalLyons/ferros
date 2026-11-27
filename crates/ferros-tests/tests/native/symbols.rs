@@ -47,6 +47,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("values_basic"),
         fixture!("values_dyn"),
         fixture!("values_enums"),
+        fixture!("values_ffi_strings"),
         fixture!("values_maps"),
         fixture!("values_paths"),
         fixture!("values_shared"),

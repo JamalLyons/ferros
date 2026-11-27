@@ -140,6 +140,14 @@ impl<'a> ValueFormatter<'a>
         self.options
     }
 
+    pub(super) fn remaining_children(&self) -> usize
+    {
+        if self.depth >= self.options.max_depth {
+            return 0;
+        }
+        self.remaining
+    }
+
     /// Read a range on behalf of a renderer.
     ///
     /// # Errors

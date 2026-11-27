@@ -488,7 +488,13 @@ fn unavailable_pointee_preserves_the_rest_of_the_value()
 #[test]
 fn unknown_standard_library_layouts_show_raw_fields()
 {
-    const NAMES: &[&str] = &["&str", "alloc::vec::Vec<u8, alloc::alloc::Global>"];
+    const NAMES: &[&str] = &[
+        "&str",
+        "alloc::vec::Vec<u8, alloc::alloc::Global>",
+        "std::collections::hash::map::HashMap<u8, u8>",
+        "std::collections::hash::set::HashSet<u8>",
+        "alloc::collections::btree::map::BTreeMap<u8, u8>",
+    ];
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
     let unit = &mut dwarf.unit;
     unit.get_mut(byte)

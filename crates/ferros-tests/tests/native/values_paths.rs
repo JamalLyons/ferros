@@ -92,6 +92,11 @@ fn print_follows_fields_of_the_active_enum_variant()
         ("res_err.0", "i32 = -71"),
         ("opt_ref.0.name", r#"alloc::string::String = "ferris""#),
         ("opt_ref.0.id", "u16 = 3"),
+        ("maybe_order.0", "core::cmp::Ordering = Greater"),
+        ("opt_ptr.0", "u32 = 42"),
+        ("(*opt_ptr).0", "u32 = 42"),
+        ("single.0", "u16 = 51"),
+        ("huge.0", "u8 = 5"),
     ];
     const FAILURES: &[(&str, &str)] = &[
         (
@@ -113,6 +118,10 @@ fn print_follows_fields_of_the_active_enum_variant()
         (
             "ordering.0",
             "cannot evaluate 'ordering.0': `ordering.0`: core::cmp::Ordering has no fields",
+        ),
+        (
+            "single.1",
+            "cannot evaluate 'single.1': `single.1`: no field `1` in ferros_fixture_values_paths::Single::Value",
         ),
     ];
     print_paths(SAMPLES, FAILURES);

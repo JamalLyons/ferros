@@ -60,9 +60,10 @@ impl ReplCommand for Print
     {
         "print <path>\n\nShow the type and value of an argument or local variable in the selected frame, or of a \
          value reached from it:\n  name        the variable\n  name.field  a field of a struct or of an enum's \
-         active variant (name.0 for a tuple field)\n  name[n]     an element of an array, slice or Vec\n  *name       the value a reference, Box or \
-         raw pointer points to\n  (path)      grouping, as in (*name).field\n\nField access and indexing look \
-         through references and boxes. Function calls and operators are not supported."
+         active variant (name.0 for a tuple field)\n  name[n]     an element of an array, slice or Vec\n  \
+         *name       the value a reference, Box or raw pointer points to\n  (path)      grouping, as in \
+         (*name).field\n\nField access and indexing look through references and boxes. Function calls and \
+         operators are not supported."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult

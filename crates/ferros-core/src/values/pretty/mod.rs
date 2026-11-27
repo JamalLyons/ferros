@@ -11,7 +11,7 @@ mod vec;
 
 use gimli::RunTimeEndian;
 
-pub(super) use self::enums::{active_variant, variant_payload};
+pub(super) use self::enums::{variant_for_tag, variant_payload};
 pub(super) use self::vec::layout as vec_layout;
 use super::format::{ValueFormatter, ValueView, format_raw, unsigned};
 use super::types::{BaseEncoding, Type, TypeId, TypeKind, TypeTable};

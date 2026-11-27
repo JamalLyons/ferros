@@ -12,11 +12,11 @@
 //! As in Rust, `*a.b` dereferences `a.b`; write `(*a).b` to dereference `a` first. `.0`
 //! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
 //! of the active variant, read from the discriminant (an explicit tag or a niche) as the
-//! enum printer does; a field only another variant has is an error naming both. `[n]` indexes an array, a slice (`&[T]`,
-//! `Box<[T]>`) or a `Vec`. `*` follows a reference, a raw pointer or a `Box`. Field access
-//! and indexing look through references and boxes as Rust's auto-dereference does; raw
-//! pointers need an explicit `*`. There are no function calls, operators or literals other
-//! than an index.
+//! enum printer does; a field only another variant has is an error naming both. `[n]`
+//! indexes an array, a slice (`&[T]`, `Box<[T]>`) or a `Vec`. `*` follows a reference, a
+//! raw pointer or a `Box`. Field access and indexing look through references and boxes as
+//! Rust's auto-dereference does; raw pointers need an explicit `*`. There are no function
+//! calls, operators or literals other than an index.
 //!
 //! Evaluation reads only what the path needs: the root variable's bytes, the pointers and
 //! headers it follows, and the bytes of the final value, which the caller formats.
@@ -27,7 +27,7 @@ use gimli::RunTimeEndian;
 
 use super::format::{ValueView, unsigned};
 use super::location::value_size;
-use super::pretty::{active_variant, fat_pointer, variant_payload, vec_layout};
+use super::pretty::{fat_pointer, variant_for_tag, variant_payload, vec_layout};
 use super::types::{Member, PointerKind, RustEnum, TypeId, TypeKind, TypeTable, Variant};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
@@ -514,13 +514,18 @@ impl Evaluator<'_>
         name: &str,
     ) -> Result<Place, PathError>
     {
-        let bytes = self.load(expr, &place)?;
-        let view = ValueView {
-            ty,
-            bytes: &bytes,
-            address: None,
+        // Read only the discriminant, so a large enum whose active variant is small stays
+        // inside the value cap.
+        // A discriminant without a readable layout falls through to the shared error.
+        let tag = match layout
+            .discriminant
+            .as_ref()
+            .and_then(|discriminant| self.member_place(expr, &place, discriminant, 0).ok())
+        {
+            Some(tag) => Some(self.load(expr, &tag)?),
+            None => None,
         };
-        let variant = active_variant(view, layout, self.types, self.endian)
+        let variant = variant_for_tag(layout, tag.as_deref(), self.endian)
             .map_err(|error| PathError::at(expr, format!("cannot read the variant of {}: {error}", self.type_name(ty))))?;
         let enum_name = self.types.get(ty).and_then(|ty| ty.name.clone());
         let enum_name = enum_name.as_deref();
@@ -528,7 +533,7 @@ impl Evaluator<'_>
         // own member, when rustc wraps the fields in one.
         let find = |variant: &Variant| -> Option<(Member, Option<u64>)> {
             match variant_payload(variant, enum_name, self.types) {
-                Some((payload, fields)) => Some((member_named(&fields.members, name)?.clone(), payload.offset)),
+                Some(payload) => Some((member_named(payload.fields(), name)?.clone(), payload.member.offset)),
                 None => Some((member_named(&variant.members, name)?.clone(), Some(0))),
             }
         };

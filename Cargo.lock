@@ -404,6 +404,7 @@ name = "ferros-core"
 version = "0.0.0"
 dependencies = [
  "addr2line",
+ "ferros-core",
  "gimli",
  "once_cell",
  "rustc-demangle",

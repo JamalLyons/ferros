@@ -25,7 +25,8 @@
 //! lengths, pointers and references with their pointee, typedefs, qualifiers and function
 //! types. Members keep their names and byte offsets; structs and enums keep their
 //! template type parameters (`T` of `Option<T>` and `Vec<T>`), so pretty-printers can find
-//! element types.
+//! element types. When an enum declares none, the table collects named parameters from
+//! its variant payload structs, preferring the first parameter with a type or value.
 //!
 //! Discriminant values are raw: the unsigned bits of the discriminant member, at its size,
 //! whatever the form DWARF used to encode them. A niche-encoded enum's dataful variant has
@@ -56,8 +57,8 @@
 //!   `type_named`, `array_named`, `strip_aliases`, `unit_at`, `resolve`, `read_type`,
 //!   `read_entry`, `composite`, `variant_part`, `member`, `scalar_info`.
 //! - Name indexing: `index_unit`.
-//! - Derived names and sizes of new types: `derive_name`, `derive_size`, `unreadable`, `qualified`.
-//! - Attribute helpers: `own_name`, `udata`, `flag`, `type_ref`, `member_location`,
+//! - Derived type metadata: `derive_name`, `derive_size`, `variant_template_params`, `unreadable`, `qualified`.
+//! - Attribute helpers: `own_name`, `udata`, `flag`, `type_ref`, `die_ref`, `member_location`,
 //!   `raw_bits`, `cut`, `discriminant_list`, `base_encoding`, `pointer_kind`, `is_type_tag`.
 //! - Unit tests over synthetic DWARF in `mod tests`.
 
@@ -260,7 +261,7 @@ pub struct RustEnum
 {
     /// Members of the struct outside the variant part (rustc emits none).
     pub members: Vec<Member>,
-    /// Generic parameters of the enum.
+    /// Generic parameters of the enum, inherited from its payload structs if absent here.
     pub template_params: Vec<TemplateParam>,
     /// The member `DW_AT_discr` names, whose bits select the variant: an explicit tag, or
     /// the niche of a niche-encoded enum. `None` for an enum with one variant, which needs
@@ -272,6 +273,13 @@ pub struct RustEnum
 
 impl RustEnum
 {
+    /// The generic parameter named `name`, if DWARF describes one.
+    #[must_use]
+    pub fn template_param(&self, name: &str) -> Option<&TemplateParam>
+    {
+        self.template_params.iter().find(|param| param.name.as_deref() == Some(name))
+    }
+
     /// The variant named `name`.
     #[must_use]
     pub fn variant(&self, name: &str) -> Option<&Variant>
@@ -715,15 +723,30 @@ impl TypeTable
                 None => arena.types.get(id.index()).map(Arc::as_ref),
             }
         };
-        let derived: Vec<(Option<String>, Option<u64>)> = (0..pending.len())
-            .map(|at| {
+        let derived: Vec<_> = pending
+            .iter()
+            .enumerate()
+            .map(|(at, ty)| {
                 let id = TypeId((base + at) as u32);
-                (derive_name(&lookup, id, ALIAS_DEPTH), derive_size(&lookup, id, ALIAS_DEPTH))
+                let params = match &ty.kind {
+                    TypeKind::Enum(value) if value.template_params.is_empty() => {
+                        Some(variant_template_params(&lookup, &value.variants))
+                    }
+                    _ => None,
+                };
+                (
+                    derive_name(&lookup, id, ALIAS_DEPTH),
+                    derive_size(&lookup, id, ALIAS_DEPTH),
+                    params,
+                )
             })
             .collect();
-        for (ty, (name, size)) in pending.iter_mut().zip(derived) {
+        for (ty, (name, size, params)) in pending.iter_mut().zip(derived) {
             ty.name = name;
             ty.size = size;
+            if let (TypeKind::Enum(value), Some(params)) = (&mut ty.kind, params) {
+                value.template_params = params;
+            }
         }
         arena.types.extend(pending.into_iter().map(Arc::new));
         arena.by_die.extend(new_ids);
@@ -924,11 +947,7 @@ impl TypeTable
         intern: &mut dyn FnMut(usize) -> TypeId,
     ) -> gimli::Result<(Option<Member>, Vec<Variant>)>
     {
-        let discr = match node.entry().attr_value(constants::DW_AT_discr)? {
-            Some(AttributeValue::UnitRef(offset)) => Some(unit.start + offset.0),
-            Some(AttributeValue::DebugInfoRef(offset)) => Some(offset.0),
-            _ => None,
-        };
+        let discr = die_ref(node.entry().attr_value(constants::DW_AT_discr)?, unit.start)?;
         let mut discriminant = None;
         // (size, signed) of the discriminant member's type.
         let mut info = (None, false);
@@ -937,7 +956,12 @@ impl TypeTable
         let mut children = node.children();
         while let Some(child) = children.next()? {
             match child.entry().tag() {
-                constants::DW_TAG_member if Some(unit.start + child.entry().offset().0) == discr => {
+                constants::DW_TAG_member
+                    if unit
+                        .start
+                        .checked_add(child.entry().offset().0)
+                        .is_some_and(|offset| discr == Some(offset)) =>
+                {
                     let entry = child.entry();
                     if let Some(ty) = type_ref(entry, unit.start)? {
                         info = self.scalar_info(ty);
@@ -1160,6 +1184,33 @@ fn derive_size<'a>(lookup: &impl Fn(TypeId) -> Option<&'a Type>, id: TypeId, dep
     }
 }
 
+/// Collect named parameters from the payload structs in variant order.
+fn variant_template_params<'a>(lookup: &impl Fn(TypeId) -> Option<&'a Type>, variants: &[Variant]) -> Vec<TemplateParam>
+{
+    let payload_params = variants
+        .iter()
+        .flat_map(|variant| &variant.members)
+        .filter_map(|member| match &lookup(member.ty?)?.kind {
+            TypeKind::Struct(payload) => Some(&payload.template_params),
+            _ => None,
+        })
+        .flatten();
+    let mut params = Vec::<TemplateParam>::new();
+    for param in payload_params {
+        let Some(name) = param.name.as_deref().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        if let Some(previous) = params.iter_mut().find(|previous| previous.name.as_deref() == Some(name)) {
+            if previous.ty.is_none() && previous.value.is_none() && (param.ty.is_some() || param.value.is_some()) {
+                *previous = param.clone();
+            }
+        } else {
+            params.push(param.clone());
+        }
+    }
+    params
+}
+
 fn unreadable(die: DieOffset, reason: String) -> Type
 {
     Type {
@@ -1200,11 +1251,18 @@ fn flag(entry: &Entry<'_, '_>, name: gimli::DwAt) -> gimli::Result<bool>
 /// into a type unit.
 fn type_ref(entry: &Entry<'_, '_>, start: usize) -> gimli::Result<Option<usize>>
 {
-    Ok(match entry.attr_value(constants::DW_AT_type)? {
-        Some(AttributeValue::UnitRef(offset)) => Some(start + offset.0),
-        Some(AttributeValue::DebugInfoRef(offset)) => Some(offset.0),
-        _ => None,
-    })
+    die_ref(entry.attr_value(constants::DW_AT_type)?, start)
+}
+
+fn die_ref(value: Option<AttributeValue<OwnedReader>>, start: usize) -> gimli::Result<Option<usize>>
+{
+    match value {
+        Some(AttributeValue::UnitRef(offset)) => {
+            start.checked_add(offset.0).map(Some).ok_or(gimli::Error::OffsetOutOfBounds)
+        }
+        Some(AttributeValue::DebugInfoRef(offset)) => Ok(Some(offset.0)),
+        _ => Ok(None),
+    }
 }
 
 /// A member's byte offset: a constant `DW_AT_data_member_location`, or the
@@ -1646,6 +1704,76 @@ mod tests
         assert!(!later_ty.declaration, "the definition wins over a declaration listed first");
         assert_eq!(table.type_of(later_ty.die), None, "a struct has no DW_AT_type");
         assert_eq!(table.type_at(DieOffset(u64::MAX)), None);
+    }
+
+    #[test]
+    fn overflowing_unit_refs_make_types_unreadable()
+    {
+        // A 32-bit DWARF v4 unit can still use an eight-byte unit-relative reference.
+        let abbrev = vec![
+            1,
+            constants::DW_TAG_compile_unit.0 as u8,
+            1,
+            0,
+            0,
+            2,
+            constants::DW_TAG_pointer_type.0 as u8,
+            0,
+            constants::DW_AT_name.0 as u8,
+            constants::DW_FORM_string.0 as u8,
+            constants::DW_AT_type.0 as u8,
+            constants::DW_FORM_ref8.0 as u8,
+            0,
+            0,
+            3,
+            constants::DW_TAG_structure_type.0 as u8,
+            1,
+            constants::DW_AT_name.0 as u8,
+            constants::DW_FORM_string.0 as u8,
+            0,
+            0,
+            4,
+            constants::DW_TAG_variant_part.0 as u8,
+            0,
+            constants::DW_AT_discr.0 as u8,
+            constants::DW_FORM_ref8.0 as u8,
+            0,
+            0,
+            0,
+        ];
+        let mut info = Vec::new();
+        let mut add_unit = |entries: &[u8]| {
+            info.extend_from_slice(&(7 + u32::try_from(entries.len()).expect("small unit")).to_le_bytes());
+            info.extend_from_slice(&4_u16.to_le_bytes()); // Version.
+            info.extend_from_slice(&0_u32.to_le_bytes()); // Abbreviation table offset.
+            info.push(8); // Address size.
+            info.extend_from_slice(entries);
+        };
+        add_unit(&[1, 0]);
+
+        // Both references overflow when the reader adds the nonzero start of this unit.
+        let mut entries = b"\x01\x02BadPointer\0".to_vec();
+        entries.extend_from_slice(&u64::MAX.to_le_bytes());
+        entries.extend_from_slice(b"\x03BadEnum\0\x04");
+        entries.extend_from_slice(&u64::MAX.to_le_bytes());
+        entries.extend_from_slice(&[0, 0]);
+        add_unit(&entries);
+
+        let table = TypeTable::build(
+            TestDwarf {
+                sections: HashMap::from([(gimli::SectionId::DebugAbbrev, abbrev), (gimli::SectionId::DebugInfo, info)]),
+            }
+            .load(),
+            RunTimeEndian::Little,
+        );
+        for name in ["BadPointer", "BadEnum"] {
+            let id = table.type_named(name).expect("indexed type");
+            assert_eq!(
+                kind(&table, id),
+                TypeKind::Unreadable(gimli::Error::OffsetOutOfBounds.to_string()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

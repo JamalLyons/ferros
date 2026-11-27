@@ -201,6 +201,7 @@ fn check_enum_layouts(types: &TypeTable, maybe: &RustEnum, shape: &RustEnum, pri
         Some((Some(u32_id), Some(number(printed, "maybe.Some.field.0"))))
     );
     assert_eq!(payload.template_param("T").and_then(|param| param.ty), Some(u32_id));
+    assert_eq!(maybe.template_param("T").and_then(|param| param.ty), Some(u32_id));
 
     // A fieldful #[repr(u8)] enum: explicit discriminants and per-variant fields.
     assert_eq!(shape.variants.len(), 3);

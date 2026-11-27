@@ -7,7 +7,7 @@ use gimli::RunTimeEndian;
 
 use super::location::{Unavailable, value_size};
 use super::pretty::{PRINTERS, PrettyPrinter};
-use super::types::{ArrayType, BaseEncoding, Composite, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
+use super::types::{ArrayType, BaseEncoding, Member, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
 
@@ -61,6 +61,15 @@ impl<'a> ValueView<'a>
             None => None,
         };
         Some(Self { ty, bytes, address })
+    }
+
+    pub(super) fn member(self, member: &Member, types: &TypeTable) -> Option<Self>
+    {
+        if member.bit_size.is_some() {
+            return None;
+        }
+        let ty = member.ty?;
+        self.slice(ty, member.offset?, types.get(ty)?.size?)
     }
 }
 
@@ -235,8 +244,8 @@ impl<'a> ValueFormatter<'a>
         let name = ty.name.as_deref().unwrap_or("?");
         match &ty.kind {
             TypeKind::Base(encoding) => format_base(*encoding, name, self.endian, value.bytes),
-            TypeKind::Struct(fields) if !ty.declaration => self.format_composite(value, fields, Some(name)),
-            TypeKind::Tuple(fields) if !ty.declaration => self.format_composite(value, fields, None),
+            TypeKind::Struct(fields) if !ty.declaration => self.format_members(value, &fields.members, Some(name)),
+            TypeKind::Tuple(fields) if !ty.declaration => self.format_members(value, &fields.members, None),
             TypeKind::Array(array) => self.format_array(array, address, Some(bytes)),
             TypeKind::Pointer(pointer) => self.format_pointer(value, pointer),
             TypeKind::Enum(_) | TypeKind::Enumeration(_) => format!("<enum {name}>"),
@@ -250,12 +259,12 @@ impl<'a> ValueFormatter<'a>
         self.printers.iter().copied().find(|printer| printer.matches(ty, self.types))
     }
 
-    fn format_composite(&mut self, value: ValueView<'_>, fields: &Composite, name: Option<&str>) -> String
+    pub(super) fn format_members(&mut self, value: ValueView<'_>, members: &[Member], name: Option<&str>) -> String
     {
         // Rust describes tuple-struct fields with sequential names such as `__0`.
         let tuple_struct = name.is_some()
-            && !fields.members.is_empty()
-            && fields.members.iter().enumerate().all(|(index, member)| {
+            && !members.is_empty()
+            && members.iter().enumerate().all(|(index, member)| {
                 member
                     .name
                     .as_deref()
@@ -264,19 +273,12 @@ impl<'a> ValueFormatter<'a>
                     == Some(index)
             });
         let mut children = Vec::new();
-        for member in &fields.members {
+        for member in members {
             if children.len() == self.options.max_elements || self.depth >= self.options.max_depth || self.remaining == 0 {
                 children.push(ELLIPSIS.to_owned());
                 break;
             }
-            let child = (|| {
-                if member.bit_size.is_some() {
-                    return None;
-                }
-                let ty = member.ty?;
-                value.slice(ty, member.offset?, self.types.get(ty)?.size?)
-            })();
-            let text = match child {
+            let text = match value.member(member, self.types) {
                 Some(child) => self.format(child),
                 None => {
                     self.remaining -= 1;
@@ -293,7 +295,7 @@ impl<'a> ValueFormatter<'a>
             (Some(name), _) if tuple_struct => format!("{name}({})", children.join(", ")),
             (Some(name), []) => format!("{name} {{}}"),
             (Some(name), _) => format!("{name} {{ {} }}", children.join(", ")),
-            (None, [child]) if fields.members.len() == 1 && child != ELLIPSIS => format!("({child},)"),
+            (None, [child]) if members.len() == 1 && child != ELLIPSIS => format!("({child},)"),
             (None, _) => format!("({})", children.join(", ")),
         }
     }
@@ -413,12 +415,12 @@ pub(crate) fn format_raw(bytes: Result<&[u8], &Unavailable>) -> String
     text
 }
 
-fn unavailable(reason: impl Display) -> String
+pub(super) fn unavailable(reason: impl Display) -> String
 {
     format!("<unavailable: {reason}>")
 }
 
-fn unsigned(bytes: &[u8], endian: RunTimeEndian) -> Option<u128>
+pub(super) fn unsigned(bytes: &[u8], endian: RunTimeEndian) -> Option<u128>
 {
     if bytes.is_empty() || bytes.len() > 16 {
         return None;

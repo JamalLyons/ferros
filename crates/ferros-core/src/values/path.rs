@@ -10,11 +10,13 @@
 //! ```
 //!
 //! As in Rust, `*a.b` dereferences `a.b`; write `(*a).b` to dereference `a` first. `.0`
-//! selects a tuple or tuple-struct field. `[n]` indexes an array, a slice (`&[T]`,
-//! `Box<[T]>`) or a `Vec`. `*` follows a reference, a raw pointer or a `Box`. Field access
-//! and indexing look through references and boxes as Rust's auto-dereference does; raw
-//! pointers need an explicit `*`. There are no function calls, operators or literals other
-//! than an index.
+//! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
+//! of the active variant, read from the discriminant (an explicit tag or a niche) as the
+//! enum printer does; a field only another variant has is an error naming both. `[n]`
+//! indexes an array, a slice (`&[T]`, `Box<[T]>`) or a `Vec`. `*` follows a reference, a
+//! raw pointer or a `Box`. Field access and indexing look through references and boxes as
+//! Rust's auto-dereference does; raw pointers need an explicit `*`. There are no function
+//! calls, operators or literals other than an index.
 //!
 //! Evaluation reads only what the path needs: the root variable's bytes, the pointers and
 //! headers it follows, and the bytes of the final value, which the caller formats.
@@ -23,10 +25,10 @@ use std::fmt;
 
 use gimli::RunTimeEndian;
 
-use super::format::unsigned;
+use super::format::{ValueView, unsigned};
 use super::location::value_size;
-use super::pretty::{fat_pointer, vec_layout};
-use super::types::{PointerKind, TypeId, TypeKind, TypeTable};
+use super::pretty::{fat_pointer, variant_for_tag, variant_payload, vec_layout};
+use super::types::{Member, PointerKind, RustEnum, TypeId, TypeKind, TypeTable, Variant};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
 
@@ -481,7 +483,7 @@ impl Evaluator<'_>
         Ok(place)
     }
 
-    fn field(&self, expr: &Expr, place: Place, name: &str) -> Result<Place, PathError>
+    fn field(&mut self, expr: &Expr, place: Place, name: &str) -> Result<Place, PathError>
     {
         let ty = self.types.strip_aliases(place.ty);
         let fields = match self.types.get(ty).map(|ty| ty.kind.clone()) {
@@ -490,35 +492,85 @@ impl Evaluator<'_>
             {
                 fields
             }
-            Some(TypeKind::Enum(_) | TypeKind::Enumeration(_)) => {
-                return Err(PathError::at(
-                    expr,
-                    format!("{} is an enum; field access on enums is not supported", self.type_name(ty)),
-                ));
-            }
+            Some(TypeKind::Enum(layout)) => return self.variant_field(expr, place, ty, &layout, name),
             _ => {
                 let hint = raw_pointer_hint(expr, &self.shape(ty));
                 return Err(PathError::at(expr, format!("{} has no fields{hint}", self.type_name(ty))));
             }
         };
-        // Rust names tuple and tuple-struct fields `__0`, `__1`, ...
-        let member = fields
-            .member(name)
-            .or_else(|| {
-                name.bytes()
-                    .all(|byte| byte.is_ascii_digit())
-                    .then(|| fields.member(&format!("__{name}")))
-                    .flatten()
-            })
+        let member = member_named(&fields.members, name)
             .ok_or_else(|| PathError::at(expr, format!("no field `{name}` in {}", self.type_name(ty))))?;
+        self.member_place(expr, &place, member, 0)
+    }
+
+    /// Field `name` of the variant a Rust enum holds. A field only another variant has
+    /// is an error naming both variants.
+    fn variant_field(
+        &mut self,
+        expr: &Expr,
+        place: Place,
+        ty: TypeId,
+        layout: &RustEnum,
+        name: &str,
+    ) -> Result<Place, PathError>
+    {
+        // Read only the discriminant, so a large enum whose active variant is small stays
+        // inside the value cap.
+        // A discriminant without a readable layout falls through to the shared error.
+        let tag = match layout
+            .discriminant
+            .as_ref()
+            .and_then(|discriminant| self.member_place(expr, &place, discriminant, 0).ok())
+        {
+            Some(tag) => Some(self.load(expr, &tag)?),
+            None => None,
+        };
+        let variant = variant_for_tag(layout, tag.as_deref(), self.endian)
+            .map_err(|error| PathError::at(expr, format!("cannot read the variant of {}: {error}", self.type_name(ty))))?;
+        let enum_name = self.types.get(ty).and_then(|ty| ty.name.clone());
+        let enum_name = enum_name.as_deref();
+        // A variant's field and the offset its member offset is from: the payload struct's
+        // own member, when rustc wraps the fields in one.
+        let find = |variant: &Variant| -> Option<(Member, Option<u64>)> {
+            match variant_payload(variant, enum_name, self.types) {
+                Some(payload) => Some((member_named(payload.fields(), name)?.clone(), payload.member.offset)),
+                None => Some((member_named(&variant.members, name)?.clone(), Some(0))),
+            }
+        };
+        if let Some((member, base)) = find(variant) {
+            let base = base.ok_or_else(|| PathError::at(expr, "field layout unknown"))?;
+            return self.member_place(expr, &place, &member, base);
+        }
+        let variant_name = |variant: &Variant| variant.name.clone().unwrap_or_else(|| "?".to_owned());
+        let others: Vec<_> = layout
+            .variants
+            .iter()
+            .filter(|other| !std::ptr::eq(*other, variant) && find(other).is_some())
+            .map(variant_name)
+            .collect();
+        let active = variant_name(variant);
+        let reason = if others.is_empty() {
+            format!("no field `{name}` in {}::{active}", self.type_name(ty))
+        } else {
+            format!("{} is {active}, not {}", self.type_name(ty), others.join(" or "))
+        };
+        Err(PathError::at(expr, reason))
+    }
+
+    /// The value of `member`, whose offset is from `base` bytes into `place`.
+    fn member_place(&self, expr: &Expr, place: &Place, member: &Member, base: u64) -> Result<Place, PathError>
+    {
         let missing = || PathError::at(expr, "field layout unknown");
         if member.bit_size.is_some() {
             return Err(PathError::at(expr, "bit fields are not supported"));
         }
         let member_ty = member.ty.ok_or_else(missing)?;
-        let offset = member.offset.ok_or_else(missing)?;
+        let offset = member
+            .offset
+            .and_then(|offset| offset.checked_add(base))
+            .ok_or_else(missing)?;
         let size = self.types.get(member_ty).and_then(|ty| ty.size).ok_or_else(missing)?;
-        child(expr, &place, member_ty, offset, size)
+        child(expr, place, member_ty, offset, size)
     }
 
     fn index(&mut self, expr: &Expr, place: Place, index: u64) -> Result<Place, PathError>
@@ -535,7 +587,7 @@ impl Evaluator<'_>
             Shape::Elements => {
                 let bytes = self.load(expr, &place)?;
                 let ty = self.types.strip_aliases(place.ty);
-                let view = super::format::ValueView {
+                let view = ValueView {
                     ty,
                     bytes: &bytes,
                     address: None,
@@ -643,6 +695,18 @@ impl Evaluator<'_>
             }
         }
     }
+}
+
+/// The member named `name`. Rust names tuple and tuple-struct fields `__0`, `__1`, ...
+fn member_named<'m>(members: &'m [Member], name: &str) -> Option<&'m Member>
+{
+    let named = |wanted: &str| members.iter().find(|member| member.name.as_deref() == Some(wanted));
+    named(name).or_else(|| {
+        name.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| named(&format!("__{name}")))
+            .flatten()
+    })
 }
 
 /// Raw pointers are not dereferenced implicitly. Suggest the explicit form.

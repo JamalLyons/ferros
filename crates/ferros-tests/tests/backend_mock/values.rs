@@ -579,6 +579,10 @@ fn unknown_standard_library_layouts_show_raw_fields()
         "std::collections::hash::map::HashMap<u8, u8>",
         "std::collections::hash::set::HashSet<u8>",
         "alloc::collections::btree::map::BTreeMap<u8, u8>",
+        "alloc::collections::btree::set::BTreeSet<u8>",
+        "alloc::collections::vec_deque::VecDeque<u8>",
+        "alloc::collections::linked_list::LinkedList<u8>",
+        "alloc::collections::binary_heap::BinaryHeap<u8>",
     ];
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
     let unit = &mut dwarf.unit;
@@ -603,4 +607,175 @@ fn unknown_standard_library_layouts_show_raw_fields()
             format!("{name} {{ unknown: 7 }} <unrecognized layout>")
         );
     }
+}
+
+fn named_struct(unit: &mut Unit, parent: UnitEntryId, name: &str, size: u64) -> UnitEntryId
+{
+    let ty = unit.add(parent, gimli::DW_TAG_structure_type);
+    unit.get_mut(ty)
+        .set(gimli::DW_AT_name, Attr::String(name.as_bytes().to_vec()));
+    unit.get_mut(ty).set(gimli::DW_AT_byte_size, Attr::Udata(size));
+    ty
+}
+
+fn add_member(unit: &mut Unit, parent: UnitEntryId, name: &str, ty: UnitEntryId, offset: u64)
+{
+    let member = variable(unit, parent, gimli::DW_TAG_member, Attr::String(name.as_bytes().to_vec()), ty);
+    unit.get_mut(member)
+        .set(gimli::DW_AT_data_member_location, Attr::Udata(offset));
+}
+
+fn element_param(unit: &mut Unit, parent: UnitEntryId, ty: UnitEntryId)
+{
+    variable(
+        unit,
+        parent,
+        gimli::DW_TAG_template_type_parameter,
+        Attr::String(b"T".to_vec()),
+        ty,
+    );
+}
+
+fn pointer_to(unit: &mut Unit, name: &str, pointee: UnitEntryId) -> UnitEntryId
+{
+    let ty = variable(
+        unit,
+        unit.root(),
+        gimli::DW_TAG_pointer_type,
+        Attr::String(name.as_bytes().to_vec()),
+        pointee,
+    );
+    unit.get_mut(ty).set(gimli::DW_AT_byte_size, Attr::Udata(8));
+    ty
+}
+
+fn static_local(unit: &mut Unit, function: UnitEntryId, name: &str, ty: UnitEntryId, address: Address)
+{
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(address.value()));
+    local(unit, function, name, ty, location);
+}
+
+fn words(values: &[u64]) -> Vec<u8>
+{
+    values.iter().copied().flat_map(u64::to_le_bytes).collect()
+}
+
+/// `u8`, `usize` and a `RawVec<u8>` of `{ ptr, cap }` for the collection tests.
+fn raw_vec_types(unit: &mut Unit, byte: UnitEntryId) -> (UnitEntryId, UnitEntryId)
+{
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let usize = index_type(unit, gimli::DW_ATE_unsigned, 8);
+    unit.get_mut(usize).set(gimli::DW_AT_name, Attr::String(b"usize".to_vec()));
+    let data = pointer_to(unit, "*const u8", byte);
+    let raw_vec = named_struct(unit, unit.root(), "alloc::raw_vec::RawVec<u8>", 16);
+    add_member(unit, raw_vec, "ptr", data, 0);
+    add_member(unit, raw_vec, "cap", usize, 8);
+    (usize, raw_vec)
+}
+
+#[test]
+fn vec_deque_and_binary_heap_reject_corrupt_headers()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let (usize, raw_vec) = raw_vec_types(unit, byte);
+    let deque = named_struct(unit, unit.root(), "alloc::collections::vec_deque::VecDeque<u8>", 32);
+    element_param(unit, deque, byte);
+    add_member(unit, deque, "head", usize, 0);
+    add_member(unit, deque, "len", usize, 8);
+    add_member(unit, deque, "buf", raw_vec, 16);
+    let vec = named_struct(unit, unit.root(), "alloc::vec::Vec<u8>", 24);
+    element_param(unit, vec, byte);
+    add_member(unit, vec, "buf", raw_vec, 0);
+    add_member(unit, vec, "len", usize, 16);
+    let heap = named_struct(unit, unit.root(), "alloc::collections::binary_heap::BinaryHeap<u8>", 24);
+    element_param(unit, heap, byte);
+    add_member(unit, heap, "data", vec, 0);
+    let deque_at = Address::new(BASE + 0x200);
+    let heap_at = Address::new(BASE + 0x240);
+    let buffer = Address::new(BASE + 0x300);
+    static_local(unit, function, "deque", deque, deque_at);
+    static_local(unit, function, "heap", heap, heap_at);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    session.write_memory(buffer, &[1, 2, 3, 4]).expect("store elements");
+    let mut render = |name: &str, at: Address, header: &[u64]| {
+        session.write_memory(at, &words(header)).expect("store header");
+        let vars = session.selected_frame_variables().expect("collection locals");
+        let var = vars.iter().find(|var| var.name == name).expect(name);
+        session.format_variable(var, FormatOptions::default()).1
+    };
+    let ptr = buffer.value();
+    // VecDeque: head, len, ptr, cap.
+    assert_eq!(render("deque", deque_at, &[3, 2, ptr, 4]), "[4, 1] (len: 2, capacity: 4)");
+    assert_eq!(
+        render("deque", deque_at, &[4, 1, ptr, 4]),
+        "<unavailable: VecDeque head 4 is outside capacity 4>"
+    );
+    assert_eq!(
+        render("deque", deque_at, &[0, 5, ptr, 4]),
+        "<unavailable: VecDeque length 5 exceeds capacity 4>"
+    );
+    assert_eq!(
+        render("deque", deque_at, &[0, 1, 0, 4]),
+        "<unavailable: null VecDeque buffer pointer>"
+    );
+    // BinaryHeap: ptr, cap, len.
+    assert_eq!(render("heap", heap_at, &[ptr, 4, 3]), "[1, 2, 3] (len: 3, capacity: 4)");
+    assert_eq!(
+        render("heap", heap_at, &[ptr, 4, 5]),
+        "<unavailable: heap length 5 exceeds capacity 4>"
+    );
+}
+
+#[test]
+fn linked_list_stops_at_a_repeated_or_missing_node()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let (usize, _) = raw_vec_types(unit, byte);
+    let root = unit.root();
+    // LinkedList<u8> { head: Option<NonNull<Node<u8>>> @0, len @8 }, Node<u8> { next @0, element @8 }.
+    let node = named_struct(unit, root, "alloc::collections::linked_list::Node<u8>", 16);
+    let node_pointer = pointer_to(unit, "*const alloc::collections::linked_list::Node<u8>", node);
+    let non_null = named_struct(unit, root, "core::ptr::non_null::NonNull<Node<u8>>", 8);
+    add_member(unit, non_null, "pointer", node_pointer, 0);
+    let option = named_struct(unit, root, "core::option::Option<NonNull<Node<u8>>>", 8);
+    let some = named_struct(unit, option, "Some", 8);
+    add_member(unit, some, "__0", non_null, 0);
+    let variants = unit.add(option, gimli::DW_TAG_variant_part);
+    let variant = unit.add(variants, gimli::DW_TAG_variant);
+    add_member(unit, variant, "Some", some, 0);
+    add_member(unit, node, "next", option, 0);
+    add_member(unit, node, "element", byte, 8);
+    let list = named_struct(unit, root, "alloc::collections::linked_list::LinkedList<u8>", 16);
+    element_param(unit, list, byte);
+    add_member(unit, list, "head", option, 0);
+    add_member(unit, list, "len", usize, 8);
+    let list_at = Address::new(BASE + 0x200);
+    static_local(unit, function, "list", list, list_at);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let (first, second) = (Address::new(BASE + 0x300), Address::new(BASE + 0x310));
+    let mut render = |len: u64, after_second: Address| {
+        session
+            .write_memory(first, &words(&[second.value(), 10]))
+            .expect("store first node");
+        session
+            .write_memory(second, &words(&[after_second.value(), 20]))
+            .expect("store second node");
+        session
+            .write_memory(list_at, &words(&[first.value(), len]))
+            .expect("store list header");
+        let vars = session.selected_frame_variables().expect("list local");
+        session.format_variable(&vars[0], FormatOptions::default()).1
+    };
+    assert_eq!(render(2, Address::ZERO), "[10, 20]");
+    assert_eq!(render(3, first), "[10, 20, <unavailable: repeated LinkedList node>] (len: 3)");
+    assert_eq!(
+        render(3, Address::ZERO),
+        "[10, 20, <unavailable: LinkedList has fewer nodes than its length>] (len: 3)"
+    );
 }

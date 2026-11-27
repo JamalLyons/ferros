@@ -197,6 +197,21 @@ path = "fixtures/values_maps.rs"
 test = false
 
 [[bin]]
+name = "ferros-fixture-values_collections"
+path = "fixtures/values_collections.rs"
+test = false
+
+[[bin]]
 name = "ferros-fixture-values_dyn"
 path = "fixtures/values_dyn.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-values_ffi_strings"
+path = "fixtures/values_ffi_strings.rs"
+test = false
+
+[[bin]]
+name = "ferros-fixture-values_newtypes"
+path = "fixtures/values_newtypes.rs"
 test = false

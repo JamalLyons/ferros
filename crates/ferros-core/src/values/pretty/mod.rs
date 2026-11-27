@@ -1,8 +1,10 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
+mod collections;
 mod dyn_trait;
 mod enums;
 mod maps;
+mod newtypes;
 mod shared;
 mod strings;
 mod vec;
@@ -31,6 +33,7 @@ pub trait PrettyPrinter: Sync
 pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &enums::EnumPrinter,
     &strings::StringPrinter,
+    &strings::ByteStringPrinter,
     &vec::SlicePrinter,
     &vec::RawSlicePrinter,
     &vec::VecPrinter,
@@ -40,6 +43,11 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &shared::SharedPrinter,
     &shared::CellPrinter,
     &maps::MapPrinter,
+    &collections::CollectionPrinter,
+    &newtypes::NewtypePrinter,
+    &newtypes::DurationPrinter,
+    &newtypes::MaybeUninitPrinter,
+    &newtypes::PhantomPrinter,
 ];
 
 fn field<'a>(value: ValueView<'a>, name: &str, types: &TypeTable) -> Option<ValueView<'a>>

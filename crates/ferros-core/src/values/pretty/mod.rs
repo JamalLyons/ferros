@@ -1,5 +1,6 @@
 //! Type-specific renderers for values whose logical contents differ from their fields.
 
+mod dyn_trait;
 mod enums;
 mod maps;
 mod shared;
@@ -31,6 +32,7 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &strings::StringPrinter,
     &vec::SlicePrinter,
     &vec::VecPrinter,
+    &dyn_trait::DynTraitPrinter,
     &vec::BoxPrinter,
     &shared::SharedPrinter,
     &shared::CellPrinter,

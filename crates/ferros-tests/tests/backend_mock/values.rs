@@ -167,6 +167,91 @@ fn oversized_piece_is_unavailable_through_session()
 }
 
 #[test]
+fn trait_objects_distinguish_exact_inferred_and_unknown_vtable_types()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let root = unit.root();
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let concrete = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(concrete)
+        .set(gimli::DW_AT_name, Attr::String(b"Reading".to_vec()));
+    unit.get_mut(concrete).set(gimli::DW_AT_byte_size, Attr::Udata(1));
+    let count = variable(unit, concrete, gimli::DW_TAG_member, Attr::String(b"count".to_vec()), byte);
+    unit.get_mut(count).set(gimli::DW_AT_data_member_location, Attr::Udata(0));
+
+    let storage = Address::new(BASE + 0x400);
+    let data = Address::new(BASE + 0x450);
+    let table = Address::new(BASE + 0x500);
+    let vtable_type = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(vtable_type)
+        .set(gimli::DW_AT_containing_type, Attr::UnitRef(concrete));
+    let vtable = variable(
+        unit,
+        root,
+        gimli::DW_TAG_variable,
+        Attr::String(b"<Reading as Shape>::{vtable}".to_vec()),
+        vtable_type,
+    );
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(table.value()));
+    unit.get_mut(vtable).set(gimli::DW_AT_location, Attr::Exprloc(location));
+
+    let method = Address::new(BASE + 0x200);
+    let implementation = unit.add(root, gimli::DW_TAG_subprogram);
+    let implementation = unit.get_mut(implementation);
+    implementation.set(gimli::DW_AT_name, Attr::String(b"<Reading as Shape>::area".to_vec()));
+    implementation.set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(method.value())));
+    implementation.set(gimli::DW_AT_high_pc, Attr::Udata(8));
+
+    let erased = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(erased)
+        .set(gimli::DW_AT_name, Attr::String(b"dyn Shape".to_vec()));
+    unit.get_mut(erased).set(gimli::DW_AT_byte_size, Attr::Udata(0));
+    let word = index_type(unit, gimli::DW_ATE_unsigned, 8);
+    let entries = array_with_bounds(unit, word, None, Attr::Udata(0), Attr::Udata(3));
+    let trait_object = unit.add(root, gimli::DW_TAG_structure_type);
+    unit.get_mut(trait_object)
+        .set(gimli::DW_AT_name, Attr::String(b"&dyn Shape".to_vec()));
+    unit.get_mut(trait_object).set(gimli::DW_AT_byte_size, Attr::Udata(16));
+    let mut add_member = |name: &[u8], offset, pointee| {
+        let pointer = unit.add(root, gimli::DW_TAG_pointer_type);
+        unit.get_mut(pointer).set(gimli::DW_AT_type, Attr::UnitRef(pointee));
+        let field = variable(unit, trait_object, gimli::DW_TAG_member, Attr::String(name.to_vec()), pointer);
+        unit.get_mut(field)
+            .set(gimli::DW_AT_data_member_location, Attr::Udata(offset));
+    };
+    add_member(b"pointer", 0, erased);
+    add_member(b"vtable", 8, entries);
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(storage.value()));
+    local(unit, function, "object", trait_object, location);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    session.write_memory(data, &[42]).expect("store object data");
+    let inferred = table + 0x20;
+    let unknown = table + 0x40;
+    for (vtable, entry) in [(inferred, method), (unknown, method + 4)] {
+        let bytes = [0, 1, 1, entry.value()]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect::<Vec<_>>();
+        session.write_memory(vtable, &bytes).expect("store mock vtable");
+    }
+    let addresses = format!("dyn {{ data: {data}, vtable: {unknown} }}");
+    let mut assert_rendered = |vtable: Address, expected: &str| {
+        let bytes = [data.value().to_le_bytes(), vtable.value().to_le_bytes()].concat();
+        session.write_memory(storage, &bytes).expect("store fat pointer");
+        let vars = session.selected_frame_variables().expect("read locals");
+        assert_eq!(session.format_variable(&vars[0], FormatOptions::default()).1, expected);
+    };
+    assert_rendered(table, "Reading { count: 42 }");
+    assert_rendered(inferred, "Reading { count: 42 } (type inferred from vtable methods)");
+    assert_rendered(unknown, &addresses);
+}
+
+#[test]
 fn bad_variable_name_leaves_its_neighbors_readable()
 {
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));

@@ -185,3 +185,8 @@ test = false
 name = "ferros-fixture-values_maps"
 path = "fixtures/values_maps.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-values_dyn"
+path = "fixtures/values_dyn.rs"
+test = false

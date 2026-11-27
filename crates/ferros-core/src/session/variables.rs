@@ -1,5 +1,6 @@
 //! Variable inspection through a stopped session.
 
+use std::cell::RefCell;
 use std::sync::PoisonError;
 
 use super::Session;
@@ -104,8 +105,18 @@ impl Session
             Some(ValueLocation::Memory(address)) => Some(address),
             _ => None,
         };
-        let mut read = |address, len| self.read_memory(address, len);
-        let text = ValueFormatter::new(types, image.endian(), options, &mut read).format(ValueView { ty, bytes, address });
+        self.begin_symbol_request();
+        let session = RefCell::new(self);
+        let mut read = |address, len| session.borrow_mut().read_memory(address, len);
+        let mut image_lookup = |address| {
+            let mut session = session.borrow_mut();
+            session.require_stopped().ok()?;
+            let _ = session.load_symbols_for_address(address);
+            session.symbols.image_for_address(address)
+        };
+        let text = ValueFormatter::new(types, image.endian(), options, &mut read)
+            .with_image_lookup(&mut image_lookup)
+            .format(ValueView { ty, bytes, address });
         (name, text)
     }
 }

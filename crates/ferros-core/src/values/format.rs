@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::{Display, Write as _};
+use std::sync::Arc;
 
 use gimli::RunTimeEndian;
 
@@ -9,6 +10,7 @@ use super::location::{Unavailable, value_size};
 use super::pretty::{PRINTERS, PrettyPrinter};
 use super::types::{BaseEncoding, Member, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
 use crate::error::Result as DebuggerResult;
+use crate::symbols::BinaryImage;
 use crate::types::Address;
 
 pub(super) const ELLIPSIS: &str = "...";
@@ -73,16 +75,23 @@ impl<'a> ValueView<'a>
     }
 }
 
-/// Formats values from one image and reads additional bytes from the stopped target.
+enum Types<'a>
+{
+    Borrowed(&'a TypeTable),
+    Shared(Arc<TypeTable>),
+}
+
+/// Formats typed values and reads additional bytes from the stopped target.
 pub struct ValueFormatter<'a>
 {
-    types: &'a TypeTable,
+    types: Types<'a>,
     endian: RunTimeEndian,
     options: FormatOptions,
     read: &'a mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
     printers: &'a [&'a dyn PrettyPrinter],
+    image_lookup: Option<&'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>>,
     // Printers can follow links and render a value already on the stack.
-    active: HashSet<(TypeId, Address)>,
+    active: HashSet<(*const TypeTable, TypeId, Address)>,
     depth: usize,
     remaining: usize,
     in_pointee: bool,
@@ -99,16 +108,28 @@ impl<'a> ValueFormatter<'a>
     ) -> Self
     {
         Self {
-            types,
+            types: Types::Borrowed(types),
             endian,
             options,
             read,
             printers: PRINTERS,
+            image_lookup: None,
             active: HashSet::new(),
             depth: 0,
             remaining: MAX_NODES,
             in_pointee: false,
         }
+    }
+
+    pub(crate) fn with_image_lookup(mut self, lookup: &'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>) -> Self
+    {
+        self.image_lookup = Some(lookup);
+        self
+    }
+
+    pub(super) fn image_at(&mut self, address: Address) -> Option<Arc<BinaryImage>>
+    {
+        self.image_lookup.as_mut()?(address)
     }
 
     /// Replace the registry with an ordered list of printers for this formatter.
@@ -121,9 +142,12 @@ impl<'a> ValueFormatter<'a>
 
     /// The image's type table.
     #[must_use]
-    pub const fn types(&self) -> &TypeTable
+    pub fn types(&self) -> &TypeTable
     {
-        self.types
+        match &self.types {
+            Types::Borrowed(types) => types,
+            Types::Shared(types) => types.as_ref(),
+        }
     }
 
     /// Byte order for target scalars and addresses.
@@ -181,6 +205,14 @@ impl<'a> ValueFormatter<'a>
         self.render(ty, Some(address), None)
     }
 
+    pub(super) fn format_at_in(&mut self, types: Arc<TypeTable>, ty: TypeId, address: Address) -> String
+    {
+        let previous = std::mem::replace(&mut self.types, Types::Shared(types));
+        let text = self.format_at(ty, address);
+        self.types = previous;
+        text
+    }
+
     fn render(&mut self, ty: TypeId, address: Option<Address>, bytes: Option<&[u8]>) -> String
     {
         if self.depth == 0 {
@@ -193,7 +225,8 @@ impl<'a> ValueFormatter<'a>
         if self.depth >= self.options.max_depth {
             return ELLIPSIS.to_owned();
         }
-        let key = address.map(|address| (self.types.strip_aliases(ty), address));
+        let types = self.types();
+        let key = address.map(|address| (std::ptr::from_ref(types), types.strip_aliases(ty), address));
         if key.is_some_and(|key| !self.active.insert(key)) {
             return "<cycle>".to_owned();
         }
@@ -208,14 +241,14 @@ impl<'a> ValueFormatter<'a>
 
     fn render_value(&mut self, mut id: TypeId, address: Option<Address>, bytes: Option<&[u8]>) -> String
     {
-        let Some(mut ty) = self.types.get(id) else {
+        let Some(mut ty) = self.types().get(id) else {
             return unavailable("type unknown");
         };
         let mut printer = self.printer(&ty);
         if printer.is_none() {
-            let underlying = self.types.strip_aliases(id);
+            let underlying = self.types().strip_aliases(id);
             if underlying != id
-                && let Some(base) = self.types.get(underlying)
+                && let Some(base) = self.types().get(underlying)
             {
                 ty = base;
                 id = underlying;
@@ -264,7 +297,10 @@ impl<'a> ValueFormatter<'a>
 
     fn printer(&self, ty: &Type) -> Option<&'a dyn PrettyPrinter>
     {
-        self.printers.iter().copied().find(|printer| printer.matches(ty, self.types))
+        self.printers
+            .iter()
+            .copied()
+            .find(|printer| printer.matches(ty, self.types()))
     }
 
     pub(super) fn format_members(&mut self, value: ValueView<'_>, members: &[Member], name: Option<&str>) -> String
@@ -286,7 +322,7 @@ impl<'a> ValueFormatter<'a>
                 children.push(ELLIPSIS.to_owned());
                 break;
             }
-            let text = match value.member(member, self.types) {
+            let text = match value.member(member, self.types()) {
                 Some(child) => self.format(child),
                 None => {
                     self.remaining -= 1;
@@ -319,7 +355,7 @@ impl<'a> ValueFormatter<'a>
         let Some(element) = element else {
             return unavailable("array element type unknown");
         };
-        let Some(size) = self.types.get(element).and_then(|ty| ty.size) else {
+        let Some(size) = self.types().get(element).and_then(|ty| ty.size) else {
             return unavailable("array element size unknown");
         };
         self.format_dimensions(address, bytes, element, size, lengths)

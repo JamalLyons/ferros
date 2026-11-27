@@ -40,6 +40,7 @@ mod values_dyn;
 mod values_enums;
 mod values_ffi_strings;
 mod values_maps;
+mod values_newtypes;
 mod values_paths;
 mod values_shared;
 mod values_std;

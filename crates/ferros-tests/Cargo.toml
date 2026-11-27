@@ -182,6 +182,11 @@ path = "fixtures/values_shared.rs"
 test = false
 
 [[bin]]
+name = "ferros-fixture-values_paths"
+path = "fixtures/values_paths.rs"
+test = false
+
+[[bin]]
 name = "ferros-fixture-values_maps"
 path = "fixtures/values_maps.rs"
 test = false

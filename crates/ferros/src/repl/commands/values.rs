@@ -1,6 +1,7 @@
 //! Inspect the values visible in the selected frame.
 
 use ferros_core::values::format::FormatOptions;
+use ferros_core::values::path::Path;
 use ferros_core::values::scope::Variable;
 
 use super::{CommandError, CommandResult, Flow, ReplCommand, no_args};
@@ -40,7 +41,7 @@ impl ReplCommand for Locals
     }
 }
 
-/// `print <name>`: show one of the selected frame's variables.
+/// `print <path>`: show one of the selected frame's variables, or a value inside it.
 pub struct Print;
 
 impl ReplCommand for Print
@@ -52,26 +53,37 @@ impl ReplCommand for Print
 
     fn summary(&self) -> &'static str
     {
-        "show one argument or local variable by name"
+        "show a variable, or a field, element or pointee inside one"
     }
 
     fn help(&self) -> &'static str
     {
-        "print <name>\n\nShow the type and value of an argument or local variable in the selected frame."
+        "print <path>\n\nShow the type and value of an argument or local variable in the selected frame, or of a \
+         value reached from it:\n  name        the variable\n  name.field  a struct field (name.0 for a tuple \
+         field)\n  name[n]     an element of an array, slice or Vec\n  *name       the value a reference, Box or \
+         raw pointer points to\n  (path)      grouping, as in (*name).field\n\nField access and indexing look \
+         through references and boxes. Function calls and operators are not supported."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
     {
-        if args.is_empty() || args.contains(char::is_whitespace) {
-            return Err(CommandError::new("usage: print <name>"));
+        if args.is_empty() {
+            return Err(CommandError::new("usage: print <path>"));
         }
+        let path = Path::parse(args).map_err(|error| CommandError::new(format!("invalid path '{args}': {error}")))?;
+        let root = path.root();
         let variables = ctx.session().selected_frame_variables()?;
         // Outer scopes precede inner scopes, so the last declaration wins when shadowed.
         let variable = variables
             .iter()
-            .rfind(|variable| variable.name == args)
-            .ok_or_else(|| CommandError::new(format!("no variable named '{args}' in the selected frame")))?;
-        write_variable(ctx, variable)?;
+            .rfind(|variable| variable.name == root)
+            .ok_or_else(|| CommandError::new(format!("no variable named '{root}' in the selected frame")))?;
+        let (ty, text) = ctx
+            .session()
+            .format_path(variable, &path, FormatOptions::default())
+            .map_err(|error| CommandError::new(format!("cannot evaluate '{path}': {error}")))?;
+        let ty = ty.as_deref().unwrap_or("?");
+        writeln!(ctx.out, "{path}: {ty} = {text}")?;
         Ok(Flow::Continue)
     }
 }

@@ -37,15 +37,15 @@ impl PrettyPrinter for VecPrinter
     }
 }
 
-pub(super) struct VecLayout
+pub(in crate::values) struct VecLayout
 {
-    pub(super) address: Address,
-    pub(super) len: u64,
-    pub(super) capacity: u64,
-    pub(super) element: TypeId,
+    pub(in crate::values) address: Address,
+    pub(in crate::values) len: u64,
+    pub(in crate::values) capacity: u64,
+    pub(in crate::values) element: TypeId,
 }
 
-pub(super) fn layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<VecLayout>
+pub(in crate::values) fn layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<VecLayout>
 {
     let ty = types.get(types.strip_aliases(value.ty))?;
     let TypeKind::Struct(layout) = &ty.kind else {

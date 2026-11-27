@@ -34,6 +34,7 @@
 //! | `threads`, `select_thread`, registers, memory, regions     | `NotAttached`       | yes                 | `NotStopped`   |
 //! | breakpoint add/remove/enable/disable                       | `NotAttached`       | yes                 | `NotStopped`   |
 //! | `stack_trace`, `symbolicate`, `images`                     | `NotAttached`       | yes                 | `NotStopped`   |
+//! | `select_frame`, `selected_stack_frame`                     | `NotAttached`       | yes                 | `NotStopped`   |
 //! | `breakpoint_info`                                          | `NotAttached`       | yes                 | yes            |
 //! | `wait(Some(timeout))`                                      | `NotAttached`       | yes (drains events) | yes            |
 //! | `wait(None)`                                               | `NotAttached`       | pending event, else `NotRunning` | yes |
@@ -48,6 +49,10 @@
 //!   is `None` (the initial stop has no event).
 //! - On a stop event that names a thread, that thread is selected. If the selected
 //!   thread no longer exists after a stop, the first thread is selected.
+//! - The selected frame is index 0, the innermost frame, after `launch`, `attach`,
+//!   every resume, every stop, and [`Session::select_thread`].
+//!   [`Session::select_frame`] chooses another frame of that thread. Inline frames
+//!   count, as in [`Session::stack_trace`].
 //! - A terminal event ([`StopEvent::is_terminal`]) moves the session to
 //!   [`SessionState::Exited`]: the pid, thread list and selection are cleared and the
 //!   breakpoint table is emptied (the process memory that held the traps is gone).
@@ -72,6 +77,7 @@
 
 mod breakpoints;
 mod exits;
+mod frames;
 mod images;
 mod lifecycle;
 mod line_stepping;
@@ -127,6 +133,9 @@ pub struct Session
     pid: Option<ProcessId>,
     threads: Vec<ThreadId>,
     selected: Option<ThreadId>,
+    /// Index into the selected thread's backtrace. `0` is the innermost frame.
+    /// Reset when the process resumes or stops and when the selected thread changes.
+    selected_frame: usize,
     last_stop: Option<StopEvent>,
     /// Whether the last reported signal has been carried or discarded.
     last_signal_taken: bool,
@@ -200,6 +209,7 @@ impl std::fmt::Debug for Session
             .field("pid", &self.pid)
             .field("threads", &self.threads)
             .field("selected", &self.selected)
+            .field("selected_frame", &self.selected_frame)
             .field("last_stop", &self.last_stop)
             .field("breakpoints", &self.breakpoints)
             .finish_non_exhaustive()
@@ -328,6 +338,7 @@ impl Session
             pid: None,
             threads: Vec::new(),
             selected: None,
+            selected_frame: 0,
             last_stop: None,
             last_signal_taken: false,
             deferred: None,
@@ -479,11 +490,15 @@ impl Session
 
     fn fix_selection(&mut self, preferred: Option<ThreadId>)
     {
+        let previous = self.selected;
         let exists = |thread: &ThreadId| self.threads.contains(thread);
         self.selected = preferred
             .filter(exists)
             .or_else(|| self.selected.filter(exists))
             .or_else(|| self.threads.first().copied());
+        if self.selected != previous {
+            self.reset_selected_frame();
+        }
     }
 
     /// Forget everything about the current process (after detach or a terminal event).
@@ -493,6 +508,7 @@ impl Session
         self.ownership = None;
         self.threads.clear();
         self.selected = None;
+        self.reset_selected_frame();
         self.deferred = None;
         self.step_plan = None;
         self.line_plan = None;
@@ -541,7 +557,7 @@ impl Session
     }
 
     /// Select `thread`, which must be one of the threads known since the last stop
-    /// (see [`threads`](Self::threads)).
+    /// (see [`threads`](Self::threads)). The selected frame becomes the innermost one.
     ///
     /// # Errors
     ///
@@ -555,6 +571,7 @@ impl Session
             return Err(DebuggerError::ThreadNotFound(thread.0));
         }
         self.selected = Some(thread);
+        self.reset_selected_frame();
         Ok(())
     }
 

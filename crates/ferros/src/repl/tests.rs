@@ -209,6 +209,30 @@ fn memory_read_failure_is_an_error()
 }
 
 #[test]
+fn frame_commands_print_the_only_frame_and_stop_at_the_ends()
+{
+    let mock = mock();
+    let commands = vec!["frame", "up", "down", "frame 1", "help"];
+    let t = batch(&mock, &commands);
+    assert!(t.out.contains("#0 0x0000000000010000 * in ??\n"), "{}", t.out);
+    assert!(t.err.contains("error: already at the oldest frame\n"), "{}", t.err);
+    assert!(t.err.contains("error: already at the newest frame\n"), "{}", t.err);
+    assert!(
+        t.err
+            .contains("error: Invalid argument: no frame 1 (the stack has 1 frames)\n"),
+        "{}",
+        t.err
+    );
+    for name in ["frame", "up", "down"] {
+        assert!(
+            t.out.lines().any(|line| line.split_whitespace().next() == Some(name)),
+            "help missing {name}:\n{}",
+            t.out
+        );
+    }
+}
+
+#[test]
 fn registers_show_the_selected_thread()
 {
     let mock = mock();

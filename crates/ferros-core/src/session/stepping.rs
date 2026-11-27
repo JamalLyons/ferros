@@ -496,6 +496,7 @@ impl Session
     {
         self.state = SessionState::Running;
         self.last_stop = None;
+        self.reset_selected_frame();
         Ok(())
     }
 
@@ -564,6 +565,7 @@ impl Session
                     self.state = SessionState::Stopped;
                     self.sync_threads(None);
                     self.last_stop = None;
+                    self.reset_selected_frame();
                     return Err(error);
                 }
             }

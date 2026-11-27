@@ -17,6 +17,7 @@ mod error_codes;
 mod exit_watcher;
 mod fixture_staging;
 mod fixtures;
+mod frames;
 mod harness;
 mod images;
 mod lifecycle;

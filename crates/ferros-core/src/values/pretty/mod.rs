@@ -9,6 +9,7 @@ mod vec;
 
 use gimli::RunTimeEndian;
 
+pub(super) use self::vec::layout as vec_layout;
 use super::format::{ValueFormatter, ValueView, format_raw, unsigned};
 use super::types::{BaseEncoding, Type, TypeId, TypeKind, TypeTable};
 use crate::types::Address;
@@ -75,7 +76,11 @@ fn thin_pointer(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) 
 }
 
 // rustc describes strings and slices with the same named data and length fields.
-fn fat_pointer(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<(Address, u64, TypeId)>
+pub(in crate::values) fn fat_pointer(
+    value: ValueView<'_>,
+    types: &TypeTable,
+    endian: RunTimeEndian,
+) -> Option<(Address, u64, TypeId)>
 {
     let (address, element) = thin_pointer(field(value, "data_ptr", types)?, types, endian)?;
     let len = usize_value(field(value, "length", types)?, types, endian)?;

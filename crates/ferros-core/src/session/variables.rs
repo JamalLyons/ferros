@@ -1,14 +1,17 @@
 //! Variable inspection through a stopped session.
 
 use std::cell::RefCell;
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 
 use super::Session;
 use crate::error::{DebuggerError, Result};
+use crate::symbols::BinaryImage;
+use crate::types::Address;
 use crate::values::format::{FormatOptions, ValueFormatter, ValueView, format_raw};
-use crate::values::location::ValueLocation;
+use crate::values::location::{Unavailable, ValueLocation};
+use crate::values::path::{Path, PathError, Place, Storage, evaluate};
 use crate::values::scope::{Variable, frame_variables};
-use crate::values::types::DieOffset;
+use crate::values::types::{DieOffset, TypeId};
 
 impl Session
 {
@@ -101,9 +104,58 @@ impl Session
         let Ok(bytes) = bytes else {
             return (name, format_raw(bytes));
         };
-        let address = match variable.value.location {
-            Some(ValueLocation::Memory(address)) => Some(address),
-            _ => None,
+        let text = self.format_storage(&image, ty, &Storage::Bytes(bytes.to_vec(), memory_address(variable)), options);
+        (name, text)
+    }
+
+    /// Evaluate `path` from `root`, the variable named by [`Path::root`], and render the
+    /// value it selects. Returns the value's type name, if known, and its text. A path
+    /// that is only the variable's name renders as [`Self::format_variable`].
+    ///
+    /// # Errors
+    ///
+    /// A [`PathError`] naming the segment that cannot be evaluated: an unknown field, an
+    /// index out of bounds, a null dereference, an unreadable pointer or a value of the
+    /// wrong kind.
+    pub fn format_path(
+        &mut self,
+        root: &Variable,
+        path: &Path,
+        options: FormatOptions,
+    ) -> std::result::Result<(Option<String>, String), PathError>
+    {
+        if path.is_variable() {
+            return Ok(self.format_variable(root, options));
+        }
+        let unknown = || PathError::root(path, "type unknown");
+        let image = self.symbols.image_by_id(root.image_id).ok_or_else(unknown)?;
+        let types = image.types().map_err(|_| unknown())?;
+        let ty = root
+            .type_offset
+            .and_then(|offset| types.type_at(DieOffset(offset.0 as u64)))
+            .ok_or_else(unknown)?;
+        let bytes = root
+            .value
+            .bytes
+            .as_ref()
+            .map_err(|reason| PathError::root(path, reason.to_string()))?;
+        let root_place = Place {
+            ty,
+            storage: Storage::Bytes(bytes.clone(), memory_address(root)),
+        };
+        let place = {
+            let mut read = |address, len| self.read_memory(address, len);
+            evaluate(path, root_place, types, image.endian(), &mut read)?
+        };
+        let name = types.get(place.ty).and_then(|ty| ty.name.clone());
+        let text = self.format_storage(&image, place.ty, &place.storage, options);
+        Ok((name, text))
+    }
+
+    fn format_storage(&mut self, image: &Arc<BinaryImage>, ty: TypeId, storage: &Storage, options: FormatOptions) -> String
+    {
+        let Ok(types) = image.types() else {
+            return format_raw(Err(&Unavailable::SizeUnknown));
         };
         self.begin_symbol_request();
         let session = RefCell::new(self);
@@ -114,9 +166,23 @@ impl Session
             let _ = session.load_symbols_for_address(address);
             session.symbols.image_for_address(address)
         };
-        let text = ValueFormatter::new(types, image.endian(), options, &mut read)
-            .with_image_lookup(&mut image_lookup)
-            .format(ValueView { ty, bytes, address });
-        (name, text)
+        let mut formatter =
+            ValueFormatter::new(types, image.endian(), options, &mut read).with_image_lookup(&mut image_lookup);
+        match storage {
+            Storage::Bytes(bytes, address) => formatter.format(ValueView {
+                ty,
+                bytes,
+                address: *address,
+            }),
+            Storage::Memory(address) => formatter.format_at(ty, *address),
+        }
+    }
+}
+
+fn memory_address(variable: &Variable) -> Option<Address>
+{
+    match variable.value.location {
+        Some(ValueLocation::Memory(address)) => Some(address),
+        _ => None,
     }
 }

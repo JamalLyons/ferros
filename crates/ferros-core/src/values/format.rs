@@ -7,11 +7,11 @@ use gimli::RunTimeEndian;
 
 use super::location::{Unavailable, value_size};
 use super::pretty::{PRINTERS, PrettyPrinter};
-use super::types::{ArrayType, BaseEncoding, Member, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
+use super::types::{BaseEncoding, Member, PointerKind, PointerType, Type, TypeId, TypeKind, TypeTable};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
 
-const ELLIPSIS: &str = "...";
+pub(super) const ELLIPSIS: &str = "...";
 // Depth and per-aggregate limits alone allow exponential expansion of wide, nested values.
 const MAX_NODES: usize = 1024;
 
@@ -218,7 +218,7 @@ impl<'a> ValueFormatter<'a>
         if printer.is_none()
             && let (None, Some(_), TypeKind::Array(array)) = (bytes, address, &ty.kind)
         {
-            return self.format_array(array, address, None);
+            return self.format_sequence(array.element, &array.lengths, address, None);
         }
         let owned;
         let bytes = match (bytes, address) {
@@ -246,7 +246,7 @@ impl<'a> ValueFormatter<'a>
             TypeKind::Base(encoding) => format_base(*encoding, name, self.endian, value.bytes),
             TypeKind::Struct(fields) if !ty.declaration => self.format_members(value, &fields.members, Some(name)),
             TypeKind::Tuple(fields) if !ty.declaration => self.format_members(value, &fields.members, None),
-            TypeKind::Array(array) => self.format_array(array, address, Some(bytes)),
+            TypeKind::Array(array) => self.format_sequence(array.element, &array.lengths, address, Some(bytes)),
             TypeKind::Pointer(pointer) => self.format_pointer(value, pointer),
             TypeKind::Enum(_) | TypeKind::Enumeration(_) => format!("<enum {name}>"),
             TypeKind::Unreadable(reason) => unavailable(reason),
@@ -300,15 +300,21 @@ impl<'a> ValueFormatter<'a>
         }
     }
 
-    fn format_array(&mut self, array: &ArrayType, address: Option<Address>, bytes: Option<&[u8]>) -> String
+    pub(super) fn format_sequence(
+        &mut self,
+        element: Option<TypeId>,
+        lengths: &[Option<u64>],
+        address: Option<Address>,
+        bytes: Option<&[u8]>,
+    ) -> String
     {
-        let Some(element) = array.element else {
+        let Some(element) = element else {
             return unavailable("array element type unknown");
         };
         let Some(size) = self.types.get(element).and_then(|ty| ty.size) else {
             return unavailable("array element size unknown");
         };
-        self.format_dimensions(address, bytes, element, size, &array.lengths)
+        self.format_dimensions(address, bytes, element, size, lengths)
     }
 
     fn format_dimensions(

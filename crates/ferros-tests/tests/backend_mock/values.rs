@@ -484,3 +484,25 @@ fn unavailable_pointee_preserves_the_rest_of_the_value()
     );
     assert!(text.ends_with(">, byte: 42 }"), "{text}");
 }
+
+#[test]
+fn unknown_string_layout_shows_raw_fields()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let string = unit.add(unit.root(), gimli::DW_TAG_structure_type);
+    unit.get_mut(string).set(gimli::DW_AT_name, Attr::String(b"&str".to_vec()));
+    unit.get_mut(string).set(gimli::DW_AT_byte_size, Attr::Udata(1));
+    let field = variable(unit, string, gimli::DW_TAG_member, Attr::String(b"unknown".to_vec()), byte);
+    unit.get_mut(field).set(gimli::DW_AT_data_member_location, Attr::Udata(0));
+    local(unit, function, "text", string, register_location());
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let vars = session.selected_frame_variables().expect("mock string");
+    assert_eq!(
+        session.format_variable(&vars[0], FormatOptions::default()).1,
+        "&str { unknown: 7 } <unrecognized layout>"
+    );
+}

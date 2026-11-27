@@ -1,5 +1,5 @@
-//! Unions, function pointers, raw slice pointers and vector iterators for the value
-//! formatter integration test (issue #412).
+//! Unions, function pointers, raw slice and `str` pointers, and vector and array iterators
+//! for the value formatter integration test (issue #412).
 #![expect(dead_code, reason = "the debugger reads these fields; the program does not")]
 
 use std::hint::black_box;
@@ -62,7 +62,14 @@ fn main()
     let mut remaining = vec![1_u32, 2, 3].into_iter();
     let first = remaining.next();
     let empty = Vec::<u64>::new().into_iter();
+    let mut array_iter = [1_u8, 2, 3].into_iter();
+    let array_first = array_iter.next();
+    let uninit = std::mem::MaybeUninit::new(0x0102_0304_u32);
+    let text = "hi there";
+    let raw_str: *const str = text;
+    let raw_mut_str: *mut str = std::ptr::from_ref::<str>(text).cast_mut();
 
     black_box((&bits, &word, &stray, &handler, &raw_slice, &null_slice, &data_ref)); // BREAK: inspect
     black_box((callback(1, 2), &remaining, &first, &empty));
+    black_box((&array_iter, &array_first, &uninit, &raw_str, &raw_mut_str));
 }

@@ -38,6 +38,7 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &vec::RawSlicePrinter,
     &vec::VecPrinter,
     &vec::IntoIterPrinter,
+    &vec::ArrayIntoIterPrinter,
     &dyn_trait::DynTraitPrinter,
     &vec::BoxPrinter,
     &shared::SharedPrinter,

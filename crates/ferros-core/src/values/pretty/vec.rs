@@ -1,4 +1,5 @@
-//! Render slices, vectors and boxes using their debug info.
+//! Render slices, raw slice and `str` pointers, vectors, vector and array `IntoIter`s, and
+//! boxes using their debug info.
 
 use gimli::RunTimeEndian;
 
@@ -9,6 +10,8 @@ use crate::values::types::{PointerKind, Type, TypeId, TypeKind, TypeTable};
 
 const VEC_NAME: &str = "alloc::vec::Vec<";
 const INTO_ITER_NAME: &str = "alloc::vec::into_iter::IntoIter<";
+const ARRAY_INTO_ITER_NAME: &str = "core::array::iter::IntoIter<";
+const RAW_FAT_POINTERS: &[&str] = &["*const [", "*mut [", "*const str", "*mut str"];
 
 pub(super) struct VecPrinter;
 
@@ -135,7 +138,7 @@ impl PrettyPrinter for RawSlicePrinter
             && ty
                 .name
                 .as_deref()
-                .is_some_and(|name| name.starts_with("*const [") || name.starts_with("*mut ["))
+                .is_some_and(|name| RAW_FAT_POINTERS.iter().any(|prefix| name.starts_with(prefix)))
     }
 
     // A raw pointer may dangle, so its elements are not read.
@@ -189,6 +192,51 @@ fn into_iter_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndi
         (distance % size == 0).then_some(distance / size)?
     };
     Some((ptr, len, element))
+}
+
+pub(super) struct ArrayIntoIterPrinter;
+
+impl PrettyPrinter for ArrayIntoIterPrinter
+{
+    fn matches(&self, ty: &Type, _types: &TypeTable) -> bool
+    {
+        matches!(ty.kind, TypeKind::Struct(_))
+            && ty.name.as_deref().is_some_and(|name| name.starts_with(ARRAY_INTO_ITER_NAME))
+    }
+
+    // The slots outside `alive` are uninitialized, so only `alive` is shown, as `T`s.
+    fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        let Some((alive, len, element)) = array_into_iter_layout(value, formatter.types(), formatter.endian()) else {
+            return raw_layout(value, formatter);
+        };
+        formatter.format_sequence(Some(element), &[Some(len)], alive.address, Some(alive.bytes))
+    }
+}
+
+// Recent versions hold `alive` and `data: [MaybeUninit<T>; N]` in an `inner:
+// ManuallyDrop<PolymorphicIter<..>>` field.
+fn array_into_iter_layout<'a>(
+    value: ValueView<'a>,
+    types: &TypeTable,
+    endian: RunTimeEndian,
+) -> Option<(ValueView<'a>, u64, TypeId)>
+{
+    let ty = types.get(types.strip_aliases(value.ty))?;
+    let TypeKind::Struct(layout) = &ty.kind else {
+        return None;
+    };
+    let element = layout.template_param("T")?.ty?;
+    let size = types.get(element)?.size?;
+    let state = field(value, "inner", types).map_or(value, |inner| field(inner, "value", types).unwrap_or(inner));
+    let alive = field(state, "alive", types)?;
+    let start = usize_value(field(alive, "start", types)?, types, endian)?;
+    let end = usize_value(field(alive, "end", types)?, types, endian)?;
+    let data = field(state, "data", types)?;
+    let len = end.checked_sub(start)?;
+    let offset = start.checked_mul(size)?;
+    let live = data.slice(element, offset, len.checked_mul(size)?)?;
+    Some((live, len, element))
 }
 
 pub(super) struct BoxPrinter;

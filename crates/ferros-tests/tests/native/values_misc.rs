@@ -22,9 +22,24 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             "alloc::vec::into_iter::IntoIter<u32, alloc::alloc::Global> = [2, 3]",
         ),
         ("empty", "alloc::vec::into_iter::IntoIter<u64, alloc::alloc::Global> = []"),
+        // Only the slots not yet yielded, read as `u8`, not as `MaybeUninit` union members.
+        ("array_iter", "core::array::iter::IntoIter<u8, 3> = [2, 3]"),
+        (
+            "uninit",
+            "core::mem::maybe_uninit::MaybeUninit<u32> = MaybeUninit(<maybe uninit> 0x01020304)",
+        ),
     ];
     // Checked below against addresses read from the same run.
-    const OTHERS: &[&str] = &["callback", "handler", "stray", "raw_slice", "null_slice", "data_ref"];
+    const OTHERS: &[&str] = &[
+        "callback",
+        "handler",
+        "stray",
+        "raw_slice",
+        "null_slice",
+        "data_ref",
+        "raw_str",
+        "raw_mut_str",
+    ];
     let _ = transcript::ferros_bin();
     harness::run(|t| {
         let fixture = fixture!("values_misc");
@@ -88,5 +103,17 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             .map_or_else(|| panic!("data_ref: {data}"), |(address, _)| address);
         assert_eq!(raw_slice, format!("*const [u8] = {data_address} (len: 2)"));
         assert_eq!(rendered("null_slice"), "*mut [u8] = 0x0 (len: 0)");
+
+        // A raw `str` pointer is shown the same way; both point at the same literal.
+        let raw_str = rendered("raw_str");
+        let str_address = raw_str
+            .strip_prefix("*const str = 0x")
+            .and_then(|value| value.strip_suffix(" (len: 8)"))
+            .unwrap_or_else(|| panic!("raw_str: {raw_str}"));
+        assert!(
+            u64::from_str_radix(str_address, 16).is_ok_and(|address| address != 0),
+            "raw_str: {raw_str}"
+        );
+        assert_eq!(rendered("raw_mut_str"), format!("*mut str = 0x{str_address} (len: 8)"));
     });
 }

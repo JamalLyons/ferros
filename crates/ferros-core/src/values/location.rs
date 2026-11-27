@@ -1,8 +1,8 @@
 //! Evaluate DWARF locations against the registers and memory of a stopped frame.
 
 use gimli::{
-    AttributeValue, EvaluationResult, Expression, Location, RawLocListEntry, Reader as _, RunTimeEndian, Section as _,
-    UnitRef, Value,
+    AttributeValue, Encoding, EvaluationResult, Expression, Location, Operation, RawLocListEntry, Reader as _,
+    RunTimeEndian, Section as _, UnitRef, Value,
 };
 
 use crate::error::Result as DebuggerResult;
@@ -72,6 +72,9 @@ pub enum Unavailable
     /// Malformed DWARF or a piece that does not fit its stated size.
     #[error("invalid DWARF location: {0}")]
     InvalidDwarf(#[from] gimli::Error),
+    /// The variable's type or other metadata could not be read.
+    #[error("invalid DWARF variable metadata: {0}")]
+    InvalidMetadata(gimli::Error),
     /// A file address from DWARF could not be mapped into the loaded image.
     #[error("unmapped DWARF address 0x{0:x}")]
     UnmappedAddress(u64),
@@ -235,7 +238,9 @@ where
                 Unavailable::FrameBaseUnknown
             });
         }
-        let mut evaluation = expression.evaluation(self.unit.encoding());
+        let encoding = self.unit.encoding();
+        validate_piece_sizes(expression.0.clone(), encoding)?;
+        let mut evaluation = expression.evaluation(encoding);
         evaluation.set_max_iterations(4096);
         let mut state = evaluation.evaluate()?;
         loop {
@@ -381,6 +386,33 @@ fn value_size(size: Option<u64>) -> EvalResult<usize>
         return Err(Unavailable::TooLarge);
     }
     Ok(size as usize)
+}
+
+/// gimli 0.32 multiplies a `DW_OP_piece` byte count by eight before checking it.
+/// Inspect that operand before gimli parses the operation. Branch targets must stay
+/// on operation boundaries so evaluation cannot reinterpret unvalidated operands.
+fn validate_piece_sizes(mut input: OwnedReader, encoding: Encoding) -> gimli::Result<()>
+{
+    let len = input.len();
+    let mut starts = Vec::new();
+    let mut targets = Vec::new();
+    while !input.is_empty() {
+        starts.push(len - input.len());
+        let mut probe = input.clone();
+        if probe.read_u8()? == gimli::DW_OP_piece.0 && probe.read_uleb128()?.checked_mul(8).is_none() {
+            return Err(gimli::Error::InvalidPiece);
+        }
+        if let Operation::Bra { target } | Operation::Skip { target } = Operation::parse(&mut input, encoding)? {
+            let next = len - input.len();
+            targets.push(next.wrapping_add_signed(isize::from(target)));
+        }
+    }
+    for target in targets {
+        if target != len && starts.binary_search(&target).is_err() {
+            return Err(gimli::Error::BadBranchTarget(target as u64));
+        }
+    }
+    Ok(())
 }
 
 fn byte_aligned(bits: u64) -> EvalResult<usize>
@@ -588,5 +620,29 @@ pub(super) mod tests
         let value = evaluator.read_value(expr(&ops, endian), None);
         assert_eq!(value.location, Some(ValueLocation::Memory(Address::new(0x5020))));
         assert_eq!(value.bytes, Err(Unavailable::SizeUnknown));
+    }
+
+    #[test]
+    fn rejects_piece_size_that_cannot_be_represented_in_bits()
+    {
+        use gimli::write::{self, Writer as _};
+
+        let endian = RunTimeEndian::Little;
+        let dwarf = synthetic_dwarf(DwarfUnit::new(encoding(4)), endian);
+        let unit = dwarf.unit(dwarf.units().next().unwrap().unwrap()).unwrap();
+        let registers = frame_registers();
+        let mut evaluator = LocationEvaluator::new(
+            UnitRef::new(&dwarf, &unit),
+            &registers,
+            |_, _| panic!("malformed location must not read memory"),
+            |_| None,
+            Ok(None),
+        );
+        let mut ops = write::EndianVec::new(endian);
+        ops.write_u8(op::DW_OP_reg0.0).unwrap();
+        ops.write_u8(op::DW_OP_piece.0).unwrap();
+        ops.write_uleb128(u64::MAX / 8 + 1).unwrap();
+        let value = evaluator.read_value(expr(ops.slice(), endian), Some(1));
+        assert_eq!(value.bytes, Err(Unavailable::InvalidDwarf(gimli::Error::InvalidPiece)));
     }
 }

@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `(source, compiler flags, fixture)`.
-static SOURCES: [(&str, &[&str], &str); 5] = [
+static SOURCES: [(&str, &[&str], &str); 6] = [
     ("fixtures/asm/frameless_stack.s", &[], "frameless_stack"),
     ("fixtures/c/long_jump.c", &["-g", "-O0"], "long_jump"),
     ("fixtures/c/pthread_once.c", &["-g", "-O0"], "pthread_once"),
     ("fixtures/c/soft_faults.c", &["-g", "-O0"], "soft_faults"),
     ("fixtures/c/dyld_aliases.c", &["-g", "-O0"], "dyld_aliases"),
+    ("fixtures/c/values_registers.c", &["-g", "-O2"], "values_basic"),
 ];
 
 const ALIAS_LIBRARY_SOURCE: &str = "fixtures/c/alias_library.c";

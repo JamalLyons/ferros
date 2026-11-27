@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use ferros_core::values::location::ValueLocation;
+use ferros_core::values::location::{Unavailable, ValueLocation};
 use ferros_core::values::scope::Variable;
 use ferros_core::{BreakpointLocation, StopEvent};
 use ferros_tests::{fixture, harness, transcript};
@@ -11,6 +11,17 @@ use ferros_tests::{fixture, harness, transcript};
 #[test]
 fn reads_locals_and_arguments_in_the_callee_and_caller()
 {
+    const CALLEE_DECLARATIONS: &[&str] = &[
+        "int_arg",
+        "float_arg",
+        "bool_arg",
+        "char_arg",
+        "int_local",
+        "float_local",
+        "bool_local",
+        "char_local",
+        "array_local",
+    ];
     harness::run(|t| {
         let fixture = fixture!("values_basic");
         let mut d = t.launch(&fixture);
@@ -29,6 +40,10 @@ fn reads_locals_and_arguments_in_the_callee_and_caller()
         assert!(matches!(stop, Some(StopEvent::Breakpoint { .. })), "got {stop:?}");
 
         let current = d.selected_frame_variables().expect("callee locals");
+        let array = current.iter().find(|var| var.name == "array_local").expect("array local");
+        assert_eq!(array.value.bytes.as_deref(), Ok(&[0x10, 0x32, 0x54, 0x76][..]));
+        let names = current.iter().map(|var| var.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, CALLEE_DECLARATIONS);
         assert_value(&current, "int_arg", "i32", &37_i32.to_le_bytes());
         assert_value(&current, "float_arg", "f64", &6.5_f64.to_le_bytes());
         assert_value(&current, "bool_arg", "bool", &[1]);
@@ -88,6 +103,35 @@ fn reads_only_the_selected_inline_or_physical_scope()
         let owner = d.selected_frame_variables().expect("owner locals");
         assert_value(&owner, "owner_local", "u32", &31_u32.to_le_bytes());
         assert!(!owner.iter().any(|var| var.name.starts_with("inline_")), "{owner:?}");
+    });
+}
+
+#[test]
+fn caller_saved_location_is_unavailable_in_a_real_caller()
+{
+    harness::run(|t| {
+        let fixture = fixture!("values_basic");
+        let mut debuggee = t.launch(&fixture);
+        debuggee
+            .set_breakpoint(BreakpointLocation::Function("values_register_stop".to_owned()))
+            .expect("break in the optimized callee");
+        debuggee.resume().expect("resume");
+        let stop = debuggee.wait(Some(Duration::from_secs(5))).expect("wait");
+        assert!(matches!(stop, Some(StopEvent::Breakpoint { .. })), "got {stop:?}");
+
+        let caller = debuggee.select_frame(1).expect("select the optimized caller");
+        assert!(
+            caller
+                .symbol
+                .is_some_and(|symbol| symbol.raw().contains("values_register_caller"))
+        );
+        let variables = debuggee.selected_frame_variables().expect("optimized caller locals");
+        let argument = variables
+            .iter()
+            .find(|var| var.name == "volatile_arg")
+            .expect("argument described by the caller's location list");
+        assert_eq!(argument.value.location, Some(ValueLocation::Register(0)));
+        assert_eq!(argument.value.bytes, Err(Unavailable::RegisterUnknown(0)));
     });
 }
 

@@ -7,7 +7,8 @@ fn callee(int_arg: i32, float_arg: f64, bool_arg: bool, char_arg: char)
     let float_local = black_box(1.25_f64);
     let bool_local = black_box(false);
     let char_local = black_box('λ');
-    black_box((int_local, float_local, bool_local, char_local)); // BREAK: callee_locals
+    let array_local = black_box([0x10_u8, 0x32, 0x54, 0x76]);
+    black_box((int_local, float_local, bool_local, char_local, array_local)); // BREAK: callee_locals
     {
         let later_local = black_box(101_u32);
         black_box(later_local); // BREAK: later_local

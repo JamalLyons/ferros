@@ -32,6 +32,8 @@
 //! - [gimli crate documentation](https://docs.rs/gimli/0.32.3/gimli/)
 //! - [addr2line crate documentation](https://docs.rs/addr2line/0.25.1/addr2line/)
 
+use std::borrow::Cow;
+
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
 pub mod cache;
@@ -46,6 +48,12 @@ pub mod unwind;
 // Shared type aliases
 pub(crate) type OwnedReader = EndianArcSlice<RunTimeEndian>;
 pub(crate) type OwnedDwarf = Dwarf<OwnedReader>;
+
+/// A readable name makes this addr2line entry a logical stack frame.
+pub(crate) fn dwarf_frame_name<'a>(frame: &'a addr2line::Frame<'_, OwnedReader>) -> Option<Cow<'a, str>>
+{
+    frame.function.as_ref()?.raw_name().ok()
+}
 
 // Re-exports
 pub use cache::{SymbolCache, SymbolFrame, Symbolication};

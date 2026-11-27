@@ -13,6 +13,7 @@ impl Session
     /// Frame selection includes inline frames. A caller's scopes and location lists
     /// are evaluated at the call instruction. A frame without source debug information
     /// returns an empty list. Unavailable values have a reason on their own entry.
+    /// Arguments precede locals, and outer lexical scopes precede nested scopes.
     ///
     /// # Errors
     ///
@@ -47,7 +48,15 @@ impl Session
         let Some(file_pc) = image.file_address(pc) else {
             return Ok(Vec::new());
         };
-        let context = image.symbol_context()?.lock().unwrap_or_else(PoisonError::into_inner);
+        let debug_info_error = |detail| DebuggerError::NoDebugInfo {
+            path: image.path().to_path_buf(),
+            detail,
+        };
+        let context = image
+            .symbol_context()
+            .map_err(|error| debug_info_error(error.to_string()))?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         frame_variables(
             &context,
             file_pc,
@@ -57,6 +66,6 @@ impl Session
             |address, len| self.read_memory(address, len),
             |address| image.runtime_address(address),
         )
-        .map_err(|error| DebuggerError::InvalidArgument(format!("failed to read variable DWARF: {error}")))
+        .map_err(|error| debug_info_error(format!("failed to walk variable DWARF: {error}")))
     }
 }

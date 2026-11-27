@@ -21,10 +21,12 @@ fn print_resolves_concrete_types_through_vtables()
         let run = transcript::launch_batch(&t.tag(), &fixture, &[], &commands);
         assert!(run.status.success(), "status {:?}, stderr: {}", run.status, run.stderr);
         let rendered = |name: &str| {
-            run.stdout
+            let value = run
+                .stdout
                 .lines()
                 .find_map(|line| line.strip_prefix(name)?.split_once(" = ").map(|(_, value)| value))
-                .unwrap_or_else(|| panic!("missing {name} in:\n{}", run.stdout))
+                .unwrap_or_else(|| panic!("missing {name} in:\n{}", run.stdout));
+            value.strip_suffix(" (type inferred from vtable methods)").unwrap_or(value)
         };
         assert_eq!(rendered("debug: "), "ferros_fixture_values_dyn::Reading { count: 11 }");
         assert_eq!(

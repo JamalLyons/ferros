@@ -51,24 +51,32 @@ impl PrettyPrinter for DynTraitPrinter
             .and_then(|types| {
                 let ty = types.concrete_type_for_vtable(image.file_address(vtable)?)?;
                 let concrete = types.get(ty)?;
-                (concrete.size.is_some() && !concrete.declaration).then(|| (types.clone(), ty))
+                (concrete.size.is_some() && !concrete.declaration).then(|| (types.clone(), ty, false))
             })
             .or_else(|| {
                 let (principal, entries) = method_layout(erased.as_deref()?, table_type.as_deref()?)?;
                 from_methods(formatter, vtable, vtable_field.bytes.len(), entries, principal)
+                    .map(|(types, ty)| (types, ty, true))
             });
-        let Some((types, ty)) = concrete else {
+        let Some((types, ty, inferred)) = concrete else {
             return fallback();
         };
         let concrete = types.get(ty);
         let rendered = formatter.format_at_in(types, ty, data);
-        match concrete.as_ref().and_then(|ty| ty.name.as_deref()) {
+        let rendered = match concrete.as_ref().and_then(|ty| ty.name.as_deref()) {
             Some(name)
                 if rendered != ELLIPSIS && !rendered.strip_prefix(name).is_some_and(|rest| rest.starts_with([' ', '('])) =>
             {
                 format!("{name} = {rendered}")
             }
             _ => rendered,
+        };
+        // Optimizers can share a method body between distinct impls and retain only
+        // one impl's debug info at the entry, even when the vtables belong to different types.
+        if inferred && rendered != ELLIPSIS {
+            format!("{rendered} (type inferred from vtable methods)")
+        } else {
+            rendered
         }
     }
 }

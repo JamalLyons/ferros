@@ -15,6 +15,10 @@ fn main()
     let path = Path::new("/tmp/café");
     let invalid = OsString::from_vec(vec![b'a', 0xff, b'b', 0xc3]);
     let boxed_path: Box<Path> = Path::new("/boxed").into();
+    let boxed_c_str: Box<CStr> = c"boxed c".into();
+    let boxed_os_str: Box<OsStr> = OsStr::new("boxed os").into();
+    let mut owned_path: Box<Path> = Path::new("/mut").into();
+    let mut_path: &mut Path = &mut owned_path;
     // An invalid byte inside the preview, then a character the 256-byte limit cuts short.
     let mut long_bytes = vec![0xff];
     long_bytes.resize(255, b'a');
@@ -27,4 +31,5 @@ fn main()
     black_box(&c_string); // BREAK: inspect
     black_box((&c_str, &os_string, &os_str, &path_buf, &path, &invalid));
     black_box((&boxed_path, &long_os, &text, &owned, &boxed_str));
+    black_box((&boxed_c_str, &boxed_os_str, &mut_path));
 }

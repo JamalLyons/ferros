@@ -181,7 +181,7 @@ impl PrettyPrinter for ByteStringPrinter
 
 /// The byte type behind a borrowed FFI or OS string's pointee. A reference to `Path`,
 /// `OsStr` or `CStr` points at the unsized struct, whose `inner` fields at offset zero
-/// end in a byte slice. Other element types are returned unchanged.
+/// end in a byte slice. Any other element type is returned with its aliases stripped.
 fn unsized_element(element: TypeId, types: &TypeTable) -> Option<TypeId>
 {
     let mut current = types.strip_aliases(element);

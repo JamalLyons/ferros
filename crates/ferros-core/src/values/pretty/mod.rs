@@ -33,6 +33,7 @@ pub trait PrettyPrinter: Sync
 pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &enums::EnumPrinter,
     &strings::StringPrinter,
+    &strings::ByteStringPrinter,
     &vec::SlicePrinter,
     &vec::VecPrinter,
     &dyn_trait::DynTraitPrinter,

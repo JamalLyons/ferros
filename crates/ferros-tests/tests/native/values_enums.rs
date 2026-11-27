@@ -24,17 +24,11 @@ fn print_shows_active_variants_and_their_fields()
         ("ref_none", "None"),
         ("box_some", "Some(88)"),
         ("box_none", "None"),
-        (
-            "nonzero_some",
-            "Some(core::num::nonzero::NonZero<u32>(core::num::niche_types::NonZeroU32Inner(31)))",
-        ),
+        ("nonzero_some", "Some(31)"),
         ("nonzero_none", "None"),
         (
             "offset_some",
-            concat!(
-                "Some(ferros_fixture_values_enums::Niche { prefix: 0, ",
-                "value: core::num::nonzero::NonZero<u32>(core::num::niche_types::NonZeroU32Inner(56)) })",
-            ),
+            "Some(ferros_fixture_values_enums::Niche { prefix: 0, value: 56 })",
         ),
         ("offset_none", "None"),
         ("success", "Ok(61)"),

@@ -37,4 +37,5 @@ mod types;
 mod universal_images;
 mod values;
 mod values_enums;
+mod values_shared;
 mod values_std;

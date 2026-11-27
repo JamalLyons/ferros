@@ -110,8 +110,9 @@ fn framed_process() -> MockBackend
 }
 
 /// A peer stop is reported while a signal handler's return is still queued. Selecting a
-/// caller and polling `wait` lets that return resume the process internally; the selected
-/// frame does not survive the resume.
+/// caller and polling `wait` lets that return resume the process internally. The session
+/// is running afterwards, so the selected frame is back at 0 and another selection is
+/// refused.
 #[test]
 fn handler_return_resume_clears_a_frame_selected_after_the_peer_stop()
 {
@@ -155,5 +156,8 @@ fn handler_return_resume_clears_a_frame_selected_after_the_peer_stop()
     session.select_frame(1).expect("outer frame");
     assert_eq!(session.selected_frame(), 1);
     assert_eq!(session.wait(Some(Duration::ZERO)).expect("poll"), None);
+    assert_eq!(session.state(), SessionState::Running);
     assert_eq!(session.selected_frame(), 0);
+    assert!(session.last_stop().is_none());
+    assert!(matches!(session.select_frame(0), Err(DebuggerError::NotStopped)));
 }

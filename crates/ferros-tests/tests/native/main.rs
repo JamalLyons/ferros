@@ -33,4 +33,5 @@ mod smoke;
 mod source_breakpoints;
 mod stepping;
 mod symbols;
+mod types;
 mod universal_images;

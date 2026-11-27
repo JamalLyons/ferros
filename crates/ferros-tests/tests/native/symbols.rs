@@ -44,6 +44,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("symbols"),
         fixture!("thread_signals"),
         fixture!("threads"),
+        fixture!("values_types"),
         fixture!("workqueue"),
     ]
 }

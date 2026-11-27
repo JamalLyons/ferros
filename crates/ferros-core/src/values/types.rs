@@ -39,8 +39,8 @@
 //!
 //! # Unreadable debug info
 //!
-//! A unit whose header or entries cannot be parsed is left out of the name index and
-//! recorded in [`TypeTable::skipped`]; the other units are still indexed. A type entry that
+//! Failures to read a unit or its entries are recorded in [`TypeTable::skipped`]. Names
+//! found before the failure and in other readable units remain indexed. A type entry that
 //! cannot be read when it is resolved becomes [`TypeKind::Unreadable`] with the reason, so a
 //! walker shows it as such instead of failing the whole value. Type units (`.debug_types`)
 //! are not read: a reference into them resolves to no type.
@@ -51,12 +51,14 @@
 //! - The model: `Type`, `TypeKind`, `BaseEncoding`, `Composite`, `Member`, `TemplateParam`,
 //!   `RustEnum`, `Variant`, `Discriminant`, `DiscriminantRange`, `Enumeration`,
 //!   `Enumerator`, `ArrayType`, `PointerType`, `PointerKind`, `Qualifier`, `FunctionType`.
-//! - `TypeTable`: `build` and the name index (`index_unit`), lookups (`type_at`, `type_of`,
-//!   `type_named`, `get`, `strip_aliases`), and resolution (`resolve`, `read_type`,
-//!   `read_entry`, `composite`, `variant_part`, `member`, `scalar_info`).
-//! - Derived names and sizes of new types: `derive_name`, `derive_size`.
+//! - Table storage: `IndexedUnit`, `Arena`, `TypeTable`.
+//! - `TypeTable`: `build`, `skipped`, `len`, `is_empty`, `get`, `type_at`, `type_of`,
+//!   `type_named`, `array_named`, `strip_aliases`, `unit_at`, `resolve`, `read_type`,
+//!   `read_entry`, `composite`, `variant_part`, `member`, `scalar_info`.
+//! - Name indexing: `index_unit`.
+//! - Derived names and sizes of new types: `derive_name`, `derive_size`, `unreadable`, `qualified`.
 //! - Attribute helpers: `own_name`, `udata`, `flag`, `type_ref`, `member_location`,
-//!   `raw_bits`, `discriminant_list`, `base_encoding`, `pointer_kind`, `is_type_tag`.
+//!   `raw_bits`, `cut`, `discriminant_list`, `base_encoding`, `pointer_kind`, `is_type_tag`.
 //! - Unit tests over synthetic DWARF in `mod tests`.
 
 use std::collections::{HashMap, VecDeque};
@@ -489,6 +491,9 @@ pub struct TypeTable
     names: HashMap<usize, String>,
     /// Type entries by qualified name: definitions in offset order, then declarations.
     by_name: HashMap<String, Vec<usize>>,
+    /// `(element entry, array entry)` of every unnamed array entry, in offset order: rustc
+    /// names no array, so [`type_named`](Self::type_named) finds `[T; N]` through these.
+    arrays: Vec<(usize, usize)>,
     skipped: Vec<SkippedDebugInfo>,
     arena: RwLock<Arena>,
 }
@@ -514,6 +519,7 @@ impl TypeTable
         let mut units = Vec::new();
         let mut names = HashMap::new();
         let mut by_name = HashMap::<String, Vec<(bool, usize)>>::new();
+        let mut arrays = Vec::new();
         let mut skipped = Vec::new();
         let mut headers = dwarf.units();
         loop {
@@ -536,7 +542,7 @@ impl TypeTable
                     continue;
                 }
             };
-            index_unit(&dwarf, &unit, start, &mut names, &mut by_name, &mut skipped);
+            index_unit(&dwarf, &unit, start, &mut names, &mut by_name, &mut arrays, &mut skipped);
             units.push(IndexedUnit { start, end, unit });
         }
         units.sort_by_key(|unit| unit.start);
@@ -553,6 +559,7 @@ impl TypeTable
             units,
             names,
             by_name,
+            arrays,
             skipped,
             arena: RwLock::new(Arena::default()),
         }
@@ -579,7 +586,7 @@ impl TypeTable
         self.len() == 0
     }
 
-    /// The type `id` names, or `None` for an id from another table.
+    /// The type at `id`'s arena index. Pass an id obtained from this table.
     #[must_use]
     pub fn get(&self, id: TypeId) -> Option<Arc<Type>>
     {
@@ -612,14 +619,36 @@ impl TypeTable
 
     /// The type whose qualified name is `name` (a leading `::` is ignored): the definition
     /// at the lowest offset, else a declaration. rustc repeats a type in every unit that
-    /// uses it; any copy describes the same layout.
+    /// uses it; any copy describes the same layout. An array, which DWARF does not name, is
+    /// found by its derived Rust spelling `[T; N]`.
     #[must_use]
     pub fn type_named(&self, name: &str) -> Option<TypeId>
     {
         let name = name.trim();
         let name = name.strip_prefix("::").unwrap_or(name);
-        let offset = *self.by_name.get(name)?.first()?;
-        Some(self.resolve(offset))
+        if let Some(&offset) = self.by_name.get(name).and_then(|entries| entries.first()) {
+            return Some(self.resolve(offset));
+        }
+        self.array_named(name)
+    }
+
+    /// The first unnamed array entry spelled `[element; length]`.
+    fn array_named(&self, name: &str) -> Option<TypeId>
+    {
+        let (element, length) = name.strip_prefix('[')?.strip_suffix(']')?.rsplit_once(';')?;
+        let element = element.trim();
+        let element = element.strip_prefix("::").unwrap_or(element);
+        let length: u64 = length.trim().parse().ok()?;
+        let spelling = format!("[{element}; {length}]");
+        self.arrays
+            .iter()
+            .filter(|&&(element_offset, _)| {
+                element.starts_with('[') || self.names.get(&element_offset).is_none_or(|found| found == element)
+            })
+            .find_map(|&(_, offset)| {
+                let id = self.resolve(offset);
+                (self.get(id)?.name.as_deref() == Some(spelling.as_str())).then_some(id)
+            })
     }
 
     /// `id` with typedefs and qualifiers removed: the type a value of `id` is laid out as.
@@ -881,8 +910,8 @@ impl TypeTable
             members,
             template_params,
         };
-        Ok(match name.and_then(|name| name.rsplit("::").next()) {
-            Some(last) if last.starts_with('(') && last.ends_with(')') => TypeKind::Tuple(composite),
+        Ok(match name {
+            Some(name) if name.starts_with('(') && name.ends_with(')') => TypeKind::Tuple(composite),
             _ => TypeKind::Struct(composite),
         })
     }
@@ -1009,6 +1038,7 @@ fn index_unit(
     start: usize,
     names: &mut HashMap<usize, String>,
     by_name: &mut HashMap<String, Vec<(bool, usize)>>,
+    arrays: &mut Vec<(usize, usize)>,
     skipped: &mut Vec<SkippedDebugInfo>,
 )
 {
@@ -1041,6 +1071,12 @@ fn index_unit(
                 continue;
             }
         };
+        if tag == constants::DW_TAG_array_type
+            && name.is_none()
+            && let Ok(Some(element)) = type_ref(entry, start)
+        {
+            arrays.push((element, offset));
+        }
         if is_type_tag(tag)
             && let Some(name) = &name
         {
@@ -1560,6 +1596,11 @@ mod tests
         );
         b.add(
             root,
+            constants::DW_TAG_variable,
+            &[name("grid"), (constants::DW_AT_type, W::UnitRef(alias))],
+        );
+        b.add(
+            root,
             constants::DW_TAG_structure_type,
             &[name("Later"), (constants::DW_AT_declaration, W::Flag(true))],
         );
@@ -1572,10 +1613,22 @@ mod tests
         let table = b.table();
 
         let grid = table.type_named("Grid").expect("Grid");
+        let indexed = &table.units[0];
+        let mut entries = indexed.unit.entries();
+        let variable = loop {
+            let (_, entry) = entries.next_dfs().expect("read entry").expect("variable");
+            if entry.tag() == constants::DW_TAG_variable {
+                break DieOffset((indexed.start + entry.offset().0) as u64);
+            }
+        };
+        assert_eq!(table.type_at(variable), None, "a variable is not a type");
+        assert_eq!(table.type_of(variable), Some(grid), "follow the variable's DW_AT_type");
         let array = table.strip_aliases(grid);
         assert_ne!(array, grid);
         let array_ty = table.get(array).expect("array");
         assert_eq!(array_ty.name.as_deref(), Some("[[u16; 3]; 4]"));
+        assert_eq!(table.type_named("[[u16; 3]; 4]"), Some(array));
+        assert_eq!(table.type_named("[u16; 4]"), None, "lengths must match every dimension");
         assert_eq!(array_ty.size, Some(24));
         assert_eq!(
             array_ty.kind,
@@ -1593,5 +1646,31 @@ mod tests
         assert!(!later_ty.declaration, "the definition wins over a declaration listed first");
         assert_eq!(table.type_of(later_ty.die), None, "a struct has no DW_AT_type");
         assert_eq!(table.type_at(DieOffset(u64::MAX)), None);
+    }
+
+    #[test]
+    fn a_union_member_may_omit_its_zero_offset()
+    {
+        let mut b = Builder::new();
+        let u16_ty = base(&mut b, "u16", 2, constants::DW_ATE_unsigned);
+        let union = b.add(
+            b.root(),
+            constants::DW_TAG_union_type,
+            &[name("Word"), (constants::DW_AT_byte_size, W::Data1(2))],
+        );
+        b.add(
+            union,
+            constants::DW_TAG_member,
+            &[name("bits"), (constants::DW_AT_type, W::UnitRef(u16_ty))],
+        );
+        let table = b.table();
+
+        let word = table.type_named("Word").expect("Word");
+        let TypeKind::Union(fields) = kind(&table, word) else {
+            panic!("Word is a union");
+        };
+        let bits = fields.member("bits").expect("bits");
+        assert_eq!(bits.ty, table.type_named("u16"));
+        assert_eq!(bits.offset, Some(0));
     }
 }

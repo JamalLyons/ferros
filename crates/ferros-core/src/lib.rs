@@ -60,6 +60,7 @@ pub mod runtime;
 pub mod session;
 pub mod symbols;
 pub mod types;
+pub mod values;
 
 pub use arch::Arch;
 pub use backend::{Backend, BackendError, BackendResult, FaultKind, LaunchSpec, ResumeRequest, StopEvent, ThreadAction};

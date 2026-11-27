@@ -663,7 +663,7 @@ impl BinaryImage
         EndianArcSlice::new(data, self.executable.endian)
     }
 
-    fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
+    pub(crate) fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
     {
         let sections = self.debug_sections()?;
         self.context_cache.get_or_try_init(|| {

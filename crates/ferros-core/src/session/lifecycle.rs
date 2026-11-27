@@ -216,6 +216,7 @@ impl Session
         self.deferred = self.continue_after_drain(&request, signal_policy)?;
         self.state = SessionState::Running;
         self.last_stop = None;
+        self.reset_selected_frame();
         self.drive_step_overs()
     }
 
@@ -408,6 +409,7 @@ impl Session
                     self.state = SessionState::Stopped;
                     self.sync_threads(None);
                     self.last_stop = None;
+                    self.reset_selected_frame();
                     return Err(error);
                 }
             }
@@ -418,6 +420,7 @@ impl Session
     fn handle_stop(&mut self, event: StopEvent) -> StopEvent
     {
         self.interrupt_requested = false;
+        self.reset_selected_frame();
         if event.is_terminal() {
             self.clear_process();
             self.state = SessionState::Exited;

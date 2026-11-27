@@ -102,11 +102,22 @@ impl Session
     }
 
     /// A successful resume consumes held signals for the threads it starts.
+    ///
+    /// This is every resume the backend actually starts, including an internal
+    /// continue or step the caller does not make itself (a handler return, a
+    /// breakpoint step-over, a line-step continuation). The process is running
+    /// again: the session is [`SessionState::Running`](super::SessionState::Running),
+    /// [`last_stop`](Self::last_stop) is cleared, and a frame selected at the previous
+    /// stop no longer applies. A refused resume ran nothing and leaves the state and
+    /// the selection as they were.
     fn resume_backend(&mut self, request: &ResumeRequest) -> BackendResult<()>
     {
         self.backend.resume(request)?;
         self.carried_signals
             .retain(|(thread, _)| request.action_for(*thread) == ThreadAction::Suspend);
+        self.state = SessionState::Running;
+        self.last_stop = None;
+        self.reset_selected_frame();
         Ok(())
     }
 
@@ -496,6 +507,7 @@ impl Session
     {
         self.state = SessionState::Running;
         self.last_stop = None;
+        self.reset_selected_frame();
         Ok(())
     }
 
@@ -564,6 +576,7 @@ impl Session
                     self.state = SessionState::Stopped;
                     self.sync_threads(None);
                     self.last_stop = None;
+                    self.reset_selected_frame();
                     return Err(error);
                 }
             }
@@ -747,7 +760,9 @@ impl Session
             return Ok(None);
         };
         // Adding and removing traps needs a stopped session; the backend is stopped.
-        let state = std::mem::replace(&mut self.state, SessionState::Stopped);
+        // A resume started below leaves the process running, and that state must
+        // outlive this temporary stop.
+        let saved = std::mem::replace(&mut self.state, SessionState::Stopped);
         let follow = self.follow_handler_exit(&mut exits, hit, interrupted_sp);
         let mut exits = Some(exits);
         let result = follow.and_then(|follow| {
@@ -760,7 +775,9 @@ impl Session
                 Follow::Report(event) => Ok(Some(event)),
             }
         });
-        self.state = state;
+        if self.state != SessionState::Running {
+            self.state = saved;
+        }
         self.handler_exits = exits;
         result.map(Some)
     }

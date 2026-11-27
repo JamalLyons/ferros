@@ -150,6 +150,50 @@ fn handler_return_reports_a_real_trap_stop_reported_with_it()
     }
 }
 
+/// A peer stop is reported before a queued handler return. Selecting a caller and polling
+/// `wait` lets that return resume the process: the session is running, the selected frame
+/// is the innermost one, and another selection is refused.
+#[test]
+fn queued_handler_return_resumes_and_clears_the_selected_frame()
+{
+    let stack = Address::new(0x8000);
+    let mut bytes = vec![0u8; 16];
+    bytes[8..].copy_from_slice(&(INTERRUPTED + 24).value().to_le_bytes());
+    let mock = handler_stopped_process().with_region(stack, "rw-", bytes);
+    let mut session = Session::new(Box::new(mock.clone()), MockObjectFormat::shared());
+    session
+        .launch(&LaunchSpec::new("scripted-queued-handler-return"))
+        .expect("launch");
+    let mut peer_registers = session.read_registers_for(THREAD).expect("peer registers");
+    peer_registers.fp = stack;
+    peer_registers.sp = stack;
+    session
+        .write_registers_for(THREAD, &peer_registers)
+        .expect("give the peer a caller frame");
+    let (_, registers) = handler_stopped_in_its_handler(&mock, &mut session);
+
+    let peer = handler_peer_stop(&mut session, PeerTrap::Armed);
+    mock.script_simultaneous(vec![
+        peer.expect_resume(ResumeRequest::continue_all()),
+        handler_return(&registers).expect_resume(ResumeRequest::continue_all()),
+    ]);
+    session.resume().expect("continue while the handler is stopped");
+    let peer_stop = session.wait(None).expect("wait").expect("the peer stop");
+    assert!(
+        matches!(peer_stop, StopEvent::Breakpoint { thread: THREAD, .. }),
+        "{peer_stop:?}"
+    );
+    assert_eq!(session.state(), SessionState::Stopped);
+
+    session.select_frame(1).expect("outer frame");
+    assert_eq!(session.selected_frame(), 1);
+    assert_eq!(session.wait(Some(std::time::Duration::ZERO)).expect("poll"), None);
+    assert_eq!(session.selected_frame(), 0);
+    assert_eq!(session.state(), SessionState::Running);
+    assert!(session.last_stop().is_none());
+    assert!(matches!(session.select_frame(0), Err(DebuggerError::NotStopped)));
+}
+
 /// #165: the reissued continue after a stopped handler's return steps the handler off its
 /// breakpoint first; another thread's breakpoint stop at a private trap that is gone
 /// arrives just before that step, so the backend refuses it. The stop belongs to no

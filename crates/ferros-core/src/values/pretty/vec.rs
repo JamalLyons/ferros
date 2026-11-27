@@ -20,20 +20,10 @@ impl PrettyPrinter for VecPrinter
 
     fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
     {
-        let Some(VecLayout {
-            address,
-            len,
-            capacity,
-            element,
-        }) = layout(value, formatter.types(), formatter.endian())
-        else {
+        let Some(layout) = layout(value, formatter.types(), formatter.endian()) else {
             return raw_layout(value, formatter);
         };
-        if len > capacity {
-            return unavailable(format!("vector length {len} exceeds capacity {capacity}"));
-        }
-        let elements = format_elements(address, len, element, formatter);
-        format!("{elements} (len: {len}, capacity: {capacity})")
+        format_contents(&layout, "vector", formatter)
     }
 }
 
@@ -57,7 +47,23 @@ pub(in crate::values) fn layout(value: ValueView<'_>, types: &TypeTable, endian:
     let element = layout.template_param("T")?.ty?;
     let element_size = types.get(element)?.size?;
     let len = usize_value(value.member(layout.member("len")?, types)?, types, endian)?;
-    let buf = value.member(layout.member("buf")?, types)?;
+    let (address, capacity) = raw_buffer(value.member(layout.member("buf")?, types)?, element_size, types, endian)?;
+    Some(VecLayout {
+        address,
+        len,
+        capacity,
+        element,
+    })
+}
+
+/// The allocation pointer and capacity of a `RawVec` whose elements are `element_size` bytes.
+pub(super) fn raw_buffer(
+    buf: ValueView<'_>,
+    element_size: u64,
+    types: &TypeTable,
+    endian: RunTimeEndian,
+) -> Option<(Address, u64)>
+{
     // Recent RawVecs place the allocation fields in RawVecInner.
     let raw = field(buf, "inner", types).unwrap_or(buf);
     let ptr = field(raw, "ptr", types)?;
@@ -74,12 +80,24 @@ pub(in crate::values) fn layout(value: ValueView<'_>, types: &TypeTable, endian:
     } else {
         capacity
     };
-    Some(VecLayout {
+    Some((address, capacity))
+}
+
+/// Render a `Vec`'s elements and its length and capacity. `noun` names the container in
+/// the error when the length exceeds the capacity.
+pub(super) fn format_contents(layout: &VecLayout, noun: &str, formatter: &mut ValueFormatter<'_>) -> String
+{
+    let VecLayout {
         address,
         len,
         capacity,
         element,
-    })
+    } = *layout;
+    if len > capacity {
+        return unavailable(format!("{noun} length {len} exceeds capacity {capacity}"));
+    }
+    let elements = format_elements(address, len, element, formatter);
+    format!("{elements} (len: {len}, capacity: {capacity})")
 }
 
 pub(super) struct SlicePrinter;

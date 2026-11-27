@@ -130,6 +130,10 @@ fn caller_saved_location_is_unavailable_in_a_real_caller()
             .iter()
             .find(|var| var.name == "volatile_arg")
             .expect("argument described by the caller's location list");
+        // ARM64 looks up return PC minus four. Clang's DW_OP_reg0 range includes
+        // that whole call through call + 3 and ends at the return PC.
+        // UnsupportedLocation indicates clang's DW_OP_entry_value range now covers
+        // the lookup PC.
         assert_eq!(argument.value.location, Some(ValueLocation::Register(0)));
         assert_eq!(argument.value.bytes, Err(Unavailable::RegisterUnknown(0)));
     });

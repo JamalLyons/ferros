@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use addr2line::Context;
 use gimli::{AttributeValue, DebugInfoOffset, DebuggingInformationEntry, DwAt, DwTag, Reader as _, UnitOffset, UnitRef};
 
-use super::location::{LocationEvaluator, Unavailable, VariableValue, expression_at};
+use super::location::{LocationEvaluator, Unavailable, VariableValue, expression_at, read_constant};
 use crate::error::Result;
 use crate::symbols::{ImageId, OwnedReader, dwarf_frame_name};
 use crate::types::{Address, FrameKind, FrameRegisters};
@@ -83,11 +83,7 @@ pub(crate) fn frame_variables(
             .and_then(|attr| expression_at(unit, attr, pc));
         match location {
             Ok(Some(location)) => evaluator.read_value(location, byte_size),
-            Ok(None) => match constant {
-                Ok(Some(constant)) => evaluator.read_constant(constant, byte_size),
-                Ok(None) => VariableValue::unavailable(Unavailable::OptimizedOut),
-                Err(error) => VariableValue::unavailable(Unavailable::InvalidMetadata(error)),
-            },
+            Ok(None) => read_constant(unit, constant, byte_size),
             Err(reason) => VariableValue::unavailable(reason),
         }
     };
@@ -120,6 +116,7 @@ impl FrameScope
                 Ok(Some(start)) => Some(start),
                 Ok(None) if offset == selected => None,
                 Ok(None) => continue,
+                Err(error) if offset == selected => return Err(error),
                 Err(error) => {
                     warn_die(root.entry(), error);
                     continue;
@@ -192,9 +189,9 @@ impl FrameScope
             let offset = entry.offset().to_debug_info_offset(&unit.header);
             if let Some(index) = offset.and_then(|offset| by_origin.get(&offset)) {
                 declarations.push(AbstractVariable::Concrete(*index));
-            } else if let Some(variable) = self.variable(unit, entry, start, |_, _| {
-                VariableValue::unavailable(Unavailable::OptimizedOut)
-            }) {
+            } else if let Some(variable) =
+                self.variable(unit, entry, start, |size, constant| read_constant(unit, constant, size))
+            {
                 declarations.push(AbstractVariable::Omitted(variable));
             }
         }
@@ -420,15 +417,25 @@ fn wrapped_name(name: &str, pointer: Option<&str>, qualifier: Option<&str>) -> S
 
 fn array_size(unit: Unit<'_>, entry: &Entry<'_, '_>, depth: usize) -> DwarfResult<Option<u64>>
 {
-    let Some(element) = with_reference(unit, entry.attr_value(gimli::DW_AT_type)?, |unit, offset| {
+    let element = with_reference(unit, entry.attr_value(gimli::DW_AT_type)?, |unit, offset| {
         describe_type(unit, offset, depth + 1)
     })?
-    .and_then(|element| element.byte_size) else {
+    .and_then(|element| element.byte_size);
+    let size = match entry.attr_value(gimli::DW_AT_byte_stride)? {
+        Some(stride) => stride.udata_value(),
+        None => match entry.attr_value(gimli::DW_AT_bit_stride)? {
+            Some(stride) => stride
+                .udata_value()
+                .filter(|bits| bits.is_multiple_of(8))
+                .map(|bits| bits / 8),
+            None => element,
+        },
+    };
+    let Some(mut size) = size else {
         return Ok(None);
     };
     let mut tree = unit.entries_tree(Some(entry.offset()))?;
     let mut children = tree.root()?.children();
-    let mut size = element;
     let mut has_dimension = false;
     while let Some(child) = children.next()? {
         let subrange = child.entry();
@@ -474,6 +481,8 @@ fn subrange_count(unit: Unit<'_>, entry: &Entry<'_, '_>) -> DwarfResult<Option<u
 fn integer_bound(attr: Attr) -> Option<i128>
 {
     match attr {
+        // LLVM can emit -1 in a fixed-width form without an explicit sign.
+        Attr::Data1(u8::MAX) | Attr::Data2(u16::MAX) | Attr::Data4(u32::MAX) => Some(-1),
         Attr::Sdata(value) => Some(i128::from(value)),
         other => other.udata_value().map(i128::from),
     }

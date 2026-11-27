@@ -1,5 +1,7 @@
 //! Evaluate DWARF locations against the registers and memory of a stopped frame.
 
+use std::collections::HashSet;
+
 use gimli::{
     AttributeValue, Encoding, EvaluationResult, Expression, Location, Operation, RawLocListEntry, Reader as _,
     RunTimeEndian, Section as _, UnitRef, Value,
@@ -202,28 +204,6 @@ where
         Ok(bytes)
     }
 
-    pub(super) fn read_constant(&self, constant: AttributeValue<OwnedReader>, byte_size: Option<u64>) -> VariableValue
-    {
-        VariableValue {
-            location: Some(ValueLocation::Implicit),
-            bytes: value_size(byte_size).and_then(|size| self.constant_bytes(constant, size)),
-        }
-    }
-
-    fn constant_bytes(&self, constant: AttributeValue<OwnedReader>, size: usize) -> EvalResult<Vec<u8>>
-    {
-        match constant {
-            AttributeValue::Block(bytes) => reader_bytes(&bytes, 0, size),
-            other => {
-                let bits = other
-                    .udata_value()
-                    .or_else(|| other.sdata_value().map(|value| value as u64))
-                    .ok_or(Unavailable::UnsupportedLocation)?;
-                self.scalar_bytes(bits, 0, size)
-            }
-        }
-    }
-
     fn evaluate(
         &mut self,
         expression: LocationExpression,
@@ -319,14 +299,14 @@ where
                 let address = address.checked_add(offset as u64).ok_or(gimli::Error::InvalidPiece)?;
                 self.memory(Address::new(address), len)
             }
-            Location::Register { register } => self.scalar_bytes(self.register(register.0)?, offset, len),
+            Location::Register { register } => scalar_bytes(self.endian(), self.register(register.0)?, offset, len),
             Location::Value { value } => {
                 let bits = match value {
                     Value::F32(value) => u64::from(value.to_bits()),
                     Value::F64(value) => value.to_bits(),
                     other => other.to_u64(u64::MAX)?,
                 };
-                self.scalar_bytes(bits, offset, len)
+                scalar_bytes(self.endian(), bits, offset, len)
             }
             Location::Bytes { value } => reader_bytes(value, offset, len),
             Location::Empty => Err(Unavailable::OptimizedOut),
@@ -363,20 +343,56 @@ where
 
     fn endian(&self) -> RunTimeEndian
     {
-        self.unit.dwarf.debug_info.reader().endian()
+        unit_endian(self.unit)
     }
+}
 
-    fn scalar_bytes(&self, bits: u64, offset: usize, len: usize) -> EvalResult<Vec<u8>>
-    {
-        let end = offset + len;
-        if end > 8 {
-            return Err(Unavailable::UnsupportedLocation);
-        }
-        Ok(match self.endian() {
-            RunTimeEndian::Little => bits.to_le_bytes()[offset..end].to_vec(),
-            RunTimeEndian::Big => bits.to_be_bytes()[8 - end..8 - offset].to_vec(),
-        })
+pub(super) fn read_constant(
+    unit: UnitRef<'_, OwnedReader>,
+    constant: gimli::Result<Option<AttributeValue<OwnedReader>>>,
+    byte_size: Option<u64>,
+) -> VariableValue
+{
+    let constant = match constant {
+        Ok(Some(constant)) => constant,
+        Ok(None) => return VariableValue::unavailable(Unavailable::OptimizedOut),
+        Err(error) => return VariableValue::unavailable(Unavailable::InvalidMetadata(error)),
+    };
+    VariableValue {
+        location: Some(ValueLocation::Implicit),
+        bytes: value_size(byte_size).and_then(|size| constant_bytes(unit_endian(unit), constant, size)),
     }
+}
+
+fn constant_bytes(endian: RunTimeEndian, constant: AttributeValue<OwnedReader>, size: usize) -> EvalResult<Vec<u8>>
+{
+    match constant {
+        AttributeValue::Block(bytes) => reader_bytes(&bytes, 0, size),
+        other => {
+            let bits = other
+                .udata_value()
+                .or_else(|| other.sdata_value().map(|value| value as u64))
+                .ok_or(Unavailable::UnsupportedLocation)?;
+            scalar_bytes(endian, bits, 0, size)
+        }
+    }
+}
+
+fn unit_endian(unit: UnitRef<'_, OwnedReader>) -> RunTimeEndian
+{
+    unit.dwarf.debug_info.reader().endian()
+}
+
+fn scalar_bytes(endian: RunTimeEndian, bits: u64, offset: usize, len: usize) -> EvalResult<Vec<u8>>
+{
+    let end = offset + len;
+    if end > 8 {
+        return Err(Unavailable::UnsupportedLocation);
+    }
+    Ok(match endian {
+        RunTimeEndian::Little => bits.to_le_bytes()[offset..end].to_vec(),
+        RunTimeEndian::Big => bits.to_be_bytes()[8 - end..8 - offset].to_vec(),
+    })
 }
 
 fn value_size(size: Option<u64>) -> EvalResult<usize>
@@ -389,27 +405,35 @@ fn value_size(size: Option<u64>) -> EvalResult<usize>
 }
 
 /// gimli 0.32 multiplies a `DW_OP_piece` byte count by eight before checking it.
-/// Inspect that operand before gimli parses the operation. Branch targets must stay
-/// on operation boundaries so evaluation cannot reinterpret unvalidated operands.
-fn validate_piece_sizes(mut input: OwnedReader, encoding: Encoding) -> gimli::Result<()>
+/// Follow branch targets as well as fallthrough so any piece the evaluator can
+/// reach gets checked. Leave decode errors on each path to normal evaluation.
+fn validate_piece_sizes(input: OwnedReader, encoding: Encoding) -> gimli::Result<()>
 {
     let len = input.len();
-    let mut starts = Vec::new();
-    let mut targets = Vec::new();
-    while !input.is_empty() {
-        starts.push(len - input.len());
-        let mut probe = input.clone();
-        if probe.read_u8()? == gimli::DW_OP_piece.0 && probe.read_uleb128()?.checked_mul(8).is_none() {
-            return Err(gimli::Error::InvalidPiece);
+    let mut pending = vec![0];
+    let mut seen = HashSet::new();
+    while let Some(start) = pending.pop() {
+        let mut cursor = input.clone();
+        if cursor.skip(start).is_err() {
+            continue;
         }
-        if let Operation::Bra { target } | Operation::Skip { target } = Operation::parse(&mut input, encoding)? {
-            let next = len - input.len();
-            targets.push(next.wrapping_add_signed(isize::from(target)));
-        }
-    }
-    for target in targets {
-        if target != len && starts.binary_search(&target).is_err() {
-            return Err(gimli::Error::BadBranchTarget(target as u64));
+        while !cursor.is_empty() && seen.insert(len - cursor.len()) {
+            let mut probe = cursor.clone();
+            if probe.read_u8() == Ok(gimli::DW_OP_piece.0)
+                && probe.read_uleb128().is_ok_and(|size| size.checked_mul(8).is_none())
+            {
+                return Err(gimli::Error::InvalidPiece);
+            }
+            let Ok(op) = Operation::parse(&mut cursor, encoding) else {
+                break;
+            };
+            if let Operation::Bra { target } | Operation::Skip { target } = op {
+                let next = len - cursor.len();
+                pending.push(next.wrapping_add_signed(isize::from(target)));
+                if matches!(op, Operation::Skip { .. }) {
+                    break;
+                }
+            }
         }
     }
     Ok(())

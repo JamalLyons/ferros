@@ -54,7 +54,10 @@ impl Session
         };
         let context = image
             .symbol_context()
-            .map_err(|error| debug_info_error(error.to_string()))?
+            .map_err(|error| match error {
+                DebuggerError::NoDebugInfo { .. } => error,
+                other => debug_info_error(other.to_string()),
+            })?
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         frame_variables(

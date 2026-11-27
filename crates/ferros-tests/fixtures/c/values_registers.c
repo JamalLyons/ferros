@@ -7,6 +7,10 @@ __attribute__((noinline)) static unsigned values_register_stop(unsigned input) {
 }
 
 __attribute__((noinline)) static unsigned values_register_caller(unsigned volatile_arg) {
+    // Clang's DW_OP_reg0 range ends at the return address, covering the whole
+    // four-byte call through call + 3. Ferros looks up the start of the call.
+    // UnsupportedLocation here indicates clang moved its DW_OP_entry_value range
+    // over the lookup address.
     unsigned result = values_register_stop(volatile_arg);
     // Keep the caller on the stack and stop the optimizer from making a tail call.
     __asm__ volatile("" : "+r"(result));

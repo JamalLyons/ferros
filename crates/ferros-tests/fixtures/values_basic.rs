@@ -47,8 +47,52 @@ fn inline_owner()
     black_box(owner_local);
 }
 
+struct Inner
+{
+    count: i32,
+}
+
+struct Nested
+{
+    ready: bool,
+    inner: Inner,
+}
+
+struct Meters(i32);
+
+static LARGE_VALUES: [u8; 2_000_000] = [77; 2_000_000];
+
+#[inline(never)]
+fn formatted_samples()
+{
+    let nested = black_box(Nested {
+        ready: true,
+        inner: Inner { count: -4 },
+    });
+    let tuple_local = black_box(('λ', -3_i16, false));
+    let distance = black_box(Meters(5));
+    let array_local = black_box([-2_i16, 0, 7]);
+    let number = black_box(-17_i32);
+    let reference = black_box(&number);
+    let double_reference = black_box(&reference);
+    let null_raw = black_box(std::ptr::null::<i32>());
+    let large_array = black_box([42_u8; 32]);
+    let large_reference = black_box(&LARGE_VALUES);
+    black_box(&nested); // BREAK: format_locals
+    black_box((nested.ready, nested.inner.count, distance.0));
+    black_box((
+        tuple_local,
+        array_local,
+        double_reference,
+        null_raw,
+        large_array,
+        large_reference,
+    ));
+}
+
 fn main()
 {
     caller(-82, -0.75, false, '雪');
     inline_owner();
+    formatted_samples();
 }

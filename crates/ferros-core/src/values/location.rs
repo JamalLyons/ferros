@@ -395,7 +395,7 @@ fn scalar_bytes(endian: RunTimeEndian, bits: u64, offset: usize, len: usize) -> 
     })
 }
 
-fn value_size(size: Option<u64>) -> EvalResult<usize>
+pub(super) fn value_size(size: Option<u64>) -> EvalResult<usize>
 {
     let size = size.ok_or(Unavailable::SizeUnknown)?;
     if size > MAX_VALUE_BYTES as u64 {

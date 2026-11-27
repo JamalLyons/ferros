@@ -145,5 +145,5 @@ registry! {
     frame: [Frame, Up, Down],
     images: [Images],
     help: [Help],
-    values: [Locals],
+    values: [Locals, Print],
 }

@@ -4,7 +4,10 @@ use std::sync::PoisonError;
 
 use super::Session;
 use crate::error::{DebuggerError, Result};
+use crate::values::format::{FormatOptions, ValueFormatter, ValueView, format_raw};
+use crate::values::location::ValueLocation;
 use crate::values::scope::{Variable, frame_variables};
+use crate::values::types::DieOffset;
 
 impl Session
 {
@@ -70,5 +73,39 @@ impl Session
             |address| image.runtime_address(address),
         )
         .map_err(|error| debug_info_error(format!("failed to walk variable DWARF: {error}")))
+    }
+
+    /// Render a variable from the current stop. Returns its type name, if known,
+    /// and its value text. Readable bytes fall back to hex when the type is missing.
+    pub fn format_variable(&mut self, variable: &Variable, options: FormatOptions) -> (Option<String>, String)
+    {
+        let bytes = variable.value.bytes.as_deref();
+        let fallback = || (variable.type_name.clone(), format_raw(bytes));
+        let Some(image) = self.symbols.image_by_id(variable.image_id) else {
+            return fallback();
+        };
+        let Ok(types) = image.types() else {
+            return fallback();
+        };
+        let Some(ty) = variable
+            .type_offset
+            .and_then(|offset| types.type_at(DieOffset(offset.0 as u64)))
+        else {
+            return fallback();
+        };
+        let name = types
+            .get(ty)
+            .and_then(|ty| ty.name.clone())
+            .or_else(|| variable.type_name.clone());
+        let Ok(bytes) = bytes else {
+            return (name, format_raw(bytes));
+        };
+        let address = match variable.value.location {
+            Some(ValueLocation::Memory(address)) => Some(address),
+            _ => None,
+        };
+        let mut read = |address, len| self.read_memory(address, len);
+        let text = ValueFormatter::new(types, image.endian(), options, &mut read).format(ValueView { ty, bytes, address });
+        (name, text)
     }
 }

@@ -2,18 +2,22 @@
 
 use std::io::Write as _;
 
-use ferros_core::Session;
 use ferros_core::backend::mock::{MockBackend, arm64_registers};
 use ferros_core::backend::{ImageRole, LaunchSpec, LoadedImage};
 use ferros_core::error::DebuggerError;
 use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat, MockObjectImage};
+use ferros_core::symbols::ImageDescriptor;
 use ferros_core::types::{Address, BuildIdentity, FrameKind};
+use ferros_core::values::format::{FormatOptions, ValueFormatter, ValueView};
 use ferros_core::values::location::{Unavailable, ValueLocation};
+use ferros_core::values::pretty::PrettyPrinter;
+use ferros_core::values::types::{Type, TypeKind, TypeTable};
+use ferros_core::{Session, SymbolCache};
 use gimli::write::{
     Address as DwarfAddress, AttributeValue as Attr, DwarfUnit, EndianVec, Expression, Range, RangeList, Sections, Unit,
     UnitEntryId, Writer as _,
 };
-use gimli::{DwTag, Encoding, Format, LittleEndian, SectionId};
+use gimli::{DwTag, Encoding, Format, LittleEndian, RunTimeEndian, SectionId};
 
 use crate::helpers::{RemoveOnDrop, THREAD};
 
@@ -158,6 +162,8 @@ fn oversized_piece_is_unavailable_through_session()
         vars[0].value.bytes,
         Err(Unavailable::InvalidDwarf(gimli::Error::InvalidPiece))
     );
+    let (_, text) = session.format_variable(&vars[0], FormatOptions::default());
+    assert_eq!(text, format!("<unavailable: {}>", vars[0].value.bytes.as_ref().unwrap_err()));
 }
 
 #[test]
@@ -363,4 +369,118 @@ fn all_ones_byte_upper_bound_uses_index_signedness()
     assert_eq!(vars[1].value.bytes.as_deref(), Ok(&[][..]));
     assert_eq!(vars[2].name, "untyped");
     assert_eq!(vars[2].value.bytes.as_deref(), Ok(contents.as_slice()));
+}
+
+#[test]
+fn formatting_cuts_cycles_and_lets_a_printer_recurse()
+{
+    struct FirstByte;
+
+    impl PrettyPrinter for FirstByte
+    {
+        fn matches(&self, ty: &Type, _: &TypeTable) -> bool
+        {
+            matches!(ty.kind, TypeKind::Struct(_)) && ty.name.as_deref() == Some("Recursive")
+        }
+
+        fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
+        {
+            let byte = formatter.types().type_named("u8").expect("byte type");
+            let first = formatter.format(value.slice(byte, 0, 1).expect("first byte"));
+            format!("first byte is {first}")
+        }
+    }
+
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let recursive = unit.add(unit.root(), gimli::DW_TAG_structure_type);
+    unit.get_mut(recursive)
+        .set(gimli::DW_AT_name, Attr::String(b"Recursive".to_vec()));
+    unit.get_mut(recursive).set(gimli::DW_AT_byte_size, Attr::Udata(1));
+    let child = variable(
+        unit,
+        recursive,
+        gimli::DW_TAG_member,
+        Attr::String(b"child".to_vec()),
+        recursive,
+    );
+    unit.get_mut(child).set(gimli::DW_AT_data_member_location, Attr::Udata(0));
+    let address = Address::new(BASE + 0x200);
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(address.value()));
+    local(unit, function, "recursive", recursive, location);
+
+    let (mut session, image_path) = session(&mut dwarf, None);
+    let vars = session.selected_frame_variables().expect("locals");
+    let options = FormatOptions::default();
+    assert_eq!(session.format_variable(&vars[0], options).1, "Recursive { child: <cycle> }");
+    let shallow = FormatOptions { max_depth: 1, ..options };
+    assert_eq!(session.format_variable(&vars[0], shallow).1, "Recursive { ... }");
+
+    let image = SymbolCache::new(MockObjectFormat::shared())
+        .load_image(ImageDescriptor {
+            path: image_path.0[0].clone(),
+            load_address: BASE,
+        })
+        .expect("image with debug info");
+    let types = image.types().expect("type table");
+    let ty = types.type_named("Recursive").expect("recursive type");
+    let mut read = |address, len| session.read_memory(address, len);
+    let printers: &[&dyn PrettyPrinter] = &[&FirstByte];
+    let mut formatter = ValueFormatter::new(types, RunTimeEndian::Little, options, &mut read).with_printers(printers);
+    assert_eq!(formatter.format_at(ty, address), "first byte is 0");
+    assert_eq!(
+        formatter.format(ValueView {
+            ty,
+            bytes: &[37],
+            address: None
+        }),
+        "first byte is 37"
+    );
+}
+
+#[test]
+fn unavailable_pointee_preserves_the_rest_of_the_value()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    unit.get_mut(byte)
+        .set(gimli::DW_AT_encoding, Attr::Encoding(gimli::DW_ATE_unsigned));
+    let reference = variable(
+        unit,
+        unit.root(),
+        gimli::DW_TAG_pointer_type,
+        Attr::String(b"&u8".to_vec()),
+        byte,
+    );
+    let record = unit.add(unit.root(), gimli::DW_TAG_structure_type);
+    unit.get_mut(record).set(gimli::DW_AT_name, Attr::String(b"Record".to_vec()));
+    unit.get_mut(record).set(gimli::DW_AT_byte_size, Attr::Udata(16));
+    let mut add_field = |name: &str, ty, offset| {
+        let field = variable(unit, record, gimli::DW_TAG_member, Attr::String(name.as_bytes().to_vec()), ty);
+        unit.get_mut(field)
+            .set(gimli::DW_AT_data_member_location, Attr::Udata(offset));
+    };
+    add_field("reference", reference, 0);
+    add_field("byte", byte, 8);
+    let address = Address::new(BASE + 0x200);
+    let mut location = Expression::new();
+    location.op_addr(DwarfAddress::Constant(address.value()));
+    local(unit, function, "record", record, location);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let unmapped = BASE + IMAGE_SIZE;
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&unmapped.to_le_bytes());
+    bytes[8] = 42;
+    session.write_memory(address, &bytes).expect("store mock record");
+    let vars = session.selected_frame_variables().expect("record bytes");
+    let text = session.format_variable(&vars[0], FormatOptions::default()).1;
+    assert!(
+        text.starts_with(&format!("Record {{ reference: {unmapped:#x} -> <unavailable: ")),
+        "{text}"
+    );
+    assert!(text.ends_with(">, byte: 42 }"), "{text}");
 }

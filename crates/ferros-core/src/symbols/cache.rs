@@ -424,6 +424,11 @@ impl SymbolCache
     {
         self.image_for_address(address).and_then(|image| image.symbolicate(address))
     }
+
+    pub(crate) fn image_by_id(&self, id: ImageId) -> Option<Arc<BinaryImage>>
+    {
+        self.images.get(&id).cloned()
+    }
 }
 
 #[cfg(test)]

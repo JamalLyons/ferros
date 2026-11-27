@@ -1,4 +1,4 @@
-//! Raw argument and local values in physical and inline frames (issue #383).
+//! Argument and local values in physical and inline frames (issues #383 and #385).
 #![cfg(target_os = "macos")]
 
 use std::time::Duration;
@@ -140,36 +140,120 @@ fn caller_saved_location_is_unavailable_in_a_real_caller()
 }
 
 #[test]
-fn locals_command_follows_up_and_prints_raw_bytes()
+fn locals_command_formats_values_in_the_selected_frame()
 {
     let _ = transcript::ferros_bin();
     harness::run(|t| {
         let fixture = fixture!("values_basic");
         let tag = t.tag();
         let break_at = format!("break values_basic.rs:{}", fixture.marker_line("callee_locals"));
-        let commands = vec![break_at.as_str(), "continue", "locals", "up", "locals"];
+        let commands = vec![
+            break_at.as_str(),
+            "continue",
+            "locals",
+            "up",
+            "locals",
+            "print caller_int_arg",
+            "quit",
+        ];
         let run = transcript::launch_batch(&tag, &fixture, &[], &commands);
         assert!(run.status.success(), "status {:?}, stderr: {}", run.status, run.stderr);
-        let locals: Vec<_> = run.stdout.split("(ferros) locals\n").skip(1).collect();
-        assert_eq!(locals.len(), 2, "{}", run.stdout);
-        assert!(locals[0].contains("int_local: i32 = 0xefffffff\n"), "{}", run.stdout);
-        assert!(
-            locals[0].contains("float_local: f64 = 0x000000000000f43f\n"),
+        let locals = command_output(&run.stdout, "locals");
+        assert_eq!(
+            locals,
+            [
+                concat!(
+                    "int_arg: i32 = 37\n",
+                    "float_arg: f64 = 6.5\n",
+                    "bool_arg: bool = true\n",
+                    "char_arg: char = 'Ƶ'\n",
+                    "int_local: i32 = -17\n",
+                    "float_local: f64 = 1.25\n",
+                    "bool_local: bool = false\n",
+                    "char_local: char = 'λ'\n",
+                    "array_local: [u8; 4] = [16, 50, 84, 118]\n",
+                ),
+                concat!(
+                    "caller_int_arg: i32 = -82\n",
+                    "caller_float_arg: f64 = -0.75\n",
+                    "caller_bool_arg: bool = false\n",
+                    "caller_char_arg: char = '雪'\n",
+                    "caller_int_local: i32 = 57\n",
+                    "caller_float_local: f64 = -2.5\n",
+                    "caller_bool_local: bool = true\n",
+                    "caller_char_local: char = '🦀'\n",
+                ),
+            ],
             "{}",
             run.stdout
         );
-        assert!(locals[0].contains("bool_arg: bool = 0x01\n"), "{}", run.stdout);
-        assert!(locals[0].contains("char_arg: char = 0xb5010000\n"), "{}", run.stdout);
-        assert!(locals[1].contains("caller_int_arg: i32 = 0xaeffffff\n"), "{}", run.stdout);
-        assert!(
-            locals[1].contains("caller_float_arg: f64 = 0x000000000000e8bf\n"),
-            "{}",
-            run.stdout
+        assert_eq!(
+            command_output(&run.stdout, "print caller_int_arg"),
+            ["caller_int_arg: i32 = -82\n"]
         );
-        assert!(locals[1].contains("caller_bool_local: bool = 0x01\n"), "{}", run.stdout);
-        assert!(locals[1].contains("caller_char_local: char = 0x80f90100\n"), "{}", run.stdout);
         assert!(!run.stdout.contains("later_local") && !run.stdout.contains("later_caller_local"));
     });
+}
+
+#[test]
+fn print_formats_aggregates_references_and_raw_pointers()
+{
+    const SAMPLES: &[(&str, &str)] = &[
+        (
+            "print nested",
+            concat!(
+                "nested: ferros_fixture_values_basic::Nested = ferros_fixture_values_basic::Nested ",
+                "{ ready: true, inner: ferros_fixture_values_basic::Inner { count: -4 } }\n"
+            ),
+        ),
+        ("print tuple_local", "tuple_local: (char, i16, bool) = ('λ', -3, false)\n"),
+        ("print array_local", "array_local: [i16; 3] = [-2, 0, 7]\n"),
+        ("print number", "number: i32 = -17\n"),
+        ("print reference", "reference: &i32 = 0x<hex> -> -17\n"),
+        ("print double_reference", "double_reference: &&i32 = 0x<hex> -> 0x<hex>\n"),
+        ("print null_raw", "null_raw: *const i32 = 0x<hex>\n"),
+        (
+            "print large_array",
+            "large_array: [u8; 32] = [42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, ...]\n",
+        ),
+    ];
+    let _ = transcript::ferros_bin();
+    harness::run(|t| {
+        let fixture = fixture!("values_basic");
+        let tag = t.tag();
+        let break_at = format!("break values_basic.rs:{}", fixture.marker_line("format_locals"));
+        let mut commands = vec![break_at.as_str(), "continue"];
+        commands.extend(SAMPLES.iter().map(|&(command, _)| command));
+        commands.extend(["locals", "quit"]);
+        let run = transcript::launch_batch(&tag, &fixture, &[], &commands);
+        assert!(
+            run.status.success(),
+            "status {:?}, stderr: {}\n{}",
+            run.status,
+            run.stderr,
+            run.stdout
+        );
+        let normalized = transcript::normalize(&run.stdout);
+        for &(command, expected) in SAMPLES {
+            assert_eq!(command_output(&normalized, command), [expected], "{}", run.stdout);
+        }
+        let locals: String = SAMPLES.iter().map(|&(_, expected)| expected).collect();
+        assert_eq!(command_output(&normalized, "locals"), [locals.as_str()]);
+        assert_eq!(
+            command_output(&run.stdout, "print null_raw"),
+            ["null_raw: *const i32 = 0x0\n"]
+        );
+        assert!(command_output(&run.stdout, "locals")[0].contains("null_raw: *const i32 = 0x0\n"));
+    });
+}
+
+fn command_output<'a>(stdout: &'a str, command: &str) -> Vec<&'a str>
+{
+    let prefix = format!("{command}\n");
+    stdout
+        .split("(ferros) ")
+        .filter_map(|section| section.strip_prefix(&prefix))
+        .collect()
 }
 
 fn assert_value(vars: &[Variable], name: &str, expected_type: &str, bytes: &[u8])

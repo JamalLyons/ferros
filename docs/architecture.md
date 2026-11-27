@@ -216,7 +216,7 @@ The `symbols` module provides symbol resolution, DWARF parsing, and type introsp
 **Key Components**:
 - **`SymbolCache`**: Caches symbol information for binary images
 - **`Symbolication`**: Resolves addresses to function names and source locations
-- **`TypeExtractor`**: Extracts type information from DWARF
+- **`values::types::TypeTable`**: Resolves DWARF types per image through `BinaryImage::types`
 - **`BinaryImage`**: Represents a loaded binary and its DWARF sections
 
 **Code Reference**: [`crates/ferros-core/src/symbols/mod.rs`](../crates/ferros-core/src/symbols/mod.rs)

@@ -8,7 +8,6 @@
 //!
 //! - **`cache`**: Symbol cache for binary images and address symbolication
 //! - **`demangle`**: Symbol demangling utilities (Rust, C++)
-//! - **`extractor`**: DWARF type extraction and introspection
 //! - **`functions`**: Function index: function name to entry and post-prologue addresses
 //! - **`image`**: Binary images: DWARF sections, segment mapping and unwind information
 //!   read by the session's [`ObjectFormat`](crate::objfile::ObjectFormat)
@@ -38,7 +37,6 @@ use gimli::{Dwarf, EndianArcSlice, RunTimeEndian};
 
 pub mod cache;
 pub mod demangle;
-pub mod extractor;
 pub mod functions;
 pub mod image;
 pub mod lines;
@@ -57,7 +55,6 @@ pub(crate) fn dwarf_frame_name<'a>(frame: &'a addr2line::Frame<'_, OwnedReader>)
 
 // Re-exports
 pub use cache::{SymbolCache, SymbolFrame, Symbolication};
-pub use extractor::{TypeField, TypeKind, TypeSummary, TypeVariant};
 pub use functions::FunctionAddress;
 pub use image::{BinaryImage, ImageDescriptor, ImageId, ImageMapping, ImageSegment};
 pub use lines::{AddressLine, LineAddresses, SkippedDebugInfo, SourceLookupError};

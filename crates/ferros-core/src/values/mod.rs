@@ -1,4 +1,5 @@
-//! DWARF scopes and raw values for stopped stack frames.
+//! DWARF types, variable scopes, and storage locations.
 
 pub mod location;
 pub mod scope;
+pub mod types;

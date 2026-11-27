@@ -33,14 +33,13 @@
 //! - `ImageId`: stable identity of a loaded image.
 //! - `BinaryImage`: construction (`from_contents`), layout queries, call frame sections
 //!   (`eh_frame_section`, `debug_frame_section`), `unwind_hints`, `symbolicate`, and
-//!   `describe_type`. Line and function lookups on `BinaryImage` live in `lines.rs` and
-//!   `functions.rs`.
+//!   `types` (the image's [`TypeTable`]). Line and function lookups on `BinaryImage` live
+//!   in `lines.rs` and `functions.rs`.
 //! - Mapping tests in `mod mapping_tests`.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use addr2line::Context;
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian, SectionId};
@@ -48,13 +47,13 @@ use once_cell::sync::OnceCell;
 
 use super::cache::{SymbolFrame, Symbolication};
 use super::demangle::make_symbol_name;
-use super::extractor::{TypeExtractor, TypeSummary};
 use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
 use super::{OwnedDwarf, OwnedReader, dwarf_frame_name};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
+use crate::values::types::TypeTable;
 
 /// Describes a binary image mapped in the debuggee's address space.
 ///
@@ -316,7 +315,9 @@ pub struct BinaryImage
     /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
     /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
     context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
-    type_cache: RwLock<HashMap<String, Arc<TypeSummary>>>,
+    /// Built on the first type lookup (see `values::types`); a failure to load the DWARF
+    /// sections is cached too.
+    types: OnceCell<std::result::Result<TypeTable, SourceLookupError>>,
     /// Built on the first source lookup (see `symbols::lines`); a failure to load the
     /// DWARF sections is cached too.
     line_index: OnceCell<std::result::Result<LineIndex, SourceLookupError>>,
@@ -370,7 +371,7 @@ impl BinaryImage
             retry_debug,
             dwarf_cache: OnceCell::new(),
             context_cache: OnceCell::new(),
-            type_cache: RwLock::new(HashMap::new()),
+            types: OnceCell::new(),
             line_index: OnceCell::new(),
             function_index: OnceCell::new(),
         }
@@ -807,64 +808,29 @@ impl BinaryImage
         Vec::new()
     }
 
-    /// Describe a type by name using DWARF type information.
+    /// The image's types, resolved from its DWARF on demand (see
+    /// [`values::types`](crate::values::types)). The name index is built on the first call
+    /// and cached, and so is a failure to load the DWARF sections.
     ///
-    /// This method searches through the image's DWARF type information to find
-    /// a type definition matching the given name. It returns a summary of the
-    /// type's structure (fields, variants, etc.).
+    /// # Errors
     ///
-    /// ## Parameters
-    ///
-    /// - `name`: The type name to look up (e.g., "std::option::Option", "Point")
-    ///
-    /// ## Returns
-    ///
-    /// `Ok(Some(summary))` if the type is found, `Ok(None)` if not found,
-    /// or an error if DWARF parsing fails.
-    ///
-    /// ## Caching
-    ///
-    /// Type summaries are cached after first lookup to avoid re-parsing DWARF
-    /// on subsequent requests for the same type.
-    ///
-    /// ## Example
-    ///
-    /// ```rust,no_run
-    /// use ferros_core::symbols::{BinaryImage, ImageDescriptor, SymbolCache};
-    ///
-    /// # let format = ferros_core::objfile::mock::MockObjectFormat::shared();
-    /// let mut cache = SymbolCache::new(format);
-    /// let descriptor = ImageDescriptor {
-    ///     path: std::path::PathBuf::from("/usr/bin/prog"),
-    ///     load_address: 0x100000000,
-    /// };
-    /// let image = cache.load_image(descriptor).unwrap();
-    /// if let Ok(Some(summary)) = image.describe_type("std::option::Option") {
-    ///     println!("Type: {}", summary.name);
-    ///     println!("Kind: {:?}", summary.kind);
-    ///     for field in &summary.fields {
-    ///         println!("Field: {:?}", field.name);
-    ///     }
-    /// }
-    /// ```
-    pub fn describe_type(&self, name: &str) -> Result<Option<Arc<TypeSummary>>>
+    /// [`SourceLookupError::DebugInfo`] when the image has no debug information or its
+    /// DWARF sections cannot be loaded.
+    pub fn types(&self) -> std::result::Result<&TypeTable, SourceLookupError>
     {
-        if let Some(existing) = self.type_cache.read().unwrap().get(name) {
-            return Ok(Some(existing.clone()));
-        }
-
-        let dwarf = self.dwarf()?;
-        let extractor = TypeExtractor::new(dwarf)?;
-        let Some(summary) = extractor.describe(name)? else {
-            return Ok(None);
-        };
-        let summary = Arc::new(summary);
-        let mut cache = self.type_cache.write().unwrap();
-        cache.insert(name.to_string(), summary.clone());
-        if summary.name != name {
-            cache.insert(summary.name.clone(), summary.clone());
-        }
-        Ok(Some(summary))
+        self.types
+            .get_or_init(|| {
+                let sections = self
+                    .debug_sections()
+                    .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
+                let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
+                    .map_err(|error| SourceLookupError::DebugInfo(format!("failed to load DWARF: {error}")))?;
+                let table = TypeTable::build(dwarf, self.executable.endian);
+                super::lines::warn_skipped(self, "type", table.skipped());
+                Ok(table)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 }
 

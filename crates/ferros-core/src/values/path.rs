@@ -30,6 +30,8 @@ use super::types::{PointerKind, TypeId, TypeKind, TypeTable};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
 
+const MAX_TOKENS: usize = 256;
+
 /// A parsed `print` path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Path
@@ -57,6 +59,10 @@ impl Path
     pub fn parse(text: &str) -> Result<Self, PathError>
     {
         let tokens = tokenize(text)?;
+        // The parser and evaluator recurse once per token at most.
+        if tokens.len() > MAX_TOKENS {
+            return Err(PathError::syntax(format!("path is longer than {MAX_TOKENS} tokens")));
+        }
         let mut parser = Parser { tokens, next: 0 };
         let expr = parser.path()?;
         if let Some(&(token, column)) = parser.tokens.get(parser.next) {
@@ -411,12 +417,12 @@ impl Evaluator<'_>
             Expr::Variable(_) => Ok(root),
             Expr::Field(base, name) => {
                 let place = self.eval(base, root)?;
-                let place = self.auto_deref(expr, place)?;
+                let place = self.auto_deref(base, place)?;
                 self.field(expr, place, name)
             }
             Expr::Index(base, index) => {
                 let place = self.eval(base, root)?;
-                let place = self.auto_deref(expr, place)?;
+                let place = self.auto_deref(base, place)?;
                 self.index(expr, place, *index)
             }
             Expr::Deref(inner) => {
@@ -491,7 +497,8 @@ impl Evaluator<'_>
                 ));
             }
             _ => {
-                return Err(PathError::at(expr, format!("{} has no fields", self.type_name(ty))));
+                let hint = raw_pointer_hint(expr, &self.shape(ty));
+                return Err(PathError::at(expr, format!("{} has no fields{hint}", self.type_name(ty))));
             }
         };
         // Rust names tuple and tuple-struct fields `__0`, `__1`, ...
@@ -556,7 +563,13 @@ impl Evaluator<'_>
                     storage: Storage::Memory(address),
                 })
             }
-            _ => Err(PathError::at(expr, format!("cannot index {}", self.type_name(place.ty)))),
+            shape => {
+                let hint = raw_pointer_hint(expr, &shape);
+                Err(PathError::at(
+                    expr,
+                    format!("cannot index {}{hint}", self.type_name(place.ty)),
+                ))
+            }
         }
     }
 
@@ -630,6 +643,20 @@ impl Evaluator<'_>
             }
         }
     }
+}
+
+/// Raw pointers are not dereferenced implicitly. Suggest the explicit form.
+fn raw_pointer_hint(expr: &Expr, shape: &Shape) -> String
+{
+    if !matches!(shape, Shape::Pointer(PointerKind::Raw { .. }, _)) {
+        return String::new();
+    }
+    let explicit = match expr {
+        Expr::Field(base, name) => Expr::Field(Box::new(Expr::Deref(base.clone())), name.clone()),
+        Expr::Index(base, index) => Expr::Index(Box::new(Expr::Deref(base.clone())), *index),
+        _ => return String::new(),
+    };
+    format!("; dereference the raw pointer first, as in `{explicit}`")
 }
 
 fn check_bounds(expr: &Expr, index: u64, len: u64) -> Result<(), PathError>
@@ -770,6 +797,15 @@ mod tests
         assert!(rejected("v[99999999999999999999999]").starts_with("invalid index"));
         assert!(rejected("t.1x").starts_with("invalid index"));
         assert!(rejected("1.0").contains("starts with a variable name"));
+    }
+
+    #[test]
+    fn rejects_deeply_nested_paths()
+    {
+        let deep = format!("{}x", "*".repeat(100_000));
+        assert_eq!(rejected(&deep), "path is longer than 256 tokens");
+        let nested = format!("{}x{}", "(".repeat(100), ")".repeat(100));
+        assert_eq!(parsed(&nested), "x");
     }
 
     #[test]

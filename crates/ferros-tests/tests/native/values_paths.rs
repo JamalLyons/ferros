@@ -31,6 +31,10 @@ fn print_follows_fields_indexes_and_dereferences()
         ("(*boxed_point).y", "i32 = 2"),
         ("grid[1][0]", "u8 = 3"),
         ("( * r ) . id", "u16 = 3"),
+        ("vr[3]", "u32 = 40"),
+        ("(*vr)[0]", "u32 = 10"),
+        ("boxed_slice[2]", "u16 = 13"),
+        ("mut_slice[1]", "i16 = -6"),
     ];
     const FAILURES: &[(&str, &str)] = &[
         (
@@ -54,7 +58,12 @@ fn print_follows_fields_indexes_and_dereferences()
         ("(*null).x", "cannot evaluate '(*null).x': `*null`: null pointer"),
         (
             "raw.x",
-            "cannot evaluate 'raw.x': `raw.x`: *const ferros_fixture_values_paths::Inner has no fields",
+            "cannot evaluate 'raw.x': `raw.x`: *const ferros_fixture_values_paths::Inner has no fields; dereference the \
+             raw pointer first, as in `(*raw).x`",
+        ),
+        (
+            "boxed_slice[3]",
+            "cannot evaluate 'boxed_slice[3]': `boxed_slice[3]`: index 3 is out of bounds for length 3",
         ),
         ("*count", "cannot evaluate '*count': `*count`: cannot dereference u32"),
         ("count[0]", "cannot evaluate 'count[0]': `count[0]`: cannot index u32"),

@@ -47,8 +47,13 @@ fn main()
     let grid = [[1_u8, 2], [3, 4]];
     let empty: Vec<u32> = Vec::new();
     let count = 6_u32;
+    let vr = &v;
+    let boxed_slice: Box<[u16]> = Box::new([11, 12, 13]);
+    let mut storage = [5_i16, -6, 7];
+    let mut_slice: &mut [i16] = &mut storage;
 
     black_box(&p); // BREAK: inspect
     black_box((&v, &boxed, &t, &named, &r, &rr, &arr, &slice, &raw, &null));
     black_box((&wrapper, &boxed_point, &grid, &empty, &count));
+    black_box((&vr, &boxed_slice, &mut_slice));
 }

@@ -1,8 +1,15 @@
-//! Values reached by `print <path>`: fields, tuple fields, indexes and dereferences.
+//! Values reached by `print <path>`: fields, tuple fields, indexes and dereferences,
+//! through smart pointers, cells and containers.
 #![expect(dead_code, reason = "the debugger reads these fields; the program does not")]
 
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::hint::black_box;
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 struct Inner
 {
@@ -88,6 +95,32 @@ fn main()
     let opt_ptr = &opt;
     let single = Single::Value(51);
     let huge: Box<Huge> = Box::new(Huge::Small(5));
+    let rc = Rc::new(Named {
+        name: String::from("shared"),
+        id: 9,
+    });
+    let arc: Arc<[u32]> = Arc::from([100_u32, 200, 300]);
+    let pinned: Pin<Box<i64>> = Box::pin(-88);
+    let cell = Cell::new(Inner { x: 21, y: 22 });
+    let cell_struct = RefCell::new(Inner { x: 31, y: 32 });
+    let weak = Rc::downgrade(&rc);
+    let dangling: Weak<Named> = {
+        let gone = Rc::new(Named {
+            name: String::new(),
+            id: 0,
+        });
+        Rc::downgrade(&gone)
+    };
+    let empty_weak: Weak<Named> = Weak::new();
+    // Capacity 4 with the head moved to slot 2: logical [3, 4, 5, 6] is stored [5, 6, 3, 4].
+    let mut vd: VecDeque<u32> = VecDeque::with_capacity(4);
+    vd.extend([1, 2, 3]);
+    vd.drain(..2);
+    vd.extend([4, 5, 6]);
+    let raw_slice: *const [u16] = storage_u16();
+    let text = String::from("hey");
+    let cow_borrowed: Cow<'_, str> = Cow::Borrowed("cow");
+    let cow_owned: Cow<'_, [u8]> = Cow::Owned(vec![7, 8]);
 
     black_box(&p); // BREAK: inspect
     black_box((&v, &boxed, &t, &named, &r, &rr, &arr, &slice, &raw, &null));
@@ -95,4 +128,13 @@ fn main()
     black_box((&vr, &boxed_slice, &mut_slice));
     black_box((&shape, &sq, &empty_shape, &opt, &none, &res_ok, &res_err, &opt_ref, &ordering));
     black_box((&maybe_order, &opt_ptr, &single, &huge));
+    black_box((&rc, &arc, &pinned, &cell, &cell_struct, &weak, &dangling, &vd, &raw_slice));
+    black_box(&empty_weak);
+    black_box((&text, &cow_borrowed, &cow_owned));
+}
+
+/// A slice that outlives `main`'s raw pointer to it.
+fn storage_u16() -> &'static [u16]
+{
+    &[10, 20, 30]
 }

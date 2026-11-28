@@ -1,5 +1,6 @@
 //! `print <path>`: field access, indexing and dereference from a stopped Rust program
-//! (issue #391), and fields of an enum's active variant (issue #413).
+//! (issue #391), fields of an enum's active variant (issue #413), and smart pointers, cells,
+//! `VecDeque`, strings, raw slices and index literals (issue #414).
 #![cfg(target_os = "macos")]
 
 use ferros_tests::{fixture, harness, transcript};
@@ -123,6 +124,68 @@ fn print_follows_fields_of_the_active_enum_variant()
             "single.1",
             "cannot evaluate 'single.1': `single.1`: no field `1` in ferros_fixture_values_paths::Single::Value",
         ),
+    ];
+    print_paths(SAMPLES, FAILURES);
+}
+
+#[test]
+fn print_follows_smart_pointers_and_indexes_more_containers()
+{
+    const SAMPLES: &[(&str, &str)] = &[
+        (
+            "*rc",
+            r#"ferros_fixture_values_paths::Named = ferros_fixture_values_paths::Named { name: "shared", id: 9 }"#,
+        ),
+        ("rc.name", r#"alloc::string::String = "shared""#),
+        ("rc.id", "u16 = 9"),
+        ("arc[1]", "u32 = 200"),
+        ("*pinned", "i64 = -88"),
+        ("cell.x", "i32 = 21"),
+        (
+            "*cell",
+            "ferros_fixture_values_paths::Inner = ferros_fixture_values_paths::Inner { x: 21, y: 22 }",
+        ),
+        ("cell_struct.x", "i32 = 31"),
+        ("cell_struct.y", "i32 = 32"),
+        ("(*weak).id", "u16 = 9"),
+        ("vd[0]", "u32 = 3"),
+        ("vd[1]", "u32 = 4"),
+        ("vd[3]", "u32 = 6"),
+        ("(*raw_slice)[1]", "u16 = 20"),
+        ("text[0]", "u8 = 104"),
+        ("*cow_borrowed", r#"&str = "cow""#),
+        ("cow_borrowed[1]", "u8 = 111"),
+        ("cow_owned[1]", "u8 = 8"),
+        ("v[0x1]", "u32 = 20"),
+        ("v[0b11]", "u32 = 40"),
+        ("v[0o2]", "u32 = 30"),
+        ("v[0_0]", "u32 = 10"),
+    ];
+    const FAILURES: &[(&str, &str)] = &[
+        ("*dangling", "cannot evaluate '*dangling': `*dangling`: dangling Weak"),
+        (
+            "vd[4]",
+            "cannot evaluate 'vd[4]': `vd[4]`: index 4 is out of bounds for length 4",
+        ),
+        (
+            "weak.id",
+            "cannot evaluate 'weak.id': `weak.id`: no field `id` in alloc::rc::Weak<ferros_fixture_values_paths::Named, \
+             alloc::alloc::Global>; dereference the Weak first, as in `(*weak).id`",
+        ),
+        (
+            "raw_slice[1]",
+            "cannot evaluate 'raw_slice[1]': `raw_slice[1]`: cannot index *const [u16]; dereference the raw pointer first, \
+             as in `(*raw_slice)[1]`",
+        ),
+        (
+            "*raw_slice",
+            "cannot evaluate '*raw_slice': `*raw_slice`: [u16] is unsized; print `raw_slice` whole or index it",
+        ),
+        (
+            "text[3]",
+            "cannot evaluate 'text[3]': `text[3]`: index 3 is out of bounds for length 3",
+        ),
+        ("v[0x]", "invalid path 'v[0x]': invalid index `0x` at column 3"),
     ];
     print_paths(SAMPLES, FAILURES);
 }

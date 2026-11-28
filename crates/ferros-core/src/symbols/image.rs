@@ -39,20 +39,19 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use addr2line::Context;
 use gimli::{Dwarf, EndianArcSlice, RunTimeEndian, SectionId};
 use once_cell::sync::OnceCell;
 
-use super::cache::{SymbolFrame, Symbolication};
-use super::demangle::make_symbol_name;
+use super::cache::Symbolication;
+use super::frames::{DwarfFrames, FrameIndex};
 use super::functions::FunctionIndex;
 use super::lines::{LineIndex, SourceLookupError};
-use super::{OwnedDwarf, OwnedReader, dwarf_frame_name};
+use super::{OwnedDwarf, OwnedReader};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, SectionData, UnwindHints};
-use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
+use crate::types::{Address, Architecture};
 use crate::values::statics::StaticIndex;
 use crate::values::types::TypeTable;
 
@@ -297,7 +296,7 @@ impl ImageId
 ///
 /// ## Caching
 ///
-/// The `BinaryImage` caches parsed DWARF data and symbolication contexts to avoid
+/// The `BinaryImage` caches parsed DWARF data and frame indexes to avoid
 /// re-parsing on every lookup. The caches are lazily initialized on first use.
 ///
 /// ## Address Relocation
@@ -313,9 +312,7 @@ pub struct BinaryImage
     debug: Result<DebugSections>,
     retry_debug: Option<DebugInfoRetry>,
     dwarf_cache: OnceCell<OwnedDwarf>,
-    /// `addr2line::Context` is not `Sync`; the mutex makes `BinaryImage` `Send + Sync`
-    /// so a `SymbolCache` (and the `Session` holding it) can move between threads.
-    context_cache: OnceCell<Mutex<Context<OwnedReader>>>,
+    frame_index: OnceCell<gimli::Result<FrameIndex>>,
     /// Built on the first type lookup (see `values::types`); a failure to load the DWARF
     /// sections is cached too.
     types: OnceCell<std::result::Result<Arc<TypeTable>, SourceLookupError>>,
@@ -374,7 +371,7 @@ impl BinaryImage
             debug,
             retry_debug,
             dwarf_cache: OnceCell::new(),
-            context_cache: OnceCell::new(),
+            frame_index: OnceCell::new(),
             types: OnceCell::new(),
             line_index: OnceCell::new(),
             function_index: OnceCell::new(),
@@ -650,7 +647,7 @@ impl BinaryImage
     ///
     /// # Errors
     /// Why the image has no source debug information, or why its DWARF does not load.
-    pub(super) fn dwarf(&self) -> Result<&OwnedDwarf>
+    pub(crate) fn dwarf(&self) -> Result<&OwnedDwarf>
     {
         let sections = self.debug_sections()?;
         self.dwarf_cache.get_or_try_init(|| {
@@ -669,16 +666,15 @@ impl BinaryImage
         EndianArcSlice::new(data, self.executable.endian)
     }
 
-    pub(crate) fn symbol_context(&self) -> Result<&Mutex<Context<OwnedReader>>>
+    pub(crate) fn dwarf_frames(&self, pc: u64) -> std::result::Result<Option<DwarfFrames<'_>>, String>
     {
-        let sections = self.debug_sections()?;
-        self.context_cache.get_or_try_init(|| {
-            let dwarf = Dwarf::load(|section| Ok::<_, gimli::Error>(self.section_reader(sections, section)))
-                .map_err(|err| DebuggerError::InvalidArgument(format!("failed to load DWARF for addr2line: {err}")))?;
-            Context::from_dwarf(dwarf)
-                .map(Mutex::new)
-                .map_err(|err| DebuggerError::InvalidArgument(format!("failed to build addr2line context: {err}")))
-        })
+        let dwarf = self.dwarf().map_err(|error| error.to_string())?;
+        let index = self
+            .frame_index
+            .get_or_init(|| FrameIndex::build(dwarf))
+            .as_ref()
+            .map_err(|error| format!("failed to index frame units: {error}"))?;
+        index.lookup(dwarf, pc)
     }
 
     /// Symbolicate an address to function names and source locations.
@@ -734,83 +730,18 @@ impl BinaryImage
             }
         };
 
-        let ctx = match self.symbol_context() {
-            Ok(ctx) => ctx.lock().unwrap_or_else(PoisonError::into_inner),
-            Err(e) => {
-                use tracing::debug;
-                debug!("Failed to get symbol context for {}: {}", self.executable.path.display(), e);
+        let frames = match self.dwarf_frames(file_addr) {
+            Ok(Some(frames)) => frames.symbols(file_addr),
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(file_addr, path = %self.executable.path.display(), %error, "failed to find DWARF frames");
                 return None;
             }
         };
-
-        let mut frames = Vec::new();
-
-        let lookup = ctx.find_frames(file_addr);
-        let mut frame_iter = match lookup.skip_all_loads() {
-            Ok(iter) => iter,
-            Err(e) => {
-                use tracing::debug;
-                debug!(
-                    "Failed to find frames for 0x{:x} in {}: {:?}",
-                    file_addr,
-                    self.executable.path.display(),
-                    e
-                );
-                return None;
-            }
-        };
-
-        while let Ok(Some(frame)) = frame_iter.next() {
-            let symbol_name = dwarf_frame_name(&frame).map(|raw| make_symbol_name(raw.to_string(), SymbolSource::DebugInfo));
-            let location = frame.location.as_ref().and_then(|loc| {
-                loc.file.as_ref().map(|file| SourceLocation {
-                    file: file.to_string(),
-                    line: loc.line,
-                    column: loc.column,
-                })
-            });
-
-            if let Some(symbol) = symbol_name {
-                // Extract function parameters from DWARF
-                let parameters = self.extract_function_parameters(file_addr, &frame);
-                frames.push(SymbolFrame {
-                    symbol,
-                    location,
-                    parameters,
-                });
-            } else {
-                use tracing::debug;
-                debug!("Frame at 0x{:x} has no symbol name", file_addr);
-            }
-        }
-
-        if frames.is_empty() {
-            use tracing::debug;
-            debug!(
-                "No frames found for address 0x{:x} in {}",
-                file_addr,
-                self.executable.path.display()
-            );
-            return None;
-        }
-
-        Some(Symbolication {
+        (!frames.is_empty()).then_some(Symbolication {
             image_id: self.executable.id,
             frames,
         })
-    }
-
-    /// Extract function parameters from DWARF for a given address and frame.
-    ///
-    /// This method walks the DWARF DIEs to find function parameters.
-    fn extract_function_parameters(&self, file_addr: u64, _frame: &addr2line::Frame<OwnedReader>) -> Vec<FunctionParameter>
-    {
-        // TODO: Implement full DWARF parameter extraction
-        // For now, return empty vector as parameter extraction from DWARF
-        // requires walking the DIE tree and finding DW_TAG_formal_parameter entries
-        // This is a placeholder that can be enhanced later
-        let _ = file_addr;
-        Vec::new()
     }
 
     /// The image's types, resolved from its DWARF on demand (see

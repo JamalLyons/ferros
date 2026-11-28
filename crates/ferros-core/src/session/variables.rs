@@ -1,7 +1,7 @@
 //! Variable inspection through a stopped session.
 
 use std::cell::{OnceCell, RefCell};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use super::Session;
 use crate::error::{DebuggerError, Result};
@@ -58,18 +58,13 @@ impl Session
         };
         let debug_info_error = |detail| DebuggerError::NoDebugInfo {
             path: image.path().to_path_buf(),
-            detail,
+            detail: format!("failed to walk variable DWARF at PC {file_pc:#x}: {detail}"),
         };
-        let context = image
-            .symbol_context()
-            .map_err(|error| match error {
-                DebuggerError::NoDebugInfo { .. } => error,
-                other => debug_info_error(other.to_string()),
-            })?
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let Some(frames) = image.dwarf_frames(file_pc).map_err(debug_info_error)? else {
+            return Ok(Vec::new());
+        };
         frame_variables(
-            &context,
+            frames,
             file_pc,
             frame.kind,
             image.id(),
@@ -77,7 +72,7 @@ impl Session
             |address, len| self.read_memory(address, len),
             |address| image.runtime_address(address),
         )
-        .map_err(|error| debug_info_error(format!("failed to walk variable DWARF: {error}")))
+        .map_err(debug_info_error)
     }
 
     /// Render a variable from the current stop. Returns its type name, if known,

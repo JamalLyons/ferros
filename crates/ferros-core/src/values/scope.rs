@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use addr2line::Context;
 use gimli::{AttributeValue, DebugInfoOffset, DebuggingInformationEntry, DwAt, DwTag, Reader as _, UnitOffset, UnitRef};
 
 use super::location::{LocationEvaluator, Unavailable, VariableValue, expression_at, read_constant};
 use crate::error::Result;
-use crate::symbols::{ImageId, OwnedReader, dwarf_frame_name};
+use crate::symbols::frames::{DwarfFrames, die_error};
+use crate::symbols::{ImageId, OwnedReader};
 use crate::types::{Address, FrameKind, FrameRegisters};
 
 /// A local variable or argument visible in a stopped logical stack frame.
@@ -37,40 +37,22 @@ type Attr = AttributeValue<OwnedReader>;
 type DwarfResult<T> = gimli::Result<T>;
 
 pub(crate) fn frame_variables(
-    context: &Context<OwnedReader>,
+    frames: DwarfFrames<'_>,
     pc: u64,
     kind: FrameKind,
     image_id: ImageId,
     registers: &FrameRegisters,
     read_memory: impl FnMut(Address, usize) -> Result<Vec<u8>>,
     relocate: impl Fn(u64) -> Option<Address>,
-) -> DwarfResult<Vec<Variable>>
+) -> std::result::Result<Vec<Variable>, String>
 {
-    let mut frames = context.find_frames(pc).skip_all_loads()?;
-    let Some(unit) = context.find_dwarf_and_unit(pc).skip_all_loads() else {
+    let Some(selected) = frames.scope(kind) else {
         return Ok(Vec::new());
     };
-    let mut owner = None;
-    let mut named = Vec::new();
-    while let Some(frame) = frames.next()? {
-        owner = frame.dw_die_offset;
-        if dwarf_frame_name(&frame).is_some()
-            && let Some(offset) = frame.dw_die_offset
-        {
-            named.push(offset);
-        }
-    }
-    let Some(owner) = owner else { return Ok(Vec::new()) };
-    let selected = match kind {
-        // Stack traces present the last named entry as physical. The actual
-        // subprogram still owns the frame base, including when it has no name.
-        FrameKind::Physical => named.last().copied().unwrap_or(owner),
-        FrameKind::Inlined { depth, .. } => match named.get(usize::from(depth)) {
-            Some(&inline) => inline,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let owner_die = unit.entry(owner)?;
+    let unit = frames.unit;
+    let owner_die = unit
+        .entry(frames.owner)
+        .map_err(|error| die_error(unit, frames.owner, error))?;
     let frame_base = owner_die
         .attr_value(gimli::DW_AT_frame_base)
         .map_err(Unavailable::from)
@@ -105,18 +87,19 @@ impl FrameScope
         unit: Unit<'_>,
         selected: UnitOffset<usize>,
         mut inspect: impl FnMut(&Entry<'_, '_>, Option<u64>, DwarfResult<Option<Attr>>) -> VariableValue,
-    ) -> DwarfResult<Vec<Variable>>
+    ) -> std::result::Result<Vec<Variable>, String>
     {
         let mut variables = Vec::new();
         let mut pending = vec![(selected, None)];
         while let Some((offset, inherited_start)) = pending.pop() {
-            let mut tree = unit.entries_tree(Some(offset))?;
-            let root = tree.root()?;
+            let scope_error = |error| die_error(unit, offset, error);
+            let mut tree = unit.entries_tree(Some(offset)).map_err(scope_error)?;
+            let root = tree.root().map_err(scope_error)?;
             let start = match scope_start(unit, root.entry(), self.pc, inherited_start) {
                 Ok(Some(start)) => Some(start),
                 Ok(None) if offset == selected => None,
                 Ok(None) => continue,
-                Err(error) if offset == selected => return Err(error),
+                Err(error) if offset == selected => return Err(scope_error(error)),
                 Err(error) => {
                     warn_die(root.entry(), error);
                     continue;
@@ -127,7 +110,7 @@ impl FrameScope
             let mut nested = Vec::new();
             let mut concrete = Vec::new();
             let mut by_origin = HashMap::new();
-            while let Some(child) = children.next()? {
+            while let Some(child) = children.next().map_err(scope_error)? {
                 let entry = child.entry();
                 if entry.tag() == gimli::DW_TAG_lexical_block {
                     nested.push((entry.offset(), start));
@@ -556,6 +539,8 @@ mod tests
     use gimli::write::{Address as FileAddress, AttributeValue as WriteAttr, DwarfUnit, Expression, Location, LocationList};
 
     use super::*;
+    use crate::symbols::OwnedDwarf;
+    use crate::symbols::frames::FrameIndex;
     use crate::values::location::ValueLocation;
     use crate::values::location::tests::{encoding, synthetic_dwarf};
 
@@ -575,10 +560,10 @@ mod tests
         function
     }
 
-    fn test_frame(context: &Context<OwnedReader>, pc: u64) -> DwarfResult<Vec<Variable>>
+    fn test_frame(dwarf: &OwnedDwarf, index: &FrameIndex, pc: u64) -> std::result::Result<Vec<Variable>, String>
     {
         frame_variables(
-            context,
+            index.lookup(dwarf, pc)?.expect("function at PC"),
             pc,
             FrameKind::Physical,
             ImageId::from_parts(Path::new("test"), 0),
@@ -605,7 +590,7 @@ mod tests
         let mut dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
         // Only the middle variable uses this section. Its offset now points past the end.
         dwarf.debug_str = gimli::DebugStr::from(OwnedReader::new(std::sync::Arc::from([]), RunTimeEndian::Little));
-        let vars = test_frame(&Context::from_dwarf(dwarf).unwrap(), 0x105).unwrap();
+        let vars = test_frame(&dwarf, &FrameIndex::build(&dwarf).unwrap(), 0x105).unwrap();
         assert_eq!(
             vars.iter().map(|var| var.name.as_str()).collect::<Vec<_>>(),
             ["first", "last"]
@@ -646,12 +631,12 @@ mod tests
             .set(gimli::DW_AT_location, WriteAttr::Exprloc(location));
 
         let dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
-        let context = Context::from_dwarf(dwarf).unwrap();
-        let vars = test_frame(&context, 0x10b).unwrap();
+        let index = FrameIndex::build(&dwarf).unwrap();
+        let vars = test_frame(&dwarf, &index, 0x10b).unwrap();
         assert_eq!(vars.len(), 1, "before inherited start scope");
         assert_eq!(vars[0].name, "omitted");
         assert_eq!(vars[0].value.bytes, Err(Unavailable::OptimizedOut));
-        let vars = test_frame(&context, 0x10c).unwrap();
+        let vars = test_frame(&dwarf, &index, 0x10c).unwrap();
         assert_eq!(
             vars.iter().map(|var| var.name.as_str()).collect::<Vec<_>>(),
             ["omitted", "started"]
@@ -734,12 +719,13 @@ mod tests
             late.set(gimli::DW_AT_start_scope, WriteAttr::Udata(0x20));
             late.set(gimli::DW_AT_location, WriteAttr::Exprloc(stack));
 
-            let context = Context::from_dwarf(synthetic_dwarf(dwarf, RunTimeEndian::Little)).unwrap();
+            let dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
+            let index = FrameIndex::build(&dwarf).unwrap();
             let image = ImageId::from_parts(Path::new("test"), 0);
             let read_frame = |pc, known_reg| {
                 let registers = FrameRegisters::new(Some(Address::new(0x8010)), |n| (n == 0 && known_reg).then_some(0x1234));
                 frame_variables(
-                    &context,
+                    index.lookup(&dwarf, pc).unwrap().expect("function at PC"),
                     pc,
                     FrameKind::Physical,
                     image,

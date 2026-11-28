@@ -86,6 +86,14 @@ fn get(types: &TypeTable, id: TypeId) -> std::sync::Arc<Type>
     types.get(id).expect("an id of this table")
 }
 
+fn check_unsigned_base(types: &TypeTable, id: TypeId, name: &str, size: u64)
+{
+    let ty = get(types, id);
+    assert_eq!(ty.name.as_deref(), Some(name));
+    assert_eq!(ty.kind, TypeKind::Base(BaseEncoding::Unsigned));
+    assert_eq!(ty.size, Some(size));
+}
+
 fn composite(types: &TypeTable, id: TypeId) -> Composite
 {
     match &get(types, id).kind {
@@ -150,8 +158,6 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
         );
     }
     let field_type = |field: &str| sample_fields.member(field).and_then(|member| member.ty).expect("typed");
-    let u16_id = types.type_named("u16").expect("u16");
-    assert_eq!(get(types, u16_id).kind, TypeKind::Base(BaseEncoding::Unsigned));
 
     // A struct whose fields rustc reordered, and a tuple.
     let point = composite(types, field_type("point"));
@@ -170,7 +176,8 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
     let TypeKind::Array(words) = &get(types, field_type("words")).kind else {
         panic!("[u16; 4] is an array");
     };
-    assert_eq!((words.element, words.lengths.as_slice()), (Some(u16_id), &[Some(4)][..]));
+    check_unsigned_base(types, words.element.expect("array element type"), "u16", 2);
+    assert_eq!(words.lengths, [Some(4)]);
     for (field, kind) in [
         ("word_ref", PointerKind::Reference { mutable: false }),
         ("word_ptr", PointerKind::Raw { mutable: false }),
@@ -179,8 +186,9 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
         let TypeKind::Pointer(target) = &pointer.kind else {
             panic!("{field} is a pointer");
         };
-        assert_eq!((target.kind, target.pointee), (kind, Some(u16_id)), "{field}");
-        assert_eq!(types.type_of(pointer.die), Some(u16_id), "{field}: DW_AT_type of the entry");
+        assert_eq!(target.kind, kind, "{field}");
+        check_unsigned_base(types, target.pointee.expect("pointee type"), "u16", 2);
+        assert_eq!(types.type_of(pointer.die), target.pointee, "{field}: DW_AT_type of the entry");
         assert_eq!(
             types.type_at(pointer.die),
             Some(field_type(field)),
@@ -192,16 +200,20 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
 fn check_enum_layouts(types: &TypeTable, maybe: &RustEnum, shape: &RustEnum, printed: &HashMap<String, String>)
 {
     // Option<u32>: a tagged enum, `Some`'s payload after the tag, `T` = u32.
-    let u32_id = types.type_named("u32").expect("u32");
+    check_unsigned_base(types, types.type_named("u32").expect("u32 by name"), "u32", 4);
     assert_eq!((value_of(maybe, "None"), value_of(maybe, "Some")), (0, 1));
     let some = maybe.variant("Some").expect("Some");
     let payload = composite(types, some.members[0].ty.expect("Some payload"));
-    assert_eq!(
-        payload.member("__0").map(|member| (member.ty, member.offset)),
-        Some((Some(u32_id), Some(number(printed, "maybe.Some.field.0"))))
-    );
-    assert_eq!(payload.template_param("T").and_then(|param| param.ty), Some(u32_id));
-    assert_eq!(maybe.template_param("T").and_then(|param| param.ty), Some(u32_id));
+    let field = payload.member("__0").expect("Some field");
+    assert_eq!(field.offset, Some(number(printed, "maybe.Some.field.0")));
+    // A reference can point at a different CU's equivalent base-type DIE.
+    for id in [
+        field.ty,
+        payload.template_param("T").and_then(|param| param.ty),
+        maybe.template_param("T").and_then(|param| param.ty),
+    ] {
+        check_unsigned_base(types, id.expect("typed enum payload or parameter"), "u32", 4);
+    }
 
     // A fieldful #[repr(u8)] enum: explicit discriminants and per-variant fields.
     assert_eq!(shape.variants.len(), 3);

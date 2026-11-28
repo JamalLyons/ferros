@@ -7,17 +7,17 @@ use ferros_core::backend::{ImageRole, LaunchSpec, LoadedImage};
 use ferros_core::error::DebuggerError;
 use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat, MockObjectImage};
 use ferros_core::symbols::ImageDescriptor;
-use ferros_core::types::{Address, BuildIdentity, FrameKind};
+use ferros_core::types::{Address, BuildIdentity, FrameKind, SymbolName};
 use ferros_core::values::format::{FormatOptions, ValueFormatter, ValueView};
 use ferros_core::values::location::{Unavailable, ValueLocation};
 use ferros_core::values::pretty::PrettyPrinter;
 use ferros_core::values::types::{Type, TypeKind, TypeTable};
 use ferros_core::{Session, SymbolCache};
 use gimli::write::{
-    Address as DwarfAddress, AttributeValue as Attr, DwarfUnit, EndianVec, Expression, Range, RangeList, Sections, Unit,
-    UnitEntryId, Writer as _,
+    Address as DwarfAddress, AttributeValue as Attr, Dwarf, DwarfUnit, EndianVec, Expression, LineProgram, LineString,
+    Range, RangeList, Reference, Sections, Unit, UnitEntryId, Writer as _,
 };
-use gimli::{DwTag, Encoding, Format, LittleEndian, RunTimeEndian, SectionId};
+use gimli::{DwTag, Encoding, Format, LineEncoding, LittleEndian, RunTimeEndian, SectionId};
 
 use crate::helpers::{RemoveOnDrop, THREAD};
 
@@ -40,6 +40,15 @@ fn session_with(
 {
     let mut sections = Sections::new(EndianVec::new(LittleEndian));
     dwarf.write(&mut sections).expect("write DWARF");
+    session_with_sections(&sections, omit, extra)
+}
+
+fn session_with_sections(
+    sections: &Sections<EndianVec<LittleEndian>>,
+    omit: Option<SectionId>,
+    extra: impl FnOnce(MockBackend) -> MockBackend,
+) -> (Session, MockBackend, RemoveOnDrop)
+{
     let mut image = MockObjectFile::new(BASE, IMAGE_SIZE);
     for &id in ferros_core::objfile::DWARF_SECTIONS {
         if Some(id) != omit
@@ -48,6 +57,14 @@ fn session_with(
             image = image.with_dwarf(id, data.slice());
         }
     }
+    session_with_object(&image, extra)
+}
+
+fn session_with_object(
+    image: &MockObjectFile,
+    extra: impl FnOnce(MockBackend) -> MockBackend,
+) -> (Session, MockBackend, RemoveOnDrop)
+{
     let (mut file, path) = ferros_tests::scratch::create_file("ferros-mock-values", ".mock");
     file.write_all(&image.to_bytes()).expect("write mock image");
     drop(file);
@@ -76,9 +93,14 @@ fn session_with(
 
 fn dwarf_function(name: Option<&str>) -> (DwarfUnit, UnitEntryId, UnitEntryId)
 {
+    dwarf_function_for_version(4, name)
+}
+
+fn dwarf_function_for_version(version: u16, name: Option<&str>) -> (DwarfUnit, UnitEntryId, UnitEntryId)
+{
     let mut dwarf = DwarfUnit::new(Encoding {
         format: Format::Dwarf32,
-        version: 4,
+        version,
         address_size: 8,
     });
     let unit = &mut dwarf.unit;
@@ -155,6 +177,216 @@ fn array_with_bounds(
     entry.set(gimli::DW_AT_lower_bound, lower);
     entry.set(gimli::DW_AT_upper_bound, upper);
     array
+}
+
+#[test]
+fn overlapping_unit_bounds_without_aranges_use_the_subprogram_range()
+{
+    let (mut decoy, wrong, wrong_byte) = dwarf_function(Some("decoy"));
+    decoy
+        .unit
+        .get_mut(decoy.unit.root())
+        .set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    decoy
+        .unit
+        .get_mut(wrong)
+        .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+    local(&mut decoy.unit, wrong, "wrong", wrong_byte, register_location());
+
+    let (mut actual, right, right_byte) = dwarf_function(Some("owner"));
+    let ranges = actual.unit.ranges.add(RangeList(vec![
+        Range::OffsetPair { begin: 0, end: 0x10 },
+        Range::OffsetPair { begin: 0x20, end: 0x30 },
+    ]));
+    let function = actual.unit.get_mut(right);
+    function.delete(gimli::DW_AT_high_pc);
+    function.set(gimli::DW_AT_ranges, Attr::RangeListRef(ranges));
+    local(&mut actual.unit, right, "right", right_byte, register_location());
+    // Both subprograms have the same unit-relative DIE offset. The decoy's
+    // bounding range ends first and contains the PC, but its subprogram does not.
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(actual.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let vars = session.selected_frame_variables().expect("read locals");
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].name, "right");
+    assert_eq!(vars[0].value.bytes.as_deref(), Ok(&[7][..]));
+}
+
+#[test]
+fn partial_aranges_preserve_locals_in_the_rest_of_the_unit()
+{
+    let (mut dwarf, second, byte) = dwarf_function(Some("second"));
+    local(&mut dwarf.unit, second, "second_local", byte, register_location());
+    let first = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_subprogram);
+    let entry = dwarf.unit.get_mut(first);
+    entry.set(gimli::DW_AT_name, Attr::String(b"first".to_vec()));
+    entry.set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x120)));
+    entry.set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).unwrap();
+    // A DWARF32 aranges set for CU 0. It lists first's range but omits second's.
+    let mut aranges = EndianVec::new(LittleEndian);
+    aranges.write_u32(44).unwrap();
+    aranges.write_u16(2).unwrap();
+    aranges.write_u32(0).unwrap();
+    aranges.write_u8(8).unwrap();
+    aranges.write_u8(0).unwrap();
+    aranges.write_u32(0).unwrap();
+    for word in [BASE + 0x120, 0x10, 0, 0] {
+        aranges.write_u64(word).unwrap();
+    }
+
+    let mut image = MockObjectFile::new(BASE, IMAGE_SIZE).with_dwarf(SectionId::DebugAranges, aranges.slice());
+    for id in [SectionId::DebugInfo, SectionId::DebugAbbrev] {
+        image = image.with_dwarf(id, sections.get(id).unwrap().slice());
+    }
+    let (mut session, _, _image) = session_with_object(&image, |backend| backend);
+    let frame = session.selected_stack_frame().expect("stack frame");
+    let vars = session.selected_frame_variables().expect("locals outside aranges");
+    assert_eq!(vars.first().map(|var| var.name.as_str()), Some("second_local"));
+    assert!(frame.symbol.is_some_and(|name| name.raw() == "second"));
+}
+
+#[test]
+fn mock_object_preserves_the_debug_info_section_kind()
+{
+    // The kind is persisted immediately after the 32-byte mock file header.
+    let file = MockObjectFile::new(BASE, IMAGE_SIZE).with_dwarf(SectionId::DebugInfo, &[1]);
+    assert_eq!(file.to_bytes()[32..40], 2_u64.to_le_bytes());
+}
+
+fn corrupt_variable_abbreviation(sections: &mut Sections<EndianVec<LittleEndian>>, unit_offset: usize) -> usize
+{
+    let die_offset = {
+        let dwarf = gimli::Dwarf::load(|id| {
+            let bytes = sections.get(id).map_or(&[][..], EndianVec::slice);
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, LittleEndian))
+        })
+        .expect("read synthetic DWARF");
+        let header = dwarf
+            .debug_info
+            .header_from_offset(gimli::DebugInfoOffset(unit_offset))
+            .expect("unit header");
+        let unit = dwarf.unit(header).expect("load unit");
+        let mut entries = unit.entries();
+        loop {
+            let (_, entry) = entries.next_dfs().expect("read DIE").expect("variable");
+            if entry.tag() == gimli::DW_TAG_variable {
+                break entry.offset().0;
+            }
+        }
+    };
+    sections
+        .debug_info
+        .0
+        .write_at(unit_offset + die_offset, &[0x7f])
+        .expect("write unknown abbreviation");
+    die_offset
+}
+
+#[test]
+fn corrupt_overlapping_unit_does_not_hide_the_healthy_owner()
+{
+    let (mut decoy, wrong, wrong_byte) = dwarf_function(Some("decoy"));
+    let root = decoy.unit.root();
+    decoy.unit.get_mut(root).set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    local(&mut decoy.unit, wrong, "wrong", wrong_byte, register_location());
+
+    let (mut actual, right, right_byte) = dwarf_function(Some("owner"));
+    local(&mut actual.unit, right, "right", right_byte, register_location());
+
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(actual.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+    corrupt_variable_abbreviation(&mut sections, 0);
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let frame = session.selected_stack_frame().expect("selected frame");
+    assert_eq!(frame.symbol.as_ref().map(SymbolName::raw), Some("owner"));
+    let vars = session.selected_frame_variables().expect("locals from the healthy unit");
+    assert_eq!(vars.first().map(|var| var.name.as_str()), Some("right"));
+}
+
+#[test]
+fn corrupt_inline_frames_do_not_hide_the_healthy_owner()
+{
+    let (mut decoy, wrong, wrong_byte) = dwarf_function(Some("decoy"));
+    let root = decoy.unit.root();
+    decoy.unit.get_mut(root).set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    let (_, inline) = add_inline(&mut decoy.unit, wrong, wrong_byte);
+    let ranges = decoy
+        .unit
+        .ranges
+        .add(RangeList(vec![Range::OffsetPair { begin: 4, end: 0x14 }]));
+    decoy
+        .unit
+        .get_mut(inline)
+        .set(gimli::DW_AT_ranges, Attr::RangeListRef(ranges));
+
+    let (actual, ..) = dwarf_function(Some("owner"));
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(actual.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+
+    let ranges = sections.debug_ranges.0.take();
+    sections
+        .debug_ranges
+        .0
+        .write(&ranges[..1])
+        .expect("truncate inline range list");
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let frame = session.selected_stack_frame().expect("selected frame");
+    assert_eq!(frame.symbol.as_ref().map(SymbolName::raw), Some("owner"));
+}
+
+#[test]
+fn corrupt_variable_abbreviation_reports_its_unit_and_die_offsets()
+{
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    let mut damaged = [(0, 0); 2];
+    for (index, (unit_offset, die_offset)) in damaged.iter_mut().enumerate() {
+        let (mut dwarf, owner, byte) = dwarf_function(Some("owner"));
+        if index == 0 {
+            dwarf
+                .unit
+                .get_mut(dwarf.unit.root())
+                .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+        }
+        local(&mut dwarf.unit, owner, "damaged", byte, register_location());
+
+        *unit_offset = sections.debug_info.0.slice().len();
+        dwarf.write(&mut sections).expect("write unit");
+        *die_offset = corrupt_variable_abbreviation(&mut sections, *unit_offset);
+    }
+    let [(unrelated_unit, _), (unit_offset, die_offset)] = damaged;
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let error = session.selected_frame_variables().expect_err("unknown abbreviation");
+    let DebuggerError::NoDebugInfo { detail, .. } = error else {
+        panic!("{error}")
+    };
+    assert!(detail.contains("unknown abbreviation code"), "{detail}");
+    assert!(
+        detail.contains(&format!(
+            "unit at .debug_info+{unit_offset:#x}, DIE at unit offset {die_offset:#x}"
+        )),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains(&format!("unit at .debug_info+{unrelated_unit:#x},")),
+        "{detail}"
+    );
 }
 
 #[test]
@@ -392,7 +624,7 @@ fn bad_variable_name_leaves_its_neighbors_readable()
     assert!(vars.iter().all(|var| var.value.bytes.as_deref() == Ok(&[7][..])));
 }
 
-fn add_inline(unit: &mut Unit, owner: UnitEntryId, byte: UnitEntryId) -> UnitEntryId
+fn add_inline(unit: &mut Unit, owner: UnitEntryId, byte: UnitEntryId) -> (UnitEntryId, UnitEntryId)
 {
     local(unit, owner, "outer", byte, register_location());
     let abstract_fn = unit.add(unit.root(), gimli::DW_TAG_subprogram);
@@ -404,14 +636,202 @@ fn add_inline(unit: &mut Unit, owner: UnitEntryId, byte: UnitEntryId) -> UnitEnt
     entry.set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x104)));
     entry.set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
     local(unit, inline, "inner", byte, register_location());
-    abstract_fn
+    (abstract_fn, inline)
+}
+
+fn inline_call_file(unit: &mut Unit, inline: UnitEntryId, path: &str)
+{
+    let mut lines = LineProgram::new(
+        unit.encoding(),
+        LineEncoding::default(),
+        LineString::String(b"/src".to_vec()),
+        None,
+        LineString::String(path.as_bytes().to_vec()),
+        None,
+    );
+    let file = lines.add_file(LineString::String(path.as_bytes().to_vec()), lines.default_directory(), None);
+    unit.line_program = lines;
+    let entry = unit.get_mut(inline);
+    entry.set(gimli::DW_AT_call_file, Attr::FileIndex(Some(file)));
+    entry.set(gimli::DW_AT_call_line, Attr::Udata(42));
+}
+
+#[test]
+fn inline_call_file_uses_the_unit_that_owns_the_frames()
+{
+    let (mut decoy, wrong, wrong_byte) = dwarf_function(Some("decoy"));
+    decoy
+        .unit
+        .get_mut(decoy.unit.root())
+        .set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    decoy
+        .unit
+        .get_mut(wrong)
+        .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+    let (_, inline) = add_inline(&mut decoy.unit, wrong, wrong_byte);
+    inline_call_file(&mut decoy.unit, inline, "wrong.rs");
+
+    let (mut actual, owner, byte) = dwarf_function(Some("owner"));
+    let (_, inline) = add_inline(&mut actual.unit, owner, byte);
+    inline_call_file(&mut actual.unit, inline, "right.rs");
+
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(actual.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).unwrap();
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let trace = session.stack_trace(2).expect("inline and physical frames");
+    assert_eq!(trace.len(), 2);
+    let location = trace[1].location.as_ref().expect("inline call location");
+    assert_eq!(location.file, "right.rs");
+    assert_eq!(location.line, Some(42));
+    assert_eq!(session.frame_variables(0).unwrap()[0].name, "inner");
+    assert_eq!(session.frame_variables(1).unwrap()[0].name, "outer");
+}
+
+#[test]
+fn inherited_linkage_name_beats_the_concrete_source_name()
+{
+    let (mut concrete, owner, _) = dwarf_function(Some("run"));
+    let origin = concrete.unit.add(concrete.unit.root(), gimli::DW_TAG_subprogram);
+    let entry = concrete.unit.get_mut(owner);
+    entry.set(gimli::DW_AT_abstract_origin, Attr::UnitRef(origin));
+
+    let (mut declarations, placeholder, _) = dwarf_function(None);
+    declarations.unit.get_mut(placeholder).delete(gimli::DW_AT_low_pc);
+    let declaration = declarations.unit.add(declarations.unit.root(), gimli::DW_TAG_subprogram);
+    declarations.unit.get_mut(declaration).set(
+        gimli::DW_AT_MIPS_linkage_name,
+        Attr::String(b"_ZN3app3run17h0123456789abcdefE".to_vec()),
+    );
+
+    let mut dwarf = Dwarf::new();
+    let declarations = dwarf.units.add(declarations.unit);
+    concrete.unit.get_mut(origin).set(
+        gimli::DW_AT_specification,
+        Attr::DebugInfoRef(Reference::Entry(declarations, declaration)),
+    );
+    dwarf.units.add(concrete.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let frame = session.selected_stack_frame().expect("selected frame");
+    let name = frame.symbol.expect("frame name");
+    assert_eq!(name.demangled(), Some("app::run"));
+}
+
+#[test]
+fn rooted_paths_are_preserved_in_inline_call_locations()
+{
+    const CASES: &[(&str, &str, &str)] = &[
+        ("/build", r"C:\src\main.rs", r"C:\src\main.rs"),
+        ("/build", "C:/src/main.rs", "C:/src/main.rs"),
+        ("/build", r"\src\main.rs", r"\src\main.rs"),
+        ("/build", r"\\server\src\main.rs", r"\\server\src\main.rs"),
+        (r"C:\src", "main.rs", r"C:\src\main.rs"),
+    ];
+    for &(comp_dir, path, expected) in CASES {
+        let (mut dwarf, owner, byte) = dwarf_function(Some("owner"));
+        let root = dwarf.unit.root();
+        dwarf
+            .unit
+            .get_mut(root)
+            .set(gimli::DW_AT_comp_dir, Attr::String(comp_dir.as_bytes().to_vec()));
+        let (_, inline) = add_inline(&mut dwarf.unit, owner, byte);
+        inline_call_file(&mut dwarf.unit, inline, path);
+        let (mut session, _image) = session(&mut dwarf, None);
+        let trace = session.stack_trace(2).expect("inline and physical frames");
+        assert_eq!(trace[1].location.as_ref().expect("inline call location").file, expected);
+    }
+}
+
+#[test]
+fn completed_line_rows_keep_dynamically_defined_paths_after_a_parse_error()
+{
+    let (mut dwarf, owner, byte) = dwarf_function(Some("owner"));
+    let (_, inline) = add_inline(&mut dwarf.unit, owner, byte);
+    inline_call_file(&mut dwarf.unit, inline, "static.rs");
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+
+    let lines = &mut sections.debug_line.0;
+    let file = b"dynamic.rs\0\0\0\0";
+    // Define file 2, then write one complete sequence using it. The last
+    // instruction is missing its address, so parsing stops after that sequence.
+    lines
+        .write(&[0, u8::try_from(1 + file.len()).unwrap(), gimli::DW_LNE_define_file.0])
+        .unwrap();
+    lines.write(file).unwrap();
+    lines.write(&[0, 9, gimli::DW_LNE_set_address.0]).unwrap();
+    lines.write_u64(PC).unwrap();
+    lines.write(&[gimli::DW_LNS_set_file.0, 2, gimli::DW_LNS_copy.0]).unwrap();
+    lines
+        .write(&[gimli::DW_LNS_advance_pc.0, 4, 0, 1, gimli::DW_LNE_end_sequence.0])
+        .unwrap();
+    lines.write(&[0, 9, gimli::DW_LNE_set_address.0]).unwrap();
+    lines
+        .write_u32_at(0, u32::try_from(lines.slice().len() - 4).unwrap())
+        .unwrap();
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    for _ in 0..2 {
+        let trace = session.stack_trace(2).expect("inline and physical frames");
+        assert_eq!(trace[0].location.as_ref().expect("completed row location").file, "dynamic.rs");
+        assert_eq!(trace[1].location.as_ref().expect("inline call location").file, "static.rs");
+    }
+}
+
+#[test]
+fn folded_subprograms_keep_the_selected_dwarf5_unit()
+{
+    let (mut decoy, wrong, _) = dwarf_function(Some("decoy"));
+    decoy
+        .unit
+        .get_mut(decoy.unit.root())
+        .set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    decoy
+        .unit
+        .get_mut(wrong)
+        .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+
+    let make_unit = |bound, name, variable| {
+        let (mut dwarf, function, byte) = dwarf_function_for_version(5, Some(name));
+        let unit = &mut dwarf.unit;
+        let cu_ranges = unit.ranges.add(RangeList(vec![Range::OffsetPair { begin: 0, end: bound }]));
+        let root = unit.get_mut(unit.root());
+        root.delete(gimli::DW_AT_high_pc);
+        root.set(gimli::DW_AT_ranges, Attr::RangeListRef(cu_ranges));
+        let ranges = unit.ranges.add(RangeList(vec![Range::OffsetPair { begin: 0, end: 0x18 }]));
+        let entry = unit.get_mut(function);
+        entry.delete(gimli::DW_AT_high_pc);
+        entry.set(gimli::DW_AT_ranges, Attr::RangeListRef(ranges));
+        local(unit, function, variable, byte, register_location());
+        dwarf.unit
+    };
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(make_unit(0x20, "owner", "right"));
+    dwarf.units.add(make_unit(0x30, "folded", "wrong"));
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).unwrap();
+    assert_ne!(sections.debug_rnglists.0.slice(), []);
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let frame = session.selected_stack_frame().expect("selected frame");
+    assert!(frame.symbol.is_some_and(|name| name.raw() == "owner"));
+    let vars = session.selected_frame_variables().expect("locals of the selected unit");
+    assert_eq!(vars[0].name, "right");
+    assert_eq!(vars[0].value.bytes.as_deref(), Ok(&[7][..]));
 }
 
 #[test]
 fn selected_named_inline_under_unnamed_owner_includes_abstract_parameter()
 {
     let (mut dwarf, owner, byte) = dwarf_function(None);
-    let abstract_fn = add_inline(&mut dwarf.unit, owner, byte);
+    let (abstract_fn, _) = add_inline(&mut dwarf.unit, owner, byte);
     variable(
         &mut dwarf.unit,
         abstract_fn,
@@ -437,7 +857,7 @@ fn selected_named_inline_under_unnamed_owner_includes_abstract_parameter()
 fn abstract_parameter_without_a_concrete_die_retains_its_constant()
 {
     let (mut dwarf, owner, byte) = dwarf_function(None);
-    let abstract_fn = add_inline(&mut dwarf.unit, owner, byte);
+    let (abstract_fn, _) = add_inline(&mut dwarf.unit, owner, byte);
     let argument = variable(
         &mut dwarf.unit,
         abstract_fn,
@@ -458,7 +878,7 @@ fn abstract_parameter_without_a_concrete_die_retains_its_constant()
 fn malformed_range_on_selected_scope_reports_no_debug_info()
 {
     let (mut dwarf, function, byte) = dwarf_function(Some("function"));
-    // addr2line can select this DIE by its valid range list. gimli rejects the
+    // Frame lookup can select this DIE by its valid range list. gimli rejects the
     // malformed low_pc encountered before that list when validating the scope.
     let range = dwarf
         .unit
@@ -475,7 +895,7 @@ fn malformed_range_on_selected_scope_reports_no_debug_info()
     local(&mut dwarf.unit, function, "local", byte, register_location());
 
     let (mut session, _image) = session(&mut dwarf, None);
-    let selected = session.selected_stack_frame().expect("addr2line selected the function");
+    let selected = session.selected_stack_frame().expect("selected the function");
     assert!(selected.symbol.is_some_and(|name| name.raw() == "function"));
     assert!(
         matches!(session.selected_frame_variables(), Err(DebuggerError::NoDebugInfo { detail, .. })

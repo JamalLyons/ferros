@@ -61,7 +61,7 @@ pub struct Symbolication
 {
     /// ID of the binary image containing this address
     pub image_id: ImageId,
-    /// Stack of symbol frames (outermost to innermost, for inlined functions)
+    /// Logical frames ordered innermost to outermost, followed by the physical frame.
     pub frames: Vec<SymbolFrame>,
 }
 

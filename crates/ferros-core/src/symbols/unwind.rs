@@ -1039,7 +1039,7 @@ fn hinted(image: &BinaryImage, lookup: Address) -> Hinted
 
 /// Push one physical frame and the frames inlined into it.
 ///
-/// `symbolication.frames` comes from `addr2line`, innermost first: the inlined callees,
+/// `symbolication.frames` is ordered innermost first: the inlined callees,
 /// then the function that owns the code. Each inlined function is its own logical frame
 /// (kind [`FrameKind::Inlined`]) before the physical frame.
 #[allow(clippy::too_many_arguments)]

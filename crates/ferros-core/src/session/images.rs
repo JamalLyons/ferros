@@ -103,6 +103,9 @@ pub(super) struct SessionImage
     /// The symbol request whose read of the symbol table layout last failed. The failure
     /// is not kept past that request.
     pub(super) symtab_failed_in_request: Option<u64>,
+    /// The stop whose entry lookup failed to read this header. Kept with the image
+    /// so refreshing the list can drop names without retrying an unchanged header.
+    pub(super) symtab_entry_failed_in_stop: Option<u64>,
 }
 
 /// An image's symbol table and the names read from it so far.
@@ -178,6 +181,7 @@ impl Session
         self.format = format;
         self.loaded_images.clear();
         self.exit_images.clear();
+        self.entry_names.clear();
         self
     }
 
@@ -310,6 +314,7 @@ impl Session
             }
         }
         let mut previous = std::mem::take(&mut self.loaded_images);
+        let mut changed = false;
         for image in images {
             let descriptor = ImageDescriptor {
                 path: image.path,
@@ -335,6 +340,7 @@ impl Session
                 self.forget_contradicted_file(&mut kept);
                 self.loaded_images.push(kept);
             } else {
+                changed = true;
                 let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
@@ -347,8 +353,13 @@ impl Session
                     failed_load: None,
                     symtab: None,
                     symtab_failed_in_request: None,
+                    symtab_entry_failed_in_stop: None,
                 });
             }
+        }
+        if changed || !previous.is_empty() {
+            // A name, or the lack of one, may come from an image that is gone or new.
+            self.entry_names.clear();
         }
         self.symbols
             .retain_ids(&self.loaded_images.iter().filter_map(|image| image.symbols).collect());

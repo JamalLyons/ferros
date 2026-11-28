@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `(source, compiler flags, fixture)`.
-static SOURCES: [(&str, &[&str], &str); 6] = [
+static SOURCES: [(&str, &[&str], &str); 7] = [
     ("fixtures/asm/frameless_stack.s", &[], "frameless_stack"),
+    ("fixtures/asm/values_misc.s", &[], "values_misc"),
     ("fixtures/c/long_jump.c", &["-g", "-O0"], "long_jump"),
     ("fixtures/c/pthread_once.c", &["-g", "-O0"], "pthread_once"),
     ("fixtures/c/soft_faults.c", &["-g", "-O0"], "soft_faults"),
@@ -43,6 +44,9 @@ fn main()
         assert!(status.success(), "cc failed to build {source}: {status}");
         println!("cargo::rustc-link-arg-bin=ferros-fixture-{fixture}={}", object.display());
     }
+    // The assembly fixture has an interior label. Omit the linker's function-start
+    // list, which can classify that label as an entry.
+    println!("cargo::rustc-link-arg-bin=ferros-fixture-values_misc=-Wl,-no_function_starts");
     let library = out_dir.join("libferros_alias_fixture.dylib");
     let status = Command::new("cc")
         .args(["-arch", "arm64", "-dynamiclib"])

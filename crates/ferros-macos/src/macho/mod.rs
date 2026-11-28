@@ -277,6 +277,11 @@ impl SymbolIndex for MachOIndex
             .map(|strx| SymbolKey(u64::from(strx)))
     }
 
+    fn lookup_entry(&self, address: Address) -> Option<SymbolKey>
+    {
+        self.table.entry(address).map(|strx| SymbolKey(u64::from(strx)))
+    }
+
     fn symbols(&self) -> Box<dyn Iterator<Item = (Address, SymbolKey)> + '_>
     {
         Box::new(

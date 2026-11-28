@@ -1,8 +1,27 @@
 //! Unions, function pointers, raw slice pointers and vector iterators from a stopped Rust
-//! program (issue #412).
+//! program (issue #412), and function pointers into code without DWARF (#419).
 #![cfg(target_os = "macos")]
 
+use std::time::Duration;
+
+use ferros_core::values::format::FormatOptions;
+use ferros_core::{Address, BreakpointLocation, StopEvent};
+use ferros_tests::symbols::raw_symbol_address;
 use ferros_tests::{fixture, harness, transcript};
+
+/// Values checked against addresses read from the same run.
+const OTHERS: &[&str] = &[
+    "callback",
+    "handler",
+    "stray",
+    "raw_slice",
+    "null_slice",
+    "data_ref",
+    "raw_str",
+    "raw_mut_str",
+    "c_function",
+    "c_stray",
+];
 
 #[test]
 fn print_shows_unions_function_symbols_raw_slices_and_iterators()
@@ -28,17 +47,6 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             "uninit",
             "core::mem::maybe_uninit::MaybeUninit<u32> = MaybeUninit(<maybe uninit> 0x01020304)",
         ),
-    ];
-    // Checked below against addresses read from the same run.
-    const OTHERS: &[&str] = &[
-        "callback",
-        "handler",
-        "stray",
-        "raw_slice",
-        "null_slice",
-        "data_ref",
-        "raw_str",
-        "raw_mut_str",
     ];
     let _ = transcript::ferros_bin();
     harness::run(|t| {
@@ -115,5 +123,91 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             "raw_str: {raw_str}"
         );
         assert_eq!(rendered("raw_mut_str"), format!("*mut str = 0x{str_address} (len: 8)"));
+        assert_c_function_pointers(&rendered("c_function"), &rendered("c_stray"));
+    });
+}
+
+/// A C library function has no DWARF: its symbol table names a pointer to its entry,
+/// and not one four bytes past it, inside the function (#419).
+fn assert_c_function_pointers(c_function: &str, c_stray: &str)
+{
+    let (address, symbol) = c_function
+        .split_once(" = ")
+        .and_then(|(_, value)| value.split_once(' '))
+        .unwrap_or_else(|| panic!("c_function: {c_function}"));
+    assert_eq!(symbol, "<dispatch_get_specific>", "c_function: {c_function}");
+    let entry = u64::from_str_radix(address.trim_start_matches("0x"), 16).expect("hex address");
+    assert_eq!(
+        c_stray,
+        format!(
+            "ferros_fixture_values_misc::CCallback = ferros_fixture_values_misc::CCallback {{ raw: {}, call: {:#x} }}",
+            entry + 4,
+            entry + 4
+        )
+    );
+}
+
+/// The fixture is linked without function starts, so the symbol table is the only
+/// evidence: a pointer to a symbol is named after it.
+#[test]
+fn function_pointer_is_named_without_function_starts()
+{
+    harness::run(|t| {
+        let fixture = fixture!("values_misc");
+        let mut d = t.launch(&fixture);
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "values_misc.rs".to_owned(),
+            line: fixture.marker_line("inspect"),
+        })
+        .expect("set breakpoint");
+        d.resume().expect("resume");
+        let stop = d.wait(Some(Duration::from_secs(5))).expect("wait");
+        assert!(matches!(stop, Some(StopEvent::Breakpoint { .. })), "got {stop:?}");
+
+        let entry = raw_symbol_address(&mut d, &fixture, "_ferros_callback_entry");
+        let mut callback = d
+            .selected_frame_variables()
+            .expect("read variables")
+            .into_iter()
+            .find(|var| var.name == "callback")
+            .expect("function pointer variable");
+        callback.value.bytes = Ok(entry.value().to_le_bytes().to_vec());
+        let rendered = d.format_variable(&callback, FormatOptions::default()).1;
+        assert_eq!(rendered, format!("{:#x} <ferros_callback_entry>", entry.value()));
+    });
+}
+
+// Without boundary evidence beyond the symbol table, an interior label reads as an
+// entry; the linker records such labels as function starts too.
+#[test]
+#[ignore = "an interior code label is named as a function entry: #428"]
+fn function_pointer_skips_a_named_instruction_inside_a_function()
+{
+    harness::run(|t| {
+        let fixture = fixture!("values_misc");
+        let mut d = t.launch(&fixture);
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "values_misc.rs".to_owned(),
+            line: fixture.marker_line("inspect"),
+        })
+        .expect("set breakpoint");
+        d.resume().expect("resume");
+        let stop = d.wait(Some(Duration::from_secs(5))).expect("wait");
+        assert!(matches!(stop, Some(StopEvent::Breakpoint { .. })), "got {stop:?}");
+
+        let entry = raw_symbol_address(&mut d, &fixture, "_ferros_callback_entry");
+        let marker = raw_symbol_address(&mut d, &fixture, "_ferros_callback_marker");
+        assert_eq!(marker, entry + 4);
+        let mut callback = d
+            .selected_frame_variables()
+            .expect("read variables")
+            .into_iter()
+            .find(|var| var.name == "callback")
+            .expect("function pointer variable");
+        let mut render = |address: Address| {
+            callback.value.bytes = Ok(address.value().to_le_bytes().to_vec());
+            d.format_variable(&callback, FormatOptions::default()).1
+        };
+        assert_eq!(render(marker), format!("{:#x}", marker.value()));
     });
 }

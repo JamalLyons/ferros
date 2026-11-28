@@ -1,5 +1,5 @@
 //! Render locks, atomics, lazily set cells, weak references and pins from a stopped Rust
-//! program (issue #409).
+//! program (issues #409, #422).
 #![cfg(target_os = "macos")]
 
 use ferros_tests::{fixture, harness, transcript};
@@ -16,6 +16,13 @@ fn print_shows_synchronized_values_and_their_state()
         ("rwlock", "RwLock(unlocked) 8"),
         ("read_locked", "RwLock(readers: 1) 11"),
         ("write_locked", "RwLock(write-locked) 15"),
+        // A guard shows the value it holds (issue #422).
+        ("guarded", "Mutex(locked) 16"),
+        ("guard", "MutexGuard 16"),
+        ("reader", "RwLockReadGuard 11"),
+        ("writer", "RwLockWriteGuard 15"),
+        ("poisoned_guard", "MutexGuard(poisoned) 17"),
+        ("poisoned_writer", "RwLockWriteGuard 19"),
         ("atomic_u32", "7"),
         ("atomic_bool", "true"),
         ("null_ptr", "0x0"),

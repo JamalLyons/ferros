@@ -8,7 +8,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::rc::{self, Rc};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, mpsc};
 use std::thread;
 
 fn main()
@@ -19,9 +19,12 @@ fn main()
     drop(released.lock());
     let rwlock = RwLock::new(8_u32);
     let read_locked = RwLock::new(11_u32);
-    let reader = read_locked.read();
-    let write_locked = RwLock::new(15_u32);
-    let writer = write_locked.write();
+    let reader = read_locked.read().unwrap();
+    let write_locked = RwLock::new(0_u32);
+    let mut writer = write_locked.write().unwrap();
+    *writer = 15;
+    let guarded = Mutex::new(16_u32);
+    let guard = guarded.lock().unwrap();
     let atomic_u32 = AtomicU32::new(7);
     let atomic_bool = AtomicBool::new(true);
     let mut pointee = 12_u32;
@@ -53,6 +56,21 @@ fn main()
         panic!("poison the mutex");
     })
     .join();
+
+    // Reacquire both locks from their poison errors and keep the guards alive.
+    let poisoned_again = Arc::new(Mutex::new(17_u32));
+    let poisoned_rwlock = Arc::new(RwLock::new(18_u32));
+    let panicking = Arc::clone(&poisoned_again);
+    let panicking_writer = Arc::clone(&poisoned_rwlock);
+    let _ = thread::spawn(move || {
+        let _guard = panicking.lock();
+        let _writer = panicking_writer.write();
+        panic!("poison both locks");
+    })
+    .join();
+    let poisoned_guard = poisoned_again.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut poisoned_writer = poisoned_rwlock.write().unwrap_or_else(PoisonError::into_inner);
+    *poisoned_writer = 19;
 
     // Another thread holds `held` until the process exits.
     let held = Arc::new(Mutex::new(14_u32));
@@ -87,4 +105,5 @@ fn main()
     black_box((&once_set, &once_unset, &once_lock, &once_lock_unset, &unsafe_cell));
     black_box((&rc, &rc_weak, &arc, &arc_weak, &arc_dangling, &rc_new, &pinned, &pinned_ref));
     black_box((&poisoned, &held, &rc_path, &arc_os_str, &rc_c_str));
+    black_box((&guarded, &guard, &poisoned_guard, &poisoned_writer));
 }

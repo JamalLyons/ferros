@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use gimli::{AttributeValue, DebugInfoOffset, DwTag, LineProgramHeader, Range, Reader as _, UnitOffset, UnitType};
+use gimli::{AttributeValue, DebugInfoOffset, DwTag, Range, Reader as _, UnitOffset, UnitType};
 use once_cell::sync::OnceCell;
 
 use super::cache::SymbolFrame;
@@ -109,7 +109,7 @@ impl FrameIndex
                 } else if let Some(range) = bounds {
                     primary.push((range, index));
                 } else {
-                    primary.extend(record.lines().sequences.0.iter().map(|(range, _, _)| (*range, index)));
+                    primary.extend(record.lines(dwarf).sequences.0.iter().map(|(range, _, _)| (*range, index)));
                 }
             }
             units.push(record);
@@ -123,29 +123,36 @@ impl FrameIndex
 
     pub(crate) fn lookup<'a>(&'a self, dwarf: &'a OwnedDwarf, pc: u64) -> Result<Option<DwarfFrames<'a>>, String>
     {
+        let mut first_error = None;
         for &index in self.primary.covering(pc).chain(self.bounds.covering(pc)) {
             let record = &self.units[index];
             let unit = Unit::new(dwarf, &record.unit);
-            let functions = record
-                .functions
-                .get_or_init(|| Functions::read(unit))
-                .as_ref()
-                .map_err(Clone::clone)?;
-            if let Some(&function) = functions.addresses.covering(pc).next() {
-                let (owner, frames) = &functions.entries[function];
-                let frames = frames
-                    .get_or_init(|| self.read_function(unit, *owner))
-                    .as_ref()
-                    .map_err(Clone::clone)?;
-                return Ok(Some(DwarfFrames {
-                    unit,
-                    owner: *owner,
-                    frames: frames.covering(pc),
-                    record,
-                }));
+            let functions = match record.functions.get_or_init(|| Functions::read(unit)) {
+                Ok(functions) => functions,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            let Some(&function) = functions.addresses.covering(pc).next() else {
+                continue;
+            };
+            let (owner, frames) = &functions.entries[function];
+            match frames.get_or_init(|| self.read_function(unit, *owner)) {
+                Ok(frames) => {
+                    return Ok(Some(DwarfFrames {
+                        unit,
+                        owner: *owner,
+                        frames: frames.covering(pc),
+                        record,
+                    }));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(None)
+        first_error.map_or(Ok(None), |error| Err(error.clone()))
     }
 
     fn read_function(&self, unit: Unit<'_>, owner: UnitOffset<usize>) -> Result<FunctionFrames, String>
@@ -180,7 +187,7 @@ impl FrameIndex
                 };
                 frames.push(FunctionFrame {
                     offset,
-                    name: self.function_name(unit, &die, 16)?,
+                    name: self.function_name(unit, &die)?,
                     call_site,
                 });
                 children.push(Vec::new());
@@ -194,41 +201,85 @@ impl FrameIndex
         })
     }
 
-    fn function_name(&self, unit: Unit<'_>, entry: &Die<'_, '_>, remaining: usize) -> Result<Option<String>, String>
+    fn function_name(&self, unit: Unit<'_>, entry: &Die<'_, '_>) -> Result<Option<String>, String>
+    {
+        let mut source_name = None;
+        match self.linkage_name(unit, entry, &mut source_name, 16) {
+            Ok(linkage) => Ok(linkage.or(source_name)),
+            // A readable source name is still usable if inheritance is corrupt.
+            Err(_) if source_name.is_some() => Ok(source_name),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn linkage_name(
+        &self,
+        unit: Unit<'_>,
+        entry: &Die<'_, '_>,
+        source_name: &mut Option<String>,
+        remaining: usize,
+    ) -> Result<Option<String>, String>
     {
         if remaining == 0 {
             return Ok(None);
         }
         let at_die = |error| die_error(unit, entry.offset(), error);
-        for name in [gimli::DW_AT_linkage_name, gimli::DW_AT_MIPS_linkage_name, gimli::DW_AT_name] {
-            if let Some(attr) = entry.attr_value(name).map_err(at_die)?
-                && let Ok(raw) = unit.attr_string(attr)
-            {
-                return Ok(Some(raw.to_string_lossy().map_err(at_die)?.into_owned()));
+        let read_name = |name| -> Result<Option<String>, String> {
+            let Some(raw) = entry
+                .attr_value(name)
+                .map_err(at_die)?
+                .and_then(|attr| unit.attr_string(attr).ok())
+            else {
+                return Ok(None);
+            };
+            Ok(Some(raw.to_string_lossy().map_err(at_die)?.into_owned()))
+        };
+        for name in [gimli::DW_AT_linkage_name, gimli::DW_AT_MIPS_linkage_name] {
+            if let Some(linkage) = read_name(name)? {
+                return Ok(Some(linkage));
             }
         }
-        let origin = entry
-            .attr_value(gimli::DW_AT_abstract_origin)
-            .map_err(at_die)?
-            .or(entry.attr_value(gimli::DW_AT_specification).map_err(at_die)?);
-        let (target, offset) = match origin {
-            Some(AttributeValue::UnitRef(offset)) => (unit, offset),
-            Some(AttributeValue::DebugInfoRef(offset)) => {
-                let end = self.units.partition_point(|record| record.offset <= offset);
-                let record = end.checked_sub(1).and_then(|index| self.units.get(index));
-                let Some((target, offset)) = record.and_then(|record| {
-                    offset
-                        .to_unit_offset(&record.unit.header)
-                        .map(|offset| (Unit::new(unit.dwarf, &record.unit), offset))
-                }) else {
-                    return Ok(None);
-                };
-                (target, offset)
+        if source_name.is_none() {
+            *source_name = read_name(gimli::DW_AT_name)?;
+        }
+
+        let mut first_error = None;
+        for attribute in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+            let reference = entry.attr_value(attribute).map_err(at_die)?;
+            let Some((target, offset)) = reference.and_then(|reference| self.referenced_die(unit, reference)) else {
+                continue;
+            };
+            let linkage = target
+                .entry(offset)
+                .map_err(|error| die_error(target, offset, error))
+                .and_then(|origin| self.linkage_name(target, &origin, source_name, remaining - 1));
+            match linkage {
+                Ok(Some(linkage)) => return Ok(Some(linkage)),
+                Ok(None) => (),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
-            _ => return Ok(None),
-        };
-        let origin = target.entry(offset).map_err(|error| die_error(target, offset, error))?;
-        self.function_name(target, &origin, remaining - 1)
+        }
+        first_error.map_or(Ok(None), Err)
+    }
+
+    fn referenced_die<'a>(
+        &'a self,
+        unit: Unit<'a>,
+        reference: AttributeValue<OwnedReader>,
+    ) -> Option<(Unit<'a>, UnitOffset<usize>)>
+    {
+        match reference {
+            AttributeValue::UnitRef(offset) => Some((unit, offset)),
+            AttributeValue::DebugInfoRef(offset) => {
+                let end = self.units.partition_point(|record| record.offset <= offset);
+                let record = &self.units[end.checked_sub(1)?];
+                let offset = offset.to_unit_offset(&record.unit.header)?;
+                Some((Unit::new(unit.dwarf, &record.unit), offset))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -410,14 +461,14 @@ impl DwarfFrames<'_>
 
     pub(super) fn symbols(&self, pc: u64) -> Vec<SymbolFrame>
     {
-        let lines = self.record.lines();
-        let mut location = lines.at(self.unit, pc);
+        let lines = self.record.lines(self.unit.dwarf);
+        let mut location = lines.at(pc);
         self.frames
             .iter()
             .rev()
             .filter_map(|frame| {
                 let current = location.take();
-                location = frame.call_site.as_ref().and_then(|call| lines.location(self.unit, call));
+                location = frame.call_site.as_ref().and_then(|call| lines.location(call));
                 Some(SymbolFrame {
                     symbol: make_symbol_name(frame.name.clone()?, SymbolSource::DebugInfo),
                     location: current,
@@ -462,23 +513,33 @@ impl CallSite
 
 struct FrameLines
 {
-    header: Option<LineProgramHeader<OwnedReader>>,
+    files: Vec<Option<String>>,
     sequences: AddressIndex<LineSequence>,
 }
 
 impl FrameUnit
 {
-    fn lines(&self) -> &FrameLines
+    fn lines(&self, dwarf: &OwnedDwarf) -> &FrameLines
     {
         self.lines.get_or_init(|| {
             let mut sequences = Vec::new();
-            let header = read_sequences(&self.unit, &mut sequences, |_, file| Ok(file.try_into().unwrap_or(u32::MAX)))
-                .unwrap_or_else(|error| {
-                    tracing::debug!(unit = self.offset.0, %error, "unreadable frame line program");
-                    self.unit.line_program.as_ref().map(|program| program.header().clone())
-                });
+            let (header, result) =
+                read_sequences(&self.unit, &mut sequences, |_, file| Ok(file.try_into().unwrap_or(u32::MAX)));
+            if let Err(error) = result {
+                tracing::debug!(unit = self.offset.0, %error, "unreadable frame line program");
+            }
+            let files = header.map_or_else(Vec::new, |header| {
+                let count = header.file_names().len() + usize::from(header.version() < 5);
+                (0..count.max(1) as u64)
+                    .map(|index| match header.file(index) {
+                        Some(file) => render_file(dwarf, &self.unit, file, &header).ok(),
+                        None if index == 0 => Some(String::new()),
+                        None => None,
+                    })
+                    .collect()
+            });
             FrameLines {
-                header,
+                files,
                 sequences: AddressIndex::new(sequences.into_iter().map(|sequence| {
                     (
                         Range {
@@ -495,29 +556,22 @@ impl FrameUnit
 
 impl FrameLines
 {
-    fn at(&self, unit: Unit<'_>, pc: u64) -> Option<SourceLocation>
+    fn at(&self, pc: u64) -> Option<SourceLocation>
     {
         let sequence = self.sequences.covering(pc).next()?;
         let end = sequence.rows.partition_point(|row| row.address <= pc);
         let row = sequence.rows.get(end.checked_sub(1)?)?;
-        self.location(
-            unit,
-            &CallSite {
-                file: u64::from(row.file),
-                line: (row.line != 0).then_some(row.line),
-                column: (row.line != 0).then_some(row.column),
-            },
-        )
+        self.location(&CallSite {
+            file: u64::from(row.file),
+            line: (row.line != 0).then_some(row.line),
+            column: (row.line != 0).then_some(row.column),
+        })
     }
 
-    fn location(&self, unit: Unit<'_>, position: &CallSite) -> Option<SourceLocation>
+    fn location(&self, position: &CallSite) -> Option<SourceLocation>
     {
-        let header = self.header.as_ref()?;
-        let file = match header.file(position.file) {
-            Some(entry) => render_file(unit.dwarf, unit.unit, entry, header).ok()?,
-            None if position.file == 0 => String::new(),
-            None => return None,
-        };
+        let index = usize::try_from(position.file).ok()?;
+        let file = self.files.get(index)?.as_ref()?.clone();
         Some(SourceLocation {
             file,
             line: position.line,

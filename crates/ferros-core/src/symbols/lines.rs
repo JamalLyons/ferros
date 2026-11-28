@@ -305,7 +305,7 @@ impl LineIndex
     {
         // DWARF file index -> index into files, for this unit.
         let mut unit_files = HashMap::<u64, u32>::new();
-        read_sequences(unit, &mut self.sequences, |header, file_index| {
+        let (_, result) = read_sequences(unit, &mut self.sequences, |header, file_index| {
             let file = match unit_files.get(&file_index) {
                 Some(&file) => file,
                 None => {
@@ -322,8 +322,8 @@ impl LineIndex
                 }
             };
             Ok(file)
-        })?;
-        Ok(())
+        });
+        result
     }
 
     /// Debug info left out of this index because it could not be parsed.
@@ -440,52 +440,56 @@ impl LineIndex
     }
 }
 
-/// Read and collapse rows for one unit, keeping completed sequences on an error.
+/// Read and collapse rows for one unit. Return the header with any dynamically defined
+/// files, and keep completed sequences even if a later row fails to parse.
 pub(super) fn read_sequences(
     unit: &Unit<OwnedReader>,
     sequences: &mut Vec<LineSequence>,
     mut file_index: impl FnMut(&LineProgramHeader<OwnedReader>, u64) -> gimli::Result<u32>,
-) -> gimli::Result<Option<LineProgramHeader<OwnedReader>>>
+) -> (Option<LineProgramHeader<OwnedReader>>, gimli::Result<()>)
 {
     let Some(program) = unit.line_program.clone() else {
-        return Ok(None);
+        return (None, Ok(()));
     };
     let mut rows = program.rows();
-    let mut current = Vec::<LineRow>::new();
-    while let Some((header, row)) = rows.next_row()? {
-        let file = file_index(header, row.file_index())?;
-        let line = LineRow {
-            address: row.address(),
-            file,
-            line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
-            column: match row.column() {
-                ColumnType::LeftEdge => 0,
-                ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
-            },
-            is_stmt: row.is_stmt(),
-            prologue_end: row.prologue_end(),
-            end_sequence: row.end_sequence(),
-        };
-        match current.last_mut() {
-            Some(last) if last.address == line.address && !last.end_sequence => {
-                let prologue_end = last.prologue_end;
-                *last = line;
-                last.prologue_end |= prologue_end;
+    let result = (|| {
+        let mut current = Vec::<LineRow>::new();
+        while let Some((header, row)) = rows.next_row()? {
+            let file = file_index(header, row.file_index())?;
+            let line = LineRow {
+                address: row.address(),
+                file,
+                line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
+                column: match row.column() {
+                    ColumnType::LeftEdge => 0,
+                    ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
+                },
+                is_stmt: row.is_stmt(),
+                prologue_end: row.prologue_end(),
+                end_sequence: row.end_sequence(),
+            };
+            match current.last_mut() {
+                Some(last) if last.address == line.address && !last.end_sequence => {
+                    let prologue_end = last.prologue_end;
+                    *last = line;
+                    last.prologue_end |= prologue_end;
+                }
+                _ => current.push(line),
             }
-            _ => current.push(line),
-        }
-        if line.end_sequence {
-            let rows = std::mem::take(&mut current);
-            if rows.len() > 1 {
-                sequences.push(LineSequence {
-                    start: rows[0].address,
-                    end: line.address,
-                    rows,
-                });
+            if line.end_sequence {
+                let rows = std::mem::take(&mut current);
+                if rows.len() > 1 {
+                    sequences.push(LineSequence {
+                        start: rows[0].address,
+                        end: line.address,
+                        rows,
+                    });
+                }
             }
         }
-    }
-    Ok(Some(rows.header().clone()))
+        Ok(())
+    })();
+    (Some(rows.header().clone()), result)
 }
 
 /// Record the canonical statement address of every run of rows for one line.
@@ -560,14 +564,20 @@ fn attr_string(dwarf: &OwnedDwarf, unit: &Unit<OwnedReader>, value: AttributeVal
 
 fn push_path(path: &mut String, part: &str)
 {
-    if part.starts_with('/') || path.is_empty() {
+    if part.starts_with('/') || part.get(1..3) == Some(":/") || has_backslash_root(part) || path.is_empty() {
         part.clone_into(path);
     } else {
-        if !path.ends_with('/') {
-            path.push('/');
+        let separator = if has_backslash_root(path) { '\\' } else { '/' };
+        if !path.ends_with(separator) {
+            path.push(separator);
         }
         path.push_str(part);
     }
+}
+
+fn has_backslash_root(path: &str) -> bool
+{
+    path.starts_with('\\') || path.get(1..3) == Some(":\\")
 }
 
 impl BinaryImage

@@ -1,11 +1,15 @@
 //! Statics and globals: variables with a fixed address in their image.
 //!
-//! A static is a `DW_TAG_variable` whose `DW_AT_location` is a single address operation
-//! (`DW_OP_addr`, or `DW_OP_addrx` through `.debug_addr`), wherever it is declared: Rust
-//! statics at module level and inside functions (rustc nests the latter in a namespace
-//! named after the function), C globals and function-level `static`s. Its name is
-//! qualified by the namespaces, types and functions that enclose it, joined with `::`,
-//! such as `my_crate::config::LIMIT`.
+//! A static is a named `DW_TAG_variable` whose `DW_AT_location` is a single address
+//! operation (`DW_OP_addr`, or `DW_OP_addrx` through `.debug_addr`), wherever it is
+//! declared: Rust statics at module level and inside functions (rustc nests the latter in a
+//! namespace named after the function), and C globals and function-level `static`s that
+//! carry their own `DW_AT_name`. Its name is qualified by the namespaces, types and
+//! functions that enclose it, joined with `::`, such as `my_crate::config::LIMIT`.
+//!
+//! Several statics can share a qualified name: two `static S` in separate blocks of one
+//! function, or the per-call-site statics a logging macro expands to. Each is its own entry,
+//! told apart by address.
 //!
 //! The index stores link-time (file) addresses. A value is read at the address the loaded
 //! image maps that file address to, so it follows the image's load slide.
@@ -15,6 +19,8 @@
 //! - thread-locals (`thread_local!`, `#[thread_local]`, C `_Thread_local`): their location
 //!   is a per-thread offset (`DW_OP_form_tls_address`), not an address;
 //! - declarations (`DW_AT_declaration`), which describe a static defined elsewhere;
+//! - definitions without a name of their own, named only through `DW_AT_specification`
+//!   (C++ class statics and namespace members defined out of line);
 //! - Rust vtables (`<T as Trait>::{vtable}`), which are compiler data, not program statics.
 //!
 //! The index is built once per image, on the first lookup, from every compilation unit
@@ -25,7 +31,7 @@ use gimli::{AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Operatio
 
 use super::location::{Unavailable, ValueLocation, VariableValue, value_size};
 use super::scope::Variable;
-use super::types::{DieOffset, TypeTable};
+use super::types::DieOffset;
 use crate::error::Result as DebuggerResult;
 use crate::symbols::lines::SkippedDebugInfo;
 use crate::symbols::{BinaryImage, OwnedDwarf, OwnedReader};
@@ -34,19 +40,22 @@ use crate::types::Address;
 type Unit = gimli::Unit<OwnedReader>;
 type Entry<'abbrev, 'unit> = DebuggingInformationEntry<'abbrev, 'unit, OwnedReader>;
 
-/// A static of a loaded image, as `globals` lists it.
+/// A static of a loaded image with its value, as `globals` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Static
 {
-    /// Qualified name, such as `my_crate::config::LIMIT`.
-    pub name: String,
-    /// The type's name, when the image's types resolve it.
-    pub type_name: Option<String>,
     /// Link-time address from the debug information.
     pub file_address: u64,
     /// Where the loaded image maps `file_address`; `None` when no mapped segment holds it.
     pub address: Option<Address>,
+    /// The static read from the loaded image, named by its qualified name (such as
+    /// `my_crate::config::LIMIT`), for [`Session::format_variable`] and
+    /// [`Session::format_path`].
+    ///
+    /// [`Session::format_variable`]: crate::session::Session::format_variable
+    /// [`Session::format_path`]: crate::session::Session::format_path
+    pub variable: Variable,
 }
 
 /// One indexed static.
@@ -201,33 +210,20 @@ impl StaticIndex
     }
 }
 
-/// `entry` as [`globals`](crate::session::Session::statics) lists it.
-pub(crate) fn describe(image: &BinaryImage, types: Option<&TypeTable>, entry: &StaticEntry) -> Static
-{
-    let type_name = types
-        .and_then(|types| types.type_of(DieOffset(entry.die as u64)).and_then(|ty| types.get(ty)))
-        .and_then(|ty| ty.name.clone());
-    Static {
-        name: entry.name.clone(),
-        type_name,
-        file_address: entry.file_address,
-        address: image.runtime_address(entry.file_address),
-    }
-}
-
-/// Read `entry` from the loaded `image` as a [`Variable`] named by its qualified name, so
-/// `print` formats it, and evaluates paths from it, as it does a local.
+/// Read `entry` from the loaded `image`. The value is a [`Variable`] named by the
+/// qualified name, so `print` formats it, and evaluates paths from it, as it does a local.
 pub(crate) fn read_static(
     image: &BinaryImage,
     entry: &StaticEntry,
     mut read_memory: impl FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
-) -> Variable
+) -> Static
 {
     let ty = image
         .types()
         .ok()
         .and_then(|types| types.type_of(DieOffset(entry.die as u64)).and_then(|ty| types.get(ty)));
-    let value = match image.runtime_address(entry.file_address) {
+    let address = image.runtime_address(entry.file_address);
+    let value = match address {
         None => VariableValue::unavailable(Unavailable::UnmappedAddress(entry.file_address)),
         Some(address) => VariableValue {
             location: Some(ValueLocation::Memory(address)),
@@ -244,13 +240,18 @@ pub(crate) fn read_static(
             }),
         },
     };
-    Variable {
+    let variable = Variable {
         name: entry.name.clone(),
         type_name: ty.as_ref().and_then(|ty| ty.name.clone()),
         image_id: image.id(),
         die_offset: DebugInfoOffset(entry.die),
         type_offset: ty.as_ref().and_then(|ty| usize::try_from(ty.die.0).ok().map(DebugInfoOffset)),
         value,
+    };
+    Static {
+        file_address: entry.file_address,
+        address,
+        variable,
     }
 }
 
@@ -360,6 +361,51 @@ mod tests
             ]
         );
         assert!(index.skipped().is_empty());
+    }
+
+    #[test]
+    fn reads_an_indexed_address_from_the_address_table()
+    {
+        let mut dwarf = DwarfUnit::new(encoding(5));
+        let root = dwarf.unit.root();
+        // DW_OP_addrx 1: the second address of `.debug_addr` (the unit's base is zero).
+        located(&mut dwarf, root, "INDEXED", Expression::raw(vec![gimli::DW_OP_addrx.0, 1]));
+        let mut dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
+        let table: Vec<u8> = [0x1000_u64, 0x2468]
+            .iter()
+            .flat_map(|address| address.to_le_bytes())
+            .collect();
+        dwarf.debug_addr = gimli::DebugAddr::from(OwnedReader::new(table.into(), RunTimeEndian::Little));
+        let index = StaticIndex::build(&dwarf);
+        let found: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_address))
+            .collect();
+        assert_eq!(found, [("INDEXED", 0x2468)]);
+    }
+
+    #[test]
+    fn statics_sharing_a_name_stay_separate()
+    {
+        let mut dwarf = DwarfUnit::new(encoding(4));
+        let root = dwarf.unit.root();
+        let function = named(&mut dwarf, root, gimli::DW_TAG_subprogram, "blocks");
+        for (block, address) in [(0x100, 0x1008), (0x200, 0x1000)] {
+            let block_id = dwarf.unit.add(function, gimli::DW_TAG_lexical_block);
+            dwarf
+                .unit
+                .get_mut(block_id)
+                .set(gimli::DW_AT_low_pc, WriteAttr::Address(FileAddress::Constant(block)));
+            located(&mut dwarf, block_id, "S", super::tests::address(address));
+        }
+        let index = StaticIndex::build(&synthetic_dwarf(dwarf, RunTimeEndian::Little));
+        let found: Vec<_> = index
+            .lookup("S")
+            .into_iter()
+            .map(|entry| (entry.name.as_str(), entry.file_address))
+            .collect();
+        assert_eq!(found, [("blocks::S", 0x1000), ("blocks::S", 0x1008)]);
     }
 
     #[test]

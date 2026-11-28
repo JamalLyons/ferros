@@ -340,6 +340,12 @@ impl<'a> Parser<'a>
                 Some(Token::Dot) => {
                     self.next += 1;
                     let name = match self.take()? {
+                        // `::` belongs only to the root: a field name is one identifier.
+                        (Token::Name(name), column) if name.contains("::") => {
+                            return Err(PathError::syntax(format!(
+                                "unexpected `{name}` at column {column}: a field name has no `::`"
+                            )));
+                        }
                         (Token::Name(name), _) => name.to_owned(),
                         (Token::Integer(index), column) => {
                             parse_index(index, column)?;
@@ -848,6 +854,11 @@ mod tests
         assert_eq!(rejected("app::"), "unexpected `:` at column 4");
         assert_eq!(rejected("app::1"), "unexpected `:` at column 4");
         assert_eq!(rejected("a:b"), "unexpected `:` at column 2");
+        assert_eq!(rejected("s.a::b"), "unexpected `a::b` at column 3: a field name has no `::`");
+        assert_eq!(
+            rejected("app::S.x::y"),
+            "unexpected `x::y` at column 8: a field name has no `::`"
+        );
     }
 
     #[test]

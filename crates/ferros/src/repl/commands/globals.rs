@@ -25,7 +25,8 @@ impl ReplCommand for Globals
         "globals [filter]\n\nList the statics of the main executable, sorted by qualified name, as \
          '<name>: <type> = <value> @ <address>', where the address is the static's runtime address in the \
          loaded image. With a filter, list only the statics whose qualified name contains it, such as the \
-         crate or module name. Thread-locals are not listed. 'print <name>' shows one static."
+         crate or module name. Statics that share a name (such as two in separate blocks of one function) are \
+         listed once each, in address order. Thread-locals are not listed. 'print <name>' shows one static."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -39,14 +40,9 @@ impl ReplCommand for Globals
             }
         }
         for found in &statics {
-            let session = ctx.session();
-            let (ty, text) = match session.static_variable(&found.name) {
-                Ok(Some(variable)) => session.format_variable(&variable, FormatOptions::default()),
-                Ok(None) => (found.type_name.clone(), "<unavailable: not found>".to_owned()),
-                Err(error) => (found.type_name.clone(), format!("<unavailable: {error}>")),
-            };
+            let (ty, text) = ctx.session().format_variable(&found.variable, FormatOptions::default());
             // Written in pieces: one `writeln!` with every argument trips `large_stack_arrays`.
-            write!(ctx.out, "{}: {}", found.name, ty.as_deref().unwrap_or("?"))?;
+            write!(ctx.out, "{}: {}", found.variable.name, ty.as_deref().unwrap_or("?"))?;
             write!(ctx.out, " = {text}")?;
             if let Some(address) = found.address {
                 write!(ctx.out, " @ {address}")?;

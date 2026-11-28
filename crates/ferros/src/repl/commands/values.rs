@@ -53,7 +53,7 @@ impl ReplCommand for Print
 
     fn summary(&self) -> &'static str
     {
-        "show a variable, or a field, element or pointee inside one"
+        "show a local or static, or a field, element or pointee inside one"
     }
 
     fn help(&self) -> &'static str
@@ -63,9 +63,10 @@ impl ReplCommand for Print
          active variant (name.0 for a tuple field)\n  name[n]     an element of an array, slice or Vec\n  \
          *name       the value a reference, Box or raw pointer points to\n  (path)      grouping, as in \
          (*name).field\n\nname may also be a static of the main executable, by its qualified name \
-         (crate::module::NAME) or a trailing part of it (module::NAME, NAME); a local of the same name comes \
-         first. Field access and indexing look through references and boxes. Function calls and operators are \
-         not supported."
+         (crate::module::NAME) or a trailing part of it (module::NAME, NAME). A local of the same name comes \
+         first. The output names the static, as in 'LIMIT (static my_crate::config::LIMIT): u16 = 512', and a \
+         name several statics share is an error listing each with its address. Field access and indexing look \
+         through references and boxes. Function calls and operators are not supported."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -78,19 +79,27 @@ impl ReplCommand for Print
         let variables = ctx.session().selected_frame_variables()?;
         // Outer scopes precede inner scopes, so the last declaration wins when shadowed.
         // A local shadows a static of the same name, as in Rust.
-        let variable = match variables.into_iter().rfind(|variable| variable.name == root) {
-            Some(variable) => variable,
-            None => ctx
-                .session()
-                .static_variable(root)?
-                .ok_or_else(|| CommandError::new(format!("no variable named '{root}' in the selected frame")))?,
+        let (variable, is_static) = if let Some(variable) = variables.into_iter().rfind(|variable| variable.name == root) {
+            (variable, false)
+        } else {
+            let found = ctx.session().static_variable(root)?.ok_or_else(|| {
+                CommandError::new(format!("no variable or static named '{root}' in the selected frame"))
+            })?;
+            (found.variable, true)
         };
         let (ty, text) = ctx
             .session()
             .format_path(&variable, &path, FormatOptions::default())
             .map_err(|error| CommandError::new(format!("cannot evaluate '{path}': {error}")))?;
         let ty = ty.as_deref().unwrap_or("?");
-        writeln!(ctx.out, "{path}: {ty} = {text}")?;
+        // Name the static the root resolved to, so a short name that matched a static of
+        // another module or crate shows which one.
+        if is_static {
+            write!(ctx.out, "{path} (static {}): ", variable.name)?;
+        } else {
+            write!(ctx.out, "{path}: ")?;
+        }
+        writeln!(ctx.out, "{ty} = {text}")?;
         Ok(Flow::Continue)
     }
 }

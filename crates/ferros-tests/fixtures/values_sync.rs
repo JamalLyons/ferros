@@ -110,11 +110,16 @@ fn main()
     inspect_guard_payloads();
 }
 
+const _: () = assert!(size_of::<Reading>() == 96 && align_of::<Reading>() == 32);
+
+// Size 96 and alignment 32 differ, so reading the vtable's size slot instead of its
+// alignment slot puts the payload at the wrong offset.
 #[derive(Debug)]
 #[repr(align(32))]
 struct Reading
 {
     count: u32,
+    spare: (u64, u64, u64, u64, u64, u64, u64, u64),
 }
 
 fn inspect_guard_payloads()
@@ -124,11 +129,20 @@ fn inspect_guard_payloads()
     let slice: Box<Mutex<[u8]>> = Box::new(Mutex::new([1, 2]));
     let read_slice: Box<RwLock<[u8]>> = Box::new(RwLock::new([3, 4]));
     let write_slice: Box<RwLock<[u8]>> = Box::new(RwLock::new([5, 6]));
-    let reading = Reading { count: 7 };
-    black_box(reading.count);
+    let reading = Reading {
+        count: 7,
+        spare: (0, 0, 0, 0, 0, 0, 0, 0),
+    };
+    black_box((reading.count, reading.spare));
     let object: Box<Mutex<dyn Debug>> = Box::new(Mutex::new(reading));
-    let read_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading { count: 8 }));
-    let write_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading { count: 9 }));
+    let read_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading {
+        count: 8,
+        spare: (0, 0, 0, 0, 0, 0, 0, 0),
+    }));
+    let write_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading {
+        count: 9,
+        spare: (0, 0, 0, 0, 0, 0, 0, 0),
+    }));
 
     let slice_guard = slice.lock().unwrap();
     let slice_reader = read_slice.read().unwrap();

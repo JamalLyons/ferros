@@ -80,14 +80,17 @@ fn print_reads_unsized_and_large_guard_payloads()
         ("slice_guard", "MutexGuard [1, 2]"),
         ("slice_reader", "RwLockReadGuard [3, 4]"),
         ("slice_writer", "RwLockWriteGuard [5, 6]"),
-        ("object_guard", "MutexGuard ferros_fixture_values_sync::Reading { count: 7 }"),
+        (
+            "object_guard",
+            "MutexGuard ferros_fixture_values_sync::Reading { count: 7, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
+        ),
         (
             "object_reader",
-            "RwLockReadGuard ferros_fixture_values_sync::Reading { count: 8 }",
+            "RwLockReadGuard ferros_fixture_values_sync::Reading { count: 8, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
         ),
         (
             "object_writer",
-            "RwLockWriteGuard ferros_fixture_values_sync::Reading { count: 9 }",
+            "RwLockWriteGuard ferros_fixture_values_sync::Reading { count: 9, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
         ),
         (
             "large_guard",

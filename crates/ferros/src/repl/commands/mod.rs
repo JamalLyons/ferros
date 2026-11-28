@@ -146,4 +146,5 @@ registry! {
     images: [Images],
     help: [Help],
     values: [Locals, Print],
+    globals: [Globals],
 }

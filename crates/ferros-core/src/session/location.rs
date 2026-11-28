@@ -142,7 +142,7 @@ impl Session
     /// The main executable's symbols (the image the backend marks as the main executable).
     /// Refreshes the image list and starts the symbol request that the location's sites
     /// are then positioned in ([`position_in_request`](Self::position_in_request)).
-    fn main_image(&mut self) -> Result<Arc<BinaryImage>>
+    pub(super) fn main_image(&mut self) -> Result<Arc<BinaryImage>>
     {
         self.load_images()?;
         self.begin_symbol_request();

@@ -67,7 +67,7 @@ fn print_follows_fields_indexes_and_dereferences()
         ),
         ("*count", "cannot evaluate '*count': `*count`: cannot dereference u32"),
         ("count[0]", "cannot evaluate 'count[0]': `count[0]`: cannot index u32"),
-        ("missing.x", "no variable named 'missing' in the selected frame"),
+        ("missing.x", "no variable or static named 'missing' in the selected frame"),
         (
             "v.len()",
             "invalid path 'v.len()': unexpected `(` at column 6: function calls are not supported",

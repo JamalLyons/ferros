@@ -7,10 +7,13 @@
 //! path    := '*' path | postfix
 //! postfix := primary ( '.' name | '.' integer | '[' integer ']' )*
 //! primary := name | '(' path ')'
-//! name    := '::'? identifier ( '::' identifier )*
+//! name    := ( '::'? identifier | qualifier '::' identifier ) ( '::' identifier )*
+//! qualifier := '<' any text with balanced '<' '>' '>'
 //! ```
 //!
-//! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`).
+//! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`). A
+//! static in an impl method starts with the impl's qualifier, written as `globals` shows it:
+//! `<my_crate::Meters>::f::X`, `<my_crate::Meters as my_crate::Unit>::f::X`.
 //!
 //! As in Rust, `*a.b` dereferences `a.b`; write `(*a).b` to dereference `a` first. `.0`
 //! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
@@ -234,13 +237,15 @@ fn tokenize(text: &str) -> Result<Vec<(Token<'_>, usize)>, PathError>
                 while chars.next_if(|&(next, _)| next < end).is_some() {}
                 Token::Integer(&text[start..end])
             }
-            ch if is_name_start(ch) || (ch == ':' && text[start..].starts_with("::")) => match name_end(text, start) {
-                Some(end) => {
-                    while chars.next_if(|&(next, _)| next < end).is_some() {}
-                    Token::Name(&text[start..end])
+            ch if is_name_start(ch) || ch == '<' || (ch == ':' && text[start..].starts_with("::")) => {
+                match name_end(text, start) {
+                    Some(end) => {
+                        while chars.next_if(|&(next, _)| next < end).is_some() {}
+                        Token::Name(&text[start..end])
+                    }
+                    None => Token::Other(ch),
                 }
-                None => Token::Other(ch),
-            },
+            }
             other => Token::Other(other),
         };
         tokens.push((token, column));
@@ -266,8 +271,10 @@ fn word_end(text: &str, start: usize) -> usize
 }
 
 /// The end of the name at `start`: identifiers joined by `::`, optionally after a leading
-/// `::`, as in a static's qualified name (`::my_crate::config::LIMIT`). `None` when `::`
-/// at `start` is not followed by an identifier.
+/// `::` or an impl qualifier, as in a static's qualified name (`::my_crate::config::LIMIT`,
+/// `<my_crate::Meters as my_crate::Unit>::f::X`). `None` when `::` at `start` is not
+/// followed by an identifier, or a `<` at `start` does not close and continue with `::`
+/// and an identifier.
 fn name_end(text: &str, start: usize) -> Option<usize>
 {
     let segment = |at: usize| {
@@ -276,6 +283,10 @@ fn name_end(text: &str, start: usize) -> Option<usize>
     };
     let mut end = if text[start..].starts_with("::") {
         segment(start + 2)?
+    } else if text[start..].starts_with('<') {
+        let close = qualifier_end(text, start)?;
+        text[close..].starts_with("::").then_some(())?;
+        segment(close + 2)?
     } else {
         segment(start)?
     };
@@ -285,6 +296,26 @@ fn name_end(text: &str, start: usize) -> Option<usize>
         end = next;
     }
     Some(end)
+}
+
+/// The end of the `<...>` at `start`, just after the `>` that balances its `<`.
+fn qualifier_end(text: &str, start: usize) -> Option<usize>
+{
+    let mut depth = 0_usize;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            // Not the `>` of a return type's `->`, as in `<fn() -> u8 as app::Unit>`.
+            '>' if !text[..start + offset].ends_with('-') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn unexpected(token: Token<'_>, column: usize) -> PathError
@@ -850,6 +881,27 @@ mod tests
         assert_eq!(path.to_string(), "app::TABLE[2]");
         assert_eq!(Path::parse("(*app::P).x").unwrap().root(), "app::P");
         assert_eq!(Path::parse("::app::LIMIT").unwrap().root(), "::app::LIMIT");
+        let path = Path::parse("<app::Meters as app::Unit>::f::X.0").unwrap();
+        assert_eq!(path.root(), "<app::Meters as app::Unit>::f::X");
+        assert_eq!(path.to_string(), "<app::Meters as app::Unit>::f::X.0");
+        assert_eq!(
+            Path::parse("*<alloc::vec::Vec<_> as app::Unit>::f::P").unwrap().root(),
+            "<alloc::vec::Vec<_> as app::Unit>::f::P"
+        );
+        assert_eq!(
+            Path::parse("<fn() -> u8 as app::Unit>::f::X").unwrap().root(),
+            "<fn() -> u8 as app::Unit>::f::X"
+        );
+        assert_eq!(
+            rejected("<app::Meters>"),
+            "unexpected `<` at column 1: operators are not supported"
+        );
+        assert_eq!(
+            rejected("<app::Meters::X"),
+            "unexpected `<` at column 1: operators are not supported"
+        );
+        assert_eq!(rejected("<a>::1"), "unexpected `<` at column 1: operators are not supported");
+        assert_eq!(rejected("a < b"), "unexpected `<` at column 3: operators are not supported");
         assert_eq!(rejected("::"), "unexpected `:` at column 1");
         assert_eq!(rejected("app::"), "unexpected `:` at column 4");
         assert_eq!(rejected("app::1"), "unexpected `:` at column 4");

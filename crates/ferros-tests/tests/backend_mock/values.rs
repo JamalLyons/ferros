@@ -14,8 +14,8 @@ use ferros_core::values::pretty::PrettyPrinter;
 use ferros_core::values::types::{Type, TypeKind, TypeTable};
 use ferros_core::{Session, SymbolCache};
 use gimli::write::{
-    Address as DwarfAddress, AttributeValue as Attr, DwarfUnit, EndianVec, Expression, Range, RangeList, Sections, Unit,
-    UnitEntryId, Writer as _,
+    Address as DwarfAddress, AttributeValue as Attr, Dwarf, DwarfUnit, EndianVec, Expression, Range, RangeList, Sections,
+    Unit, UnitEntryId, Writer as _,
 };
 use gimli::{DwTag, Encoding, Format, LittleEndian, RunTimeEndian, SectionId};
 
@@ -40,6 +40,15 @@ fn session_with(
 {
     let mut sections = Sections::new(EndianVec::new(LittleEndian));
     dwarf.write(&mut sections).expect("write DWARF");
+    session_with_sections(&sections, omit, extra)
+}
+
+fn session_with_sections(
+    sections: &Sections<EndianVec<LittleEndian>>,
+    omit: Option<SectionId>,
+    extra: impl FnOnce(MockBackend) -> MockBackend,
+) -> (Session, MockBackend, RemoveOnDrop)
+{
     let mut image = MockObjectFile::new(BASE, IMAGE_SIZE);
     for &id in ferros_core::objfile::DWARF_SECTIONS {
         if Some(id) != omit
@@ -155,6 +164,98 @@ fn array_with_bounds(
     entry.set(gimli::DW_AT_lower_bound, lower);
     entry.set(gimli::DW_AT_upper_bound, upper);
     array
+}
+
+#[test]
+fn overlapping_unit_bounds_without_aranges_use_the_subprogram_range()
+{
+    let (mut decoy, wrong, wrong_byte) = dwarf_function(Some("decoy"));
+    decoy
+        .unit
+        .get_mut(decoy.unit.root())
+        .set(gimli::DW_AT_high_pc, Attr::Udata(0x10));
+    decoy
+        .unit
+        .get_mut(wrong)
+        .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+    local(&mut decoy.unit, wrong, "wrong", wrong_byte, register_location());
+
+    let (mut actual, right, right_byte) = dwarf_function(Some("owner"));
+    let ranges = actual.unit.ranges.add(RangeList(vec![
+        Range::OffsetPair { begin: 0, end: 0x10 },
+        Range::OffsetPair { begin: 0x20, end: 0x30 },
+    ]));
+    let function = actual.unit.get_mut(right);
+    function.delete(gimli::DW_AT_high_pc);
+    function.set(gimli::DW_AT_ranges, Attr::RangeListRef(ranges));
+    local(&mut actual.unit, right, "right", right_byte, register_location());
+    // Both subprograms have the same unit-relative DIE offset. The decoy's
+    // bounding range ends first and contains the PC, but its subprogram does not.
+    let mut dwarf = Dwarf::new();
+    dwarf.units.add(decoy.unit);
+    dwarf.units.add(actual.unit);
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    dwarf.write(&mut sections).expect("write DWARF");
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let vars = session.selected_frame_variables().expect("read locals");
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].name, "right");
+    assert_eq!(vars[0].value.bytes.as_deref(), Ok(&[7][..]));
+}
+
+#[test]
+fn corrupt_variable_abbreviation_reports_its_unit_and_die_offsets()
+{
+    let (mut other, _, _) = dwarf_function(Some("other"));
+    other
+        .unit
+        .get_mut(other.unit.root())
+        .set(gimli::DW_AT_low_pc, Attr::Address(DwarfAddress::Constant(BASE + 0x200)));
+    let (mut actual, right, byte) = dwarf_function(Some("owner"));
+    local(&mut actual.unit, right, "damaged", byte, register_location());
+
+    let mut sections = Sections::new(EndianVec::new(LittleEndian));
+    other.write(&mut sections).expect("write first unit");
+    let unit_offset = sections.debug_info.0.slice().len();
+    actual.write(&mut sections).expect("write second unit");
+    let die_offset = {
+        let dwarf = gimli::Dwarf::load(|id| {
+            let bytes = sections.get(id).map_or(&[][..], EndianVec::slice);
+            Ok::<_, gimli::Error>(gimli::EndianSlice::new(bytes, LittleEndian))
+        })
+        .expect("read synthetic DWARF");
+        let header = dwarf
+            .debug_info
+            .header_from_offset(gimli::DebugInfoOffset(unit_offset))
+            .expect("second unit");
+        let unit = dwarf.unit(header).expect("load second unit");
+        let mut entries = unit.entries();
+        loop {
+            let (_, entry) = entries.next_dfs().expect("read DIE").expect("variable");
+            if entry.tag() == gimli::DW_TAG_variable {
+                break entry.offset().0;
+            }
+        }
+    };
+    sections
+        .debug_info
+        .0
+        .write_at(unit_offset + die_offset, &[0x7f])
+        .expect("write unknown abbreviation");
+
+    let (mut session, _, _image) = session_with_sections(&sections, None, |backend| backend);
+    let error = session.selected_frame_variables().expect_err("unknown abbreviation");
+    let DebuggerError::NoDebugInfo { detail, .. } = error else {
+        panic!("{error}")
+    };
+    assert!(detail.contains("unknown abbreviation code"), "{detail}");
+    assert!(
+        detail.contains(&format!(
+            "unit at .debug_info+{unit_offset:#x}, DIE at unit offset {die_offset:#x}"
+        )),
+        "{detail}"
+    );
 }
 
 #[test]

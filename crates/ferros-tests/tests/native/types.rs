@@ -150,8 +150,13 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
         );
     }
     let field_type = |field: &str| sample_fields.member(field).and_then(|member| member.ty).expect("typed");
-    let u16_id = types.type_named("u16").expect("u16");
-    assert_eq!(get(types, u16_id).kind, TypeKind::Base(BaseEncoding::Unsigned));
+    // Other compilation units can define their own u16 DIE.
+    let check_u16 = |id| {
+        let ty = get(types, id);
+        assert_eq!(ty.name.as_deref(), Some("u16"));
+        assert_eq!(ty.kind, TypeKind::Base(BaseEncoding::Unsigned));
+        assert_eq!(ty.size, Some(2));
+    };
 
     // A struct whose fields rustc reordered, and a tuple.
     let point = composite(types, field_type("point"));
@@ -170,7 +175,8 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
     let TypeKind::Array(words) = &get(types, field_type("words")).kind else {
         panic!("[u16; 4] is an array");
     };
-    assert_eq!((words.element, words.lengths.as_slice()), (Some(u16_id), &[Some(4)][..]));
+    check_u16(words.element.expect("array element type"));
+    assert_eq!(words.lengths, [Some(4)]);
     for (field, kind) in [
         ("word_ref", PointerKind::Reference { mutable: false }),
         ("word_ptr", PointerKind::Raw { mutable: false }),
@@ -179,8 +185,9 @@ fn check_sample_fields(types: &TypeTable, sample_fields: &Composite, printed: &H
         let TypeKind::Pointer(target) = &pointer.kind else {
             panic!("{field} is a pointer");
         };
-        assert_eq!((target.kind, target.pointee), (kind, Some(u16_id)), "{field}");
-        assert_eq!(types.type_of(pointer.die), Some(u16_id), "{field}: DW_AT_type of the entry");
+        assert_eq!(target.kind, kind, "{field}");
+        check_u16(target.pointee.expect("pointee type"));
+        assert_eq!(types.type_of(pointer.die), target.pointee, "{field}: DW_AT_type of the entry");
         assert_eq!(
             types.type_at(pointer.die),
             Some(field_type(field)),

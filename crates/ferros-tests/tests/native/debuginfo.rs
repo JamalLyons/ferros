@@ -172,6 +172,43 @@ fn packed_fixture_discovers_uuid_matching_dsym()
 }
 
 #[test]
+fn locals_use_the_owning_unit_in_packed_dwarf()
+{
+    harness::run(|t| {
+        let fixture = fixture!("values_packed");
+        let mut d = t.launch(&fixture);
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "values_packed.rs".into(),
+            line: fixture.marker_line("inspect"),
+        })
+        .expect("set breakpoint");
+        d.resume().expect("resume");
+        assert!(matches!(
+            d.wait(Some(Duration::from_secs(5))).expect("wait"),
+            Some(StopEvent::Breakpoint { .. })
+        ));
+
+        let vars = d.selected_frame_variables().expect("locals in the packed dSYM");
+        let deque = vars.iter().find(|var| var.name == "vd").expect("vd in main");
+        let (_, value) = d.format_variable(deque, ferros_core::values::format::FormatOptions::default());
+        assert_eq!(value, "[1, 2, 3, 4] (len: 4, capacity: 4)");
+
+        let scratch = Scratch::new();
+        let sections = MachOFormat::with_debug_info_options(scratch.options())
+            .open_image(fixture.path(), 0x1_0000_0000, None)
+            .expect("open executable")
+            .debug
+            .expect("adjacent dSYM");
+        let aranges = &sections.dwarf[&gimli::SectionId::DebugAranges];
+        let aranges = gimli::DebugAranges::new(aranges, gimli::LittleEndian);
+        let mut headers = aranges.headers();
+        let first = headers.next().expect("first aranges header").expect("first CU");
+        let second = headers.next().expect("second aranges header").expect("second CU");
+        assert_ne!(first.debug_info_offset(), second.debug_info_offset());
+    });
+}
+
+#[test]
 fn mismatched_dsym_is_rejected_and_no_tool_has_actionable_typed_error()
 {
     harness::run(|_| {

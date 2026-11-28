@@ -16,6 +16,7 @@ use crate::types::{Address, Architecture, BuildIdentity};
 pub const DWARF_SECTIONS: &[SectionId] = &[
     SectionId::DebugAbbrev,
     SectionId::DebugAddr,
+    SectionId::DebugAranges,
     SectionId::DebugInfo,
     SectionId::DebugLine,
     SectionId::DebugLineStr,

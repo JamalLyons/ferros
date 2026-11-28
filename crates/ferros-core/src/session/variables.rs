@@ -77,7 +77,10 @@ impl Session
             |address, len| self.read_memory(address, len),
             |address| image.runtime_address(address),
         )
-        .map_err(|error| debug_info_error(format!("failed to walk variable DWARF: {error}")))
+        .map_err(|error| {
+            let detail = error.detail(file_pc, || image.dwarf().ok());
+            debug_info_error(format!("failed to walk variable DWARF: {detail}"))
+        })
     }
 
     /// Render a variable from the current stop. Returns its type name, if known,

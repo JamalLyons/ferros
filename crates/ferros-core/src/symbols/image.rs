@@ -650,7 +650,7 @@ impl BinaryImage
     ///
     /// # Errors
     /// Why the image has no source debug information, or why its DWARF does not load.
-    pub(super) fn dwarf(&self) -> Result<&OwnedDwarf>
+    pub(crate) fn dwarf(&self) -> Result<&OwnedDwarf>
     {
         let sections = self.debug_sections()?;
         self.dwarf_cache.get_or_try_init(|| {

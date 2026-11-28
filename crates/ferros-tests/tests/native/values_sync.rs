@@ -73,6 +73,50 @@ fn print_shows_synchronized_values_and_their_state()
     });
 }
 
+#[test]
+fn print_reads_unsized_and_large_guard_payloads()
+{
+    const SAMPLES: &[(&str, &str)] = &[
+        ("slice_guard", "MutexGuard [1, 2]"),
+        ("slice_reader", "RwLockReadGuard [3, 4]"),
+        ("slice_writer", "RwLockWriteGuard [5, 6]"),
+        ("object_guard", "MutexGuard ferros_fixture_values_sync::Reading { count: 7 }"),
+        (
+            "object_reader",
+            "RwLockReadGuard ferros_fixture_values_sync::Reading { count: 8 }",
+        ),
+        (
+            "object_writer",
+            "RwLockWriteGuard ferros_fixture_values_sync::Reading { count: 9 }",
+        ),
+        (
+            "large_guard",
+            "MutexGuard [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...]",
+        ),
+    ];
+    let _ = transcript::ferros_bin();
+    harness::run(|t| {
+        let fixture = fixture!("values_sync");
+        let break_at = format!("break values_sync.rs:{}", fixture.marker_line("guard_payloads"));
+        let prints: Vec<_> = SAMPLES.iter().map(|(name, _)| format!("print {name}")).collect();
+        let mut commands = vec![break_at.as_str(), "continue"];
+        commands.extend(prints.iter().map(String::as_str));
+        commands.push("quit");
+        let run = transcript::launch_batch(&t.tag(), &fixture, &[], &commands);
+        assert!(run.status.success(), "status {:?}, stderr: {}", run.status, run.stderr);
+        for &(name, expected) in SAMPLES {
+            let prefix = format!("{name}: ");
+            let value = run
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix)?.split_once(" = ").map(|(_, value)| value))
+                .unwrap_or_else(|| panic!("missing {name} in:\n{}", run.stdout));
+            let value = value.strip_suffix(" (type inferred from vtable methods)").unwrap_or(value);
+            assert_eq!(value, expected, "{name}:\n{}", run.stdout);
+        }
+    });
+}
+
 /// Without a platform runtime the session cannot read a system mutex, so a `Mutex` that
 /// has been locked shows its value and no lock state; one never locked still shows
 /// `unlocked`, and poisoning still shows.

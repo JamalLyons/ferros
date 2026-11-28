@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use gimli::RunTimeEndian;
+
 use super::{BOX_NAME, PrettyPrinter, field, raw_layout, thin_pointer, word};
 use crate::symbols::functions::{find_top, group_end};
 use crate::types::Address;
@@ -24,21 +26,63 @@ impl PrettyPrinter for DynTraitPrinter
 
     fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
     {
-        let types = formatter.types();
-        let endian = formatter.endian();
-        let Some((data, erased)) = field(value, "pointer", types).and_then(|field| thin_pointer(field, types, endian))
-        else {
+        let Some((data, erased, metadata)) = DynMetadata::from_pointer(value, formatter.types(), formatter.endian()) else {
             return raw_layout(value, formatter);
         };
-        let Some(vtable_field) = field(value, "vtable", types) else {
-            return raw_layout(value, formatter);
-        };
-        let Some((vtable, table_type)) = thin_pointer(vtable_field, types, endian) else {
-            return raw_layout(value, formatter);
-        };
+        metadata.format_at(data, erased, formatter)
+    }
+}
+
+/// Metadata shared by a trait object pointer and pointers to structs with a trait object tail.
+pub(super) struct DynMetadata
+{
+    address: Address,
+    ty: TypeId,
+    width: usize,
+}
+
+impl DynMetadata
+{
+    pub(super) fn from_pointer(
+        value: ValueView<'_>,
+        types: &TypeTable,
+        endian: RunTimeEndian,
+    ) -> Option<(Address, TypeId, Self)>
+    {
+        let (data, pointee) = thin_pointer(field(value, "pointer", types)?, types, endian)?;
+        let field = field(value, "vtable", types)?;
+        let (address, ty) = thin_pointer(field, types, endian)?;
+        Some((
+            data,
+            pointee,
+            Self {
+                address,
+                ty,
+                width: field.bytes.len(),
+            },
+        ))
+    }
+
+    pub(super) fn alignment(&self, formatter: &mut ValueFormatter<'_>) -> Option<u64>
+    {
+        let Self { address, width, .. } = *self;
+        if address == Address::ZERO {
+            return None;
+        }
+        // The header stores drop glue, size, then alignment.
+        let entry = address.checked_add(2 * width as u64)?;
+        let align = word(&formatter.read_memory(entry, width).ok()?, formatter.endian())?;
+        align.is_power_of_two().then_some(align)
+    }
+
+    pub(super) fn format_at(self, data: Address, erased: TypeId, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        let Self {
+            address: vtable,
+            ty: table_type,
+            width,
+        } = self;
         let fallback = || format!("dyn {{ data: {data}, vtable: {vtable} }}");
-        let erased = types.get(types.strip_aliases(erased));
-        let table_type = types.get(types.strip_aliases(table_type));
         if data == Address::ZERO || vtable == Address::ZERO {
             return fallback();
         }
@@ -54,9 +98,11 @@ impl PrettyPrinter for DynTraitPrinter
                 (concrete.size.is_some() && !concrete.declaration).then(|| (types.clone(), ty, false))
             })
             .or_else(|| {
-                let (principal, entries) = method_layout(erased.as_deref()?, table_type.as_deref()?)?;
-                from_methods(formatter, vtable, vtable_field.bytes.len(), entries, principal)
-                    .map(|(types, ty)| (types, ty, true))
+                let types = formatter.types();
+                let erased = types.get(types.strip_aliases(erased))?;
+                let table_type = types.get(types.strip_aliases(table_type))?;
+                let (principal, entries) = method_layout(&erased, &table_type)?;
+                from_methods(formatter, vtable, width, entries, principal).map(|(types, ty)| (types, ty, true))
             });
         let Some((types, ty, inferred)) = concrete else {
             return fallback();

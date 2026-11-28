@@ -3,6 +3,7 @@
 
 use std::cell::{OnceCell, UnsafeCell};
 use std::ffi::{CStr, OsStr};
+use std::fmt::Debug;
 use std::hint::black_box;
 use std::path::Path;
 use std::pin::Pin;
@@ -106,4 +107,45 @@ fn main()
     black_box((&rc, &rc_weak, &arc, &arc_weak, &arc_dangling, &rc_new, &pinned, &pinned_ref));
     black_box((&poisoned, &held, &rc_path, &arc_os_str, &rc_c_str));
     black_box((&guarded, &guard, &poisoned_guard, &poisoned_writer));
+    inspect_guard_payloads();
+}
+
+#[derive(Debug)]
+#[repr(align(32))]
+struct Reading
+{
+    count: u32,
+}
+
+fn inspect_guard_payloads()
+{
+    static LARGE: Mutex<[u8; 2_097_152]> = Mutex::new([0; 2_097_152]);
+
+    let slice: Box<Mutex<[u8]>> = Box::new(Mutex::new([1, 2]));
+    let read_slice: Box<RwLock<[u8]>> = Box::new(RwLock::new([3, 4]));
+    let write_slice: Box<RwLock<[u8]>> = Box::new(RwLock::new([5, 6]));
+    let reading = Reading { count: 7 };
+    black_box(reading.count);
+    let object: Box<Mutex<dyn Debug>> = Box::new(Mutex::new(reading));
+    let read_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading { count: 8 }));
+    let write_object: Box<RwLock<dyn Debug>> = Box::new(RwLock::new(Reading { count: 9 }));
+
+    let slice_guard = slice.lock().unwrap();
+    let slice_reader = read_slice.read().unwrap();
+    let slice_writer = write_slice.write().unwrap();
+    let object_guard = object.lock().unwrap();
+    let object_reader = read_object.read().unwrap();
+    let object_writer = write_object.write().unwrap();
+    let mut large_guard = LARGE.lock().unwrap();
+    large_guard[0] = 7;
+
+    black_box(&slice_guard); // BREAK: guard_payloads
+    black_box((
+        &slice_reader,
+        &slice_writer,
+        &object_guard,
+        &object_reader,
+        &object_writer,
+        &large_guard,
+    ));
 }

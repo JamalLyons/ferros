@@ -134,7 +134,7 @@ struct SharedLayout
     pointee: Pointee,
 }
 
-enum Pointee
+pub(in crate::values) enum Pointee
 {
     Sized(TypeId),
     Str(u64),
@@ -242,6 +242,63 @@ fn unwrap_slice_wrappers(mut ty: TypeId, types: &TypeTable) -> Option<TypeId>
         ty = inner.ty?;
     }
     None
+}
+
+/// Where an `Rc`, `Arc` or `Weak` points, for a caller that follows it.
+pub(in crate::values) enum SharedTarget
+{
+    /// The allocation pointer is null.
+    Null,
+    /// No strong owner keeps the payload alive: a `Weak` from `Weak::new`, or one whose
+    /// last strong owner was dropped.
+    Dangling,
+    /// The payload at `address`.
+    Live
+    {
+        address: Address, pointee: Pointee
+    },
+}
+
+/// Follow `value`, an `Rc`, `Arc` or `Weak`, reading its strong count with `read`. `None`
+/// when `value` is none of those or its layout is not recognized.
+pub(in crate::values) fn follow_shared(
+    value: ValueView<'_>,
+    types: &TypeTable,
+    endian: RunTimeEndian,
+    read: &mut dyn FnMut(Address, usize) -> Result<Vec<u8>, String>,
+) -> Option<Result<SharedTarget, String>>
+{
+    let layout = shared_layout(value, types, endian)?;
+    if layout.base == Address::ZERO {
+        return Some(Ok(SharedTarget::Null));
+    }
+    // `Weak::new` points at no allocation: its address is the target's usize::MAX.
+    if layout.is_weak && layout.base.value() == u64::MAX >> (64 - 8 * layout.pointer_size) {
+        return Some(Ok(SharedTarget::Dangling));
+    }
+    let Some(counter) = layout.base.checked_add(layout.strong.offset) else {
+        return Some(Err("shared counter address overflows".to_owned()));
+    };
+    let bytes = match read(counter, layout.strong.size) {
+        Ok(bytes) => bytes,
+        Err(reason) => return Some(Err(reason)),
+    };
+    let view = ValueView {
+        ty: layout.strong.ty,
+        bytes: &bytes,
+        address: Some(counter),
+    };
+    let strong = layout.kind.read_counter(view, types, endian)?;
+    if strong.raw == 0 {
+        return Some(Ok(SharedTarget::Dangling));
+    }
+    let Some(address) = layout.base.checked_add(layout.data_offset) else {
+        return Some(Err("shared pointee address overflows".to_owned()));
+    };
+    Some(Ok(SharedTarget::Live {
+        address,
+        pointee: layout.pointee,
+    }))
 }
 
 struct Counter

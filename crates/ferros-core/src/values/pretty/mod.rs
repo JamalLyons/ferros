@@ -12,7 +12,9 @@ mod vec;
 
 use gimli::RunTimeEndian;
 
+pub(super) use self::collections::ring_layout;
 pub(super) use self::enums::{variant_for_tag, variant_payload};
+pub(super) use self::shared::{Pointee as SharedPointee, SharedTarget, follow_shared};
 pub(crate) use self::sync::LockPrinter;
 pub(super) use self::vec::layout as vec_layout;
 use super::format::{ValueFormatter, ValueView, format_raw, unsigned};

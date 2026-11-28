@@ -5,10 +5,12 @@
 //!
 //! ```text
 //! path    := '*' path | postfix
-//! postfix := primary ( '.' name | '.' integer | '[' integer ']' )*
+//! postfix := primary ( '.' name | '.' integer | '[' index ']' )*
 //! primary := name | '(' path ')'
 //! name    := ( '::'? identifier | qualifier '::' identifier ) ( '::' identifier )*
 //! qualifier := '<' any text with balanced '<' '>' '>'
+//! index   := an integer literal: decimal, 0x hex, 0o octal or 0b binary, with `_` separators
+//!            and an optional `usize` suffix
 //! ```
 //!
 //! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`). A
@@ -19,13 +21,32 @@
 //! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
 //! of the active variant, read from the discriminant (an explicit tag or a niche) as the
 //! enum printer does; a field only another variant has is an error naming both. `[n]`
-//! indexes an array, a slice (`&[T]`, `Box<[T]>`) or a `Vec`. `*` follows a reference, a
-//! raw pointer or a `Box`. Field access and indexing look through references and boxes as
-//! Rust's auto-dereference does; raw pointers need an explicit `*`. There are no function
+//! indexes an array, a slice (`&[T]`, `Box<[T]>`, `*p` for a raw `*const [T]`), a `Vec`,
+//! a `VecDeque` in logical order, or the bytes of a `String` or `str`.
+//!
+//! `*` follows a reference, a raw pointer, a `Box`, an `Rc` or `Arc` (to its payload), a
+//! live `Weak` (a dangling one is an error), a `Pin` (through the pointer it pins), a
+//! `Cell` or `RefCell` (to the value inside) and a `Cow` (to the value it borrows or
+//! owns). Dereferencing a slice, `Vec` or string gives its unsized contents, which can be
+//! indexed but not printed alone. Field access and indexing look through all of these
+//! except `Weak` and raw pointers, as Rust's auto-dereference does; a `Cow`'s `.0`
+//! selects its variant's field unless the payload has its own `.0`. Raw pointers need an explicit `*`. There are no function
 //! calls, operators or literals other than an index.
 //!
 //! Evaluation reads only what the path needs: the root variable's bytes, the pointers and
 //! headers it follows, and the bytes of the final value, which the caller formats.
+//!
+//! # Map of this file
+//!
+//! - `MAX_TOKENS`, `Path`, `Expr`, their `Display` and `write_base`: the parsed path.
+//! - `PathError`: parse and evaluation errors, naming the failing segment.
+//! - `Token`, `tokenize`, `is_name_start`, `word_end`, `name_end`, `qualifier_end`,
+//!   `unexpected`, `Parser`, `parse_index`, `parse_field_index`: the parser.
+//! - `Storage`, `Place`, `evaluate`: the evaluated value the caller formats.
+//! - `Evaluator`, `Value`, `Slice`, `Shape`, the type-name prefixes and
+//!   `starts_with_any`: one step per path segment (`field`, `index`, `deref`,
+//!   `auto_deref`) and the wrapper layouts they follow.
+//! - `member_named`, `raw_pointer_hint`, `check_bounds`, `child`: helpers.
 
 use std::fmt;
 
@@ -33,7 +54,9 @@ use gimli::RunTimeEndian;
 
 use super::format::{ValueView, unsigned};
 use super::location::value_size;
-use super::pretty::{fat_pointer, variant_for_tag, variant_payload, vec_layout};
+use super::pretty::{
+    SharedPointee, SharedTarget, fat_pointer, follow_shared, ring_layout, variant_for_tag, variant_payload, vec_layout,
+};
 use super::types::{Member, PointerKind, RustEnum, TypeId, TypeKind, TypeTable, Variant};
 use crate::error::Result as DebuggerResult;
 use crate::types::Address;
@@ -52,7 +75,8 @@ enum Expr
 {
     Variable(String),
     Field(Box<Expr>, String),
-    Index(Box<Expr>, u64),
+    /// The index and its literal as written, so errors echo `v[0x10]`.
+    Index(Box<Expr>, u64, String),
     Deref(Box<Expr>),
 }
 
@@ -87,7 +111,7 @@ impl Path
         loop {
             match expr {
                 Expr::Variable(name) => return name,
-                Expr::Field(base, _) | Expr::Index(base, _) | Expr::Deref(base) => expr = base,
+                Expr::Field(base, _) | Expr::Index(base, ..) | Expr::Deref(base) => expr = base,
             }
         }
     }
@@ -118,9 +142,9 @@ impl fmt::Display for Expr
                 write_base(f, base)?;
                 write!(f, ".{name}")
             }
-            Self::Index(base, index) => {
+            Self::Index(base, _, literal) => {
                 write_base(f, base)?;
-                write!(f, "[{index}]")
+                write!(f, "[{literal}]")
             }
             Self::Deref(inner) => write!(f, "*{inner}"),
         }
@@ -144,6 +168,8 @@ pub struct PathError
     pub segment: Option<String>,
     /// What went wrong.
     pub reason: String,
+    /// The value has no field of the requested name, so a wrapper's own field may apply.
+    missing_field: bool,
 }
 
 impl PathError
@@ -153,6 +179,7 @@ impl PathError
         Self {
             segment: None,
             reason: reason.into(),
+            missing_field: false,
         }
     }
 
@@ -161,6 +188,7 @@ impl PathError
         Self {
             segment: Some(path.root().to_owned()),
             reason: reason.into(),
+            missing_field: false,
         }
     }
 
@@ -169,6 +197,16 @@ impl PathError
         Self {
             segment: Some(expr.to_string()),
             reason: reason.into(),
+            missing_field: false,
+        }
+    }
+
+    /// The value at `expr` has no field of the requested name.
+    fn no_field(expr: &Expr, reason: impl Into<String>) -> Self
+    {
+        Self {
+            missing_field: true,
+            ..Self::at(expr, reason)
         }
     }
 }
@@ -379,7 +417,7 @@ impl<'a> Parser<'a>
                         }
                         (Token::Name(name), _) => name.to_owned(),
                         (Token::Integer(index), column) => {
-                            parse_index(index, column)?;
+                            parse_field_index(index, column)?;
                             index.to_owned()
                         }
                         (token, column) => return Err(unexpected(token, column)),
@@ -388,8 +426,8 @@ impl<'a> Parser<'a>
                 }
                 Some(Token::OpenBracket) => {
                     self.next += 1;
-                    let index = match self.take()? {
-                        (Token::Integer(index), column) => parse_index(index, column)?,
+                    let (index, literal) = match self.take()? {
+                        (Token::Integer(literal), column) => (parse_index(literal, column)?, literal.to_owned()),
                         (token, column) => {
                             return Err(PathError::syntax(format!(
                                 "unexpected `{token}` at column {column}: an index is a non-negative integer"
@@ -400,7 +438,7 @@ impl<'a> Parser<'a>
                         (Token::CloseBracket, _) => {}
                         (token, column) => return Err(unexpected(token, column)),
                     }
-                    expr = Expr::Index(Box::new(expr), index);
+                    expr = Expr::Index(Box::new(expr), index, literal);
                 }
                 Some(Token::OpenParen) => {
                     let (token, column) = self.take()?;
@@ -430,10 +468,38 @@ impl<'a> Parser<'a>
     }
 }
 
+/// An index literal as Rust spells integers: decimal, `0x`, `0o` or `0b`, with `_`
+/// separators after the first digit and an optional `usize` suffix, the only type Rust
+/// indexes with.
 fn parse_index(text: &str, column: usize) -> Result<u64, PathError>
 {
+    let invalid = || PathError::syntax(format!("invalid index `{text}` at column {column}"));
+    let (radix, digits) = match text.get(..2) {
+        Some("0x") => (16, &text[2..]),
+        Some("0o") => (8, &text[2..]),
+        Some("0b") => (2, &text[2..]),
+        _ => (10, text),
+    };
+    let digits = digits.strip_suffix("usize").unwrap_or(digits);
+    // No digit in any radix is `u` or `i`, so either starts another integer suffix.
+    if let Some(suffix) = digits.find(['u', 'i']).map(|start| &digits[start..]) {
+        return Err(PathError::syntax(format!(
+            "invalid index `{text}` at column {column}: an index is a usize, so `{suffix}` is not a valid suffix"
+        )));
+    }
+    let digits: String = digits.chars().filter(|&ch| ch != '_').collect();
+    // from_str_radix accepts a leading `+`; require digits only.
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
+        return Err(invalid());
+    }
+    u64::from_str_radix(&digits, radix).map_err(|_| invalid())
+}
+
+/// A tuple field index: plain decimal digits, as Rust requires after `.`.
+fn parse_field_index(text: &str, column: usize) -> Result<u64, PathError>
+{
     text.parse()
-        .map_err(|_| PathError::syntax(format!("invalid index `{text}` at column {column}")))
+        .map_err(|_| PathError::syntax(format!("invalid field index `{text}` at column {column}")))
 }
 
 /// Where an evaluated value's bytes are.
@@ -463,7 +529,21 @@ pub(crate) fn evaluate(
     read: &mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
 ) -> Result<Place, PathError>
 {
-    Evaluator { types, endian, read }.eval(&path.expr, root)
+    let mut evaluator = Evaluator { types, endian, read };
+    match evaluator.eval(&path.expr, Value::Place(root))? {
+        Value::Place(place) => Ok(place),
+        Value::Slice(slice) => {
+            // Only a dereference produces unsized contents.
+            let whole = match &path.expr {
+                Expr::Deref(inner) => format!("print `{inner}` whole or "),
+                _ => String::new(),
+            };
+            Err(PathError::at(
+                &path.expr,
+                format!("{} is unsized; {whole}index it", evaluator.slice_name(&slice)),
+            ))
+        }
+    }
 }
 
 struct Evaluator<'a>
@@ -473,35 +553,79 @@ struct Evaluator<'a>
     read: &'a mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
 }
 
+/// A value part way through a path: a typed place, or the unsized contents of a slice or
+/// string, which DWARF has no type for.
+#[derive(Clone)]
+enum Value
+{
+    Place(Place),
+    Slice(Slice),
+}
+
+/// `len` elements of `element` at `data`. `text` marks the bytes of a `str`.
+#[derive(Clone, Copy)]
+struct Slice
+{
+    data: Address,
+    len: u64,
+    element: TypeId,
+    text: bool,
+}
+
 /// What a value is to the path operations, after typedefs and qualifiers.
 enum Shape
 {
     Members,
     Array(TypeId, u64),
+    /// A slice reference, `Box<[T]>`, `Vec`, `String` or string reference.
     Elements,
+    VecDeque,
     Pointer(PointerKind, Option<TypeId>),
+    /// `*const [T]`, `*mut [T]`, `*const str` or `*mut str`.
+    RawSlice,
+    /// `Rc` or `Arc`, or with `weak`, their `Weak`.
+    Shared
+    {
+        weak: bool,
+    },
+    Pin,
+    Cell,
+    Cow,
     Other,
+}
+
+const STRING_NAME: &str = "alloc::string::String";
+const SHARED_NAMES: &[&str] = &["alloc::rc::Rc<", "alloc::sync::Arc<"];
+const WEAK_NAMES: &[&str] = &["alloc::rc::Weak<", "alloc::sync::Weak<"];
+const CELL_NAMES: &[&str] = &["core::cell::Cell<", "core::cell::RefCell<"];
+const RAW_SLICE_NAMES: &[&str] = &["*const [", "*mut [", "*const str", "*mut str"];
+const PIN_NAME: &str = "core::pin::Pin<";
+const COW_NAME: &str = "alloc::borrow::Cow<";
+const VEC_DEQUE_NAME: &str = "alloc::collections::vec_deque::VecDeque<";
+
+fn starts_with_any(name: &str, prefixes: &[&str]) -> bool
+{
+    prefixes.iter().any(|prefix| name.starts_with(prefix))
 }
 
 impl Evaluator<'_>
 {
-    fn eval(&mut self, expr: &Expr, root: Place) -> Result<Place, PathError>
+    fn eval(&mut self, expr: &Expr, root: Value) -> Result<Value, PathError>
     {
         match expr {
             Expr::Variable(_) => Ok(root),
             Expr::Field(base, name) => {
-                let place = self.eval(base, root)?;
-                let place = self.auto_deref(base, place)?;
-                self.field(expr, place, name)
+                let value = self.eval(base, root)?;
+                self.field_through(expr, base, value, name, 16).map(Value::Place)
             }
-            Expr::Index(base, index) => {
-                let place = self.eval(base, root)?;
-                let place = self.auto_deref(base, place)?;
-                self.index(expr, place, *index)
+            Expr::Index(base, index, _) => {
+                let value = self.eval(base, root)?;
+                let value = self.auto_deref(base, value)?;
+                self.index(expr, value, *index).map(Value::Place)
             }
             Expr::Deref(inner) => {
-                let place = self.eval(inner, root)?;
-                self.deref(expr, place)
+                let value = self.eval(inner, root)?;
+                self.deref(expr, value)
             }
         }
     }
@@ -512,6 +636,15 @@ impl Evaluator<'_>
             .get(ty)
             .and_then(|ty| ty.name.clone())
             .unwrap_or_else(|| "a value of unknown type".to_owned())
+    }
+
+    fn slice_name(&self, slice: &Slice) -> String
+    {
+        if slice.text {
+            "str".to_owned()
+        } else {
+            format!("[{}]", self.type_name(slice.element))
+        }
     }
 
     fn shape(&self, ty: TypeId) -> Shape
@@ -526,52 +659,109 @@ impl Evaluator<'_>
                 (Some(element), [Some(len)]) => Shape::Array(element, *len),
                 _ => Shape::Other,
             },
+            TypeKind::Enum(_) if name.starts_with(COW_NAME) => Shape::Cow,
             TypeKind::Struct(_)
                 if name.starts_with("alloc::vec::Vec<")
+                    || name == STRING_NAME
                     || name.starts_with("&[")
                     || name.starts_with("&mut [")
+                    || matches!(name, "&str" | "&mut str")
                     || name
                         .strip_prefix("alloc::boxed::Box<")
-                        .is_some_and(|boxed| boxed.starts_with('[')) =>
+                        .is_some_and(|boxed| boxed.starts_with('[') || boxed == "str>" || boxed.starts_with("str,")) =>
             {
                 Shape::Elements
             }
+            TypeKind::Struct(_) if name.starts_with(VEC_DEQUE_NAME) => Shape::VecDeque,
+            TypeKind::Struct(_) if starts_with_any(name, RAW_SLICE_NAMES) => Shape::RawSlice,
+            TypeKind::Struct(_) if starts_with_any(name, SHARED_NAMES) => Shape::Shared { weak: false },
+            TypeKind::Struct(_) if starts_with_any(name, WEAK_NAMES) => Shape::Shared { weak: true },
+            TypeKind::Struct(_) if name.starts_with(PIN_NAME) => Shape::Pin,
+            TypeKind::Struct(_) if starts_with_any(name, CELL_NAMES) => Shape::Cell,
             TypeKind::Struct(_) | TypeKind::Tuple(_) | TypeKind::Union(_) if !ty.declaration => Shape::Members,
             _ => Shape::Other,
         }
     }
 
-    fn auto_deref(&mut self, expr: &Expr, mut place: Place) -> Result<Place, PathError>
+    /// One automatic dereference: through a reference, a `Box`, an `Rc` or `Arc`, a `Pin`,
+    /// a cell or a `Cow`. `None` when `value` is none of those.
+    fn auto_deref_step(&mut self, expr: &Expr, value: &Value) -> Option<Result<Value, PathError>>
+    {
+        let Value::Place(place) = value else {
+            return None;
+        };
+        Some(match self.shape(place.ty) {
+            Shape::Pointer(PointerKind::Reference { .. } | PointerKind::Box, Some(_)) | Shape::Shared { weak: false } => {
+                self.deref(expr, value.clone())
+            }
+            Shape::Pin => self.pinned_pointer(expr, place).map(Value::Place),
+            Shape::Cell => self.cell_value(expr, place).map(Value::Place),
+            Shape::Cow => self.cow_payload(expr, place).map(|(payload, _)| Value::Place(payload)),
+            _ => return None,
+        })
+    }
+
+    /// Look through every automatic dereference to the value an index applies to.
+    fn auto_deref(&mut self, expr: &Expr, mut value: Value) -> Result<Value, PathError>
     {
         // Bound the walk so a malformed self-referential pointer type cannot loop.
         for _ in 0..16 {
-            match self.shape(place.ty) {
-                Shape::Pointer(PointerKind::Reference { .. } | PointerKind::Box, Some(_)) => {
-                    place = self.deref(expr, place)?;
-                }
-                _ => break,
+            match self.auto_deref_step(expr, &value) {
+                Some(next) => value = next?,
+                None => break,
             }
         }
-        Ok(place)
+        Ok(value)
     }
 
-    fn field(&mut self, expr: &Expr, place: Place, name: &str) -> Result<Place, PathError>
+    /// Field `name` of `value` or of what it automatically dereferences to. As in Rust, the
+    /// innermost value with the field wins, so `rc.name` is the payload's `name`; a field
+    /// only the wrapper has, such as a `Cell`'s `value`, a `Pin`'s `pointer` or a `Cow`'s
+    /// `.0`, is the wrapper's. Only a missing field falls back to the wrapper; a failure to
+    /// read, dereference or lay out the inner value is the error. An error names the
+    /// innermost value.
+    fn field_through(&mut self, expr: &Expr, base: &Expr, value: Value, name: &str, depth: usize)
+    -> Result<Place, PathError>
     {
-        let ty = self.types.strip_aliases(place.ty);
-        let fields = match self.types.get(ty).map(|ty| ty.kind.clone()) {
-            Some(TypeKind::Struct(fields) | TypeKind::Tuple(fields) | TypeKind::Union(fields))
-                if matches!(self.shape(ty), Shape::Members | Shape::Elements) =>
-            {
-                fields
-            }
-            Some(TypeKind::Enum(layout)) => return self.variant_field(expr, place, ty, &layout, name),
-            _ => {
-                let hint = raw_pointer_hint(expr, &self.shape(ty));
-                return Err(PathError::at(expr, format!("{} has no fields{hint}", self.type_name(ty))));
+        let inner = match self.auto_deref_step(base, &value) {
+            Some(inner) if depth > 0 => inner,
+            _ => return self.field(expr, value, name),
+        };
+        let error = match inner.and_then(|inner| self.field_through(expr, base, inner, name, depth - 1)) {
+            Ok(place) => return Ok(place),
+            Err(error) if error.missing_field => error,
+            Err(error) => return Err(error),
+        };
+        self.field(expr, value, name).map_err(|_| error)
+    }
+
+    fn field(&mut self, expr: &Expr, value: Value, name: &str) -> Result<Place, PathError>
+    {
+        let place = match value {
+            Value::Place(place) => place,
+            Value::Slice(slice) => {
+                return Err(PathError::no_field(
+                    expr,
+                    format!("{} has no fields", self.slice_name(&slice)),
+                ));
             }
         };
-        let member = member_named(&fields.members, name)
-            .ok_or_else(|| PathError::at(expr, format!("no field `{name}` in {}", self.type_name(ty))))?;
+        let ty = self.types.strip_aliases(place.ty);
+        let fields = match self.types.get(ty).map(|ty| (ty.kind.clone(), ty.declaration)) {
+            Some((TypeKind::Struct(fields) | TypeKind::Tuple(fields) | TypeKind::Union(fields), false)) => fields,
+            Some((TypeKind::Enum(layout), _)) => return self.variant_field(expr, place, ty, &layout, name),
+            _ => {
+                let hint = raw_pointer_hint(expr, &self.shape(ty));
+                return Err(PathError::no_field(
+                    expr,
+                    format!("{} has no fields{hint}", self.type_name(ty)),
+                ));
+            }
+        };
+        let member = member_named(&fields.members, name).ok_or_else(|| {
+            let hint = raw_pointer_hint(expr, &self.shape(ty));
+            PathError::no_field(expr, format!("no field `{name}` in {}{hint}", self.type_name(ty)))
+        })?;
         self.member_place(expr, &place, member, 0)
     }
 
@@ -626,7 +816,7 @@ impl Evaluator<'_>
         } else {
             format!("{} is {active}, not {}", self.type_name(ty), others.join(" or "))
         };
-        Err(PathError::at(expr, reason))
+        Err(PathError::no_field(expr, reason))
     }
 
     /// The value of `member`, whose offset is from `base` bytes into `place`.
@@ -645,8 +835,67 @@ impl Evaluator<'_>
         child(expr, place, member_ty, offset, size)
     }
 
-    fn index(&mut self, expr: &Expr, place: Place, index: u64) -> Result<Place, PathError>
+    /// The struct member `name` of `place`, whose layout the caller expects.
+    fn named_member(&self, expr: &Expr, place: &Place, names: &[&str]) -> Result<Place, PathError>
     {
+        let ty = self.types.strip_aliases(place.ty);
+        let member = match self.types.get(ty).map(|ty| ty.kind.clone()) {
+            Some(TypeKind::Struct(fields)) => names.iter().find_map(|name| fields.member(name).cloned()),
+            _ => None,
+        };
+        let member =
+            member.ok_or_else(|| PathError::at(expr, format!("unrecognized layout of {}", self.type_name(place.ty))))?;
+        self.member_place(expr, place, &member, 0)
+    }
+
+    /// The pointer a `Pin` holds.
+    fn pinned_pointer(&self, expr: &Expr, place: &Place) -> Result<Place, PathError>
+    {
+        self.named_member(expr, place, &["pointer", "__pointer"])
+    }
+
+    /// The value inside a `Cell` or `RefCell`: its `UnsafeCell`'s value.
+    fn cell_value(&self, expr: &Expr, place: &Place) -> Result<Place, PathError>
+    {
+        let unsafe_cell = self.named_member(expr, place, &["value"])?;
+        self.named_member(expr, &unsafe_cell, &["value"])
+    }
+
+    /// The field of a `Cow`'s active variant, and whether that variant is `Borrowed`.
+    fn cow_payload(&mut self, expr: &Expr, place: &Place) -> Result<(Place, bool), PathError>
+    {
+        let ty = self.types.strip_aliases(place.ty);
+        let Some(TypeKind::Enum(layout)) = self.types.get(ty).map(|ty| ty.kind.clone()) else {
+            return Err(PathError::at(expr, format!("unrecognized layout of {}", self.type_name(ty))));
+        };
+        let tag = match layout
+            .discriminant
+            .as_ref()
+            .and_then(|discriminant| self.member_place(expr, place, discriminant, 0).ok())
+        {
+            Some(tag) => Some(self.load(expr, &tag)?),
+            None => None,
+        };
+        let variant = variant_for_tag(&layout, tag.as_deref(), self.endian)
+            .map_err(|error| PathError::at(expr, format!("cannot read the variant of {}: {error}", self.type_name(ty))))?;
+        let borrowed = variant.name.as_deref() == Some("Borrowed");
+        let enum_name = self.types.get(ty).and_then(|ty| ty.name.clone());
+        let (member, base) = match variant_payload(variant, enum_name.as_deref(), self.types) {
+            Some(payload) => (member_named(payload.fields(), "0").cloned(), payload.member.offset),
+            None => (member_named(&variant.members, "0").cloned(), Some(0)),
+        };
+        let (Some(member), Some(base)) = (member, base) else {
+            return Err(PathError::at(expr, format!("unrecognized layout of {}", self.type_name(ty))));
+        };
+        Ok((self.member_place(expr, place, &member, base)?, borrowed))
+    }
+
+    fn index(&mut self, expr: &Expr, value: Value, index: u64) -> Result<Place, PathError>
+    {
+        let place = match value {
+            Value::Place(place) => place,
+            Value::Slice(slice) => return self.slice_element(expr, &slice, index),
+        };
         match self.shape(place.ty) {
             Shape::Array(element, len) => {
                 check_bounds(expr, index, len)?;
@@ -657,33 +906,23 @@ impl Evaluator<'_>
                 child(expr, &place, element, offset, size)
             }
             Shape::Elements => {
+                let slice = self.elements(expr, &place)?;
+                self.slice_element(expr, &slice, index)
+            }
+            Shape::VecDeque => {
                 let bytes = self.load(expr, &place)?;
-                let ty = self.types.strip_aliases(place.ty);
                 let view = ValueView {
-                    ty,
+                    ty: self.types.strip_aliases(place.ty),
                     bytes: &bytes,
                     address: None,
                 };
-                let layout = vec_layout(view, self.types, self.endian)
-                    .map(|vec| (vec.address, vec.len, vec.element))
-                    .or_else(|| fat_pointer(view, self.types, self.endian));
-                let Some((data, len, element)) = layout else {
-                    return Err(PathError::at(
-                        expr,
-                        format!("unrecognized layout of {}", self.type_name(place.ty)),
-                    ));
-                };
-                check_bounds(expr, index, len)?;
-                if data == Address::ZERO {
-                    return Err(PathError::at(expr, "null element data pointer"));
-                }
-                let size = self.element_size(expr, element)?;
-                let address = index
-                    .checked_mul(size)
-                    .and_then(|offset| data.checked_add(offset))
-                    .ok_or_else(|| PathError::at(expr, "element address overflows"))?;
+                let ring = ring_layout(view, self.types, self.endian)
+                    .ok_or_else(|| PathError::at(expr, format!("unrecognized layout of {}", self.type_name(place.ty))))?;
+                ring.check().map_err(|reason| PathError::at(expr, reason))?;
+                check_bounds(expr, index, ring.len)?;
+                let address = ring.element_address(index).map_err(|reason| PathError::at(expr, reason))?;
                 Ok(Place {
-                    ty: element,
+                    ty: ring.element,
                     storage: Storage::Memory(address),
                 })
             }
@@ -697,20 +936,122 @@ impl Evaluator<'_>
         }
     }
 
-    fn deref(&mut self, expr: &Expr, place: Place) -> Result<Place, PathError>
+    /// The contents of a slice reference, `Box<[T]>`, `Vec`, `String` or string reference.
+    fn elements(&mut self, expr: &Expr, place: &Place) -> Result<Slice, PathError>
     {
+        let bytes = self.load(expr, place)?;
+        let ty = self.types.strip_aliases(place.ty);
+        let view = ValueView {
+            ty,
+            bytes: &bytes,
+            address: None,
+        };
+        let name = self.types.get(ty).and_then(|ty| ty.name.clone());
+        let text = matches!(name.as_deref(), Some(STRING_NAME | "&str" | "&mut str"))
+            || name
+                .as_deref()
+                .and_then(|name| name.strip_prefix("alloc::boxed::Box<"))
+                .is_some_and(|boxed| boxed == "str>" || boxed.starts_with("str,"));
+        // A String is a Vec<u8>.
+        let vec = match self.types.get(ty).map(|ty| ty.kind.clone()) {
+            Some(TypeKind::Struct(fields)) if name.as_deref() == Some(STRING_NAME) => fields
+                .member("vec")
+                .and_then(|member| view.member(member, self.types))
+                .and_then(|vec| vec_layout(vec, self.types, self.endian)),
+            _ => vec_layout(view, self.types, self.endian),
+        };
+        let layout = match vec {
+            Some(vec) if vec.len > vec.capacity => {
+                return Err(PathError::at(
+                    expr,
+                    format!("length {} exceeds capacity {}", vec.len, vec.capacity),
+                ));
+            }
+            Some(vec) => Some((vec.address, vec.len, vec.element)),
+            None => fat_pointer(view, self.types, self.endian),
+        };
+        let (data, len, element) =
+            layout.ok_or_else(|| PathError::at(expr, format!("unrecognized layout of {}", self.type_name(place.ty))))?;
+        Ok(Slice {
+            data,
+            len,
+            element,
+            text,
+        })
+    }
+
+    fn slice_element(&self, expr: &Expr, slice: &Slice, index: u64) -> Result<Place, PathError>
+    {
+        check_bounds(expr, index, slice.len)?;
+        if slice.data == Address::ZERO {
+            return Err(PathError::at(expr, "null element data pointer"));
+        }
+        let size = self.element_size(expr, slice.element)?;
+        let address = index
+            .checked_mul(size)
+            .and_then(|offset| slice.data.checked_add(offset))
+            .ok_or_else(|| PathError::at(expr, "element address overflows"))?;
+        Ok(Place {
+            ty: slice.element,
+            storage: Storage::Memory(address),
+        })
+    }
+
+    fn deref(&mut self, expr: &Expr, value: Value) -> Result<Value, PathError>
+    {
+        let mut place = match value {
+            Value::Place(place) => place,
+            Value::Slice(slice) => {
+                return Err(PathError::at(expr, format!("cannot dereference {}", self.slice_name(&slice))));
+            }
+        };
+        // `*pin` dereferences the pointer the Pin holds. Bound nested pins.
+        for _ in 0..16 {
+            if !matches!(self.shape(place.ty), Shape::Pin) {
+                break;
+            }
+            place = self.pinned_pointer(expr, &place)?;
+        }
         let (kind, pointee) = match self.shape(place.ty) {
             Shape::Pointer(kind @ (PointerKind::Reference { .. } | PointerKind::Raw { .. } | PointerKind::Box), pointee) => {
                 (kind, pointee)
             }
-            Shape::Elements => {
-                return Err(PathError::at(
-                    expr,
-                    format!(
-                        "cannot dereference {} to an unsized value; print it whole or index it",
-                        self.type_name(place.ty)
-                    ),
-                ));
+            Shape::Elements => return self.elements(expr, &place).map(Value::Slice),
+            Shape::RawSlice => {
+                // The pointer may dangle; only an index reads through it.
+                let bytes = self.load(expr, &place)?;
+                let view = ValueView {
+                    ty: self.types.strip_aliases(place.ty),
+                    bytes: &bytes,
+                    address: None,
+                };
+                let (data, len, element) = fat_pointer(view, self.types, self.endian)
+                    .ok_or_else(|| PathError::at(expr, format!("unrecognized layout of {}", self.type_name(place.ty))))?;
+                if data == Address::ZERO {
+                    return Err(PathError::at(expr, "null pointer"));
+                }
+                let text = self
+                    .types
+                    .get(self.types.strip_aliases(place.ty))
+                    .and_then(|ty| ty.name.clone())
+                    .is_some_and(|name| name.ends_with(" str"));
+                return Ok(Value::Slice(Slice {
+                    data,
+                    len,
+                    element,
+                    text,
+                }));
+            }
+            Shape::Shared { weak } => return self.follow_shared(expr, &place, weak),
+            Shape::Cell => return self.cell_value(expr, &place).map(Value::Place),
+            Shape::Cow => {
+                // What Borrowed points to, or what Owned owns. A borrowed `str` or slice
+                // stays its reference, which prints whole.
+                let (payload, borrowed) = self.cow_payload(expr, &place)?;
+                if borrowed && let Value::Place(target) = self.deref(expr, Value::Place(payload.clone()))? {
+                    return Ok(Value::Place(target));
+                }
+                return Ok(Value::Place(payload));
             }
             _ => {
                 return Err(PathError::at(
@@ -734,9 +1075,57 @@ impl Evaluator<'_>
             };
             return Err(PathError::at(expr, format!("null {what}")));
         }
-        Ok(Place {
+        Ok(Value::Place(Place {
             ty: pointee,
             storage: Storage::Memory(Address::new(address)),
+        }))
+    }
+
+    /// The payload of an `Rc`, `Arc` or live `Weak`.
+    fn follow_shared(&mut self, expr: &Expr, place: &Place, weak: bool) -> Result<Value, PathError>
+    {
+        let bytes = self.load(expr, place)?;
+        let view = ValueView {
+            ty: self.types.strip_aliases(place.ty),
+            bytes: &bytes,
+            address: None,
+        };
+        let types = self.types;
+        let read = &mut *self.read;
+        let mut read = |address, len| read(address, len).map_err(|error| error.to_string());
+        let target = follow_shared(view, types, self.endian, &mut read)
+            .ok_or_else(|| PathError::at(expr, format!("unrecognized layout of {}", self.type_name(place.ty))))?
+            .map_err(|reason| PathError::at(expr, reason))?;
+        let name = if weak { "Weak" } else { "shared" };
+        let (address, pointee) = match target {
+            SharedTarget::Null => return Err(PathError::at(expr, format!("null {name} pointer"))),
+            SharedTarget::Dangling if weak => return Err(PathError::at(expr, "dangling Weak")),
+            SharedTarget::Dangling => {
+                return Err(PathError::at(expr, "shared allocation has no strong owners"));
+            }
+            SharedTarget::Live { address, pointee } => (address, pointee),
+        };
+        Ok(match pointee {
+            SharedPointee::Sized(ty) => Value::Place(Place {
+                ty,
+                storage: Storage::Memory(address),
+            }),
+            SharedPointee::Slice(element, len) => Value::Slice(Slice {
+                data: address,
+                len,
+                element,
+                text: false,
+            }),
+            // An `OsStr`, `Path` or `CStr` payload indexes as its bytes, like a `str`.
+            SharedPointee::Str(len) | SharedPointee::ByteStr(len, _) => Value::Slice(Slice {
+                data: address,
+                len,
+                element: self
+                    .types
+                    .type_named("u8")
+                    .ok_or_else(|| PathError::at(expr, "type u8 unknown"))?,
+                text: matches!(pointee, SharedPointee::Str(_)),
+            }),
         })
     }
 
@@ -781,18 +1170,20 @@ fn member_named<'m>(members: &'m [Member], name: &str) -> Option<&'m Member>
     })
 }
 
-/// Raw pointers are not dereferenced implicitly. Suggest the explicit form.
+/// Raw pointers and `Weak` are not dereferenced implicitly. Suggest the explicit form.
 fn raw_pointer_hint(expr: &Expr, shape: &Shape) -> String
 {
-    if !matches!(shape, Shape::Pointer(PointerKind::Raw { .. }, _)) {
-        return String::new();
-    }
-    let explicit = match expr {
-        Expr::Field(base, name) => Expr::Field(Box::new(Expr::Deref(base.clone())), name.clone()),
-        Expr::Index(base, index) => Expr::Index(Box::new(Expr::Deref(base.clone())), *index),
+    let what = match shape {
+        Shape::Pointer(PointerKind::Raw { .. }, _) | Shape::RawSlice => "raw pointer",
+        Shape::Shared { weak: true } => "Weak",
         _ => return String::new(),
     };
-    format!("; dereference the raw pointer first, as in `{explicit}`")
+    let explicit = match expr {
+        Expr::Field(base, name) => Expr::Field(Box::new(Expr::Deref(base.clone())), name.clone()),
+        Expr::Index(base, index, literal) => Expr::Index(Box::new(Expr::Deref(base.clone())), *index, literal.clone()),
+        _ => return String::new(),
+    };
+    format!("; dereference the {what} first, as in `{explicit}`")
 }
 
 fn check_bounds(expr: &Expr, index: u64, len: u64) -> Result<(), PathError>
@@ -974,8 +1365,54 @@ mod tests
         assert_eq!(rejected("a: :b"), "unexpected `:` at column 2");
         assert_eq!(rejected("a.*"), "unexpected `*` at column 3");
         assert!(rejected("v[99999999999999999999999]").starts_with("invalid index"));
-        assert!(rejected("t.1x").starts_with("invalid index"));
+        assert_eq!(rejected("t.1x"), "invalid field index `1x` at column 3");
+        assert_eq!(rejected("t.0x1"), "invalid field index `0x1` at column 3");
         assert!(rejected("1.0").contains("starts with a variable name"));
+    }
+
+    #[test]
+    fn parses_index_literals_as_rust_does()
+    {
+        let index = |text: &str| match Path::parse(text).unwrap_or_else(|error| panic!("{text}: {error}")).expr {
+            Expr::Index(_, index, _) => index,
+            expr => panic!("{text}: {expr:?}"),
+        };
+        assert_eq!(index("v[1_000]"), 1000);
+        assert_eq!(index("v[0x10]"), 16);
+        assert_eq!(index("v[0xfF]"), 255);
+        assert_eq!(index("v[0o17]"), 15);
+        assert_eq!(index("v[0b101]"), 5);
+        assert_eq!(index("v[0x_1]"), 1);
+        assert_eq!(index("v[007]"), 7);
+        assert_eq!(index("v[18446744073709551615]"), u64::MAX);
+        assert_eq!(index("v[1usize]"), 1);
+        assert_eq!(index("v[0x1f_usize]"), 31);
+        // Errors name the segment as written.
+        assert_eq!(parsed("v[0x10]"), "v[0x10]");
+        assert_eq!(parsed("v[1_000]"), "v[1_000]");
+        for text in [
+            "v[0x]",
+            "v[0b2]",
+            "v[0o8]",
+            "v[1a]",
+            "v[0x_]",
+            "v[0X1]",
+            "v[1u8]",
+            "v[0xusize]",
+            "v[1_usize_]",
+        ] {
+            assert!(rejected(text).starts_with("invalid index"), "{text}: {}", rejected(text));
+        }
+        assert_eq!(rejected("v[0xg]"), "invalid index `0xg` at column 3");
+        assert_eq!(
+            rejected("v[1u8]"),
+            "invalid index `1u8` at column 3: an index is a usize, so `u8` is not a valid suffix"
+        );
+        assert_eq!(
+            rejected("v[2i32]"),
+            "invalid index `2i32` at column 3: an index is a usize, so `i32` is not a valid suffix"
+        );
+        assert!(rejected("v[0x10000000000000000]").starts_with("invalid index"));
     }
 
     #[test]
@@ -991,7 +1428,7 @@ mod tests
     fn errors_name_their_segment()
     {
         let path = Path::parse("(*r).items[4]").unwrap();
-        let Expr::Index(base, _) = &path.expr else {
+        let Expr::Index(base, ..) = &path.expr else {
             panic!("{path:?}");
         };
         assert_eq!(PathError::at(&path.expr, "out").to_string(), "`(*r).items[4]`: out");

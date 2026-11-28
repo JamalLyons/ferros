@@ -92,17 +92,17 @@ fn format_elements(
 
 /// A `VecDeque` ring buffer: `len` elements starting at physical slot `head`, wrapping to
 /// slot 0 at `capacity`.
-struct Ring
+pub(in crate::values) struct Ring
 {
     address: Address,
     head: u64,
-    len: u64,
+    pub(in crate::values) len: u64,
     capacity: u64,
-    element: TypeId,
+    pub(in crate::values) element: TypeId,
     stride: u64,
 }
 
-fn ring_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<Ring>
+pub(in crate::values) fn ring_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<Ring>
 {
     let ty = types.get(types.strip_aliases(value.ty))?;
     let TypeKind::Struct(layout) = &ty.kind else {
@@ -127,36 +127,56 @@ fn ring_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -
 
 impl Ring
 {
-    fn format(&self, formatter: &mut ValueFormatter<'_>) -> String
+    /// Why the ring cannot be read, if its header is inconsistent.
+    pub(in crate::values) fn check(&self) -> Result<(), String>
     {
         let Self {
             address,
             head,
             len,
             capacity,
-            element,
-            stride,
+            ..
         } = *self;
         if len > capacity {
-            return unavailable(format!("VecDeque length {len} exceeds capacity {capacity}"));
+            return Err(format!("VecDeque length {len} exceeds capacity {capacity}"));
         }
         if len > 0 && head >= capacity {
-            return unavailable(format!("VecDeque head {head} is outside capacity {capacity}"));
+            return Err(format!("VecDeque head {head} is outside capacity {capacity}"));
         }
         if len > 0 && address == Address::ZERO {
-            return unavailable("null VecDeque buffer pointer");
+            return Err("null VecDeque buffer pointer".to_owned());
+        }
+        Ok(())
+    }
+
+    /// The address of logical element `index`, for a ring that passed [`Self::check`] and
+    /// an `index` below its length.
+    pub(in crate::values) fn element_address(&self, index: u64) -> Result<Address, String>
+    {
+        // head < capacity and index < len <= capacity: the slot wraps at most once.
+        let tail_room = self.capacity - self.head;
+        let slot = if index < tail_room {
+            self.head + index
+        } else {
+            index - tail_room
+        };
+        slot.checked_mul(self.stride)
+            .and_then(|offset| self.address.checked_add(offset))
+            .ok_or_else(|| "VecDeque element address overflows".to_owned())
+    }
+
+    fn format(&self, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        if let Err(reason) = self.check() {
+            return unavailable(reason);
         }
         let mut index = 0;
-        let (elements, _) = format_elements(len, element, formatter, |_| {
-            // head < capacity and index < len <= capacity: the slot wraps at most once.
-            let tail_room = capacity - head;
-            let slot = if index < tail_room { head + index } else { index - tail_room };
+        let (elements, _) = format_elements(self.len, self.element, formatter, |_| {
+            let address = self.element_address(index);
             index += 1;
-            slot.checked_mul(stride)
-                .and_then(|offset| address.checked_add(offset))
-                .ok_or_else(|| "VecDeque element address overflows".to_owned())
+            address
         });
-        format!("{elements} (len: {len}, capacity: {capacity})")
+        format!("{elements} (len: {}, capacity: {})", self.len, self.capacity)
     }
 }
 

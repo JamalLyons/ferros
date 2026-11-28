@@ -564,7 +564,7 @@ fn attr_string(dwarf: &OwnedDwarf, unit: &Unit<OwnedReader>, value: AttributeVal
 
 fn push_path(path: &mut String, part: &str)
 {
-    if part.starts_with('/') || part.get(1..3) == Some(":/") || has_backslash_root(part) || path.is_empty() {
+    if part.starts_with('/') || has_drive(part, '/') || has_backslash_root(part) || path.is_empty() {
         part.clone_into(path);
     } else {
         let separator = if has_backslash_root(path) { '\\' } else { '/' };
@@ -577,7 +577,14 @@ fn push_path(path: &mut String, part: &str)
 
 fn has_backslash_root(path: &str) -> bool
 {
-    path.starts_with('\\') || path.get(1..3) == Some(":\\")
+    path.starts_with('\\') || has_drive(path, '\\')
+}
+
+/// Whether `path` starts with a drive letter, a colon and `separator`, as in `C:/` or `C:\`.
+fn has_drive(path: &str, separator: char) -> bool
+{
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == separator as u8
 }
 
 impl BinaryImage
@@ -1066,6 +1073,21 @@ mod tests
 {
     use super::synthetic::{TestUnit, write};
     use super::*;
+
+    #[test]
+    fn push_path_keeps_rooted_parts_and_joins_relative_ones()
+    {
+        let joined = |base: &str, part: &str| {
+            let mut path = base.to_owned();
+            push_path(&mut path, part);
+            path
+        };
+        assert_eq!(joined("/build", "C:/src/main.rs"), "C:/src/main.rs");
+        assert_eq!(joined("/build", "C:\\src\\main.rs"), "C:\\src\\main.rs");
+        assert_eq!(joined("/build", "\\\\host\\share\\a.rs"), "\\\\host\\share\\a.rs");
+        assert_eq!(joined("/build", "1:/src/main.rs"), "/build/1:/src/main.rs", "not a drive");
+        assert_eq!(joined("C:\\build", "src\\a.rs"), "C:\\build\\src\\a.rs");
+    }
 
     /// AC1 (issue #88, L4): a unit whose body does not parse is skipped; the good unit is
     /// still indexed and the skip is recorded.

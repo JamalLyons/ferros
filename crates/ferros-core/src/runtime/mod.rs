@@ -15,6 +15,9 @@
 //!   platform's knowledge: [`TargetRuntime::signal_context`]. The unwinder keeps the
 //!   architecture's part, restoring the registers and checking the result
 //!   ([`StackUnwinder`](crate::symbols::unwind::StackUnwinder)).
+//! - **System locks.** A language runtime may keep a lock in the operating system's own
+//!   lock object, whose layout is private to the system library. Whether such a lock is
+//!   held is the platform's knowledge: [`TargetRuntime::system_mutex_state`].
 //!
 //! [`TargetRuntime`] is that question set. Each platform crate implements it and the
 //! session is given one ([`Session::with_runtime`](crate::Session::with_runtime)). It is
@@ -57,6 +60,27 @@ pub trait TargetRuntime: Send + Sync
         let _ = (memory, frame);
         None
     }
+
+    /// Whether the system mutex whose bytes, read from `address` without calling into the
+    /// process, are `bytes` is held. The value formatter asks this about the mutex a
+    /// standard-library `Mutex` keeps in a separate allocation. `None` (the default) when
+    /// the platform does not know the layout or the bytes do not look like one.
+    fn system_mutex_state(&self, address: Address, bytes: &[u8]) -> Option<LockState>
+    {
+        let _ = (address, bytes);
+        None
+    }
+}
+
+/// Whether a lock is held, as [`TargetRuntime::system_mutex_state`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LockState
+{
+    /// No thread holds the lock.
+    Unlocked,
+    /// A thread holds the lock, or it is being handed to a waiting thread.
+    Locked,
 }
 
 /// The runtime of a session with no platform knowledge: no exit sources and no signal

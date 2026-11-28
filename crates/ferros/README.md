@@ -118,6 +118,7 @@ To give a program input in piped mode, use `--stdin`; in interactive mode, use `
 | `threads` | | List the threads; `*` marks the selected one |
 | `thread <index>` | | Select a thread by its index in `threads` |
 | `images` | | Load address and path of each loaded image (the address includes the ASLR slide) |
+| `globals [filter]` | | Statics of the main executable whose qualified name contains `filter`, as `<name>: <type> = <value> @ <runtime address>`; `print <name>` shows one |
 | `help [command]` | `h`, `?` | List the commands, or show one command's usage |
 
 Stops print as one stable first line each. A breakpoint or step stop with source information

@@ -7,11 +7,13 @@ mod maps;
 mod newtypes;
 mod shared;
 mod strings;
+mod sync;
 mod vec;
 
 use gimli::RunTimeEndian;
 
 pub(super) use self::enums::{variant_for_tag, variant_payload};
+pub(crate) use self::sync::LockPrinter;
 pub(super) use self::vec::layout as vec_layout;
 use super::format::{ValueFormatter, ValueView, format_raw, unsigned};
 use super::types::{BaseEncoding, Type, TypeId, TypeKind, TypeTable};
@@ -44,6 +46,11 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &vec::BoxPrinter,
     &shared::SharedPrinter,
     &shared::CellPrinter,
+    &sync::LockPrinter::WITHOUT_RUNTIME,
+    &sync::AtomicPrinter,
+    &sync::OnceCellPrinter,
+    &sync::UnsafeCellPrinter,
+    &sync::PinPrinter,
     &maps::MapPrinter,
     &collections::CollectionPrinter,
     &newtypes::NewtypePrinter,

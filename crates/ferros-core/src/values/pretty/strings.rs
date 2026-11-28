@@ -167,16 +167,32 @@ impl PrettyPrinter for ByteStringPrinter
         if !is_byte {
             return raw_layout(value, formatter);
         }
-        if is_c {
-            // A C string's length counts its NUL terminator.
-            let Some(len) = len.checked_sub(1) else {
-                return unavailable("C string has no NUL terminator");
-            };
-            format!("c{}", format_bytes(address, len, formatter))
-        } else {
-            format_bytes(address, len, formatter)
-        }
+        format_byte_string(address, len, is_c, formatter)
     }
+}
+
+/// Whether the unsized type named `name` is a C string (`CStr`), or `None` when it is no
+/// unsized FFI or OS string (`OsStr`, `Path`).
+pub(super) fn unsized_byte_string_kind(name: &str) -> Option<bool>
+{
+    match name {
+        C_STR_NAME => Some(true),
+        OS_STR_NAME | PATH_NAME => Some(false),
+        _ => None,
+    }
+}
+
+/// Render `len` bytes at `address` as quoted text: `c"..."` for a C string, whose length
+/// counts its NUL terminator, `"..."` otherwise.
+pub(super) fn format_byte_string(address: Address, len: u64, is_c: bool, formatter: &mut ValueFormatter<'_>) -> String
+{
+    if !is_c {
+        return format_bytes(address, len, formatter);
+    }
+    let Some(len) = len.checked_sub(1) else {
+        return unavailable("C string has no NUL terminator");
+    };
+    format!("c{}", format_bytes(address, len, formatter))
 }
 
 /// The byte type behind a borrowed FFI or OS string's pointee. A reference to `Path`,

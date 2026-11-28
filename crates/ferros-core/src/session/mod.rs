@@ -83,6 +83,7 @@ mod lifecycle;
 mod line_stepping;
 mod location;
 mod stack;
+mod statics;
 mod stepping;
 #[cfg(test)]
 mod tests;

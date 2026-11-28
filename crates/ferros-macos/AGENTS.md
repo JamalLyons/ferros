@@ -11,7 +11,7 @@ Open first: `src/lib.rs` (launch, stops, resume, permissions), then `src/task/mo
 - `memory.rs`: `vm_read`/`vm_write`, regions, protection.
 - `images.rs`: `Backend::images`, the dyld image list.
 - `macho/`: `MachOFormat`, the `ObjectFormat` implementor. `image.rs`: segment layout and slices; `symtab.rs`: `LC_SYMTAB` names; `debuginfo.rs`: DWARF discovery (embedded, `.dSYM`); `compact_unwind.rs`: `__unwind_info`; `tests.rs`: through a `Session` on the mock backend.
-- `runtime.rs`: `MacOSRuntime` (libunwind, `__longjmp`, `_sigtramp` frame).
+- `runtime.rs`: `MacOSRuntime` (libunwind, `__longjmp`, `_sigtramp` frame, `pthread_mutex_t` lock state).
 - `registers/`: thread-state access (`arm64.rs`, `x86_64.rs`, `debug.rs` for debug registers).
 - `launch.rs`: `posix_spawn`. `lifecycle.rs`: death notification and reaping. `threads.rs`: thread listing.
 - `breakpoints.rs`: hardware breakpoints/watchpoints. `guards.rs`: RAII guards. `terminal.rs`: job control for the CLI.

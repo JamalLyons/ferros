@@ -7,8 +7,14 @@
 //! path    := '*' path | postfix
 //! postfix := primary ( '.' name | '.' integer | '[' index ']' )*
 //! primary := name | '(' path ')'
+//! name    := ( '::'? identifier | qualifier '::' identifier ) ( '::' identifier )*
+//! qualifier := '<' any text with balanced '<' '>' '>'
 //! index   := an integer literal: decimal, 0x hex, 0o octal or 0b binary, with `_` separators
 //! ```
+//!
+//! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`). A
+//! static in an impl method starts with the impl's qualifier, written as `globals` shows it:
+//! `<my_crate::Meters>::f::X`, `<my_crate::Meters as my_crate::Unit>::f::X`.
 //!
 //! As in Rust, `*a.b` dereferences `a.b`; write `(*a).b` to dereference `a` first. `.0`
 //! selects a tuple or tuple-struct field. On a Rust enum, `.field` and `.0` select a field
@@ -31,12 +37,14 @@
 //!
 //! # Map of this file
 //!
-//! - `Path`, `Expr` and their `Display`: the parsed path.
+//! - `MAX_TOKENS`, `Path`, `Expr`, their `Display` and `write_base`: the parsed path.
 //! - `PathError`: parse and evaluation errors, naming the failing segment.
-//! - `Token`, `tokenize`, `Parser`, `parse_index`, `parse_field_index`: the parser.
+//! - `Token`, `tokenize`, `is_name_start`, `word_end`, `name_end`, `qualifier_end`,
+//!   `unexpected`, `Parser`, `parse_index`, `parse_field_index`: the parser.
 //! - `Storage`, `Place`, `evaluate`: the evaluated value the caller formats.
-//! - `Evaluator`, `Value`, `Slice`, `Shape`: one step per path segment (`field`,
-//!   `index`, `deref`, `auto_deref`) and the wrapper layouts they follow.
+//! - `Evaluator`, `Value`, `Slice`, `Shape`, the type-name prefixes and
+//!   `starts_with_any`: one step per path segment (`field`, `index`, `deref`,
+//!   `auto_deref`) and the wrapper layouts they follow.
 //! - `member_named`, `raw_pointer_hint`, `check_bounds`, `child`: helpers.
 
 use std::fmt;
@@ -247,20 +255,18 @@ fn tokenize(text: &str) -> Result<Vec<(Token<'_>, usize)>, PathError>
             ')' => Token::CloseParen,
             '[' => Token::OpenBracket,
             ']' => Token::CloseBracket,
-            ch if ch.is_ascii_digit() || ch == '_' || ch.is_alphabetic() => {
-                let mut end = start + ch.len_utf8();
-                while let Some(&(next, ch)) = chars.peek() {
-                    if !(ch.is_alphanumeric() || ch == '_') {
-                        break;
+            ch if ch.is_ascii_digit() => {
+                let end = word_end(text, start);
+                while chars.next_if(|&(next, _)| next < end).is_some() {}
+                Token::Integer(&text[start..end])
+            }
+            ch if is_name_start(ch) || ch == '<' || (ch == ':' && text[start..].starts_with("::")) => {
+                match name_end(text, start) {
+                    Some(end) => {
+                        while chars.next_if(|&(next, _)| next < end).is_some() {}
+                        Token::Name(&text[start..end])
                     }
-                    end = next + ch.len_utf8();
-                    chars.next();
-                }
-                let word = &text[start..end];
-                if ch.is_ascii_digit() {
-                    Token::Integer(word)
-                } else {
-                    Token::Name(word)
+                    None => Token::Other(ch),
                 }
             }
             other => Token::Other(other),
@@ -271,6 +277,68 @@ fn tokenize(text: &str) -> Result<Vec<(Token<'_>, usize)>, PathError>
         return Err(PathError::syntax("expected a variable name"));
     }
     Ok(tokens)
+}
+
+fn is_name_start(ch: char) -> bool
+{
+    ch == '_' || ch.is_alphabetic()
+}
+
+/// The end of the run of identifier characters at `start`.
+fn word_end(text: &str, start: usize) -> usize
+{
+    text[start..]
+        .char_indices()
+        .find(|&(_, ch)| !(ch.is_alphanumeric() || ch == '_'))
+        .map_or(text.len(), |(offset, _)| start + offset)
+}
+
+/// The end of the name at `start`: identifiers joined by `::`, optionally after a leading
+/// `::` or an impl qualifier, as in a static's qualified name (`::my_crate::config::LIMIT`,
+/// `<my_crate::Meters as my_crate::Unit>::f::X`). `None` when `::` at `start` is not
+/// followed by an identifier, or a `<` at `start` does not close and continue with `::`
+/// and an identifier.
+fn name_end(text: &str, start: usize) -> Option<usize>
+{
+    let segment = |at: usize| {
+        let rest = text.get(at..)?;
+        rest.starts_with(is_name_start).then(|| word_end(text, at))
+    };
+    let mut end = if text[start..].starts_with("::") {
+        segment(start + 2)?
+    } else if text[start..].starts_with('<') {
+        let close = qualifier_end(text, start)?;
+        text[close..].starts_with("::").then_some(())?;
+        segment(close + 2)?
+    } else {
+        segment(start)?
+    };
+    while text[end..].starts_with("::")
+        && let Some(next) = segment(end + 2)
+    {
+        end = next;
+    }
+    Some(end)
+}
+
+/// The end of the `<...>` at `start`, just after the `>` that balances its `<`.
+fn qualifier_end(text: &str, start: usize) -> Option<usize>
+{
+    let mut depth = 0_usize;
+    for (offset, ch) in text[start..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            // Not the `>` of a return type's `->`, as in `<fn() -> u8 as app::Unit>`.
+            '>' if !text[..start + offset].ends_with('-') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn unexpected(token: Token<'_>, column: usize) -> PathError
@@ -326,6 +394,12 @@ impl<'a> Parser<'a>
                 Some(Token::Dot) => {
                     self.next += 1;
                     let name = match self.take()? {
+                        // `::` belongs only to the root: a field name is one identifier.
+                        (Token::Name(name), column) if name.contains("::") => {
+                            return Err(PathError::syntax(format!(
+                                "unexpected `{name}` at column {column}: a field name has no `::`"
+                            )));
+                        }
                         (Token::Name(name), _) => name.to_owned(),
                         (Token::Integer(index), column) => {
                             parse_field_index(index, column)?;
@@ -1010,14 +1084,15 @@ impl Evaluator<'_>
                 element,
                 text: false,
             }),
-            SharedPointee::Str(len) => Value::Slice(Slice {
+            // An `OsStr`, `Path` or `CStr` payload indexes as its bytes, like a `str`.
+            SharedPointee::Str(len) | SharedPointee::ByteStr(len, _) => Value::Slice(Slice {
                 data: address,
                 len,
                 element: self
                     .types
                     .type_named("u8")
                     .ok_or_else(|| PathError::at(expr, "type u8 unknown"))?,
-                text: true,
+                text: matches!(pointee, SharedPointee::Str(_)),
             }),
         })
     }
@@ -1155,6 +1230,49 @@ mod tests
     }
 
     #[test]
+    fn a_qualified_name_is_one_root()
+    {
+        let path = Path::parse("app::config::LIMIT").unwrap();
+        assert!(path.is_variable());
+        assert_eq!(path.root(), "app::config::LIMIT");
+        let path = Path::parse("app::TABLE[2]").unwrap();
+        assert_eq!(path.root(), "app::TABLE");
+        assert_eq!(path.to_string(), "app::TABLE[2]");
+        assert_eq!(Path::parse("(*app::P).x").unwrap().root(), "app::P");
+        assert_eq!(Path::parse("::app::LIMIT").unwrap().root(), "::app::LIMIT");
+        let path = Path::parse("<app::Meters as app::Unit>::f::X.0").unwrap();
+        assert_eq!(path.root(), "<app::Meters as app::Unit>::f::X");
+        assert_eq!(path.to_string(), "<app::Meters as app::Unit>::f::X.0");
+        assert_eq!(
+            Path::parse("*<alloc::vec::Vec<_> as app::Unit>::f::P").unwrap().root(),
+            "<alloc::vec::Vec<_> as app::Unit>::f::P"
+        );
+        assert_eq!(
+            Path::parse("<fn() -> u8 as app::Unit>::f::X").unwrap().root(),
+            "<fn() -> u8 as app::Unit>::f::X"
+        );
+        assert_eq!(
+            rejected("<app::Meters>"),
+            "unexpected `<` at column 1: operators are not supported"
+        );
+        assert_eq!(
+            rejected("<app::Meters::X"),
+            "unexpected `<` at column 1: operators are not supported"
+        );
+        assert_eq!(rejected("<a>::1"), "unexpected `<` at column 1: operators are not supported");
+        assert_eq!(rejected("a < b"), "unexpected `<` at column 3: operators are not supported");
+        assert_eq!(rejected("::"), "unexpected `:` at column 1");
+        assert_eq!(rejected("app::"), "unexpected `:` at column 4");
+        assert_eq!(rejected("app::1"), "unexpected `:` at column 4");
+        assert_eq!(rejected("a:b"), "unexpected `:` at column 2");
+        assert_eq!(rejected("s.a::b"), "unexpected `a::b` at column 3: a field name has no `::`");
+        assert_eq!(
+            rejected("app::S.x::y"),
+            "unexpected `x::y` at column 8: a field name has no `::`"
+        );
+    }
+
+    #[test]
     fn dereference_binds_looser_than_postfix_operators()
     {
         let path = Path::parse("*a.b").unwrap();
@@ -1212,7 +1330,7 @@ mod tests
             rejected("0"),
             "unexpected `0` at column 1: a path starts with a variable name"
         );
-        assert_eq!(rejected("a::b"), "unexpected `:` at column 2");
+        assert_eq!(rejected("a: :b"), "unexpected `:` at column 2");
         assert_eq!(rejected("a.*"), "unexpected `*` at column 3");
         assert!(rejected("v[99999999999999999999999]").starts_with("invalid index"));
         assert_eq!(rejected("t.1x"), "invalid field index `1x` at column 3");

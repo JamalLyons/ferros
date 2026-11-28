@@ -33,7 +33,7 @@
 //! - `ImageId`: stable identity of a loaded image.
 //! - `BinaryImage`: construction (`from_contents`), layout queries, call frame sections
 //!   (`eh_frame_section`, `debug_frame_section`), `unwind_hints`, `symbolicate`, and
-//!   `types` (the image's [`TypeTable`]). Line and function lookups on `BinaryImage` live
+//!   `types` (the image's [`TypeTable`]), `statics` (its `StaticIndex`). Line and function lookups on `BinaryImage` live
 //!   in `lines.rs` and `functions.rs`.
 //! - Mapping tests in `mod mapping_tests`.
 
@@ -53,6 +53,7 @@ use super::{OwnedDwarf, OwnedReader, dwarf_frame_name};
 use crate::error::{DebuggerError, Result};
 use crate::objfile::{DebugInfoRetry, DebugSections, ImageContents, ImageSlice, LoadInputs, SectionData, UnwindHints};
 use crate::types::{Address, Architecture, FunctionParameter, SourceLocation, SymbolSource};
+use crate::values::statics::StaticIndex;
 use crate::values::types::TypeTable;
 
 /// Describes a binary image mapped in the debuggee's address space.
@@ -324,6 +325,9 @@ pub struct BinaryImage
     /// Built on the first function lookup (see `symbols::functions`); a failure to load the
     /// DWARF sections is cached too.
     function_index: OnceCell<std::result::Result<FunctionIndex, SourceLookupError>>,
+    /// Built on the first static lookup (see `values::statics`); a failure to load the
+    /// DWARF sections is cached too.
+    statics: OnceCell<std::result::Result<StaticIndex, SourceLookupError>>,
 }
 
 struct ExecutableImage
@@ -374,6 +378,7 @@ impl BinaryImage
             types: OnceCell::new(),
             line_index: OnceCell::new(),
             function_index: OnceCell::new(),
+            statics: OnceCell::new(),
         }
     }
 
@@ -833,6 +838,23 @@ impl BinaryImage
                 let table = TypeTable::build(dwarf, self.executable.endian);
                 super::lines::warn_skipped(self, "type", table.skipped());
                 Ok(Arc::new(table))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The image's statics (see [`values::statics`](crate::values::statics)), indexed on
+    /// the first call and cached, and so is a failure to load the DWARF sections.
+    pub(crate) fn statics(&self) -> std::result::Result<&StaticIndex, SourceLookupError>
+    {
+        self.statics
+            .get_or_init(|| {
+                let dwarf = self
+                    .dwarf()
+                    .map_err(|error| SourceLookupError::DebugInfo(error.to_string()))?;
+                let index = StaticIndex::build(dwarf);
+                super::lines::warn_skipped(self, "static", index.skipped());
+                Ok(index)
             })
             .as_ref()
             .map_err(Clone::clone)

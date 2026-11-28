@@ -1,4 +1,5 @@
-//! Render Rust shared pointers and interior-mutable cells from named DWARF fields.
+//! Render Rust shared pointers, their weak references and interior-mutable cells from
+//! named DWARF fields.
 
 use gimli::RunTimeEndian;
 
@@ -10,6 +11,10 @@ use crate::values::types::{BaseEncoding, Member, Type, TypeId, TypeKind, TypeTab
 
 const RC_NAME: &str = "alloc::rc::Rc<";
 const ARC_NAME: &str = "alloc::sync::Arc<";
+const RC_WEAK_NAME: &str = "alloc::rc::Weak<";
+const ARC_WEAK_NAME: &str = "alloc::sync::Weak<";
+// Payload wrappers such as `Path` nest single `inner` fields around a byte slice.
+const MAX_WRAPPERS: usize = 8;
 const CELL_NAME: &str = "core::cell::Cell<";
 const REF_CELL_NAME: &str = "core::cell::RefCell<";
 
@@ -22,13 +27,17 @@ enum SharedKind
 
 impl SharedKind
 {
-    fn from_name(name: &str) -> Option<(Self, &str)>
+    /// The allocation kind, whether the pointer is a `Weak`, and the generic arguments.
+    fn from_name(name: &str) -> Option<(Self, bool, &str)>
     {
-        if let Some(args) = name.strip_prefix(RC_NAME) {
-            Some((Self::Rc, args))
-        } else {
-            name.strip_prefix(ARC_NAME).map(|args| (Self::Arc, args))
-        }
+        [
+            (RC_NAME, Self::Rc, false),
+            (ARC_NAME, Self::Arc, false),
+            (RC_WEAK_NAME, Self::Rc, true),
+            (ARC_WEAK_NAME, Self::Arc, true),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind, weak)| Some((kind, weak, name.strip_prefix(prefix)?)))
     }
 
     fn read_counter(self, value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<Count>
@@ -66,6 +75,10 @@ impl PrettyPrinter for SharedPrinter
         if layout.base == Address::ZERO {
             return unavailable("null shared allocation pointer");
         }
+        // `Weak::new` points at no allocation: its address is the target's usize::MAX.
+        if layout.is_weak && layout.base.value() == u64::MAX >> (64 - 8 * layout.pointer_size) {
+            return "Weak(dangling)".to_owned();
+        }
         let counts = layout.strong.read(layout.base, layout.kind, formatter).and_then(|strong| {
             let weak = layout.weak.read(layout.base, layout.kind, formatter)?;
             Ok(strong.zip(weak))
@@ -76,6 +89,10 @@ impl PrettyPrinter for SharedPrinter
             Err(reason) => return unavailable(reason),
         };
         if strong == 0 {
+            // The allocation outlives its value while weak references remain.
+            if layout.is_weak {
+                return "Weak(dangling)".to_owned();
+            }
             return unavailable("shared allocation has no strong owners");
         }
         // The strong owners collectively hold one implicit weak reference. An Arc may
@@ -93,9 +110,11 @@ impl PrettyPrinter for SharedPrinter
         let pointee = match layout.pointee {
             Pointee::Sized(ty) => formatter.format_at(ty, address),
             Pointee::Str(len) => strings::format_string(address, len, formatter),
+            Pointee::ByteStr(len, is_c) => strings::format_byte_string(address, len, is_c, formatter),
             Pointee::Slice(element, len) => formatter.format_sequence(Some(element), &[Some(len)], Some(address), None),
         };
         let name = match layout.kind {
+            _ if layout.is_weak => "Weak",
             SharedKind::Rc => "Rc",
             SharedKind::Arc => "Arc",
         };
@@ -106,7 +125,9 @@ impl PrettyPrinter for SharedPrinter
 struct SharedLayout
 {
     kind: SharedKind,
+    is_weak: bool,
     base: Address,
+    pointer_size: usize,
     strong: Counter,
     weak: Counter,
     data_offset: u64,
@@ -117,21 +138,23 @@ pub(in crate::values) enum Pointee
 {
     Sized(TypeId),
     Str(u64),
+    /// An `OsStr`, `Path` or (when `true`) `CStr` of this many bytes.
+    ByteStr(u64, bool),
     Slice(TypeId, u64),
 }
 
 fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<SharedLayout>
 {
     let ty = types.get(value.ty)?;
-    let name = ty.name.as_deref()?;
-    let (kind, args) = SharedKind::from_name(name).or_else(|| SharedKind::from_weak_name(name))?;
+    let (kind, is_weak, args) = SharedKind::from_name(ty.name.as_deref()?)?;
     let non_null = field(value, "ptr", types)?;
     let pointer = field(non_null, "pointer", types)?;
-    let (base, inner, len) = match thin_pointer(pointer, types, endian) {
-        Some((base, inner)) => (base, inner, None),
+    let (base, inner, len, pointer_size) = match thin_pointer(pointer, types, endian) {
+        Some((base, inner)) => (base, inner, None, pointer.bytes.len()),
         None => {
             let (base, len, inner) = fat_pointer(pointer, types, endian)?;
-            (base, inner, Some(len))
+            let data = field(pointer, "data_ptr", types)?;
+            (base, inner, Some(len), data.bytes.len())
         }
     };
     let inner = types.get(types.strip_aliases(inner))?;
@@ -149,7 +172,12 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
     let pointee = match len {
         None if types.get(ty)?.size.is_some() => Pointee::Sized(ty),
         Some(len) => {
-            let ty = types.get(types.strip_aliases(ty))?;
+            let byte_string = types
+                .get(types.strip_aliases(ty))?
+                .name
+                .as_deref()
+                .and_then(strings::unsized_byte_string_kind);
+            let ty = types.get(unwrap_slice_wrappers(ty, types)?)?;
             let TypeKind::Array(array) = &ty.kind else {
                 return None;
             };
@@ -157,7 +185,21 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
                 return None;
             }
             let element = array.element?;
-            if args == "str>" || args.starts_with("str,") {
+            let is_byte = types.get(types.strip_aliases(element)).is_some_and(|byte| {
+                byte.size == Some(1)
+                    && matches!(
+                        byte.kind,
+                        TypeKind::Base(
+                            BaseEncoding::Unsigned
+                                | BaseEncoding::UnsignedChar
+                                | BaseEncoding::Signed
+                                | BaseEncoding::SignedChar
+                        )
+                    )
+            });
+            if let Some(is_c) = byte_string.filter(|_| is_byte) {
+                Pointee::ByteStr(len, is_c)
+            } else if args == "str>" || args.starts_with("str,") {
                 let byte = types.get(types.strip_aliases(element))?;
                 if byte.name.as_deref() != Some("u8") || byte.size != Some(1) {
                     return None;
@@ -171,7 +213,9 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
     };
     Some(SharedLayout {
         kind,
+        is_weak,
         base,
+        pointer_size,
         strong: Counter::new(fields.member("strong")?, types)?,
         weak: Counter::new(fields.member("weak")?, types)?,
         data_offset: payload.offset?,
@@ -179,19 +223,25 @@ fn shared_layout(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian)
     })
 }
 
-impl SharedKind
+/// The `[T]` under an unsized payload: the payload itself, or the slice that wrapper
+/// structs such as `Path`, `OsStr` and `CStr` hold as a single `inner` field at offset 0.
+fn unwrap_slice_wrappers(mut ty: TypeId, types: &TypeTable) -> Option<TypeId>
 {
-    /// The kind of shared pointer a `Weak` downgrades, and its generic arguments.
-    fn from_weak_name(name: &str) -> Option<(Self, &str)>
-    {
-        const RC_WEAK_NAME: &str = "alloc::rc::Weak<";
-        const ARC_WEAK_NAME: &str = "alloc::sync::Weak<";
-        if let Some(args) = name.strip_prefix(RC_WEAK_NAME) {
-            Some((Self::Rc, args))
-        } else {
-            name.strip_prefix(ARC_WEAK_NAME).map(|args| (Self::Arc, args))
+    for _ in 0..=MAX_WRAPPERS {
+        ty = types.strip_aliases(ty);
+        let resolved = types.get(ty)?;
+        let TypeKind::Struct(wrapper) = &resolved.kind else {
+            return Some(ty);
+        };
+        let [inner] = wrapper.members.as_slice() else {
+            return None;
+        };
+        if inner.name.as_deref() != Some("inner") || inner.offset != Some(0) || inner.bit_size.is_some() {
+            return None;
         }
+        ty = inner.ty?;
     }
+    None
 }
 
 /// Where an `Rc`, `Arc` or `Weak` points, for a caller that follows it.
@@ -222,8 +272,8 @@ pub(in crate::values) fn follow_shared(
     if layout.base == Address::ZERO {
         return Some(Ok(SharedTarget::Null));
     }
-    // `Weak::new` stores usize::MAX, which never addresses an allocation.
-    if layout.base.value() == u64::MAX || layout.base.value() == u64::from(u32::MAX) {
+    // `Weak::new` points at no allocation: its address is the target's usize::MAX.
+    if layout.is_weak && layout.base.value() == u64::MAX >> (64 - 8 * layout.pointer_size) {
         return Some(Ok(SharedTarget::Dangling));
     }
     let Some(counter) = layout.base.checked_add(layout.strong.offset) else {

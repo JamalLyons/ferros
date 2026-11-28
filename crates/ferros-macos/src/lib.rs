@@ -88,7 +88,8 @@
 //!
 //! [`runtime::MacOSRuntime`] implements [`ferros_core::runtime::TargetRuntime`]: the
 //! non-local exit entries (`libunwind`'s resume, `__longjmp` in `libsystem_platform`) and
-//! the xnu `_sigtramp` signal frame. [`new_session`] and [`session_with`] give it to the
+//! the xnu `_sigtramp` signal frame, and whether a `pthread_mutex_t` is held (for a
+//! Rust `Mutex`'s lock state). [`new_session`] and [`session_with`] give it to the
 //! session.
 //!
 //! ## Known gaps

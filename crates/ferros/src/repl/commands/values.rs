@@ -41,7 +41,7 @@ impl ReplCommand for Locals
     }
 }
 
-/// `print <path>`: show one of the selected frame's variables, or a value inside it.
+/// `print <path>`: show one of the selected frame's variables or a static, or a value inside it.
 pub struct Print;
 
 impl ReplCommand for Print
@@ -53,7 +53,7 @@ impl ReplCommand for Print
 
     fn summary(&self) -> &'static str
     {
-        "show a variable, or a field, element or pointee inside one"
+        "show a local or static, or a field, element or pointee inside one"
     }
 
     fn help(&self) -> &'static str
@@ -63,9 +63,14 @@ impl ReplCommand for Print
          active variant (name.0 for a tuple field)\n  name[n]     an element of an array, slice, Vec or VecDeque, \
          or a byte of a String or str; n may be written 1_000, 0x10, 0o7 or 0b1\n  *name       the value a \
          reference, Box, raw pointer, Rc, Arc, live Weak, Pin, Cell, RefCell or Cow points to or holds\n  \
-         (path)      grouping, as in (*name).field\n\nField access and indexing look through references, boxes, \
-         Rc, Arc, Pin, cells and Cow; raw pointers and Weak need an explicit *. Function calls and operators are \
-         not supported."
+         (path)      grouping, as in (*name).field\n\nname may also be a static of the main executable, by its \
+         qualified name (crate::module::NAME) or a trailing part of it (module::NAME, NAME); a static in an impl \
+         method is named after its impl, as globals lists it (<crate::Type>::f::NAME, \
+         <crate::Type as crate::Trait>::f::NAME). A local of the same name comes first. The output names the \
+         static, as in 'LIMIT (static my_crate::config::LIMIT): u16 = 512', and a name several statics share is \
+         an error listing each with its address. Field access and indexing look through references, boxes, Rc, \
+         Arc, Pin, cells and Cow; raw pointers and Weak need an explicit *. Function calls and operators are not \
+         supported."
     }
 
     fn run(&self, ctx: &mut Ctx<'_>, args: &str) -> CommandResult
@@ -77,16 +82,28 @@ impl ReplCommand for Print
         let root = path.root();
         let variables = ctx.session().selected_frame_variables()?;
         // Outer scopes precede inner scopes, so the last declaration wins when shadowed.
-        let variable = variables
-            .iter()
-            .rfind(|variable| variable.name == root)
-            .ok_or_else(|| CommandError::new(format!("no variable named '{root}' in the selected frame")))?;
+        // A local shadows a static of the same name, as in Rust.
+        let (variable, is_static) = if let Some(variable) = variables.into_iter().rfind(|variable| variable.name == root) {
+            (variable, false)
+        } else {
+            let found = ctx.session().static_variable(root)?.ok_or_else(|| {
+                CommandError::new(format!("no variable or static named '{root}' in the selected frame"))
+            })?;
+            (found.variable, true)
+        };
         let (ty, text) = ctx
             .session()
-            .format_path(variable, &path, FormatOptions::default())
+            .format_path(&variable, &path, FormatOptions::default())
             .map_err(|error| CommandError::new(format!("cannot evaluate '{path}': {error}")))?;
         let ty = ty.as_deref().unwrap_or("?");
-        writeln!(ctx.out, "{path}: {ty} = {text}")?;
+        // Name the static the root resolved to, so a short name that matched a static of
+        // another module or crate shows which one.
+        if is_static {
+            write!(ctx.out, "{path} (static {}): ", variable.name)?;
+        } else {
+            write!(ctx.out, "{path}: ")?;
+        }
+        writeln!(ctx.out, "{ty} = {text}")?;
         Ok(Flow::Continue)
     }
 }

@@ -144,7 +144,7 @@ ferros-core/src/
 │   ├── stack.rs        # Stack traces and symbolication
 │   ├── images.rs       # Loading the backend's image list into the symbol cache
 │   └── exits.rs        # Non-local exits (panic landing pads, longjmp)
-├── runtime/            # TargetRuntime: exit sources and signal frames (platform-supplied)
+├── runtime/            # TargetRuntime: exit sources, signal frames, system mutexes (platform-supplied)
 ├── backend/            # Backend trait (mechanism), StopEvent, LaunchSpec, MockBackend
 ├── arch/               # CPU knowledge independent of the OS
 ├── breakpoints/        # Breakpoint types and store
@@ -169,7 +169,7 @@ ferros-macos/src/       # macOS implementation (the only crate with OS code)
 └── ...
 ```
 
-`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session, and `Session::with_runtime(Arc<dyn TargetRuntime>)` gives it the platform's runtime knowledge: which system libraries and entry symbols a thread leaves frames through (unwinder resumes, `longjmp`), and how a signal trampoline's saved registers are found. `ferros_macos::new_session()` pairs `MacOSBackend`, `MachOFormat`, and `MacOSRuntime` on macOS. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
+`Session::new(backend: Box<dyn Backend>, format: Arc<dyn ObjectFormat>)` creates a session, and `Session::with_runtime(Arc<dyn TargetRuntime>)` gives it the platform's runtime knowledge: which system libraries and entry symbols a thread leaves frames through (unwinder resumes, `longjmp`), how a signal trampoline's saved registers are found, and whether a system mutex is held. `ferros_macos::new_session()` pairs `MacOSBackend`, `MachOFormat`, and `MacOSRuntime` on macOS. See [Platform Boundary](#platform-boundary) for how the pieces divide the work.
 
 #### Platform Factory
 

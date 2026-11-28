@@ -1,0 +1,90 @@
+//! Locks, atomics, lazily set cells, weak references and pins for the formatter
+//! integration test.
+
+use std::cell::{OnceCell, UnsafeCell};
+use std::ffi::{CStr, OsStr};
+use std::hint::black_box;
+use std::path::Path;
+use std::pin::Pin;
+use std::rc::{self, Rc};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
+use std::thread;
+
+fn main()
+{
+    let mutex = Mutex::new(9_u32);
+    // Taking a lock once allocates the system mutex a free lock is then read from.
+    let released = Mutex::new(10_u32);
+    drop(released.lock());
+    let rwlock = RwLock::new(8_u32);
+    let read_locked = RwLock::new(11_u32);
+    let reader = read_locked.read();
+    let write_locked = RwLock::new(15_u32);
+    let writer = write_locked.write();
+    let atomic_u32 = AtomicU32::new(7);
+    let atomic_bool = AtomicBool::new(true);
+    let mut pointee = 12_u32;
+    let atomic_ptr = AtomicPtr::new(&raw mut pointee);
+    let null_ptr: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
+    let once_set = OnceCell::new();
+    let _ = once_set.set(4_u32);
+    let once_unset: OnceCell<u32> = OnceCell::new();
+    let once_lock = OnceLock::new();
+    let _ = once_lock.set(6_u32);
+    let once_lock_unset: OnceLock<u32> = OnceLock::new();
+    let unsafe_cell = UnsafeCell::new(3_u32);
+
+    let rc = Rc::new(20_u32);
+    let rc_weak = Rc::downgrade(&rc);
+    let arc = Arc::new(21_u32);
+    let arc_weak = Arc::downgrade(&arc);
+    let dropped = Arc::new(22_u32);
+    let arc_dangling = Arc::downgrade(&dropped);
+    drop(dropped);
+    let rc_new: rc::Weak<u32> = rc::Weak::new();
+    let pinned = Box::pin(5_u32);
+    let pinned_ref: Pin<&u32> = Pin::new(&pointee);
+
+    let poisoned = Arc::new(Mutex::new(13_u32));
+    let panicking = Arc::clone(&poisoned);
+    let _ = thread::spawn(move || {
+        let _guard = panicking.lock();
+        panic!("poison the mutex");
+    })
+    .join();
+
+    // Another thread holds `held` until the process exits.
+    let held = Arc::new(Mutex::new(14_u32));
+    let holder = Arc::clone(&held);
+    let (locked, wait) = mpsc::channel();
+    thread::spawn(move || {
+        let _guard = holder.lock();
+        let _ = locked.send(());
+        loop {
+            thread::park();
+        }
+    });
+    let _ = wait.recv();
+
+    let rc_path: Rc<Path> = Rc::from(Path::new("/tmp"));
+    let arc_os_str: Arc<OsStr> = Arc::from(OsStr::new("os"));
+    let rc_c_str: Rc<CStr> = Rc::from(c"cs");
+
+    black_box(&mutex); // BREAK: inspect
+    black_box((
+        &released,
+        &rwlock,
+        &read_locked,
+        &reader,
+        &write_locked,
+        &writer,
+        &atomic_u32,
+        &atomic_bool,
+        &atomic_ptr,
+        &null_ptr,
+    ));
+    black_box((&once_set, &once_unset, &once_lock, &once_lock_unset, &unsafe_cell));
+    black_box((&rc, &rc_weak, &arc, &arc_weak, &arc_dangling, &rc_new, &pinned, &pinned_ref));
+    black_box((&poisoned, &held, &rc_path, &arc_os_str, &rc_c_str));
+}

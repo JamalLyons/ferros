@@ -803,6 +803,9 @@ fn unknown_standard_library_layouts_show_raw_fields()
         "alloc::collections::binary_heap::BinaryHeap<u8>",
         "std::sync::poison::mutex::Mutex<u8>",
         "std::sync::poison::rwlock::RwLock<u8>",
+        "std::sync::poison::mutex::MutexGuard<u8>",
+        "std::sync::poison::rwlock::RwLockReadGuard<u8>",
+        "std::sync::poison::rwlock::RwLockWriteGuard<u8>",
         "core::sync::atomic::Atomic<u8>",
         "core::sync::atomic::Atomic<bool>",
         "core::cell::once::OnceCell<u8>",
@@ -834,6 +837,40 @@ fn unknown_standard_library_layouts_show_raw_fields()
             session.format_variable(var, FormatOptions::default()).1,
             format!("{name} {{ unknown: 7 }} <unrecognized layout>")
         );
+    }
+}
+
+#[test]
+fn lock_and_guard_reject_incompatible_data_field()
+{
+    const LOCK: &str = "std::sync::poison::mutex::Mutex<u8>";
+    const GUARD: &str = "std::sync::poison::mutex::MutexGuard<u8>";
+    const CASES: &[(&str, &str)] = &[("guard", GUARD), ("lock", LOCK)];
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let root = unit.root();
+    let pointer = pointer_to(unit, "*mut u8", byte);
+    let lock = named_struct(unit, root, LOCK, 16);
+    add_member(unit, lock, "inner", byte, 0);
+    add_member(unit, lock, "data", pointer, 8);
+    let reference = pointer_to(unit, "&Mutex<u8>", lock);
+    let guard = named_struct(unit, root, GUARD, 8);
+    add_member(unit, guard, "lock", reference, 0);
+    let lock_address = Address::new(BASE + 0x200);
+    let guard_address = Address::new(BASE + 0x220);
+    static_local(unit, function, "lock", lock, lock_address);
+    static_local(unit, function, "guard", guard, guard_address);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    session.write_memory(lock_address, &words(&[0, 0])).expect("store mock lock");
+    session
+        .write_memory(guard_address, &words(&[lock_address.value()]))
+        .expect("store mock guard");
+    let vars = session.selected_frame_variables().expect("mock values");
+    for &(name, ty) in CASES {
+        let var = vars.iter().find(|var| var.name == name).expect(name);
+        let text = session.format_variable(var, FormatOptions::default()).1;
+        assert!(text.starts_with(ty) && text.ends_with(" <unrecognized layout>"), "{text}");
     }
 }
 
@@ -1047,4 +1084,54 @@ fn vec_into_iter_rejects_a_reversed_range_and_truncates_at_max_elements()
     // `end` before `ptr` is no valid range, so the raw fields show.
     let reversed = render(start + 2, start, FormatOptions::default());
     assert!(reversed.ends_with(" <unrecognized layout>"), "{reversed}");
+}
+
+#[test]
+fn print_path_through_an_rc_reports_an_unreadable_payload_instead_of_the_rcs_own_field()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let (usize, _) = raw_vec_types(unit, byte);
+    let root = unit.root();
+    // Rc<Payload> { ptr: NonNull { pointer } }, RcInner { strong, weak, value: Payload { ptr: u8 } }.
+    let unsafe_cell = named_struct(unit, root, "core::cell::UnsafeCell<usize>", 8);
+    add_member(unit, unsafe_cell, "value", usize, 0);
+    let cell = named_struct(unit, root, "core::cell::Cell<usize>", 8);
+    add_member(unit, cell, "value", unsafe_cell, 0);
+    let payload = named_struct(unit, root, "Payload", 1);
+    add_member(unit, payload, "ptr", byte, 0);
+    let inner = named_struct(unit, root, "alloc::rc::RcInner<Payload>", 24);
+    add_member(unit, inner, "strong", cell, 0);
+    add_member(unit, inner, "weak", cell, 8);
+    add_member(unit, inner, "value", payload, 16);
+    let inner_pointer = pointer_to(unit, "*const alloc::rc::RcInner<Payload>", inner);
+    let non_null = named_struct(unit, root, "core::ptr::non_null::NonNull<alloc::rc::RcInner<Payload>>", 8);
+    add_member(unit, non_null, "pointer", inner_pointer, 0);
+    let rc = named_struct(unit, root, "alloc::rc::Rc<Payload, alloc::alloc::Global>", 8);
+    add_member(unit, rc, "ptr", non_null, 0);
+    let rc_at = Address::new(BASE + 0x200);
+    static_local(unit, function, "rc", rc, rc_at);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let allocation = Address::new(BASE + 0x300);
+    let mut allocation_bytes = words(&[1, 1]);
+    allocation_bytes.push(42);
+    session.write_memory(allocation, &allocation_bytes).expect("store allocation");
+    let path = ferros_core::values::path::Path::parse("rc.ptr").expect("parse rc.ptr");
+    let mut print = |target: u64| {
+        session.write_memory(rc_at, &words(&[target])).expect("store Rc");
+        let vars = session.selected_frame_variables().expect("rc local");
+        session
+            .format_path(&vars[0], &path, FormatOptions::default())
+            .map(|(_, text)| text)
+            .map_err(|error| error.to_string())
+    };
+    // The payload's `ptr` wins over the Rc's own `ptr`, as Rust's auto-dereference does.
+    assert_eq!(print(allocation.value()), Ok("42".to_owned()));
+    // An unreadable allocation is the error, not a silent fall back to the Rc's NonNull.
+    let unmapped = BASE + IMAGE_SIZE;
+    assert_eq!(
+        print(unmapped),
+        Err(format!("`rc`: not found: address {unmapped:#x} is not mapped"))
+    );
 }

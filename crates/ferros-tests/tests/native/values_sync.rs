@@ -1,5 +1,5 @@
 //! Render locks, atomics, lazily set cells, weak references and pins from a stopped Rust
-//! program (issue #409).
+//! program (issues #409, #422).
 #![cfg(target_os = "macos")]
 
 use ferros_tests::{fixture, harness, transcript};
@@ -16,6 +16,13 @@ fn print_shows_synchronized_values_and_their_state()
         ("rwlock", "RwLock(unlocked) 8"),
         ("read_locked", "RwLock(readers: 1) 11"),
         ("write_locked", "RwLock(write-locked) 15"),
+        // A guard shows the value it holds (issue #422).
+        ("guarded", "Mutex(locked) 16"),
+        ("guard", "MutexGuard 16"),
+        ("reader", "RwLockReadGuard 11"),
+        ("writer", "RwLockWriteGuard 15"),
+        ("poisoned_guard", "MutexGuard(poisoned) 17"),
+        ("poisoned_writer", "RwLockWriteGuard 19"),
         ("atomic_u32", "7"),
         ("atomic_bool", "true"),
         ("null_ptr", "0x0"),
@@ -63,6 +70,53 @@ fn print_shows_synchronized_values_and_their_state()
             "{}",
             run.stdout
         );
+    });
+}
+
+#[test]
+fn print_reads_unsized_and_large_guard_payloads()
+{
+    const SAMPLES: &[(&str, &str)] = &[
+        ("slice_guard", "MutexGuard [1, 2]"),
+        ("slice_reader", "RwLockReadGuard [3, 4]"),
+        ("slice_writer", "RwLockWriteGuard [5, 6]"),
+        (
+            "object_guard",
+            "MutexGuard ferros_fixture_values_sync::Reading { count: 7, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
+        ),
+        (
+            "object_reader",
+            "RwLockReadGuard ferros_fixture_values_sync::Reading { count: 8, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
+        ),
+        (
+            "object_writer",
+            "RwLockWriteGuard ferros_fixture_values_sync::Reading { count: 9, spare: (0, 0, 0, 0, 0, 0, 0, 0) }",
+        ),
+        (
+            "large_guard",
+            "MutexGuard [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...]",
+        ),
+    ];
+    let _ = transcript::ferros_bin();
+    harness::run(|t| {
+        let fixture = fixture!("values_sync");
+        let break_at = format!("break values_sync.rs:{}", fixture.marker_line("guard_payloads"));
+        let prints: Vec<_> = SAMPLES.iter().map(|(name, _)| format!("print {name}")).collect();
+        let mut commands = vec![break_at.as_str(), "continue"];
+        commands.extend(prints.iter().map(String::as_str));
+        commands.push("quit");
+        let run = transcript::launch_batch(&t.tag(), &fixture, &[], &commands);
+        assert!(run.status.success(), "status {:?}, stderr: {}", run.status, run.stderr);
+        for &(name, expected) in SAMPLES {
+            let prefix = format!("{name}: ");
+            let value = run
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix)?.split_once(" = ").map(|(_, value)| value))
+                .unwrap_or_else(|| panic!("missing {name} in:\n{}", run.stdout));
+            let value = value.strip_suffix(" (type inferred from vtable methods)").unwrap_or(value);
+            assert_eq!(value, expected, "{name}:\n{}", run.stdout);
+        }
     });
 }
 

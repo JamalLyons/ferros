@@ -9,14 +9,18 @@
 //! system's private layout, which the session's
 //! [`TargetRuntime::system_mutex_state`] reads; without a runtime that knows the layout,
 //! no lock state shows. Poisoning is the standard library's own flag and always shows.
+//!
+//! A lock guard shows the value it guards, reached through the guard's pointer to its
+//! lock or to the value.
 
 use gimli::RunTimeEndian;
 
-use super::{PrettyPrinter, field, raw_layout, variant_for_tag, variant_payload, word};
+use super::dyn_trait::DynMetadata;
+use super::{PrettyPrinter, fat_pointer, field, raw_layout, thin_pointer, variant_for_tag, variant_payload, vec, word};
 use crate::runtime::{LockState, TargetRuntime};
 use crate::types::Address;
 use crate::values::format::{ValueFormatter, ValueView, unavailable, unsigned};
-use crate::values::types::{BaseEncoding, Type, TypeKind, TypeTable};
+use crate::values::types::{BaseEncoding, Member, Type, TypeId, TypeKind, TypeTable};
 
 const UNSAFE_CELL_NAME: &str = "core::cell::UnsafeCell<";
 const ATOMIC_NAME: &str = "core::sync::atomic::Atomic";
@@ -33,6 +37,21 @@ const RW_LOCK_NAMES: &[&str] = &[
     "std::sync::poison::rwlock::RwLock<",
     "std::sync::nonpoison::rwlock::RwLock<",
     "std::sync::rwlock::RwLock<",
+];
+const MUTEX_GUARD_NAMES: &[&str] = &[
+    "std::sync::poison::mutex::MutexGuard<",
+    "std::sync::nonpoison::mutex::MutexGuard<",
+    "std::sync::mutex::MutexGuard<",
+];
+const READ_GUARD_NAMES: &[&str] = &[
+    "std::sync::poison::rwlock::RwLockReadGuard<",
+    "std::sync::nonpoison::rwlock::RwLockReadGuard<",
+    "std::sync::rwlock::RwLockReadGuard<",
+];
+const WRITE_GUARD_NAMES: &[&str] = &[
+    "std::sync::poison::rwlock::RwLockWriteGuard<",
+    "std::sync::nonpoison::rwlock::RwLockWriteGuard<",
+    "std::sync::rwlock::RwLockWriteGuard<",
 ];
 
 // A `Once` keeps its state in the low two bits of its state word.
@@ -71,10 +90,22 @@ fn type_named(value: ValueView<'_>, types: &TypeTable, prefix: &str) -> bool
 /// The `value` an `UnsafeCell` wraps.
 fn unsafe_cell_value<'a>(cell: ValueView<'a>, types: &TypeTable) -> Option<ValueView<'a>>
 {
-    if !type_named(cell, types, UNSAFE_CELL_NAME) {
+    let ty = types.get(types.strip_aliases(cell.ty))?;
+    cell.member(unsafe_cell_member(&ty)?, types)
+}
+
+fn unsafe_cell_member(ty: &Type) -> Option<&Member>
+{
+    if !has_prefix(ty, UNSAFE_CELL_NAME) {
         return None;
     }
-    field(cell, "value", types)
+    let TypeKind::Struct(layout) = &ty.kind else {
+        return None;
+    };
+    let [value] = layout.members.as_slice() else {
+        return None;
+    };
+    (value.name.as_deref() == Some("value") && value.offset == Some(0) && value.bit_size.is_none()).then_some(value)
 }
 
 /// The stored primitive of an atomic: the sole field's `UnsafeCell`, without the
@@ -328,18 +359,11 @@ impl PrettyPrinter for LockPrinter<'_>
         let Some((inner, data)) = field(value, "inner", types).zip(field(value, "data", types)) else {
             return raw_layout(value, formatter);
         };
-        let poisoned = match field(value, "poison", types) {
-            // A lock without a poison flag (the `nonpoison` locks), or with a flag that has
-            // no `failed` field (a standard library built to abort on panic), is never
-            // poisoned.
-            None => false,
-            Some(flag) => match field(flag, "failed", types) {
-                None => false,
-                Some(failed) => match atomic_bool(failed, types, endian) {
-                    Some(poisoned) => poisoned,
-                    None => return raw_layout(value, formatter),
-                },
-            },
+        if unsafe_cell_value(data, types).is_none() {
+            return raw_layout(value, formatter);
+        }
+        let Some(poisoned) = poison_flag_set(field(value, "poison", types), types, endian) else {
+            return raw_layout(value, formatter);
         };
         let lock = if is_mutex {
             self.mutex_state(inner, formatter)
@@ -358,6 +382,20 @@ impl PrettyPrinter for LockPrinter<'_>
         } else {
             format!("{name}({}) {data}", states.join(", "))
         }
+    }
+}
+
+/// Whether a lock's `poison` flag is set; `None` when it cannot be read.
+fn poison_flag_set(flag: Option<ValueView<'_>>, types: &TypeTable, endian: RunTimeEndian) -> Option<bool>
+{
+    // A lock without a poison flag (the `nonpoison` locks), or with a flag that has no
+    // `failed` field (a standard library built to abort on panic), is never poisoned.
+    let Some(flag) = flag else {
+        return Some(false);
+    };
+    match field(flag, "failed", types) {
+        None => Some(false),
+        Some(failed) => atomic_bool(failed, types, endian),
     }
 }
 
@@ -406,6 +444,159 @@ impl LockPrinter<'_>
             .to_owned(),
         )
     }
+}
+
+/// Renders the value held by a `MutexGuard`, `RwLockReadGuard` or `RwLockWriteGuard`.
+/// A `MutexGuard` includes a poison marker when its mutex is poisoned.
+pub(super) struct GuardPrinter;
+
+impl PrettyPrinter for GuardPrinter
+{
+    fn matches(&self, ty: &Type, _types: &TypeTable) -> bool
+    {
+        has_any_prefix(ty, MUTEX_GUARD_NAMES)
+            || has_any_prefix(ty, READ_GUARD_NAMES)
+            || has_any_prefix(ty, WRITE_GUARD_NAMES)
+    }
+
+    fn format(&self, value: ValueView<'_>, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        let Some(ty) = formatter.types().get(formatter.types().strip_aliases(value.ty)) else {
+            return raw_layout(value, formatter);
+        };
+        let shown = if has_any_prefix(&ty, READ_GUARD_NAMES) {
+            read_guard_data(value, formatter.types(), formatter.endian()).map(|data| ("RwLockReadGuard", false, data))
+        } else {
+            let is_mutex = has_any_prefix(&ty, MUTEX_GUARD_NAMES);
+            let name = if is_mutex { "MutexGuard" } else { "RwLockWriteGuard" };
+            guarded_lock(value, is_mutex, formatter).map(|(poisoned, data)| (name, poisoned, data))
+        };
+        let Some((name, poisoned, data)) = shown else {
+            return raw_layout(value, formatter);
+        };
+        let data = data.format(formatter);
+        if poisoned {
+            format!("{name}(poisoned) {data}")
+        } else {
+            format!("{name} {data}")
+        }
+    }
+}
+
+enum PointerMetadata
+{
+    Thin,
+    Length(u64),
+    Vtable(DynMetadata),
+}
+
+struct GuardPointer
+{
+    address: Address,
+    ty: TypeId,
+    metadata: PointerMetadata,
+}
+
+impl GuardPointer
+{
+    fn from_pointer(value: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<Self>
+    {
+        let (address, ty, metadata) = if let Some((address, ty)) = thin_pointer(value, types, endian) {
+            (address, ty, PointerMetadata::Thin)
+        } else if let Some((address, len, ty)) = fat_pointer(value, types, endian) {
+            (address, ty, PointerMetadata::Length(len))
+        } else {
+            let (address, ty, metadata) = DynMetadata::from_pointer(value, types, endian)?;
+            (address, ty, PointerMetadata::Vtable(metadata))
+        };
+        Some(Self { address, ty, metadata })
+    }
+
+    fn format(self, formatter: &mut ValueFormatter<'_>) -> String
+    {
+        match self.metadata {
+            PointerMetadata::Thin => formatter.format_at(self.ty, self.address),
+            PointerMetadata::Length(len) => vec::format_elements(self.address, len, self.ty, formatter),
+            PointerMetadata::Vtable(metadata) => metadata.format_at(self.address, self.ty, formatter),
+        }
+    }
+}
+
+/// The value a read guard's `data: NonNull<T>` points at.
+fn read_guard_data(guard: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<GuardPointer>
+{
+    let pointer = field(field(guard, "data", types)?, "pointer", types)?;
+    let data = GuardPointer::from_pointer(pointer, types, endian)?;
+    let is_supported = match data.metadata {
+        PointerMetadata::Thin => true,
+        PointerMetadata::Length(_) => type_named(pointer, types, "*const [") || type_named(pointer, types, "*mut ["),
+        PointerMetadata::Vtable(_) => types
+            .get(types.strip_aliases(data.ty))
+            .is_some_and(|ty| has_prefix(&ty, "dyn ")),
+    };
+    is_supported.then_some(data)
+}
+
+/// Follows a guard's `lock` reference to its data and checks for mutex poisoning.
+fn guarded_lock(guard: ValueView<'_>, is_mutex: bool, formatter: &mut ValueFormatter<'_>) -> Option<(bool, GuardPointer)>
+{
+    let types = formatter.types();
+    let endian = formatter.endian();
+    let mut pointer = GuardPointer::from_pointer(field(guard, "lock", types)?, types, endian)?;
+    let lock_ty = types.get(types.strip_aliases(pointer.ty))?;
+    let lock_names = if is_mutex { MUTEX_NAMES } else { RW_LOCK_NAMES };
+    if !has_any_prefix(&lock_ty, lock_names) || pointer.address == Address::ZERO {
+        return None;
+    }
+    let TypeKind::Struct(layout) = &lock_ty.kind else {
+        return None;
+    };
+    let data = layout.member("data")?;
+    if data.bit_size.is_some() {
+        return None;
+    }
+    let cell = types.get(types.strip_aliases(data.ty?))?;
+    pointer.ty = unsafe_cell_member(&cell)?.ty?;
+    let mut offset = data.offset?;
+    let payload = types.get(types.strip_aliases(pointer.ty))?;
+    match &pointer.metadata {
+        PointerMetadata::Thin => {}
+        PointerMetadata::Length(_) => {
+            let TypeKind::Array(array) = &payload.kind else {
+                return None;
+            };
+            if array.lengths != [None] {
+                return None;
+            }
+            pointer.ty = array.element?;
+        }
+        PointerMetadata::Vtable(metadata) => {
+            if !has_prefix(&payload, "dyn ") {
+                return None;
+            }
+            // DWARF gives the tail offset at the trait object's minimum alignment.
+            // Round it up to the alignment of the concrete type in this allocation.
+            offset = offset.checked_next_multiple_of(metadata.alignment(formatter)?)?;
+        }
+    }
+    let address = pointer.address;
+    pointer.address = address.checked_add(offset)?;
+    // Read the mutex flag separately so the data read stays subject to the formatter's limits.
+    let poisoned = if is_mutex && let Some(flag) = layout.member("poison") {
+        let flag_ty = flag.ty?;
+        let flag_address = address.checked_add(flag.offset?)?;
+        let size = usize::try_from(formatter.types().get(flag_ty)?.size?).ok()?;
+        let bytes = formatter.read_memory(flag_address, size).ok()?;
+        let view = ValueView {
+            ty: flag_ty,
+            bytes: &bytes,
+            address: Some(flag_address),
+        };
+        poison_flag_set(Some(view), formatter.types(), endian)?
+    } else {
+        false
+    };
+    Some((poisoned, pointer))
 }
 
 fn rw_lock_state(inner: ValueView<'_>, types: &TypeTable, endian: RunTimeEndian) -> Option<String>

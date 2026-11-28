@@ -10,8 +10,10 @@
 //! A static inside an impl method is named by its demangled `DW_AT_linkage_name` instead,
 //! because the enclosing namespace is only `{impl#N}`: `<my_crate::Meters>::f::X` in an
 //! inherent impl, `<my_crate::Meters as my_crate::Unit>::f::X` in a trait impl. The
-//! qualifier tells apart impls that each have an `f::X`. Without a linkage name that
-//! demangles, the namespace name stays (`my_crate::{impl#0}::f::X`).
+//! qualifier tells apart impls that each have an `f::X`. Without a v0-mangled (`_R`)
+//! linkage name that demangles, the namespace name stays (`my_crate::{impl#0}::f::X`):
+//! legacy demangling gives forms such as `my_crate::Foo<u8>::f::X` that a path cannot
+//! name.
 //!
 //! Several statics can share a qualified name: two `static S` in separate blocks of one
 //! function, or the per-call-site statics a logging macro expands to. Each is its own entry,
@@ -284,11 +286,15 @@ fn static_address(dwarf: &OwnedDwarf, unit: &Unit, entry: &Entry<'_, '_>) -> Opt
 }
 
 /// The entry's `DW_AT_linkage_name` demangled as a Rust symbol without its hash, such as
-/// `<my_crate::Meters as my_crate::Unit>::f::X`; `None` without one that demangles.
+/// `<my_crate::Meters as my_crate::Unit>::f::X`; `None` without a v0-mangled one that
+/// demangles.
 fn demangled_linkage_name(dwarf: &OwnedDwarf, unit: &Unit, entry: &Entry<'_, '_>) -> Option<String>
 {
     let value = entry.attr_value(constants::DW_AT_linkage_name).ok()??;
     let raw = dwarf.attr_string(unit, value).ok()?.to_string_lossy().ok()?.into_owned();
+    if !raw.starts_with("_R") {
+        return None;
+    }
     rustc_demangle::try_demangle(&raw).ok().map(|name| format!("{name:#}"))
 }
 
@@ -446,6 +452,7 @@ mod tests
                 0x1008,
             ),
             ("{impl#2}", None, 0x1010),
+            ("{impl#3}", Some("_ZN1t6Meters1f1X17h0123456789abcdefE"), 0x1020),
         ] {
             let scope = named(&mut dwarf, krate, gimli::DW_TAG_namespace, impl_name);
             let function = named(&mut dwarf, scope, gimli::DW_TAG_namespace, "f");
@@ -476,6 +483,7 @@ mod tests
                 ("<t::Meters>::f::X", 0x1000),
                 ("t::Y", 0x1018),
                 ("t::{impl#2}::f::X", 0x1010),
+                ("t::{impl#3}::f::X", 0x1020),
             ]
         );
         let names = |query| {
@@ -487,7 +495,7 @@ mod tests
         };
         assert_eq!(names("<t::Meters>::f::X"), [0x1000]);
         assert_eq!(names("<t::Meters as t::Unit>::f::X"), [0x1008]);
-        assert_eq!(names("f::X"), [0x1008, 0x1000, 0x1010]);
+        assert_eq!(names("f::X"), [0x1008, 0x1000, 0x1010, 0x1020]);
     }
 
     #[test]

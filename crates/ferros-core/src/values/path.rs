@@ -305,7 +305,8 @@ fn qualifier_end(text: &str, start: usize) -> Option<usize>
     for (offset, ch) in text[start..].char_indices() {
         match ch {
             '<' => depth += 1,
-            '>' => {
+            // Not the `>` of a return type's `->`, as in `<fn() -> u8 as app::Unit>`.
+            '>' if !text[..start + offset].ends_with('-') => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(start + offset + 1);
@@ -886,6 +887,10 @@ mod tests
         assert_eq!(
             Path::parse("*<alloc::vec::Vec<_> as app::Unit>::f::P").unwrap().root(),
             "<alloc::vec::Vec<_> as app::Unit>::f::P"
+        );
+        assert_eq!(
+            Path::parse("<fn() -> u8 as app::Unit>::f::X").unwrap().root(),
+            "<fn() -> u8 as app::Unit>::f::X"
         );
         assert_eq!(
             rejected("<app::Meters>"),

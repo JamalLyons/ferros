@@ -702,6 +702,9 @@ fn unknown_standard_library_layouts_show_raw_fields()
         "alloc::collections::binary_heap::BinaryHeap<u8>",
         "std::sync::poison::mutex::Mutex<u8>",
         "std::sync::poison::rwlock::RwLock<u8>",
+        "std::sync::poison::mutex::MutexGuard<u8>",
+        "std::sync::poison::rwlock::RwLockReadGuard<u8>",
+        "std::sync::poison::rwlock::RwLockWriteGuard<u8>",
         "core::sync::atomic::Atomic<u8>",
         "core::sync::atomic::Atomic<bool>",
         "core::cell::once::OnceCell<u8>",
@@ -733,6 +736,40 @@ fn unknown_standard_library_layouts_show_raw_fields()
             session.format_variable(var, FormatOptions::default()).1,
             format!("{name} {{ unknown: 7 }} <unrecognized layout>")
         );
+    }
+}
+
+#[test]
+fn lock_and_guard_reject_incompatible_data_field()
+{
+    const LOCK: &str = "std::sync::poison::mutex::Mutex<u8>";
+    const GUARD: &str = "std::sync::poison::mutex::MutexGuard<u8>";
+    const CASES: &[(&str, &str)] = &[("guard", GUARD), ("lock", LOCK)];
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let root = unit.root();
+    let pointer = pointer_to(unit, "*mut u8", byte);
+    let lock = named_struct(unit, root, LOCK, 16);
+    add_member(unit, lock, "inner", byte, 0);
+    add_member(unit, lock, "data", pointer, 8);
+    let reference = pointer_to(unit, "&Mutex<u8>", lock);
+    let guard = named_struct(unit, root, GUARD, 8);
+    add_member(unit, guard, "lock", reference, 0);
+    let lock_address = Address::new(BASE + 0x200);
+    let guard_address = Address::new(BASE + 0x220);
+    static_local(unit, function, "lock", lock, lock_address);
+    static_local(unit, function, "guard", guard, guard_address);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    session.write_memory(lock_address, &words(&[0, 0])).expect("store mock lock");
+    session
+        .write_memory(guard_address, &words(&[lock_address.value()]))
+        .expect("store mock guard");
+    let vars = session.selected_frame_variables().expect("mock values");
+    for &(name, ty) in CASES {
+        let var = vars.iter().find(|var| var.name == name).expect(name);
+        let text = session.format_variable(var, FormatOptions::default()).1;
+        assert!(text.starts_with(ty) && text.ends_with(" <unrecognized layout>"), "{text}");
     }
 }
 

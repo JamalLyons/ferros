@@ -261,7 +261,7 @@ impl PrettyPrinter for BoxPrinter
     }
 }
 
-fn format_elements(address: Address, len: u64, element: TypeId, formatter: &mut ValueFormatter<'_>) -> String
+pub(super) fn format_elements(address: Address, len: u64, element: TypeId, formatter: &mut ValueFormatter<'_>) -> String
 {
     if address == Address::ZERO {
         return unavailable("null element data pointer");

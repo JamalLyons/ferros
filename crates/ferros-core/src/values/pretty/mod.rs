@@ -49,6 +49,7 @@ pub static PRINTERS: &[&dyn PrettyPrinter] = &[
     &shared::SharedPrinter,
     &shared::CellPrinter,
     &sync::LockPrinter::WITHOUT_RUNTIME,
+    &sync::GuardPrinter,
     &sync::AtomicPrinter,
     &sync::OnceCellPrinter,
     &sync::UnsafeCellPrinter,

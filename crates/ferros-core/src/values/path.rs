@@ -10,6 +10,7 @@
 //! name    := ( '::'? identifier | qualifier '::' identifier ) ( '::' identifier )*
 //! qualifier := '<' any text with balanced '<' '>' '>'
 //! index   := an integer literal: decimal, 0x hex, 0o octal or 0b binary, with `_` separators
+//!            and an optional `usize` suffix
 //! ```
 //!
 //! A name with `::` segments is a static's qualified name (`my_crate::config::LIMIT`). A
@@ -28,8 +29,8 @@
 //! `Cell` or `RefCell` (to the value inside) and a `Cow` (to the value it borrows or
 //! owns). Dereferencing a slice, `Vec` or string gives its unsized contents, which can be
 //! indexed but not printed alone. Field access and indexing look through all of these
-//! except `Weak` and raw pointers, as Rust's auto-dereference does; a `Cow`'s `.0` still
-//! selects its variant's field. Raw pointers need an explicit `*`. There are no function
+//! except `Weak` and raw pointers, as Rust's auto-dereference does; a `Cow`'s `.0`
+//! selects its variant's field unless the payload has its own `.0`. Raw pointers need an explicit `*`. There are no function
 //! calls, operators or literals other than an index.
 //!
 //! Evaluation reads only what the path needs: the root variable's bytes, the pointers and
@@ -167,6 +168,8 @@ pub struct PathError
     pub segment: Option<String>,
     /// What went wrong.
     pub reason: String,
+    /// The value has no field of the requested name, so a wrapper's own field may apply.
+    missing_field: bool,
 }
 
 impl PathError
@@ -176,6 +179,7 @@ impl PathError
         Self {
             segment: None,
             reason: reason.into(),
+            missing_field: false,
         }
     }
 
@@ -184,6 +188,7 @@ impl PathError
         Self {
             segment: Some(path.root().to_owned()),
             reason: reason.into(),
+            missing_field: false,
         }
     }
 
@@ -192,6 +197,16 @@ impl PathError
         Self {
             segment: Some(expr.to_string()),
             reason: reason.into(),
+            missing_field: false,
+        }
+    }
+
+    /// The value at `expr` has no field of the requested name.
+    fn no_field(expr: &Expr, reason: impl Into<String>) -> Self
+    {
+        Self {
+            missing_field: true,
+            ..Self::at(expr, reason)
         }
     }
 }
@@ -454,7 +469,8 @@ impl<'a> Parser<'a>
 }
 
 /// An index literal as Rust spells integers: decimal, `0x`, `0o` or `0b`, with `_`
-/// separators after the first digit.
+/// separators after the first digit and an optional `usize` suffix, the only type Rust
+/// indexes with.
 fn parse_index(text: &str, column: usize) -> Result<u64, PathError>
 {
     let invalid = || PathError::syntax(format!("invalid index `{text}` at column {column}"));
@@ -464,8 +480,15 @@ fn parse_index(text: &str, column: usize) -> Result<u64, PathError>
         Some("0b") => (2, &text[2..]),
         _ => (10, text),
     };
+    let digits = digits.strip_suffix("usize").unwrap_or(digits);
+    // No digit in any radix is `u` or `i`, so either starts another integer suffix.
+    if let Some(suffix) = digits.find(['u', 'i']).map(|start| &digits[start..]) {
+        return Err(PathError::syntax(format!(
+            "invalid index `{text}` at column {column}: an index is a usize, so `{suffix}` is not a valid suffix"
+        )));
+    }
     let digits: String = digits.chars().filter(|&ch| ch != '_').collect();
-    // from_str_radix accepts a leading sign, which no index token holds but `0x+1` might.
+    // from_str_radix accepts a leading `+`; require digits only.
     if digits.is_empty() || !digits.chars().all(|ch| ch.is_digit(radix)) {
         return Err(invalid());
     }
@@ -694,7 +717,9 @@ impl Evaluator<'_>
     /// Field `name` of `value` or of what it automatically dereferences to. As in Rust, the
     /// innermost value with the field wins, so `rc.name` is the payload's `name`; a field
     /// only the wrapper has, such as a `Cell`'s `value`, a `Pin`'s `pointer` or a `Cow`'s
-    /// `.0`, is the wrapper's. An error names the innermost value.
+    /// `.0`, is the wrapper's. Only a missing field falls back to the wrapper; a failure to
+    /// read, dereference or lay out the inner value is the error. An error names the
+    /// innermost value.
     fn field_through(&mut self, expr: &Expr, base: &Expr, value: Value, name: &str, depth: usize)
     -> Result<Place, PathError>
     {
@@ -704,7 +729,8 @@ impl Evaluator<'_>
         };
         let error = match inner.and_then(|inner| self.field_through(expr, base, inner, name, depth - 1)) {
             Ok(place) => return Ok(place),
-            Err(error) => error,
+            Err(error) if error.missing_field => error,
+            Err(error) => return Err(error),
         };
         self.field(expr, value, name).map_err(|_| error)
     }
@@ -714,7 +740,10 @@ impl Evaluator<'_>
         let place = match value {
             Value::Place(place) => place,
             Value::Slice(slice) => {
-                return Err(PathError::at(expr, format!("{} has no fields", self.slice_name(&slice))));
+                return Err(PathError::no_field(
+                    expr,
+                    format!("{} has no fields", self.slice_name(&slice)),
+                ));
             }
         };
         let ty = self.types.strip_aliases(place.ty);
@@ -723,12 +752,15 @@ impl Evaluator<'_>
             Some((TypeKind::Enum(layout), _)) => return self.variant_field(expr, place, ty, &layout, name),
             _ => {
                 let hint = raw_pointer_hint(expr, &self.shape(ty));
-                return Err(PathError::at(expr, format!("{} has no fields{hint}", self.type_name(ty))));
+                return Err(PathError::no_field(
+                    expr,
+                    format!("{} has no fields{hint}", self.type_name(ty)),
+                ));
             }
         };
         let member = member_named(&fields.members, name).ok_or_else(|| {
             let hint = raw_pointer_hint(expr, &self.shape(ty));
-            PathError::at(expr, format!("no field `{name}` in {}{hint}", self.type_name(ty)))
+            PathError::no_field(expr, format!("no field `{name}` in {}{hint}", self.type_name(ty)))
         })?;
         self.member_place(expr, &place, member, 0)
     }
@@ -784,7 +816,7 @@ impl Evaluator<'_>
         } else {
             format!("{} is {active}, not {}", self.type_name(ty), others.join(" or "))
         };
-        Err(PathError::at(expr, reason))
+        Err(PathError::no_field(expr, reason))
     }
 
     /// The value of `member`, whose offset is from `base` bytes into `place`.
@@ -1353,13 +1385,33 @@ mod tests
         assert_eq!(index("v[0x_1]"), 1);
         assert_eq!(index("v[007]"), 7);
         assert_eq!(index("v[18446744073709551615]"), u64::MAX);
+        assert_eq!(index("v[1usize]"), 1);
+        assert_eq!(index("v[0x1f_usize]"), 31);
         // Errors name the segment as written.
         assert_eq!(parsed("v[0x10]"), "v[0x10]");
         assert_eq!(parsed("v[1_000]"), "v[1_000]");
-        for text in ["v[0x]", "v[0b2]", "v[0o8]", "v[1a]", "v[0x_]", "v[0X1]", "v[1u8]"] {
+        for text in [
+            "v[0x]",
+            "v[0b2]",
+            "v[0o8]",
+            "v[1a]",
+            "v[0x_]",
+            "v[0X1]",
+            "v[1u8]",
+            "v[0xusize]",
+            "v[1_usize_]",
+        ] {
             assert!(rejected(text).starts_with("invalid index"), "{text}: {}", rejected(text));
         }
         assert_eq!(rejected("v[0xg]"), "invalid index `0xg` at column 3");
+        assert_eq!(
+            rejected("v[1u8]"),
+            "invalid index `1u8` at column 3: an index is a usize, so `u8` is not a valid suffix"
+        );
+        assert_eq!(
+            rejected("v[2i32]"),
+            "invalid index `2i32` at column 3: an index is a usize, so `i32` is not a valid suffix"
+        );
         assert!(rejected("v[0x10000000000000000]").starts_with("invalid index"));
     }
 

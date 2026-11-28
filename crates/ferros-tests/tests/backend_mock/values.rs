@@ -947,3 +947,53 @@ fn vec_into_iter_rejects_a_reversed_range_and_truncates_at_max_elements()
     let reversed = render(start + 2, start, FormatOptions::default());
     assert!(reversed.ends_with(" <unrecognized layout>"), "{reversed}");
 }
+
+#[test]
+fn print_path_through_an_rc_reports_an_unreadable_payload_instead_of_the_rcs_own_field()
+{
+    let (mut dwarf, function, byte) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let (usize, _) = raw_vec_types(unit, byte);
+    let root = unit.root();
+    // Rc<Payload> { ptr: NonNull { pointer } }, RcInner { strong, weak, value: Payload { ptr: u8 } }.
+    let unsafe_cell = named_struct(unit, root, "core::cell::UnsafeCell<usize>", 8);
+    add_member(unit, unsafe_cell, "value", usize, 0);
+    let cell = named_struct(unit, root, "core::cell::Cell<usize>", 8);
+    add_member(unit, cell, "value", unsafe_cell, 0);
+    let payload = named_struct(unit, root, "Payload", 1);
+    add_member(unit, payload, "ptr", byte, 0);
+    let inner = named_struct(unit, root, "alloc::rc::RcInner<Payload>", 24);
+    add_member(unit, inner, "strong", cell, 0);
+    add_member(unit, inner, "weak", cell, 8);
+    add_member(unit, inner, "value", payload, 16);
+    let inner_pointer = pointer_to(unit, "*const alloc::rc::RcInner<Payload>", inner);
+    let non_null = named_struct(unit, root, "core::ptr::non_null::NonNull<alloc::rc::RcInner<Payload>>", 8);
+    add_member(unit, non_null, "pointer", inner_pointer, 0);
+    let rc = named_struct(unit, root, "alloc::rc::Rc<Payload, alloc::alloc::Global>", 8);
+    add_member(unit, rc, "ptr", non_null, 0);
+    let rc_at = Address::new(BASE + 0x200);
+    static_local(unit, function, "rc", rc, rc_at);
+
+    let (mut session, _image) = session(&mut dwarf, None);
+    let allocation = Address::new(BASE + 0x300);
+    let mut allocation_bytes = words(&[1, 1]);
+    allocation_bytes.push(42);
+    session.write_memory(allocation, &allocation_bytes).expect("store allocation");
+    let path = ferros_core::values::path::Path::parse("rc.ptr").expect("parse rc.ptr");
+    let mut print = |target: u64| {
+        session.write_memory(rc_at, &words(&[target])).expect("store Rc");
+        let vars = session.selected_frame_variables().expect("rc local");
+        session
+            .format_path(&vars[0], &path, FormatOptions::default())
+            .map(|(_, text)| text)
+            .map_err(|error| error.to_string())
+    };
+    // The payload's `ptr` wins over the Rc's own `ptr`, as Rust's auto-dereference does.
+    assert_eq!(print(allocation.value()), Ok("42".to_owned()));
+    // An unreadable allocation is the error, not a silent fall back to the Rc's NonNull.
+    let unmapped = BASE + IMAGE_SIZE;
+    assert_eq!(
+        print(unmapped),
+        Err(format!("`rc`: not found: address {unmapped:#x} is not mapped"))
+    );
+}

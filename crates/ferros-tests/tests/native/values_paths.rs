@@ -148,6 +148,15 @@ fn print_follows_smart_pointers_and_indexes_more_containers()
         ("cell_struct.x", "i32 = 31"),
         ("cell_struct.y", "i32 = 32"),
         ("(*weak).id", "u16 = 9"),
+        // The buffer wraps: head 2 of capacity 4, so logical [3, 4, 5, 6] is stored [5, 6, 3, 4].
+        (
+            "vd.head",
+            "alloc::collections::vec_deque::index::WrappedIndex = alloc::collections::vec_deque::index::WrappedIndex(2)",
+        ),
+        (
+            "vd",
+            "alloc::collections::vec_deque::VecDeque<u32, alloc::alloc::Global> = [3, 4, 5, 6] (len: 4, capacity: 4)",
+        ),
         ("vd[0]", "u32 = 3"),
         ("vd[1]", "u32 = 4"),
         ("vd[3]", "u32 = 6"),
@@ -163,6 +172,7 @@ fn print_follows_smart_pointers_and_indexes_more_containers()
     ];
     const FAILURES: &[(&str, &str)] = &[
         ("*dangling", "cannot evaluate '*dangling': `*dangling`: dangling Weak"),
+        ("*empty_weak", "cannot evaluate '*empty_weak': `*empty_weak`: dangling Weak"),
         (
             "vd[4]",
             "cannot evaluate 'vd[4]': `vd[4]`: index 4 is out of bounds for length 4",

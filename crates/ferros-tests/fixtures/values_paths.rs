@@ -111,6 +111,7 @@ fn main()
         });
         Rc::downgrade(&gone)
     };
+    let empty_weak: Weak<Named> = Weak::new();
     // Capacity 4 with the head moved to slot 2: logical [3, 4, 5, 6] is stored [5, 6, 3, 4].
     let mut vd: VecDeque<u32> = VecDeque::with_capacity(4);
     vd.extend([1, 2, 3]);
@@ -128,6 +129,7 @@ fn main()
     black_box((&shape, &sq, &empty_shape, &opt, &none, &res_ok, &res_err, &opt_ref, &ordering));
     black_box((&maybe_order, &opt_ptr, &single, &huge));
     black_box((&rc, &arc, &pinned, &cell, &cell_struct, &weak, &dangling, &vd, &raw_slice));
+    black_box(&empty_weak);
     black_box((&text, &cow_borrowed, &cow_owned));
 }
 

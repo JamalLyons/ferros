@@ -25,7 +25,7 @@
 //!
 //! The index is built once per image, on the first lookup, from every compilation unit
 //! that can be parsed. Units or entries that cannot be read are recorded in
-//! [`StaticIndex::skipped`] and the rest are still indexed.
+//! the index's `skipped` list and the rest are still indexed.
 
 use gimli::{AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Operation, Reader as _, constants};
 

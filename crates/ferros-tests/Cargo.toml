@@ -22,7 +22,8 @@ ferros-macos = { path = "../ferros-macos" }
 # enables it, and Cargo unifies that feature onto this copy when both are built.
 object = { version = "0.41.0", default-features = false, features = ["std", "read", "macho"] }
 rustc-demangle = "0.1"
-# The `workqueue` fixture submits GCD work items without `unsafe`.
+# The `workqueue` fixture submits GCD work items without `unsafe`; `values_misc` takes the
+# address of one of its C functions, which has no DWARF.
 dispatch2 = { version = "0.3.0", default-features = false, features = ["std"] }
 
 # Only the tests need the scripted mock backend. Keeping the feature here leaves it out

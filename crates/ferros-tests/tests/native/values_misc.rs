@@ -1,8 +1,22 @@
 //! Unions, function pointers, raw slice pointers and vector iterators from a stopped Rust
-//! program (issue #412).
+//! program (issue #412), and function pointers into code without DWARF (#419).
 #![cfg(target_os = "macos")]
 
 use ferros_tests::{fixture, harness, transcript};
+
+/// Values checked against addresses read from the same run.
+const OTHERS: &[&str] = &[
+    "callback",
+    "handler",
+    "stray",
+    "raw_slice",
+    "null_slice",
+    "data_ref",
+    "raw_str",
+    "raw_mut_str",
+    "c_function",
+    "c_stray",
+];
 
 #[test]
 fn print_shows_unions_function_symbols_raw_slices_and_iterators()
@@ -28,17 +42,6 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             "uninit",
             "core::mem::maybe_uninit::MaybeUninit<u32> = MaybeUninit(<maybe uninit> 0x01020304)",
         ),
-    ];
-    // Checked below against addresses read from the same run.
-    const OTHERS: &[&str] = &[
-        "callback",
-        "handler",
-        "stray",
-        "raw_slice",
-        "null_slice",
-        "data_ref",
-        "raw_str",
-        "raw_mut_str",
     ];
     let _ = transcript::ferros_bin();
     harness::run(|t| {
@@ -115,5 +118,26 @@ fn print_shows_unions_function_symbols_raw_slices_and_iterators()
             "raw_str: {raw_str}"
         );
         assert_eq!(rendered("raw_mut_str"), format!("*mut str = 0x{str_address} (len: 8)"));
+        assert_c_function_pointers(&rendered("c_function"), &rendered("c_stray"));
     });
+}
+
+/// A C library function has no DWARF: its symbol table names a pointer to its entry,
+/// and not one four bytes past it, inside the function (#419).
+fn assert_c_function_pointers(c_function: &str, c_stray: &str)
+{
+    let (address, symbol) = c_function
+        .split_once(" = ")
+        .and_then(|(_, value)| value.split_once(' '))
+        .unwrap_or_else(|| panic!("c_function: {c_function}"));
+    assert_eq!(symbol, "<dispatch_get_specific>", "c_function: {c_function}");
+    let entry = u64::from_str_radix(address.trim_start_matches("0x"), 16).expect("hex address");
+    assert_eq!(
+        c_stray,
+        format!(
+            "ferros_fixture_values_misc::CCallback = ferros_fixture_values_misc::CCallback {{ raw: {}, call: {:#x} }}",
+            entry + 4,
+            entry + 4
+        )
+    );
 }

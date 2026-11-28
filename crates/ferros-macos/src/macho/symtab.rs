@@ -345,6 +345,16 @@ impl SymbolTable
         }
         Some(strx)
     }
+
+    /// The string table index of the symbol at exactly `address`, the entry of the function
+    /// it names. Only symbols in executable sections are indexed ([`SymtabLayout::parse_symbols`]),
+    /// so a data symbol never matches.
+    pub(crate) fn entry(&self, address: Address) -> Option<u32>
+    {
+        let address = address.value();
+        let index = self.symbols.binary_search_by_key(&address, |&(start, _)| start).ok()?;
+        Some(self.symbols[index].1)
+    }
 }
 
 /// The function name of a raw symbol table name: Mach-O prefixes C-level names with an
@@ -499,6 +509,14 @@ mod tests
         assert_eq!(at(0x1_0000_1ffc), Some(2));
         assert_eq!(at(0x1_0000_2000), None, "data");
         assert_eq!(at(0x1_0000_0ffc), None, "before the section");
+
+        // Only an exact function entry has an entry symbol.
+        let entry = |address| table.entry(Address::new(address));
+        assert_eq!(entry(0x1_0000_1000), Some(1));
+        assert_eq!(entry(0x1_0000_1100), Some(2));
+        assert_eq!(entry(0x1_0000_1004), None, "inside a function");
+        assert_eq!(entry(0x1_0000_1180), None, "a stab entry");
+        assert_eq!(entry(0x1_0000_2000), None, "data");
     }
 
     #[test]

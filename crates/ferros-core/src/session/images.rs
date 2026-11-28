@@ -178,6 +178,7 @@ impl Session
         self.format = format;
         self.loaded_images.clear();
         self.exit_images.clear();
+        self.entry_names.clear();
         self
     }
 
@@ -310,6 +311,7 @@ impl Session
             }
         }
         let mut previous = std::mem::take(&mut self.loaded_images);
+        let mut changed = false;
         for image in images {
             let descriptor = ImageDescriptor {
                 path: image.path,
@@ -335,6 +337,7 @@ impl Session
                 self.forget_contradicted_file(&mut kept);
                 self.loaded_images.push(kept);
             } else {
+                changed = true;
                 let MappedImage { mapping, slice } = self.map_loaded_image(descriptor.load_address, build_id);
                 self.loaded_images.push(SessionImage {
                     descriptor,
@@ -349,6 +352,10 @@ impl Session
                     symtab_failed_in_request: None,
                 });
             }
+        }
+        if changed || !previous.is_empty() {
+            // A name, or the lack of one, may come from an image that is gone or new.
+            self.entry_names.clear();
         }
         self.symbols
             .retain_ids(&self.loaded_images.iter().filter_map(|image| image.symbols).collect());

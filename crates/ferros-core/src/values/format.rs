@@ -90,6 +90,7 @@ pub struct ValueFormatter<'a>
     read: &'a mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
     printers: &'a [&'a dyn PrettyPrinter],
     image_lookup: Option<&'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>>,
+    entry_symbol: Option<&'a mut dyn FnMut(Address) -> Option<String>>,
     // Printers can follow links and render a value already on the stack.
     active: HashSet<(*const TypeTable, TypeId, Address)>,
     depth: usize,
@@ -114,6 +115,7 @@ impl<'a> ValueFormatter<'a>
             read,
             printers: PRINTERS,
             image_lookup: None,
+            entry_symbol: None,
             active: HashSet::new(),
             depth: 0,
             remaining: MAX_NODES,
@@ -124,6 +126,15 @@ impl<'a> ValueFormatter<'a>
     pub(crate) fn with_image_lookup(mut self, lookup: &'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>) -> Self
     {
         self.image_lookup = Some(lookup);
+        self
+    }
+
+    /// Name a function pointer's target from symbol tables when no debug information
+    /// names it. `lookup` returns the name of the function whose first instruction is the
+    /// address, and nothing for an address inside a function.
+    pub(crate) fn with_entry_symbols(mut self, lookup: &'a mut dyn FnMut(Address) -> Option<String>) -> Self
+    {
+        self.entry_symbol = Some(lookup);
         self
     }
 
@@ -469,14 +480,20 @@ impl ValueFormatter<'_>
             .is_some_and(|pointee| matches!(pointee.kind, TypeKind::Function(_)))
     }
 
-    /// The function whose entry is `address`, from the debug info of the image mapped there.
+    /// The function whose entry is `address`, from the debug info of the image mapped
+    /// there, or else from a symbol table (code without DWARF, such as a C library).
     fn function_name(&mut self, address: Address) -> Option<String>
     {
         if address == Address::ZERO {
             return None;
         }
-        let image = self.image_at(address)?;
-        image.function_name_at(address).map(str::to_owned)
+        if let Some(name) = self
+            .image_at(address)
+            .and_then(|image| image.function_name_at(address).map(str::to_owned))
+        {
+            return Some(name);
+        }
+        self.entry_symbol.as_mut()?(address)
     }
 }
 

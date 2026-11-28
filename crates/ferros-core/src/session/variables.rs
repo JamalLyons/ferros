@@ -166,8 +166,15 @@ impl Session
             let _ = session.load_symbols_for_address(address);
             session.symbols.image_for_address(address)
         };
-        let mut formatter =
-            ValueFormatter::new(types, image.endian(), options, &mut read).with_image_lookup(&mut image_lookup);
+        let mut entry_symbol = |address| {
+            let mut session = session.borrow_mut();
+            session.require_stopped().ok()?;
+            let name = session.symbol_table_entry_name(address)?;
+            Some(name.display_name().to_owned())
+        };
+        let mut formatter = ValueFormatter::new(types, image.endian(), options, &mut read)
+            .with_image_lookup(&mut image_lookup)
+            .with_entry_symbols(&mut entry_symbol);
         match storage {
             Storage::Bytes(bytes, address) => formatter.format(ValueView {
                 ty,

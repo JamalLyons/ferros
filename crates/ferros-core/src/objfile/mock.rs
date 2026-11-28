@@ -235,6 +235,13 @@ impl SymbolIndex for MockIndex
         Some(SymbolKey(index as u64))
     }
 
+    fn lookup_entry(&self, address: Address) -> Option<SymbolKey>
+    {
+        let key = self.lookup(address)?;
+        let index = usize::try_from(key.0).ok()?;
+        (self.symbols.get(index)?.0 == address.value()).then_some(key)
+    }
+
     fn symbols(&self) -> Box<dyn Iterator<Item = (Address, SymbolKey)> + '_>
     {
         Box::new(
@@ -646,6 +653,11 @@ mod tests
         assert_eq!(name(&mut memory, 0x1050).as_deref(), Some("bar"));
         assert_eq!(name(&mut memory, 0x1100), None);
         assert_eq!(index.symbols().count(), 2);
+        let entry = |address| index.lookup_entry(Address::new(address));
+        assert_eq!(entry(0x1040), index.lookup(Address::new(0x1040)));
+        assert!(entry(0x1000).is_some());
+        assert_eq!(entry(0x1044), None, "inside bar");
+        assert_eq!(entry(0x1100), None, "past the code");
         assert!(matches!(
             MockObjectFormat.probe_unlisted_image(&mut memory, Address::new(0x800)),
             ImageProbe::Image(_)

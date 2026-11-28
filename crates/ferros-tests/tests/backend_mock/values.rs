@@ -2,7 +2,7 @@
 
 use std::io::Write as _;
 
-use ferros_core::backend::mock::{MockBackend, arm64_registers};
+use ferros_core::backend::mock::{MockBackend, MockCall, arm64_registers};
 use ferros_core::backend::{ImageRole, LaunchSpec, LoadedImage};
 use ferros_core::error::DebuggerError;
 use ferros_core::objfile::mock::{MockObjectFile, MockObjectFormat, MockObjectImage};
@@ -26,6 +26,17 @@ const PC: u64 = BASE + 0x108;
 const IMAGE_SIZE: u64 = 0x1000;
 
 fn session(dwarf: &mut DwarfUnit, omit: Option<SectionId>) -> (Session, RemoveOnDrop)
+{
+    let (session, _, cleanup) = session_with(dwarf, omit, |backend| backend);
+    (session, cleanup)
+}
+
+/// [`session`], with `extra` adding regions and images to the backend, which is returned too.
+fn session_with(
+    dwarf: &mut DwarfUnit,
+    omit: Option<SectionId>,
+    extra: impl FnOnce(MockBackend) -> MockBackend,
+) -> (Session, MockBackend, RemoveOnDrop)
 {
     let mut sections = Sections::new(EndianVec::new(LittleEndian));
     dwarf.write(&mut sections).expect("write DWARF");
@@ -57,9 +68,10 @@ fn session(dwarf: &mut DwarfUnit, omit: Option<SectionId>) -> (Session, RemoveOn
             build_id: BuildIdentity::Unknown,
             role: ImageRole::MainExecutable,
         });
-    let mut session = Session::new(Box::new(backend), MockObjectFormat::shared());
+    let backend = extra(backend);
+    let mut session = Session::new(Box::new(backend.clone()), MockObjectFormat::shared());
     session.launch(&LaunchSpec::new("/bin/prog")).expect("mock launch");
-    (session, cleanup)
+    (session, backend, cleanup)
 }
 
 fn dwarf_function(name: Option<&str>) -> (DwarfUnit, UnitEntryId, UnitEntryId)
@@ -249,6 +261,81 @@ fn trait_objects_distinguish_exact_inferred_and_unknown_vtable_types()
     assert_rendered(table, "Reading { count: 42 }");
     assert_rendered(inferred, "Reading { count: 42 } (type inferred from vtable methods)");
     assert_rendered(unknown, &addresses);
+}
+
+#[test]
+fn function_pointers_without_dwarf_name_only_an_exact_symbol_table_entry()
+{
+    // Issue #419: a function pointer into code with only a symbol table is named from it,
+    // but only at the function's first instruction. The library image has no DWARF and a
+    // table naming `c_entry` and `c_other`; a second listed image has no readable header.
+    const LIBRARY: u64 = 0x2_0000_0000;
+    const UNREADABLE: u64 = 0x5_0000_0000;
+    const OUTSIDE: u64 = 0x9_0000_0000;
+    const POINTERS: &[(&str, u64)] = &[
+        ("entry", LIBRARY + 0x1000),
+        ("inside", LIBRARY + 0x1004),
+        ("other", LIBRARY + 0x1040),
+        ("outside", OUTSIDE),
+        ("outside_too", OUTSIDE + 0x40),
+        ("with_dwarf", BASE + 0x100),
+    ];
+    let (mut dwarf, function, _) = dwarf_function(Some("function"));
+    let unit = &mut dwarf.unit;
+    let signature = unit.add(unit.root(), gimli::DW_TAG_subroutine_type);
+    let pointer = pointer_to(unit, "fn()", signature);
+    for (index, &(name, _)) in (0_u64..).zip(POINTERS) {
+        static_local(unit, function, name, pointer, Address::new(BASE + 0x300 + 8 * index));
+    }
+
+    let library = MockObjectImage::new(LIBRARY + 0x1000..LIBRARY + 0x1100, LIBRARY + 0x2000, LIBRARY + 0x3000)
+        .with_symbol(LIBRARY + 0x1000, "c_entry")
+        .with_symbol(LIBRARY + 0x1040, "c_other");
+    let mut bytes = library.header_bytes();
+    bytes.resize(0x2000, 0x1F);
+    bytes.extend(library.table_bytes());
+    bytes.resize(0x3000, 0);
+    bytes.extend(library.name_bytes());
+    let listed = |path: &str, address| LoadedImage {
+        path: format!("/nonexistent/{path}").into(),
+        load_address: Address::new(address),
+        build_id: BuildIdentity::Unknown,
+        role: ImageRole::Library,
+    };
+    let (mut session, mock, _image) = session_with(&mut dwarf, None, |backend| {
+        backend
+            .with_region(Address::new(LIBRARY), "r-x", bytes)
+            .with_image(listed("ferros-mock-c-library", LIBRARY))
+            .with_image(listed("ferros-mock-unreadable", UNREADABLE))
+    });
+    let values = words(&POINTERS.iter().map(|&(_, address)| address).collect::<Vec<_>>());
+    session
+        .write_memory(Address::new(BASE + 0x300), &values)
+        .expect("store pointers");
+    let vars = session.selected_frame_variables().expect("read locals");
+    let mut print = |name: &str| {
+        let var = vars.iter().find(|var| var.name == name).expect(name);
+        session.format_variable(var, FormatOptions::default()).1
+    };
+    assert_eq!(print("entry"), format!("{:#x} <c_entry>", LIBRARY + 0x1000));
+    assert_eq!(print("inside"), format!("{:#x}", LIBRARY + 0x1004), "not an entry");
+    assert_eq!(print("other"), format!("{:#x} <c_other>", LIBRARY + 0x1040));
+    assert_eq!(print("with_dwarf"), format!("{:#x} <function>", BASE + 0x100));
+    assert_eq!(print("outside"), format!("{OUTSIDE:#x}"));
+
+    // Printing again in the same stop reads nothing: not the unreadable header, nor the
+    // table or names of the library. Nor does another address outside every image.
+    let _ = mock.take_calls();
+    assert_eq!(print("outside"), format!("{OUTSIDE:#x}"));
+    assert_eq!(print("outside_too"), format!("{:#x}", OUTSIDE + 0x40));
+    assert_eq!(print("inside"), format!("{:#x}", LIBRARY + 0x1004));
+    assert_eq!(print("entry"), format!("{:#x} <c_entry>", LIBRARY + 0x1000));
+    let reads: Vec<_> = mock
+        .take_calls()
+        .into_iter()
+        .filter(|call| matches!(call, MockCall::ReadMemory { .. }))
+        .collect();
+    assert!(reads.is_empty(), "cached lookups read again: {reads:?}");
 }
 
 #[test]

@@ -63,8 +63,9 @@ impl ReplCommand for Print
          active variant (name.0 for a tuple field)\n  name[n]     an element of an array, slice or Vec\n  \
          *name       the value a reference, Box or raw pointer points to\n  (path)      grouping, as in \
          (*name).field\n\nname may also be a static of the main executable, by its qualified name \
-         (crate::module::NAME) or a trailing part of it (module::NAME, NAME). A local of the same name comes \
-         first. The output names the static, as in 'LIMIT (static my_crate::config::LIMIT): u16 = 512', and a \
+         (crate::module::NAME) or a trailing part of it (module::NAME, NAME); a static in an impl method is \
+         named after its impl, as globals lists it (<crate::Type>::f::NAME, \
+         <crate::Type as crate::Trait>::f::NAME). A local of the same name comes first. The output names the static, as in 'LIMIT (static my_crate::config::LIMIT): u16 = 512', and a \
          name several statics share is an error listing each with its address. Field access and indexing look \
          through references and boxes. Function calls and operators are not supported."
     }

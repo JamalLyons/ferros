@@ -1,6 +1,7 @@
 //! Statics for `print` and `globals`: an atomic the program changes, a `&str`, a
 //! `static mut` array, a static in a module, one inside a function, two that share a name
-//! in separate blocks of one function, one a local shadows, and a thread-local.
+//! in separate blocks of one function, one a local shadows, a thread-local, and a
+//! `static X` in each of four impls' `fn f` (two inherent, two trait impls, one generic).
 //!
 //! The workspace forbids `unsafe`, so the `static mut` keeps its initial value: taking
 //! its address with `&raw const` is safe and keeps it in the binary.
@@ -52,6 +53,54 @@ fn blocks() -> u32
     first + second
 }
 
+struct Meters;
+struct Feet;
+
+trait Unit
+{
+    fn f(&self) -> u32;
+}
+
+impl Meters
+{
+    #[inline(never)]
+    fn f() -> u32
+    {
+        static X: u32 = 100;
+        *black_box(&X)
+    }
+}
+
+impl Feet
+{
+    #[inline(never)]
+    fn f() -> u32
+    {
+        static X: u32 = 200;
+        *black_box(&X)
+    }
+}
+
+impl Unit for Meters
+{
+    #[inline(never)]
+    fn f(&self) -> u32
+    {
+        static X: u32 = 300;
+        *black_box(&X)
+    }
+}
+
+impl<T> Unit for Vec<T>
+{
+    #[inline(never)]
+    fn f(&self) -> u32
+    {
+        static X: u32 = 400;
+        *black_box(&X)
+    }
+}
+
 fn main()
 {
     let depth = black_box(5_i32);
@@ -60,6 +109,7 @@ fn main()
     println!("COUNTER at {:p}", &raw const COUNTER);
     PER_THREAD.with(|value| value.set(10));
     black_box((&NAME, &raw const TABLE, config::LIMIT, calls(), blocks(), &stack::depth));
+    black_box(Meters::f() + Feet::f() + Meters.f() + Vec::<u8>::new().f());
     black_box(&COUNTER); // BREAK: inspect
     black_box((PER_THREAD.with(Cell::get), depth));
 }

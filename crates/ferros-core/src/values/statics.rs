@@ -7,6 +7,14 @@
 //! carry their own `DW_AT_name`. Its name is qualified by the namespaces, types and
 //! functions that enclose it, joined with `::`, such as `my_crate::config::LIMIT`.
 //!
+//! A static inside an impl method is named by its demangled `DW_AT_linkage_name` instead,
+//! because the enclosing namespace is only `{impl#N}`: `<my_crate::Meters>::f::X` in an
+//! inherent impl, `<my_crate::Meters as my_crate::Unit>::f::X` in a trait impl. The
+//! qualifier tells apart impls that each have an `f::X`. Without a v0-mangled (`_R`)
+//! linkage name that demangles, the namespace name stays (`my_crate::{impl#0}::f::X`):
+//! legacy demangling gives forms such as `my_crate::Foo<u8>::f::X` that a path cannot
+//! name.
+//!
 //! Several statics can share a qualified name: two `static S` in separate blocks of one
 //! function, or the per-call-site statics a logging macro expands to. Each is its own entry,
 //! told apart by address.
@@ -149,12 +157,19 @@ impl StaticIndex
                 )
                 && let Some(file_address) = static_address(dwarf, unit, entry)
             {
-                let mut qualified: String = scopes.iter().flatten().fold(String::new(), |mut path, scope| {
-                    path.push_str(scope);
-                    path.push_str("::");
-                    path
-                });
-                qualified.push_str(name);
+                let in_impl = scopes.iter().flatten().any(|scope| scope.starts_with("{impl#"));
+                let qualified = in_impl
+                    .then(|| demangled_linkage_name(dwarf, unit, entry))
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        let mut path: String = scopes.iter().flatten().fold(String::new(), |mut path, scope| {
+                            path.push_str(scope);
+                            path.push_str("::");
+                            path
+                        });
+                        path.push_str(name);
+                        path
+                    });
                 self.entries.push(StaticEntry {
                     name: qualified,
                     die: offset,
@@ -268,6 +283,19 @@ fn static_address(dwarf: &OwnedDwarf, unit: &Unit, entry: &Entry<'_, '_>) -> Opt
         _ => return None,
     };
     operations.next().ok()?.is_none().then_some(address)
+}
+
+/// The entry's `DW_AT_linkage_name` demangled as a Rust symbol without its hash, such as
+/// `<my_crate::Meters as my_crate::Unit>::f::X`; `None` without a v0-mangled one that
+/// demangles.
+fn demangled_linkage_name(dwarf: &OwnedDwarf, unit: &Unit, entry: &Entry<'_, '_>) -> Option<String>
+{
+    let value = entry.attr_value(constants::DW_AT_linkage_name).ok()??;
+    let raw = dwarf.attr_string(unit, value).ok()?.to_string_lossy().ok()?.into_owned();
+    if !raw.starts_with("_R") {
+        return None;
+    }
+    rustc_demangle::try_demangle(&raw).ok().map(|name| format!("{name:#}"))
 }
 
 /// The entry's own `DW_AT_name`.
@@ -406,6 +434,68 @@ mod tests
             .map(|entry| (entry.name.as_str(), entry.file_address))
             .collect();
         assert_eq!(found, [("blocks::S", 0x1000), ("blocks::S", 0x1008)]);
+    }
+
+    #[test]
+    fn names_impl_statics_by_their_demangled_linkage_name()
+    {
+        let mut dwarf = DwarfUnit::new(encoding(4));
+        let root = dwarf.unit.root();
+        let krate = named(&mut dwarf, root, gimli::DW_TAG_namespace, "t");
+        // rustc's v0 symbols for `static X` in `impl Meters { fn f }`, in
+        // `impl Unit for Meters { fn f }`, and in an impl without a linkage name.
+        for (impl_name, linkage, file_address) in [
+            ("{impl#0}", Some("_RNvNvMCs79v3tPS8kvC_1tNtB4_6Meters1f1X"), 0x1000),
+            (
+                "{impl#1}",
+                Some("_RNvNvXs0_Cs79v3tPS8kvC_1tNtB7_6MetersNtB7_4Unit1f1X"),
+                0x1008,
+            ),
+            ("{impl#2}", None, 0x1010),
+            ("{impl#3}", Some("_ZN1t6Meters1f1X17h0123456789abcdefE"), 0x1020),
+        ] {
+            let scope = named(&mut dwarf, krate, gimli::DW_TAG_namespace, impl_name);
+            let function = named(&mut dwarf, scope, gimli::DW_TAG_namespace, "f");
+            let id = located(&mut dwarf, function, "X", address(file_address));
+            if let Some(linkage) = linkage {
+                dwarf
+                    .unit
+                    .get_mut(id)
+                    .set(gimli::DW_AT_linkage_name, WriteAttr::String(linkage.as_bytes().to_vec()));
+            }
+        }
+        // Outside an impl the scope names stay, even with a linkage name.
+        let id = located(&mut dwarf, krate, "Y", address(0x1018));
+        dwarf.unit.get_mut(id).set(
+            gimli::DW_AT_linkage_name,
+            WriteAttr::String(b"_RNvNvMCs79v3tPS8kvC_1tNtB4_6Meters1f1X".to_vec()),
+        );
+        let index = StaticIndex::build(&synthetic_dwarf(dwarf, RunTimeEndian::Little));
+        let found: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.file_address))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("<t::Meters as t::Unit>::f::X", 0x1008),
+                ("<t::Meters>::f::X", 0x1000),
+                ("t::Y", 0x1018),
+                ("t::{impl#2}::f::X", 0x1010),
+                ("t::{impl#3}::f::X", 0x1020),
+            ]
+        );
+        let names = |query| {
+            index
+                .lookup(query)
+                .into_iter()
+                .map(|entry| entry.file_address)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("<t::Meters>::f::X"), [0x1000]);
+        assert_eq!(names("<t::Meters as t::Unit>::f::X"), [0x1008]);
+        assert_eq!(names("f::X"), [0x1008, 0x1000, 0x1010, 0x1020]);
     }
 
     #[test]

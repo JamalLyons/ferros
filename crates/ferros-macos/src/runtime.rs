@@ -60,13 +60,18 @@
 //! | 0      | 8    | `sig`: `MUTX` or `MUTZ` once initialized, `0x32AAABA?` for a static initializer |
 //! | 12     | 4    | `mtxopts`: bit 14 `ulock`, bit 11 `misalign` |
 //! | 24     | 24   | `psynch` (`m_tid[2]`, `m_seq[2]`, `m_mis[2]`) or `ulock` (`uval`) |
+//! | 48     | 8    | `_reserved[0..2]`: `~address`, to detect a copied mutex |
 //!
 //! A psynch mutex holds its owner's 64-bit thread id at `m_tid` rounded up to 8 bytes
-//! (`MUTEX_GETTID_ADDR`): 0 when unlocked, the owner's id or `PTHREAD_MTX_TID_SWITCHING`
-//! (all ones, a handoff to a waiter) when locked. A ulock mutex holds 0 in `uval` when
-//! unlocked and the owner's thread port name (with a waiters bit) when locked. Checked on
-//! this machine: an unlocked mutex reads `mtxopts` `0x20a0` (psynch) and `m_tid` 0; one
-//! held by another thread reads that thread's `pthread_threadid_np` id.
+//! (`MUTEX_GETTID_ADDR`) and its sequence words at `m_seq` rounded up the same way
+//! (`MUTEX_GETSEQ_ADDR`). Locking sets the lock bit (`PTH_RWL_EBIT`, 0x2) in the first
+//! sequence word (`lgenval`) and then stores the owner's id, and unlocking clears the id
+//! before the bit, so the mutex is unlocked only when both are clear. The id is otherwise
+//! the owner's, or `PTHREAD_MTX_TID_SWITCHING` (all ones, a handoff to a waiter). A ulock
+//! mutex holds 0 in `uval` when unlocked and the owner's thread port name (with a
+//! waiters bit) when locked. Checked on this machine: an unlocked mutex reads `mtxopts`
+//! `0x20a0` (psynch), `m_tid` 0 and `lgenval` 0; one held by another thread reads that
+//! thread's `pthread_threadid_np` id and `lgenval` 2; both hold `~address` at 48.
 //!
 //! ## References
 //!
@@ -170,36 +175,58 @@ impl TargetRuntime for MacOSRuntime
 
 /// libpthread's 64-bit `struct pthread_mutex_s` (see
 /// [System mutexes](self#system-mutexes)).
-pub mod pthread_mutex
+mod pthread_mutex
 {
     use ferros_core::runtime::LockState;
 
     /// `sizeof(pthread_mutex_t)`.
-    pub const SIZE: usize = 64;
+    pub(super) const SIZE: usize = 64;
     /// `mtxopts`.
-    pub const OPTIONS: usize = 12;
-    /// The `psynch` and `ulock` union.
-    pub const LOCK_WORDS: usize = 24;
+    const OPTIONS: usize = 12;
+    /// `psynch.m_tid`, and `ulock.uval` in the same union.
+    const TID: usize = 24;
+    /// `psynch.m_seq`.
+    const SEQ: usize = 32;
+    /// `_reserved[0..2]`: `~address`.
+    const GUARD: usize = 48;
     /// `mtxopts.options.ulock`.
-    pub const OPTION_ULOCK: u32 = 1 << 14;
+    pub(super) const OPTION_ULOCK: u32 = 1 << 14;
+    /// `PTH_RWL_EBIT` in `lgenval`, the first sequence word: the mutex is held.
+    const LOCK_BIT: u32 = 0x2;
     /// `_PTHREAD_MUTEX_SIG_MASK` and `_PTHREAD_MUTEX_SIG_CMP`: `MUTX` or `MUTZ`.
-    pub const SIG_MASK: u32 = 0xffff_fffd;
+    const SIG_MASK: u32 = 0xffff_fffd;
     /// See [`SIG_MASK`].
-    pub const SIG_CMP: u32 = 0x4d55_5458;
+    const SIG_CMP: u32 = 0x4d55_5458;
     /// `_PTHREAD_MUTEX_SIG_init_MASK` and `_PTHREAD_MUTEX_SIG_init_CMP`: a static
     /// initializer the first lock has not yet replaced.
-    pub const SIG_INIT_MASK: u32 = 0xffff_fff0;
+    const SIG_INIT_MASK: u32 = 0xffff_fff0;
     /// See [`SIG_INIT_MASK`].
-    pub const SIG_INIT_CMP: u32 = 0x32aa_aba0;
+    const SIG_INIT_CMP: u32 = 0x32aa_aba0;
 
     fn u32_at(bytes: &[u8], offset: usize) -> Option<u32>
     {
-        Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn u64_at(bytes: &[u8], offset: usize) -> Option<u64>
+    {
+        Some(u64::from_le_bytes(
+            bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+        ))
+    }
+
+    /// The offset of `field` rounded up to 8 bytes in a mutex at `address`
+    /// (`MUTEX_GETTID_ADDR`, `MUTEX_GETSEQ_ADDR`).
+    fn aligned(address: u64, field: usize) -> Option<usize>
+    {
+        let at = address.checked_add(field as u64)?;
+        usize::try_from(at.checked_add(7)? / 8 * 8 - address).ok()
     }
 
     /// Whether the mutex at `address`, whose bytes are `bytes`, is held.
-    #[must_use]
-    pub fn state(address: u64, bytes: &[u8]) -> Option<LockState>
+    pub(super) fn state(address: u64, bytes: &[u8]) -> Option<LockState>
     {
         if bytes.len() != SIZE || u32_at(bytes, 4)? != 0 {
             return None;
@@ -208,18 +235,18 @@ pub mod pthread_mutex
         if sig & SIG_INIT_MASK == SIG_INIT_CMP {
             return Some(LockState::Unlocked);
         }
-        if sig & SIG_MASK != SIG_CMP {
+        // Memory that is not this initialized mutex: another value, or a copy.
+        if sig & SIG_MASK != SIG_CMP || u64_at(bytes, GUARD)? != !address {
             return None;
         }
-        let owner = if u32_at(bytes, OPTIONS)? & OPTION_ULOCK != 0 {
-            u64::from(u32_at(bytes, LOCK_WORDS)?)
+        let unlocked = if u32_at(bytes, OPTIONS)? & OPTION_ULOCK != 0 {
+            u32_at(bytes, TID)? == 0
         } else {
-            // `MUTEX_GETTID_ADDR`: `m_tid` rounded up to 8 bytes, in the 24-byte union.
-            let field = address.checked_add(LOCK_WORDS as u64)?;
-            let tid = usize::try_from((field.checked_add(7)? & !7) - address).ok()?;
-            u64::from(u32_at(bytes, tid)?) | (u64::from(u32_at(bytes, tid + 4)?) << 32)
+            let tid = u64_at(bytes, aligned(address, TID)?)?;
+            let lgenval = u32_at(bytes, aligned(address, SEQ)?)?;
+            tid == 0 && lgenval & LOCK_BIT == 0
         };
-        Some(if owner == 0 { LockState::Unlocked } else { LockState::Locked })
+        Some(if unlocked { LockState::Unlocked } else { LockState::Locked })
     }
 }
 
@@ -369,49 +396,49 @@ mod tests
         ));
     }
 
-    /// A `pthread_mutex_t` read from a stopped Rust process: `MUTZ`, psynch options, and
-    /// `owner` in `m_tid`.
-    fn psynch_mutex(owner: u64) -> Vec<u8>
+    /// A `pthread_mutex_t` at `address` as a stopped Rust process holds it: `MUTZ`, psynch
+    /// options, `tid` in `m_tid` and `lgenval` in `m_seq` (both at offsets rounded up to 8
+    /// bytes), and the `~address` guard.
+    fn psynch_mutex(address: u64, tid: u64, lgenval: u32) -> Vec<u8>
     {
         let mut bytes = vec![0_u8; pthread_mutex::SIZE];
         bytes[..4].copy_from_slice(b"ZTUM");
         bytes[12..16].copy_from_slice(&0x20a0_u32.to_le_bytes());
         bytes[20..24].copy_from_slice(b"ZTUM");
-        bytes[24..32].copy_from_slice(&owner.to_le_bytes());
-        bytes[32..36].copy_from_slice(&2_u32.to_le_bytes());
+        let skew = (address.next_multiple_of(8) - address) as usize;
+        bytes[24 + skew..32 + skew].copy_from_slice(&tid.to_le_bytes());
+        bytes[32 + skew..36 + skew].copy_from_slice(&lgenval.to_le_bytes());
+        bytes[48..56].copy_from_slice(&(!address).to_le_bytes());
         bytes
     }
 
     #[test]
-    fn pthread_mutex_owner_decides_lock_state()
+    fn pthread_mutex_owner_and_lock_bit_decide_lock_state()
     {
         let runtime = MacOSRuntime;
-        let at = Address::new(0x1000);
-        assert_eq!(runtime.system_mutex_state(at, &psynch_mutex(0)), Some(LockState::Unlocked));
-        assert_eq!(
-            runtime.system_mutex_state(at, &psynch_mutex(0xd1_44ac)),
-            Some(LockState::Locked)
-        );
-        assert_eq!(
-            runtime.system_mutex_state(at, &psynch_mutex(u64::MAX)),
-            Some(LockState::Locked)
-        );
-        // A misaligned mutex keeps its owner at the next 8-byte boundary.
-        let mut misaligned = psynch_mutex(0);
-        misaligned[28..36].copy_from_slice(&7_u64.to_le_bytes());
-        assert_eq!(
-            runtime.system_mutex_state(Address::new(0x1004), &misaligned),
-            Some(LockState::Locked)
-        );
-        let mut ulock = psynch_mutex(0);
+        let state = |address: u64, bytes: &[u8]| runtime.system_mutex_state(Address::new(address), bytes);
+        assert_eq!(state(0x1000, &psynch_mutex(0x1000, 0, 0)), Some(LockState::Unlocked));
+        assert_eq!(state(0x1000, &psynch_mutex(0x1000, 0xd1_44ac, 2)), Some(LockState::Locked));
+        // A handoff to a waiter.
+        assert_eq!(state(0x1000, &psynch_mutex(0x1000, u64::MAX, 2)), Some(LockState::Locked));
+        // Locking sets the bit before it stores the owner; unlocking clears the owner first.
+        assert_eq!(state(0x1000, &psynch_mutex(0x1000, 0, 2)), Some(LockState::Locked));
+        // A misaligned mutex keeps its owner and sequence words at the next 8-byte boundary.
+        assert_eq!(state(0x1004, &psynch_mutex(0x1004, 7, 2)), Some(LockState::Locked));
+        assert_eq!(state(0x1004, &psynch_mutex(0x1004, 0, 2)), Some(LockState::Locked));
+        assert_eq!(state(0x1004, &psynch_mutex(0x1004, 0, 0)), Some(LockState::Unlocked));
+        let mut ulock = psynch_mutex(0x1000, 0, 0);
         ulock[12..16].copy_from_slice(&(0x20a0 | pthread_mutex::OPTION_ULOCK).to_le_bytes());
+        assert_eq!(state(0x1000, &ulock), Some(LockState::Unlocked));
         ulock[24..28].copy_from_slice(&0x1303_u32.to_le_bytes());
-        assert_eq!(runtime.system_mutex_state(at, &ulock), Some(LockState::Locked));
+        assert_eq!(state(0x1000, &ulock), Some(LockState::Locked));
         let mut initializer = vec![0_u8; pthread_mutex::SIZE];
         initializer[..4].copy_from_slice(&0x32aa_aba7_u32.to_le_bytes());
-        assert_eq!(runtime.system_mutex_state(at, &initializer), Some(LockState::Unlocked));
-        assert_eq!(runtime.system_mutex_state(at, &[0; pthread_mutex::SIZE]), None);
-        assert_eq!(runtime.system_mutex_state(at, &psynch_mutex(0)[..32]), None);
+        assert_eq!(state(0x1000, &initializer), Some(LockState::Unlocked));
+        // A copy elsewhere keeps the original's guard.
+        assert_eq!(state(0x2000, &psynch_mutex(0x1000, 0, 0)), None);
+        assert_eq!(state(0x1000, &[0; pthread_mutex::SIZE]), None);
+        assert_eq!(state(0x1000, &psynch_mutex(0x1000, 0, 0)[..32]), None);
     }
 
     #[test]

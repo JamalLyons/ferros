@@ -74,6 +74,7 @@ pub trait TargetRuntime: Send + Sync
 
 /// Whether a lock is held, as [`TargetRuntime::system_mutex_state`] reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LockState
 {
     /// No thread holds the lock.

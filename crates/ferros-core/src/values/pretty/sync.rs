@@ -12,7 +12,7 @@
 
 use gimli::RunTimeEndian;
 
-use super::{PrettyPrinter, field, raw_layout, word};
+use super::{PrettyPrinter, field, raw_layout, variant_for_tag, variant_payload, word};
 use crate::runtime::{LockState, TargetRuntime};
 use crate::types::Address;
 use crate::values::format::{ValueFormatter, ValueView, unavailable, unsigned};
@@ -274,16 +274,20 @@ fn option_payload<'a>(value: ValueView<'a>, types: &TypeTable, endian: RunTimeEn
     let TypeKind::Enum(layout) = &ty.kind else {
         return None;
     };
-    let discriminant = value.member(layout.discriminant.as_ref()?, types)?;
-    let variant = layout.variant_for(unsigned(discriminant.bytes, endian)?)?;
+    let tag = layout
+        .discriminant
+        .as_ref()
+        .and_then(|discriminant| value.member(discriminant, types))
+        .map(|tag| tag.bytes);
+    let variant = variant_for_tag(layout, tag, endian).ok()?;
     match variant.name.as_deref()? {
         "None" => Some(None),
         "Some" => {
-            let [member] = variant.members.as_slice() else {
+            let payload = variant_payload(variant, ty.name.as_deref(), types)?;
+            let [inner] = payload.fields() else {
                 return None;
             };
-            let payload = value.member(member, types)?;
-            Some(Some(field(payload, "__0", types)?))
+            Some(Some(value.member(payload.member, types)?.member(inner, types)?))
         }
         _ => None,
     }
@@ -325,11 +329,16 @@ impl PrettyPrinter for LockPrinter<'_>
             return raw_layout(value, formatter);
         };
         let poisoned = match field(value, "poison", types) {
-            // A lock without a poison flag (the `nonpoison` locks) is never poisoned.
+            // A lock without a poison flag (the `nonpoison` locks), or with a flag that has
+            // no `failed` field (a standard library built to abort on panic), is never
+            // poisoned.
             None => false,
-            Some(flag) => match field(flag, "failed", types).and_then(|failed| atomic_bool(failed, types, endian)) {
-                Some(poisoned) => poisoned,
-                None => return raw_layout(value, formatter),
+            Some(flag) => match field(flag, "failed", types) {
+                None => false,
+                Some(failed) => match atomic_bool(failed, types, endian) {
+                    Some(poisoned) => poisoned,
+                    None => return raw_layout(value, formatter),
+                },
             },
         };
         let lock = if is_mutex {

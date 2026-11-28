@@ -208,7 +208,7 @@ impl Session
                 continue;
             }
             frame.symbol = self
-                .symbol_table_name(lookup)
+                .symbol_table_name(lookup, SymbolMatch::Containing)
                 .or_else(|| self.unlisted_symbol_table_name(&mut unlisted, lookup));
         }
     }
@@ -236,7 +236,7 @@ impl Session
         let alignment = self.format.unlisted_image_alignment()?;
         let request = self.symbol_request;
         if let Some(entry) = unlisted.images.iter_mut().find(|entry| entry.symbols.contains(address)) {
-            return name_in(self.backend.as_mut(), entry, address, request);
+            return name_in(self.backend.as_mut(), entry, address, SymbolMatch::Containing, request);
         }
         if unlisted.regions.is_none() {
             match self.backend.memory_regions() {
@@ -264,7 +264,7 @@ impl Session
         let symbols = self.search_image_header(&mut unlisted.probes, alignment, start, address)?;
         unlisted.images.push(SessionSymtab::new(symbols));
         let entry = unlisted.images.last_mut()?;
-        name_in(self.backend.as_mut(), entry, address, request)
+        name_in(self.backend.as_mut(), entry, address, SymbolMatch::Containing, request)
     }
 
     /// The symbol table of the nearest image header at or before `address`, on an
@@ -362,23 +362,51 @@ impl Session
 
 impl Session
 {
-    /// The name of the function containing `address` from the symbol table of the image
+    /// The name of the function whose first instruction is `address`, from the symbol
+    /// table of the listed image whose code contains it: the target of a function pointer
+    /// into code without DWARF. An address inside a function, past its entry, has no
+    /// name. Code in no listed image is not searched for.
+    ///
+    /// The answer, a name or none, is kept for the rest of the stop while the image list
+    /// stays the same ([`EntryNames`]). Each formatting request refreshes the image
+    /// list before consulting this cache. Header read failures are kept per image for
+    /// the rest of the stop, even when other images load or unload.
+    pub(super) fn symbol_table_entry_name(&mut self, address: Address) -> Option<SymbolName>
+    {
+        let generation = self.stop_generation;
+        if self.entry_names.generation != generation {
+            self.entry_names = EntryNames {
+                generation,
+                ..EntryNames::default()
+            };
+        }
+        if let Some(name) = self.entry_names.names.get(&address) {
+            return name.clone();
+        }
+        let name = self.symbol_table_name(address, SymbolMatch::Entry);
+        self.entry_names.names.insert(address, name.clone());
+        name
+    }
+
+    /// The name of the function `address` matches in the symbol table of the image
     /// mapped there, marked [`SymbolSource::SymbolTable`]. `None` when no image's code
-    /// contains it, or the table could not be read (logged, and tried again by the next
-    /// request).
+    /// contains it, no symbol matches, or the table could not be read (logged, and tried
+    /// again by the next request).
     ///
     /// The image is found by its mapped header rather than by [`ImageMapping`], which does
     /// not map shared-cache images; each image's table is read once and its names as
     /// needed.
     ///
     /// [`ImageMapping`]: crate::symbols::ImageMapping
-    fn symbol_table_name(&mut self, address: Address) -> Option<SymbolName>
+    fn symbol_table_name(&mut self, address: Address, matching: SymbolMatch) -> Option<SymbolName>
     {
         let request = self.symbol_request;
         for index in 0..self.loaded_images.len() {
             let image = &self.loaded_images[index];
-            if image.symtab.is_none() && image.symtab_failed_in_request != Some(request) {
-                let load_address = Address::new(image.descriptor_load_address());
+            let load_address = Address::new(image.descriptor_load_address());
+            let failed_in_stop =
+                matching == SymbolMatch::Entry && image.symtab_entry_failed_in_stop == Some(self.stop_generation);
+            if image.symtab.is_none() && image.symtab_failed_in_request != Some(request) && !failed_in_stop {
                 let symbols = self
                     .format
                     .mapped_symbols(&mut BackendTarget(self.backend.as_mut()), load_address);
@@ -391,6 +419,9 @@ impl Session
                     Err(detail) => {
                         tracing::debug!("no symbol table for the image at {load_address}: {detail}");
                         image.symtab_failed_in_request = Some(request);
+                        if matching == SymbolMatch::Entry {
+                            image.symtab_entry_failed_in_stop = Some(self.stop_generation);
+                        }
                     }
                 }
             }
@@ -399,10 +430,45 @@ impl Session
                 continue;
             };
             if entry.symbols.contains(address) {
-                return name_in(backend, entry, address, request);
+                return name_in(backend, entry, address, matching, request);
             }
         }
         None
+    }
+}
+
+/// Which symbol names an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolMatch
+{
+    /// The function containing it ([`SymbolIndex::lookup`]), for a pc.
+    ///
+    /// [`SymbolIndex::lookup`]: crate::objfile::SymbolIndex::lookup
+    Containing,
+    /// The function starting at it ([`SymbolIndex::lookup_entry`]), for a function pointer.
+    ///
+    /// [`SymbolIndex::lookup_entry`]: crate::objfile::SymbolIndex::lookup_entry
+    Entry,
+}
+
+/// Function pointer targets named from symbol tables in one stop
+/// ([`Session::symbol_table_entry_name`]), misses included. Dropped when the stop changes
+/// (`generation`) or the image list does
+/// ([`Session::load_images`](super::Session::load_images)).
+#[derive(Debug, Default)]
+pub(super) struct EntryNames
+{
+    /// The stop generation the names were read in.
+    generation: u64,
+    names: HashMap<Address, Option<SymbolName>>,
+}
+
+impl EntryNames
+{
+    /// Forget every name, for a changed image list.
+    pub(super) fn clear(&mut self)
+    {
+        self.names.clear();
     }
 }
 
@@ -436,10 +502,16 @@ impl TargetMemory for BackendTarget<'_>
     }
 }
 
-/// The symbol table name of `address` in the image of `entry`, reading the table and the
-/// name from the target as needed. Read failures are logged and not kept, except that
+/// The symbol table name `address` matches in the image of `entry`, reading the table and
+/// the name from the target as needed. Read failures are logged and not kept, except that
 /// the table is not read again within `request`.
-fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Address, request: u64) -> Option<SymbolName>
+fn name_in(
+    backend: &mut dyn Backend,
+    entry: &mut SessionSymtab,
+    address: Address,
+    matching: SymbolMatch,
+    request: u64,
+) -> Option<SymbolName>
 {
     let mut memory = BackendTarget(backend);
     if entry.index.is_none() {
@@ -459,7 +531,10 @@ fn name_in(backend: &mut dyn Backend, entry: &mut SessionSymtab, address: Addres
         }
     }
     let index = entry.index.as_ref()?;
-    let key = index.lookup(address)?;
+    let key = match matching {
+        SymbolMatch::Containing => index.lookup(address),
+        SymbolMatch::Entry => index.lookup_entry(address),
+    }?;
     let raw = if let Some(raw) = entry.names.get(&key) {
         raw.clone()
     } else {

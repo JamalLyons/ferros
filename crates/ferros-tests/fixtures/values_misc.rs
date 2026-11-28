@@ -1,5 +1,6 @@
 //! Unions, function pointers, raw slice and `str` pointers, and vector and array iterators
-//! for the value formatter integration test (issue #412).
+//! for the value formatter integration test (issue #412). `c_function` points at a C
+//! library function, which has a symbol but no DWARF (#419).
 #![expect(dead_code, reason = "the debugger reads these fields; the program does not")]
 
 use std::hint::black_box;
@@ -35,6 +36,18 @@ union Callback
     call: fn(u32, u32) -> u32,
 }
 
+// A C function in a system library: named from its symbol table only.
+#[cfg(target_os = "macos")]
+type CFunction = unsafe extern "C" fn(std::ptr::NonNull<std::ffi::c_void>) -> *mut std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+union CCallback
+{
+    raw: usize,
+    call: CFunction,
+}
+
 struct Handler
 {
     on_event: fn(u32, u32) -> u32,
@@ -68,8 +81,17 @@ fn main()
     let text = "hi there";
     let raw_str: *const str = text;
     let raw_mut_str: *mut str = std::ptr::from_ref::<str>(text).cast_mut();
+    #[cfg(target_os = "macos")]
+    let c_function: CFunction = dispatch2::dispatch_get_specific;
+    // Inside `dispatch_get_specific`, past its entry.
+    #[cfg(target_os = "macos")]
+    let c_stray = CCallback {
+        raw: c_function as usize + 4,
+    };
 
     black_box((&bits, &word, &stray, &handler, &raw_slice, &null_slice, &data_ref)); // BREAK: inspect
     black_box((callback(1, 2), &remaining, &first, &empty));
     black_box((&array_iter, &array_first, &uninit, &raw_str, &raw_mut_str));
+    #[cfg(target_os = "macos")]
+    black_box((&c_function, &c_stray));
 }

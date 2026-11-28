@@ -90,6 +90,7 @@ pub struct ValueFormatter<'a>
     read: &'a mut dyn FnMut(Address, usize) -> DebuggerResult<Vec<u8>>,
     printers: &'a [&'a dyn PrettyPrinter],
     image_lookup: Option<&'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>>,
+    function_symbol: Option<&'a mut dyn FnMut(Address) -> Option<String>>,
     // Printers can follow links and render a value already on the stack.
     active: HashSet<(*const TypeTable, TypeId, Address)>,
     depth: usize,
@@ -114,6 +115,7 @@ impl<'a> ValueFormatter<'a>
             read,
             printers: PRINTERS,
             image_lookup: None,
+            function_symbol: None,
             active: HashSet::new(),
             depth: 0,
             remaining: MAX_NODES,
@@ -124,6 +126,14 @@ impl<'a> ValueFormatter<'a>
     pub(crate) fn with_image_lookup(mut self, lookup: &'a mut dyn FnMut(Address) -> Option<Arc<BinaryImage>>) -> Self
     {
         self.image_lookup = Some(lookup);
+        self
+    }
+
+    /// Name a function pointer's target. `lookup` takes the raw pointer and names
+    /// the function starting at that address.
+    pub(crate) fn with_function_symbols(mut self, lookup: &'a mut dyn FnMut(Address) -> Option<String>) -> Self
+    {
+        self.function_symbol = Some(lookup);
         self
     }
 
@@ -469,14 +479,12 @@ impl ValueFormatter<'_>
             .is_some_and(|pointee| matches!(pointee.kind, TypeKind::Function(_)))
     }
 
-    /// The function whose entry is `address`, from the debug info of the image mapped there.
     fn function_name(&mut self, address: Address) -> Option<String>
     {
         if address == Address::ZERO {
             return None;
         }
-        let image = self.image_at(address)?;
-        image.function_name_at(address).map(str::to_owned)
+        self.function_symbol.as_mut()?(address)
     }
 }
 

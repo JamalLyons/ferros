@@ -31,6 +31,10 @@
 //! ranges and how to read the table. [`MappedSymbols::load`] reads the table itself into a
 //! [`SymbolIndex`], and [`SymbolIndex::read_name`] reads one name. Each step reads only
 //! what it needs, so the session can keep what was read and retry only what failed.
+//!
+//! A stack frame takes the name of the function containing its pc
+//! ([`SymbolIndex::lookup`]). A function pointer value is named only when it points at a
+//! function's first instruction ([`SymbolIndex::lookup_entry`]).
 
 mod contents;
 #[cfg(any(test, feature = "test-util"))]
@@ -223,6 +227,13 @@ pub trait SymbolIndex: Send + Sync
     /// does (outside the code, before the first symbol, or in a function the table does
     /// not name).
     fn lookup(&self, address: Address) -> Option<SymbolKey>;
+
+    /// The symbol whose function starts exactly at `address`, or `None` when no symbol
+    /// does. An address inside a function (`strlen + 4`) has no entry symbol even though
+    /// [`lookup`](Self::lookup) names the function containing it: a value that points
+    /// there is not a pointer to that function. Only code symbols count, as for
+    /// [`lookup`](Self::lookup).
+    fn lookup_entry(&self, address: Address) -> Option<SymbolKey>;
 
     /// Every code symbol, `(runtime address, key)`, sorted by address.
     fn symbols(&self) -> Box<dyn Iterator<Item = (Address, SymbolKey)> + '_>;

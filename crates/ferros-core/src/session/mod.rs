@@ -180,6 +180,8 @@ pub struct Session
     loaded_images: Vec<images::SessionImage>,
     /// Counter identifying the current symbol request; see `begin_symbol_request`.
     symbol_request: u64,
+    /// Function pointer targets named from symbol tables in this stop, misses included.
+    entry_names: stack::EntryNames,
     /// Counter of stops the backend reported, raised by `backend_wait`. An image whose
     /// build id is [`BuildIdentity::Absent`](crate::types::BuildIdentity::Absent) is kept
     /// only while this is unchanged: within one stop the process cannot replace it.
@@ -362,6 +364,7 @@ impl Session
             symbols,
             loaded_images: Vec::new(),
             symbol_request: 0,
+            entry_names: stack::EntryNames::default(),
             stop_generation: 0,
         }
     }

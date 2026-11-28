@@ -347,12 +347,16 @@ impl SymbolTable
         Some(strx)
     }
 
-    /// The string table index of the symbol at `address` when the address is a recorded
-    /// function start. A text symbol alone may label an instruction inside a function.
+    /// The string table index of the symbol at `address` when the address is a function
+    /// entry. A text symbol alone may label an instruction inside a function, so with
+    /// function starts the address must also be a recorded start; an image without them
+    /// (linked with `-no_function_starts`) trusts the symbol.
     pub(crate) fn entry(&self, address: Address) -> Option<u32>
     {
         let address = address.value();
-        self.function_starts.as_ref()?.binary_search(&address).ok()?;
+        if let Some(starts) = &self.function_starts {
+            starts.binary_search(&address).ok()?;
+        }
         let index = self.symbols.binary_search_by_key(&address, |&(start, _)| start).ok()?;
         Some(self.symbols[index].1)
     }
@@ -511,7 +515,7 @@ mod tests
         assert_eq!(at(0x1_0000_2000), None, "data");
         assert_eq!(at(0x1_0000_0ffc), None, "before the section");
 
-        assert_eq!(table.entry(Address::new(0x1_0000_1000)), None, "no function-start data");
+        assert_eq!(table.entry(Address::new(0x1_0000_1000)), Some(1), "no function-start data");
     }
 
     #[test]
@@ -538,9 +542,12 @@ mod tests
         assert_eq!(entry(0x1_0000_1014), None, "inside foo at a named label");
         assert_eq!(entry(0x1_0000_1100), None, "an unnamed function's start");
 
-        // Without function starts the nearest symbol is the fallback.
+        // Without function starts the nearest symbol is the fallback, and a symbol's own
+        // address is an entry.
         let table = layout.parse_symbols(&nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000));
         assert_eq!(table.lookup(&layout, Address::new(0x1_0000_1110)), Some(1));
+        assert_eq!(table.entry(Address::new(0x1_0000_1000)), Some(1));
+        assert_eq!(table.entry(Address::new(0x1_0000_1010)), None);
     }
 
     #[test]

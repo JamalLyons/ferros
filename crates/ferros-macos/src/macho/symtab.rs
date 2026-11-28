@@ -35,7 +35,8 @@
 //! The starts give no function ends, so padding after a function's last instruction, up to
 //! the next start (or the section end for the last function), still takes that function's
 //! name. An image without `LC_FUNCTION_STARTS` falls back to the nearest preceding symbol
-//! in the section, which can also misname a pc in an unnamed function.
+//! in the section, which can also misname a pc in an unnamed function. Naming a function
+//! pointer requires a symbol at an address recorded in `LC_FUNCTION_STARTS`.
 //!
 //! Only symbols in executable sections (`S_ATTR_PURE_INSTRUCTIONS` or
 //! `S_ATTR_SOME_INSTRUCTIONS`) count, and only for a pc in the same section, so a pc
@@ -296,7 +297,7 @@ impl SymtabLayout
     }
 }
 
-/// An image's defined function symbols, sorted by runtime address.
+/// An image's defined symbols in executable sections, sorted by runtime address.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SymbolTable
 {
@@ -346,12 +347,12 @@ impl SymbolTable
         Some(strx)
     }
 
-    /// The string table index of the symbol at exactly `address`, the entry of the function
-    /// it names. Only symbols in executable sections are indexed ([`SymtabLayout::parse_symbols`]),
-    /// so a data symbol never matches.
+    /// The string table index of the symbol at `address` when the address is a recorded
+    /// function start. A text symbol alone may label an instruction inside a function.
     pub(crate) fn entry(&self, address: Address) -> Option<u32>
     {
         let address = address.value();
+        self.function_starts.as_ref()?.binary_search(&address).ok()?;
         let index = self.symbols.binary_search_by_key(&address, |&(start, _)| start).ok()?;
         Some(self.symbols[index].1)
     }
@@ -510,13 +511,7 @@ mod tests
         assert_eq!(at(0x1_0000_2000), None, "data");
         assert_eq!(at(0x1_0000_0ffc), None, "before the section");
 
-        // Only an exact function entry has an entry symbol.
-        let entry = |address| table.entry(Address::new(address));
-        assert_eq!(entry(0x1_0000_1000), Some(1));
-        assert_eq!(entry(0x1_0000_1100), Some(2));
-        assert_eq!(entry(0x1_0000_1004), None, "inside a function");
-        assert_eq!(entry(0x1_0000_1180), None, "a stab entry");
-        assert_eq!(entry(0x1_0000_2000), None, "data");
+        assert_eq!(table.entry(Address::new(0x1_0000_1000)), None, "no function-start data");
     }
 
     #[test]
@@ -529,13 +524,19 @@ mod tests
         assert_eq!(layout.function_starts_range(), Some((Address::new(0x1_0000_8300), 8)));
         let starts = layout.parse_function_starts(&[0x80, 0x20, 0x80, 0x02, 0, 0, 0, 0]);
         assert_eq!(starts, [0x1_0000_1000, 0x1_0000_1100]);
-        let table = layout
-            .parse_symbols(&nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000))
-            .with_function_starts(starts);
+        let symbols = [nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000), nlist(2, N_SECT.0, 1, 0x1_0000_1014)].concat();
+        let table = layout.parse_symbols(&symbols).with_function_starts(starts);
         let at = |address| table.lookup(&layout, Address::new(address));
         assert_eq!(at(0x1_0000_1010), Some(1), "inside foo");
         assert_eq!(at(0x1_0000_1100), None, "an unnamed function's start");
         assert_eq!(at(0x1_0000_1110), None, "inside an unnamed function");
+        assert_eq!(at(0x1_0000_1014), Some(2), "containing lookup still uses the interior symbol");
+
+        let entry = |address| table.entry(Address::new(address));
+        assert_eq!(entry(0x1_0000_1000), Some(1));
+        assert_eq!(entry(0x1_0000_1010), None, "inside foo");
+        assert_eq!(entry(0x1_0000_1014), None, "inside foo at a named label");
+        assert_eq!(entry(0x1_0000_1100), None, "an unnamed function's start");
 
         // Without function starts the nearest symbol is the fallback.
         let table = layout.parse_symbols(&nlist(1, N_SECT.0 | 1, 1, 0x1_0000_1000));

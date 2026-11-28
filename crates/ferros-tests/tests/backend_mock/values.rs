@@ -272,9 +272,14 @@ fn function_pointers_without_dwarf_name_only_an_exact_symbol_table_entry()
     const LIBRARY: u64 = 0x2_0000_0000;
     const UNREADABLE: u64 = 0x5_0000_0000;
     const OUTSIDE: u64 = 0x9_0000_0000;
+    const SIGNATURE: u64 = 0xa532_0000_0000_0000;
     const POINTERS: &[(&str, u64)] = &[
         ("entry", LIBRARY + 0x1000),
         ("inside", LIBRARY + 0x1004),
+        ("signed_entry", SIGNATURE | (LIBRARY + 0x1000)),
+        ("signed_inside", SIGNATURE | (LIBRARY + 0x1004)),
+        ("signed_with_dwarf", SIGNATURE | (BASE + 0x100)),
+        ("signed_inside_dwarf", SIGNATURE | (BASE + 0x104)),
         ("other", LIBRARY + 0x1040),
         ("outside", OUTSIDE),
         ("outside_too", OUTSIDE + 0x40),
@@ -287,6 +292,10 @@ fn function_pointers_without_dwarf_name_only_an_exact_symbol_table_entry()
     for (index, &(name, _)) in (0_u64..).zip(POINTERS) {
         static_local(unit, function, name, pointer, Address::new(BASE + 0x300 + 8 * index));
     }
+    let pair = named_struct(unit, unit.root(), "Pair", 16);
+    add_member(unit, pair, "first", pointer, 0);
+    add_member(unit, pair, "second", pointer, 8);
+    static_local(unit, function, "pair", pair, Address::new(BASE + 0x300));
 
     let library = MockObjectImage::new(LIBRARY + 0x1000..LIBRARY + 0x1100, LIBRARY + 0x2000, LIBRARY + 0x3000)
         .with_symbol(LIBRARY + 0x1000, "c_entry")
@@ -313,6 +322,8 @@ fn function_pointers_without_dwarf_name_only_an_exact_symbol_table_entry()
         .write_memory(Address::new(BASE + 0x300), &values)
         .expect("store pointers");
     let vars = session.selected_frame_variables().expect("read locals");
+    let mut images = session.images().expect("listed images");
+    images.retain(|image| image.load_address != Address::new(LIBRARY));
     let mut print = |name: &str| {
         let var = vars.iter().find(|var| var.name == name).expect(name);
         session.format_variable(var, FormatOptions::default()).1
@@ -322,20 +333,39 @@ fn function_pointers_without_dwarf_name_only_an_exact_symbol_table_entry()
     assert_eq!(print("other"), format!("{:#x} <c_other>", LIBRARY + 0x1040));
     assert_eq!(print("with_dwarf"), format!("{:#x} <function>", BASE + 0x100));
     assert_eq!(print("outside"), format!("{OUTSIDE:#x}"));
+    assert_eq!(
+        print("signed_entry"),
+        format!("{:#x} <c_entry>", SIGNATURE | (LIBRARY + 0x1000))
+    );
+    assert_eq!(print("signed_inside"), format!("{:#x}", SIGNATURE | (LIBRARY + 0x1004)));
+    assert_eq!(
+        print("signed_with_dwarf"),
+        format!("{:#x} <function>", SIGNATURE | (BASE + 0x100))
+    );
+    assert_eq!(print("signed_inside_dwarf"), format!("{:#x}", SIGNATURE | (BASE + 0x104)));
 
-    // Printing again in the same stop reads nothing: not the unreadable header, nor the
-    // table or names of the library. Nor does another address outside every image.
+    // Printing again reuses the same symbol data, including misses for unreadable
+    // headers and addresses outside every image.
     let _ = mock.take_calls();
     assert_eq!(print("outside"), format!("{OUTSIDE:#x}"));
     assert_eq!(print("outside_too"), format!("{:#x}", OUTSIDE + 0x40));
     assert_eq!(print("inside"), format!("{:#x}", LIBRARY + 0x1004));
     assert_eq!(print("entry"), format!("{:#x} <c_entry>", LIBRARY + 0x1000));
-    let reads: Vec<_> = mock
-        .take_calls()
-        .into_iter()
-        .filter(|call| matches!(call, MockCall::ReadMemory { .. }))
-        .collect();
-    assert!(reads.is_empty(), "cached lookups read again: {reads:?}");
+    let repeated_calls = mock.take_calls();
+
+    // Replace the loader snapshot without another stop or a stack trace.
+    mock.set_images(images);
+    assert_eq!(
+        print("pair"),
+        format!("Pair {{ first: {:#x}, second: {:#x} }}", LIBRARY + 0x1000, LIBRARY + 0x1004),
+        "the library was unloaded"
+    );
+    assert_eq!(
+        repeated_calls,
+        vec![MockCall::Images; 4],
+        "each render refreshes once and reuses symbol data"
+    );
+    assert_eq!(mock.take_calls(), vec![MockCall::Images], "the whole pair shares one refresh");
 }
 
 #[test]

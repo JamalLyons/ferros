@@ -1,6 +1,6 @@
 //! Variable inspection through a stopped session.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::sync::{Arc, PoisonError};
 
 use super::Session;
@@ -166,22 +166,40 @@ impl Session
             .chain(PRINTERS.iter().copied())
             .collect();
         let session = RefCell::new(self);
+        let images_current = OnceCell::new();
+        let refresh_images = |session: &mut Self| {
+            images_current
+                .get_or_init(|| session.require_stopped().and_then(|()| session.load_images()).is_ok())
+                .then_some(())
+        };
         let mut read = |address, len| session.borrow_mut().read_memory(address, len);
         let mut image_lookup = |address| {
             let mut session = session.borrow_mut();
-            session.require_stopped().ok()?;
+            refresh_images(&mut session)?;
             let _ = session.load_symbols_for_address(address);
             session.symbols.image_for_address(address)
         };
-        let mut entry_symbol = |address| {
+        let mut function_symbol = |address| {
             let mut session = session.borrow_mut();
-            session.require_stopped().ok()?;
+            let address = session.arch().map_or(address, |arch| arch.strip_pointer_auth(address));
+            if address == Address::ZERO {
+                return None;
+            }
+            refresh_images(&mut session)?;
+            let _ = session.load_symbols_for_address(address);
+            if let Some(name) = session
+                .symbols
+                .image_for_address(address)
+                .and_then(|image| image.function_name_at(address).map(str::to_owned))
+            {
+                return Some(name);
+            }
             let name = session.symbol_table_entry_name(address)?;
             Some(name.display_name().to_owned())
         };
         let mut formatter = ValueFormatter::new(types, image.endian(), options, &mut read)
             .with_image_lookup(&mut image_lookup)
-            .with_entry_symbols(&mut entry_symbol)
+            .with_function_symbols(&mut function_symbol)
             .with_printers(&printers);
         match storage {
             Storage::Bytes(bytes, address) => formatter.format(ValueView {

@@ -1,7 +1,7 @@
 //! Stack traces and symbolication.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::Session;
@@ -368,11 +368,9 @@ impl Session
     /// name. Code in no listed image is not searched for.
     ///
     /// The answer, a name or none, is kept for the rest of the stop while the image list
-    /// stays the same ([`EntryNames`]), so printing the same pointer again reads nothing
-    /// from the target, even when it lies outside every image or a table could not be
-    /// read. An image whose header could not be read is not asked again in that stop
-    /// either, so a pointer to another address does not read it again. A read that
-    /// failed is tried again at the next stop.
+    /// stays the same ([`EntryNames`]). Each formatting request refreshes the image
+    /// list before consulting this cache. Header read failures are kept per image for
+    /// the rest of the stop, even when other images load or unload.
     pub(super) fn symbol_table_entry_name(&mut self, address: Address) -> Option<SymbolName>
     {
         let generation = self.stop_generation;
@@ -406,7 +404,8 @@ impl Session
         for index in 0..self.loaded_images.len() {
             let image = &self.loaded_images[index];
             let load_address = Address::new(image.descriptor_load_address());
-            let failed_in_stop = matching == SymbolMatch::Entry && self.entry_names.failed_headers.contains(&load_address);
+            let failed_in_stop =
+                matching == SymbolMatch::Entry && image.symtab_entry_failed_in_stop == Some(self.stop_generation);
             if image.symtab.is_none() && image.symtab_failed_in_request != Some(request) && !failed_in_stop {
                 let symbols = self
                     .format
@@ -421,7 +420,7 @@ impl Session
                         tracing::debug!("no symbol table for the image at {load_address}: {detail}");
                         image.symtab_failed_in_request = Some(request);
                         if matching == SymbolMatch::Entry {
-                            self.entry_names.failed_headers.insert(load_address);
+                            image.symtab_entry_failed_in_stop = Some(self.stop_generation);
                         }
                     }
                 }
@@ -462,8 +461,6 @@ pub(super) struct EntryNames
     /// The stop generation the names were read in.
     generation: u64,
     names: HashMap<Address, Option<SymbolName>>,
-    /// Load addresses of listed images whose header could not be read in this stop.
-    failed_headers: HashSet<Address>,
 }
 
 impl EntryNames
@@ -472,7 +469,6 @@ impl EntryNames
     pub(super) fn clear(&mut self)
     {
         self.names.clear();
-        self.failed_headers.clear();
     }
 }
 

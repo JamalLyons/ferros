@@ -2,6 +2,11 @@
 //! program (issue #412), and function pointers into code without DWARF (#419).
 #![cfg(target_os = "macos")]
 
+use std::time::Duration;
+
+use ferros_core::values::format::FormatOptions;
+use ferros_core::{Address, BreakpointLocation, StopEvent};
+use ferros_tests::symbols::raw_symbol_address;
 use ferros_tests::{fixture, harness, transcript};
 
 /// Values checked against addresses read from the same run.
@@ -140,4 +145,36 @@ fn assert_c_function_pointers(c_function: &str, c_stray: &str)
             entry + 4
         )
     );
+}
+
+#[test]
+fn function_pointer_skips_a_named_instruction_inside_a_function()
+{
+    harness::run(|t| {
+        let fixture = fixture!("values_misc");
+        let mut d = t.launch(&fixture);
+        d.set_breakpoint(BreakpointLocation::Line {
+            file: "values_misc.rs".to_owned(),
+            line: fixture.marker_line("inspect"),
+        })
+        .expect("set breakpoint");
+        d.resume().expect("resume");
+        let stop = d.wait(Some(Duration::from_secs(5))).expect("wait");
+        assert!(matches!(stop, Some(StopEvent::Breakpoint { .. })), "got {stop:?}");
+
+        let entry = raw_symbol_address(&mut d, &fixture, "_ferros_callback_entry");
+        let marker = raw_symbol_address(&mut d, &fixture, "_ferros_callback_marker");
+        assert_eq!(marker, entry + 4);
+        let mut callback = d
+            .selected_frame_variables()
+            .expect("read variables")
+            .into_iter()
+            .find(|var| var.name == "callback")
+            .expect("function pointer variable");
+        let mut render = |address: Address| {
+            callback.value.bytes = Ok(address.value().to_le_bytes().to_vec());
+            d.format_variable(&callback, FormatOptions::default()).1
+        };
+        assert_eq!(render(marker), format!("{:#x}", marker.value()));
+    });
 }

@@ -12,11 +12,10 @@ use crate::types::{Address, Architecture, BuildIdentity};
 
 /// The DWARF sections the engine reads, in the order a format may look them up. A format
 /// returns any of them it finds in [`DebugSections::dwarf`]; one it does not return reads
-/// as empty.
+/// as empty. Append new sections to preserve the section kinds in serialized mock images.
 pub const DWARF_SECTIONS: &[SectionId] = &[
     SectionId::DebugAbbrev,
     SectionId::DebugAddr,
-    SectionId::DebugAranges,
     SectionId::DebugInfo,
     SectionId::DebugLine,
     SectionId::DebugLineStr,
@@ -33,6 +32,7 @@ pub const DWARF_SECTIONS: &[SectionId] = &[
     SectionId::DebugMacro,
     SectionId::DebugCuIndex,
     SectionId::DebugTuIndex,
+    SectionId::DebugAranges,
 ];
 
 /// Which build of an image is mapped, and which part of its file holds it.

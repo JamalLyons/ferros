@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use addr2line::Context;
 use gimli::{AttributeValue, DebugInfoOffset, DebuggingInformationEntry, DwAt, DwTag, Reader as _, UnitOffset, UnitRef};
 
 use super::location::{LocationEvaluator, Unavailable, VariableValue, expression_at, read_constant};
 use crate::error::Result;
-use crate::symbols::{ImageId, OwnedDwarf, OwnedReader, dwarf_frame_name};
+use crate::symbols::frames::{DwarfFrames, die_error};
+use crate::symbols::{ImageId, OwnedReader};
 use crate::types::{Address, FrameKind, FrameRegisters};
 
 /// A local variable or argument visible in a stopped logical stack frame.
@@ -36,103 +36,23 @@ type Entry<'a, 'b> = DebuggingInformationEntry<'a, 'b, OwnedReader>;
 type Attr = AttributeValue<OwnedReader>;
 type DwarfResult<T> = gimli::Result<T>;
 
-#[derive(Debug)]
-pub(crate) enum FrameDwarfError
-{
-    Lookup(gimli::Error),
-    Scope(String),
-}
-
-impl FrameDwarfError
-{
-    pub(crate) fn detail<'a>(self, pc: u64, dwarf: impl FnOnce() -> Option<&'a OwnedDwarf>) -> String
-    {
-        let error = match self {
-            Self::Scope(detail) => return detail,
-            Self::Lookup(error) => error,
-        };
-        let mut detail = format!("frame lookup at PC {pc:#x}: {error}");
-        // addr2line reports the abbreviation code without the unit or DIE offset.
-        // Recover the possible locations on the error path only.
-        if matches!(error, gimli::Error::UnknownAbbreviation(_))
-            && let Some(dwarf) = dwarf()
-        {
-            let mut units = dwarf.units();
-            while let Ok(Some(header)) = units.next() {
-                let Ok(unit) = dwarf.unit(header) else { continue };
-                let unit = UnitRef::new(dwarf, &unit);
-                if let Some((offset, found)) = bad_abbreviation(unit)
-                    && found == error
-                {
-                    detail.push_str(&format!("; {}", die_error(unit, offset, error)));
-                }
-            }
-        }
-        detail
-    }
-}
-
-fn bad_abbreviation(unit: Unit<'_>) -> Option<(UnitOffset<usize>, gimli::Error)>
-{
-    let mut entries = unit.entries_raw(None).ok()?;
-    while !entries.is_empty() {
-        let offset = entries.next_offset();
-        match entries.read_abbreviation() {
-            Ok(Some(abbrev)) => entries.skip_attributes(abbrev.attributes()).ok()?,
-            Ok(None) => {}
-            Err(error) => return Some((offset, error)),
-        }
-    }
-    None
-}
-
 pub(crate) fn frame_variables(
-    context: &Context<OwnedReader>,
+    frames: DwarfFrames<'_>,
     pc: u64,
     kind: FrameKind,
     image_id: ImageId,
     registers: &FrameRegisters,
     read_memory: impl FnMut(Address, usize) -> Result<Vec<u8>>,
     relocate: impl Fn(u64) -> Option<Address>,
-) -> std::result::Result<Vec<Variable>, FrameDwarfError>
+) -> std::result::Result<Vec<Variable>, String>
 {
-    let mut frames = context.find_frames(pc).skip_all_loads().map_err(FrameDwarfError::Lookup)?;
-    let mut owner = None;
-    let mut named = Vec::new();
-    while let Some(frame) = frames.next().map_err(FrameDwarfError::Lookup)? {
-        owner = frame.dw_die_offset;
-        if dwarf_frame_name(&frame).is_some()
-            && let Some(offset) = frame.dw_die_offset
-        {
-            named.push(offset);
-        }
-    }
-    let Some(owner) = owner else { return Ok(Vec::new()) };
-    let selected = match kind {
-        // Stack traces present the last named entry as physical. The actual
-        // subprogram still owns the frame base, including when it has no name.
-        FrameKind::Physical => named.last().copied().unwrap_or(owner),
-        FrameKind::Inlined { depth, .. } => match named.get(usize::from(depth)) {
-            Some(&inline) => inline,
-            None => return Ok(Vec::new()),
-        },
+    let Some(selected) = frames.scope(kind) else {
+        return Ok(Vec::new());
     };
-    let Some(hint) = context.find_dwarf_and_unit(pc).skip_all_loads() else {
-        return Err(FrameDwarfError::Scope(format!(
-            "no unit for PC {pc:#x}, subprogram DIE at unit offset {:#x}",
-            owner.0
-        )));
-    };
-    let fallback;
-    let unit = if matches_frame(hint, pc, owner, selected).unwrap_or(false) {
-        hint
-    } else {
-        fallback = find_frame_unit(hint, pc, owner, selected).map_err(FrameDwarfError::Scope)?;
-        UnitRef::new(hint.dwarf, &fallback)
-    };
+    let unit = frames.unit;
     let owner_die = unit
-        .entry(owner)
-        .map_err(|error| FrameDwarfError::Scope(die_error(unit, owner, error)))?;
+        .entry(frames.owner)
+        .map_err(|error| die_error(unit, frames.owner, error))?;
     let frame_base = owner_die
         .attr_value(gimli::DW_AT_frame_base)
         .map_err(Unavailable::from)
@@ -149,111 +69,7 @@ pub(crate) fn frame_variables(
             Err(reason) => VariableValue::unavailable(reason),
         }
     };
-    FrameScope { pc, image_id }
-        .variables(unit, selected, inspect)
-        .map_err(FrameDwarfError::Scope)
-}
-
-fn die_error(unit: Unit<'_>, offset: UnitOffset<usize>, error: impl std::fmt::Display) -> String
-{
-    let base = unit.header.offset().as_debug_info_offset().map_or(0, |offset| offset.0);
-    format!("unit at .debug_info+{base:#x}, DIE at unit offset {:#x}: {error}", offset.0)
-}
-
-fn find_frame_unit(
-    hint: Unit<'_>,
-    pc: u64,
-    owner: UnitOffset<usize>,
-    selected: UnitOffset<usize>,
-) -> std::result::Result<gimli::Unit<OwnedReader>, String>
-{
-    // addr2line 0.25 can advance to another unit in find_frames while
-    // find_dwarf_and_unit still returns its first candidate. With overlapping
-    // CU ranges, recover by checking which unit actually owns the function.
-    let mut units = hint.dwarf.units();
-    let mut matched = None;
-    while let Some(header) = units.next().map_err(|error| die_error(hint, owner, error))? {
-        if header.offset() == hint.header.offset()
-            || !matches!(
-                header.type_(),
-                gimli::UnitType::Compilation | gimli::UnitType::Skeleton(_) | gimli::UnitType::SplitCompilation(_)
-            )
-        {
-            continue;
-        }
-        let Ok(unit) = hint.dwarf.unit(header) else { continue };
-        if matches_frame(UnitRef::new(hint.dwarf, &unit), pc, owner, selected).unwrap_or(false) {
-            if matched.is_some() {
-                return Err(die_error(hint, owner, format_args!("multiple matching units for PC {pc:#x}")));
-            }
-            matched = Some(unit);
-        }
-    }
-    matched.ok_or_else(|| die_error(hint, owner, format_args!("no matching subprogram for PC {pc:#x}")))
-}
-
-fn matches_frame(unit: Unit<'_>, pc: u64, owner: UnitOffset<usize>, selected: UnitOffset<usize>) -> DwarfResult<bool>
-{
-    // A relative offset from another unit can land in an attribute and still
-    // decode as a DIE. Check entry boundaries and the inline scope's parentage.
-    let mut entries = unit.entries_raw(None)?;
-    let mut owner_depth = None;
-    while !entries.is_empty() && entries.next_offset().0 <= selected.0 {
-        let offset = entries.next_offset();
-        let depth = entries.next_depth();
-        if owner_depth.is_some_and(|owner| depth <= owner) {
-            return Ok(false);
-        }
-        if let Some(abbrev) = entries.read_abbreviation()? {
-            if offset == owner {
-                if abbrev.tag() != gimli::DW_TAG_subprogram || !covers_pc(unit, offset, pc)? {
-                    return Ok(false);
-                }
-                if selected == owner {
-                    return Ok(true);
-                }
-                owner_depth = Some(depth);
-            } else if offset == selected {
-                return if owner_depth.is_some() && abbrev.tag() == gimli::DW_TAG_inlined_subroutine {
-                    covers_pc(unit, offset, pc)
-                } else {
-                    Ok(false)
-                };
-            }
-            entries.skip_attributes(abbrev.attributes())?;
-        }
-    }
-    Ok(false)
-}
-
-fn covers_pc(unit: Unit<'_>, offset: UnitOffset<usize>, pc: u64) -> DwarfResult<bool>
-{
-    let entry = unit.entry(offset)?;
-    if let Some(attr) = entry.attr_value(gimli::DW_AT_ranges)?
-        && let Some(mut ranges) = unit.attr_ranges(attr)?
-    {
-        while let Some(range) = ranges.next()? {
-            if range.begin <= pc && pc < range.end {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
-    }
-    let (Some(low), Some(high)) = (
-        entry.attr_value(gimli::DW_AT_low_pc)?,
-        entry.attr_value(gimli::DW_AT_high_pc)?,
-    ) else {
-        return Ok(false);
-    };
-    let Some(begin) = unit.attr_address(low)? else {
-        return Ok(false);
-    };
-    // A tombstone address can overflow when high_pc is a size.
-    let end = match high {
-        Attr::Udata(size) => begin.checked_add(size),
-        address => unit.attr_address(address)?,
-    };
-    Ok(begin <= pc && end.is_some_and(|end| pc < end))
+    FrameScope { pc, image_id }.variables(unit, selected, inspect)
 }
 
 struct FrameScope
@@ -723,6 +539,8 @@ mod tests
     use gimli::write::{Address as FileAddress, AttributeValue as WriteAttr, DwarfUnit, Expression, Location, LocationList};
 
     use super::*;
+    use crate::symbols::OwnedDwarf;
+    use crate::symbols::frames::FrameIndex;
     use crate::values::location::ValueLocation;
     use crate::values::location::tests::{encoding, synthetic_dwarf};
 
@@ -742,10 +560,10 @@ mod tests
         function
     }
 
-    fn test_frame(context: &Context<OwnedReader>, pc: u64) -> std::result::Result<Vec<Variable>, FrameDwarfError>
+    fn test_frame(dwarf: &OwnedDwarf, index: &FrameIndex, pc: u64) -> std::result::Result<Vec<Variable>, String>
     {
         frame_variables(
-            context,
+            index.lookup(dwarf, pc)?.expect("function at PC"),
             pc,
             FrameKind::Physical,
             ImageId::from_parts(Path::new("test"), 0),
@@ -772,7 +590,7 @@ mod tests
         let mut dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
         // Only the middle variable uses this section. Its offset now points past the end.
         dwarf.debug_str = gimli::DebugStr::from(OwnedReader::new(std::sync::Arc::from([]), RunTimeEndian::Little));
-        let vars = test_frame(&Context::from_dwarf(dwarf).unwrap(), 0x105).unwrap();
+        let vars = test_frame(&dwarf, &FrameIndex::build(&dwarf).unwrap(), 0x105).unwrap();
         assert_eq!(
             vars.iter().map(|var| var.name.as_str()).collect::<Vec<_>>(),
             ["first", "last"]
@@ -813,12 +631,12 @@ mod tests
             .set(gimli::DW_AT_location, WriteAttr::Exprloc(location));
 
         let dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
-        let context = Context::from_dwarf(dwarf).unwrap();
-        let vars = test_frame(&context, 0x10b).unwrap();
+        let index = FrameIndex::build(&dwarf).unwrap();
+        let vars = test_frame(&dwarf, &index, 0x10b).unwrap();
         assert_eq!(vars.len(), 1, "before inherited start scope");
         assert_eq!(vars[0].name, "omitted");
         assert_eq!(vars[0].value.bytes, Err(Unavailable::OptimizedOut));
-        let vars = test_frame(&context, 0x10c).unwrap();
+        let vars = test_frame(&dwarf, &index, 0x10c).unwrap();
         assert_eq!(
             vars.iter().map(|var| var.name.as_str()).collect::<Vec<_>>(),
             ["omitted", "started"]
@@ -901,12 +719,13 @@ mod tests
             late.set(gimli::DW_AT_start_scope, WriteAttr::Udata(0x20));
             late.set(gimli::DW_AT_location, WriteAttr::Exprloc(stack));
 
-            let context = Context::from_dwarf(synthetic_dwarf(dwarf, RunTimeEndian::Little)).unwrap();
+            let dwarf = synthetic_dwarf(dwarf, RunTimeEndian::Little);
+            let index = FrameIndex::build(&dwarf).unwrap();
             let image = ImageId::from_parts(Path::new("test"), 0);
             let read_frame = |pc, known_reg| {
                 let registers = FrameRegisters::new(Some(Address::new(0x8010)), |n| (n == 0 && known_reg).then_some(0x1234));
                 frame_variables(
-                    &context,
+                    index.lookup(&dwarf, pc).unwrap().expect("function at PC"),
                     pc,
                     FrameKind::Physical,
                     image,

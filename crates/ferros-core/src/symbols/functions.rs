@@ -344,7 +344,7 @@ impl FunctionIndex
 /// unit's `DW_AT_name` and `DW_AT_comp_dir`, which only the line program uses): the root
 /// entry's `DW_AT_low_pc` and section bases, which addresses, strings and range lists of
 /// its DIEs depend on, are read the same way.
-fn unit_without_lines(dwarf: &OwnedDwarf, header: UnitHeader<OwnedReader>) -> gimli::Result<Unit<OwnedReader>>
+pub(super) fn unit_without_lines(dwarf: &OwnedDwarf, header: UnitHeader<OwnedReader>) -> gimli::Result<Unit<OwnedReader>>
 {
     let encoding = header.encoding();
     let mut unit = Unit {

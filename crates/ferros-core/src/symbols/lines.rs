@@ -5,9 +5,9 @@
 //!
 //! # File paths
 //!
-//! A line-table file is first rendered the way `addr2line` renders it (compilation
-//! directory, then include directory, then file name, where an absolute component replaces
-//! what came before), then normalized: empty and `.` components are dropped and the
+//! A line-table file is rendered from its compilation directory, include directory, and file
+//! name. An absolute component replaces the preceding path. For line lookups, the path is
+//! then normalized: empty and `.` components are dropped and the
 //! remaining components are joined with `/` (a leading `/` is kept for an absolute path).
 //! Files are keyed by that normalized path, so units that spell one file differently
 //! (`/w/./src/lib.rs` and `/w/src/lib.rs`) share one entry, and [`LineAddresses::file`] /
@@ -200,8 +200,8 @@ pub struct AddressLine
 
 /// One line-table row (file virtual address).
 ///
-/// Rows that share an address are collapsed into the last one, as `addr2line` does; a
-/// `prologue_end` flag on a collapsed row is kept.
+/// Rows that share an address are collapsed into the last one, preserving any
+/// `prologue_end` flag from the collapsed rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LineRow
 {
@@ -303,60 +303,26 @@ impl LineIndex
         paths: &mut HashMap<String, u32>,
     ) -> gimli::Result<()>
     {
-        let Some(program) = unit.line_program.clone() else {
-            return Ok(());
-        };
-        // DWARF file index -> index into `files`, for this unit.
+        // DWARF file index -> index into files, for this unit.
         let mut unit_files = HashMap::<u64, u32>::new();
-        let mut rows = program.rows();
-        let mut current = Vec::<LineRow>::new();
-        while let Some((header, row)) = rows.next_row()? {
-            let file = match unit_files.get(&row.file_index()) {
+        read_sequences(unit, &mut self.sequences, |header, file_index| {
+            let file = match unit_files.get(&file_index) {
                 Some(&file) => file,
                 None => {
-                    let path = row
-                        .file(header)
+                    let path = header
+                        .file(file_index)
                         .map(|entry| render_file(dwarf, unit, entry, header))
                         .transpose()?
                         .map(|path| normalize_path(&path))
                         .unwrap_or_default();
                     let next = u32::try_from(paths.len()).unwrap_or(u32::MAX);
                     let file = *paths.entry(path).or_insert(next);
-                    unit_files.insert(row.file_index(), file);
+                    unit_files.insert(file_index, file);
                     file
                 }
             };
-            let line = LineRow {
-                address: row.address(),
-                file,
-                line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
-                column: match row.column() {
-                    ColumnType::LeftEdge => 0,
-                    ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
-                },
-                is_stmt: row.is_stmt(),
-                prologue_end: row.prologue_end(),
-                end_sequence: row.end_sequence(),
-            };
-            match current.last_mut() {
-                Some(last) if last.address == line.address && !last.end_sequence => {
-                    let prologue_end = last.prologue_end;
-                    *last = line;
-                    last.prologue_end |= prologue_end;
-                }
-                _ => current.push(line),
-            }
-            if line.end_sequence {
-                let rows = std::mem::take(&mut current);
-                if rows.len() > 1 {
-                    self.sequences.push(LineSequence {
-                        start: rows[0].address,
-                        end: line.address,
-                        rows,
-                    });
-                }
-            }
-        }
+            Ok(file)
+        })?;
         Ok(())
     }
 
@@ -474,6 +440,54 @@ impl LineIndex
     }
 }
 
+/// Read and collapse rows for one unit, keeping completed sequences on an error.
+pub(super) fn read_sequences(
+    unit: &Unit<OwnedReader>,
+    sequences: &mut Vec<LineSequence>,
+    mut file_index: impl FnMut(&LineProgramHeader<OwnedReader>, u64) -> gimli::Result<u32>,
+) -> gimli::Result<Option<LineProgramHeader<OwnedReader>>>
+{
+    let Some(program) = unit.line_program.clone() else {
+        return Ok(None);
+    };
+    let mut rows = program.rows();
+    let mut current = Vec::<LineRow>::new();
+    while let Some((header, row)) = rows.next_row()? {
+        let file = file_index(header, row.file_index())?;
+        let line = LineRow {
+            address: row.address(),
+            file,
+            line: row.line().map_or(0, |line| u32::try_from(line.get()).unwrap_or(u32::MAX)),
+            column: match row.column() {
+                ColumnType::LeftEdge => 0,
+                ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(u32::MAX),
+            },
+            is_stmt: row.is_stmt(),
+            prologue_end: row.prologue_end(),
+            end_sequence: row.end_sequence(),
+        };
+        match current.last_mut() {
+            Some(last) if last.address == line.address && !last.end_sequence => {
+                let prologue_end = last.prologue_end;
+                *last = line;
+                last.prologue_end |= prologue_end;
+            }
+            _ => current.push(line),
+        }
+        if line.end_sequence {
+            let rows = std::mem::take(&mut current);
+            if rows.len() > 1 {
+                sequences.push(LineSequence {
+                    start: rows[0].address,
+                    end: line.address,
+                    rows,
+                });
+            }
+        }
+    }
+    Ok(Some(rows.header().clone()))
+}
+
 /// Record the canonical statement address of every run of rows for one line.
 ///
 /// A run is a maximal stretch of consecutive rows with the same file and line within one
@@ -517,8 +531,8 @@ pub(crate) fn normalize_path(path: &str) -> String
     if path.starts_with('/') { format!("/{joined}") } else { joined }
 }
 
-/// Render a line-program file entry the way `addr2line` does.
-fn render_file(
+/// Render a line-program file entry for both frame and source lookups.
+pub(super) fn render_file(
     dwarf: &OwnedDwarf,
     unit: &Unit<OwnedReader>,
     file: &FileEntry<OwnedReader>,

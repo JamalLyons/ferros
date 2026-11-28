@@ -220,3 +220,8 @@ test = false
 name = "ferros-fixture-values_newtypes"
 path = "fixtures/values_newtypes.rs"
 test = false
+
+[[bin]]
+name = "ferros-fixture-values_sync"
+path = "fixtures/values_sync.rs"
+test = false

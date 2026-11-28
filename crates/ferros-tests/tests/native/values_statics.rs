@@ -9,9 +9,8 @@ use ferros_tests::{fixture, harness, transcript};
 
 const PREFIX: &str = "ferros_fixture_values_statics::";
 const COUNTER_TYPE: &str = "core::sync::atomic::Atomic<u64>";
-const COUNTER_VALUE: &str = "core::sync::atomic::Atomic<u64> { v: \
-                             core::cell::UnsafeCell<core::sync::atomic::private::Align8<u64>> { value: \
-                             core::sync::atomic::private::Align8<u64>(42) } }";
+// The atomic printer (#409) shows the stored value.
+const COUNTER_VALUE: &str = "42";
 
 /// The fixture's statics in `globals` order (by name, then address), with their types and
 /// values. The two `blocks::S` are separate rows: the first block's has the lower address.

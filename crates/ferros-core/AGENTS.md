@@ -11,7 +11,7 @@ Open first: `src/session/mod.rs` (state-machine table), then `src/backend/mod.rs
 - `session/tests.rs` + `session/tests/<area>.rs`: `Session` unit tests on `MockBackend`. Shared helpers live in `tests.rs`.
 - `backend/`: `Backend` trait (`mod.rs`), `StopEvent`/`LaunchSpec`/`ResumeRequest` (`types.rs`), `BackendError` (`error.rs`), `MockBackend` (`mock.rs`, `test-util`).
 - `objfile/`: `ObjectFormat`, the format-neutral image trait (ADR 0001). `contents.rs`: what a format reads. `mock.rs`: `MockObjectFormat`.
-- `runtime/`: `TargetRuntime` (non-local exits, signal-frame state). `mock.rs`: `MockRuntime`.
+- `runtime/`: `TargetRuntime` (non-local exits, signal-frame state, system mutex lock state). `mock.rs`: `MockRuntime`.
 - `symbols/`: DWARF and symbol work.
   - `image.rs`: `BinaryImage`, sections and segment mapping read through `ObjectFormat`.
   - `cache.rs`: per-session symbol cache, address symbolication.

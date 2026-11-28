@@ -47,3 +47,4 @@ mod values_paths;
 mod values_shared;
 mod values_statics;
 mod values_std;
+mod values_sync;

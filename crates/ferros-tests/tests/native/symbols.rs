@@ -56,6 +56,7 @@ fn all_fixtures() -> Vec<Fixture>
         fixture!("values_shared"),
         fixture!("values_statics"),
         fixture!("values_std"),
+        fixture!("values_sync"),
         fixture!("values_types"),
         fixture!("workqueue"),
     ]

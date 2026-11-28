@@ -10,6 +10,7 @@ use crate::types::Address;
 use crate::values::format::{FormatOptions, ValueFormatter, ValueView, format_raw};
 use crate::values::location::{Unavailable, ValueLocation};
 use crate::values::path::{Path, PathError, Place, Storage, evaluate};
+use crate::values::pretty::{LockPrinter, PRINTERS, PrettyPrinter};
 use crate::values::scope::{Variable, frame_variables};
 use crate::values::types::{DieOffset, TypeId};
 
@@ -158,6 +159,12 @@ impl Session
             return format_raw(Err(&Unavailable::SizeUnknown));
         };
         self.begin_symbol_request();
+        // Lock printers ask the platform runtime about system mutexes.
+        let runtime = Arc::clone(&self.runtime);
+        let locks = LockPrinter::with_runtime(runtime.as_ref());
+        let printers: Vec<&dyn PrettyPrinter> = std::iter::once(&locks as &dyn PrettyPrinter)
+            .chain(PRINTERS.iter().copied())
+            .collect();
         let session = RefCell::new(self);
         let mut read = |address, len| session.borrow_mut().read_memory(address, len);
         let mut image_lookup = |address| {
@@ -166,8 +173,9 @@ impl Session
             let _ = session.load_symbols_for_address(address);
             session.symbols.image_for_address(address)
         };
-        let mut formatter =
-            ValueFormatter::new(types, image.endian(), options, &mut read).with_image_lookup(&mut image_lookup);
+        let mut formatter = ValueFormatter::new(types, image.endian(), options, &mut read)
+            .with_image_lookup(&mut image_lookup)
+            .with_printers(&printers);
         match storage {
             Storage::Bytes(bytes, address) => formatter.format(ValueView {
                 ty,
